@@ -6,5 +6,22 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+# Deterministic test helpers (seeded RNG, in-memory signers/verifier, fake
+# clock). Shared by this crate's integration tests and the fuzz targets so
+# there is a single source of truth for test fixtures.
+test-util = []
+
 [dependencies]
 thiserror = { workspace = true }
+serde = { workspace = true }
+serde-big-array = { workspace = true }
+postcard = { workspace = true }
+ed25519-dalek = { workspace = true }
+p256 = { workspace = true }
+rand_core = { workspace = true }
+zstd = { workspace = true }
+
+[dev-dependencies]
+weaver-mux = { path = ".", features = ["test-util"] }
+proptest = { workspace = true }

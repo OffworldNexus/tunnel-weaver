@@ -21,3 +21,11 @@ weaver-proto = { path = "crates/weaver-proto", version = "0.1.0" }
 
 clap = { version = "4.5", features = ["derive"] }
 thiserror = "2.0"
+serde = { version = "1.0", features = ["derive"] }
+serde-big-array = "0.5"
+postcard = { version = "1.1", default-features = false, features = ["alloc"] }
+ed25519-dalek = "3.0"
+p256 = { version = "0.14", default-features = false, features = ["ecdsa", "alloc"] }
+rand_core = "0.10"
+zstd = { version = "0.14", default-features = false }
+proptest = { version = "1.11", default-features = false, features = ["std"] }

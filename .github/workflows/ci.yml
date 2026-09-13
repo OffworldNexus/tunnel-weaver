@@ -55,6 +55,11 @@ jobs:
     defaults:
       run:
         shell: bash
+    env:
+      # Scheduler/QFQ property tests: many cases, fixed seed, so a failure
+      # prints the same minimal counterexample on every run.
+      PROPTEST_CASES: "2000"
+      PROPTEST_RNG_SEED: "67"
     steps:
       - uses: actions/checkout@v4
 

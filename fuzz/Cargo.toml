@@ -9,7 +9,7 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-weaver-mux = { path = "../crates/weaver-mux" }
+weaver-mux = { path = "../crates/weaver-mux", features = ["test-util"] }
 
 [workspace]
 members = ["."]
@@ -17,5 +17,17 @@ members = ["."]
 [[bin]]
 name = "frame_parse"
 path = "fuzz_targets/frame_parse.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "mux_recv"
+path = "fuzz_targets/mux_recv.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "mux_handshake"
+path = "fuzz_targets/mux_handshake.rs"
 test = false
 doc = false
