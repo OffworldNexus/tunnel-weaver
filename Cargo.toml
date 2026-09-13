@@ -1,0 +1,23 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/weaver-mux",
+    "crates/weaver-proto",
+    "crates/weaver-server",
+    "crates/weave",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+authors = ["Offworld Nexus Authors"]
+license = "Apache-2.0"
+repository = "https://github.com/OffworldNexus/tunnel-weaver"
+
+[workspace.dependencies]
+weaver-mux = { path = "crates/weaver-mux", version = "0.1.0" }
+weaver-proto = { path = "crates/weaver-proto", version = "0.1.0" }
+
+clap = { version = "4.5", features = ["derive"] }
+thiserror = "2.0"

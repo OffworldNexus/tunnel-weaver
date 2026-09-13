@@ -1,0 +1,21 @@
+[package]
+name = "tunnel-weaver-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+weaver-mux = { path = "../crates/weaver-mux" }
+
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "frame_parse"
+path = "fuzz_targets/frame_parse.rs"
+test = false
+doc = false

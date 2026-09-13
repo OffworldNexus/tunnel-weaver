@@ -1,0 +1,269 @@
+name: CI
+
+on:
+  push:
+    branches: [develop, main]
+  pull_request:
+    branches: [develop, main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/develop' && github.ref != 'refs/heads/main' }}
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Register GitHub Problem Matchers
+        run: echo "::add-matcher::.github/matchers/rust.json"
+
+      - name: Install stable Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Cargo deny
+        run: cargo deny check
+
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Register GitHub Problem Matchers
+        run: echo "::add-matcher::.github/matchers/rust.json"
+
+      - name: Install stable Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run tests
+        run: |
+          if [ "${{ runner.os }}" = "Linux" ]; then
+            cargo test --workspace > test-output.txt 2>&1 || { cat test-output.txt; exit 1; }
+          else
+            cargo test --workspace --exclude weaver-server > test-output.txt 2>&1 || { cat test-output.txt; exit 1; }
+          fi
+          cat test-output.txt
+          grep -E "[1-9][0-9]* passed" test-output.txt || {
+            echo "Error: expected at least 1 test to pass"
+            exit 1
+          }
+
+  e2e-linux:
+    name: e2e-linux
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run e2e tests
+        run: |
+          cargo test --workspace -- --ignored > e2e-output.txt 2>&1 || { cat e2e-output.txt; exit 1; }
+          cat e2e-output.txt
+          grep -E "[1-9][0-9]* passed" e2e-output.txt || {
+            echo "Error: expected at least 1 ignored e2e test to pass"
+            exit 1
+          }
+
+  fuzz-smoke:
+    name: fuzz-smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install nightly Rust toolchain
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-fuzz
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+
+      - name: Run fuzz smoke tests
+        run: |
+          TARGETS=$(cargo +nightly fuzz list)
+          if [ -z "$TARGETS" ]; then
+            echo "Error: cargo fuzz list returned no targets"
+            exit 1
+          fi
+          echo "Discovered fuzz targets:"
+          echo "$TARGETS"
+          for target in $TARGETS; do
+            echo "Running fuzz target '$target' for up to 60s..."
+            cargo +nightly fuzz run "$target" --target x86_64-unknown-linux-gnu -- -max_total_time=60
+          done
+
+  build-artifacts:
+    name: build-artifacts (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            binaries: weave weaver-server
+            use_cross: false
+            can_run: true
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            binaries: weave weaver-server
+            use_cross: true
+            can_run: true
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            binaries: weave
+            use_cross: false
+            can_run: true
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            binaries: weave
+            use_cross: false
+            can_run: true
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            binaries: weave
+            use_cross: false
+            can_run: true
+          - os: windows-latest
+            target: aarch64-pc-windows-msvc
+            binaries: weave
+            use_cross: false
+            can_run: false
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install QEMU user static and cross runtime (for Linux cross-runners)
+        if: matrix.use_cross && matrix.can_run
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-user-static gcc-aarch64-linux-gnu
+
+      - name: Install cross
+        if: matrix.use_cross
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+
+      - name: Build release binaries
+        run: |
+          PKG_FLAGS=""
+          for bin in ${{ matrix.binaries }}; do
+            PKG_FLAGS="$PKG_FLAGS --package $bin"
+          done
+          if [ "${{ matrix.use_cross }}" = "true" ]; then
+            cross build --release --target ${{ matrix.target }} $PKG_FLAGS
+          else
+            cargo build --release --target ${{ matrix.target }} $PKG_FLAGS
+          fi
+
+      - name: Stage artifacts
+        run: |
+          mkdir -p dist
+          for bin in ${{ matrix.binaries }}; do
+            if [ -f "target/${{ matrix.target }}/release/${bin}.exe" ]; then
+              cp "target/${{ matrix.target }}/release/${bin}.exe" dist/
+            elif [ -f "target/${{ matrix.target }}/release/${bin}" ]; then
+              cp "target/${{ matrix.target }}/release/${bin}" dist/
+            else
+              echo "Error: Expected binary for $bin was not found in target/${{ matrix.target }}/release/"
+              exit 1
+            fi
+          done
+          ls -la dist/
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.target }}
+          path: dist/
+          if-no-files-found: error
+
+      - name: Download artifacts back
+        uses: actions/download-artifact@v4
+        with:
+          name: release-${{ matrix.target }}
+          path: downloaded/
+
+      - name: Verify downloaded artifacts
+        env:
+          QEMU_LD_PREFIX: /usr/aarch64-linux-gnu
+        run: |
+          if [ "${{ runner.os }}" != "Windows" ]; then
+            chmod +x downloaded/*
+          fi
+
+          for bin in ${{ matrix.binaries }}; do
+            if [ "${{ matrix.can_run }}" = "true" ]; then
+              BIN_PATH="downloaded/${bin}"
+              if [ -f "downloaded/${bin}.exe" ]; then
+                BIN_PATH="downloaded/${bin}.exe"
+              fi
+              echo "Executing $BIN_PATH --version"
+              VER_OUT=$("$BIN_PATH" --version)
+              echo "$VER_OUT"
+              echo "$VER_OUT" | grep -E "(weave|weaver-server)" || {
+                echo "Error: Output did not contain expected binary name"
+                exit 1
+              }
+            else
+              BIN_PATH="downloaded/${bin}.exe"
+              echo "Verifying non-empty artifact for cross-target: $BIN_PATH"
+              [ -s "$BIN_PATH" ] || {
+                echo "Error: $BIN_PATH is missing or empty"
+                exit 1
+              }
+            fi
+          done
