@@ -2,14 +2,14 @@
 
 ## Testing
 
-- Full suite (fast): `cargo test --workspace` (~4s, timeout 120000ms)
+- Full suite (fast): `cargo test --workspace` (~2s, timeout 60000ms)
 - CI-strength property tests: `PROPTEST_CASES=2000 PROPTEST_RNG_SEED=67 cargo test -p weaver-mux` (~60s, timeout 300000ms)
 - Ignored e2e suite: `cargo test --workspace -- --ignored` (~1s, timeout 60000ms)
 - Format check: `cargo fmt --check` (~1s, timeout 30000ms)
 - Clippy: `cargo clippy --workspace --all-targets -- -D warnings` (~5s, timeout 120000ms)
 - Dependency policy: `cargo deny check` (~2s, timeout 60000ms)
 - Always: quiet on success; dump failures only.
-- Last measured: 2026-09-13, full suite 4s.
+- Last measured: 2026-09-14, full suite 2s.
 
 ## Crate notes
 
