@@ -1,0 +1,7 @@
+# weaver-mux is sans-IO: every notion of "now" comes from the caller. These
+# bans (enforced by `#![forbid(clippy::disallowed_methods)]` in lib.rs) make
+# it impossible to accidentally reach for the wall clock inside the crate.
+disallowed-methods = [
+    { path = "std::time::Instant::now", reason = "sans-IO: time is passed in by the caller as `now: Instant`" },
+    { path = "std::time::SystemTime::now", reason = "sans-IO: time is passed in by the caller as `now: Instant`" },
+]
