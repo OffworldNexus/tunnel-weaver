@@ -1,0 +1,15 @@
+[package]
+name = "weaver-server"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "weaver-server"
+path = "src/main.rs"
+
+[dependencies]
+clap = { workspace = true }
+weaver-proto = { workspace = true }
