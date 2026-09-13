@@ -316,8 +316,8 @@ impl<K: Copy + Eq + Hash> Qfq<K> {
                 self.groups.remove(&group);
             }
         }
-        if self.wsum > 0 {
-            self.v += u64::from(len) * ONE_FP / self.wsum;
+        if let Some(step) = (u64::from(len) * ONE_FP).checked_div(self.wsum) {
+            self.v += step;
         }
         self.maybe_rebase();
     }
