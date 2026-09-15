@@ -11,7 +11,7 @@ async fn test_http_308_redirect_preserves_host_and_path() {
 
     let token_clone = shutdown_token.clone();
     let server_task = tokio::spawn(async move {
-        run_http_server(listener, "example.com".to_string(), 8443, token_clone).await;
+        run_http_server(listener, "example.com".to_string(), 8443, None, token_clone).await;
     });
 
     // Case 1: Standard host, non-443 HTTPS port -> appends :8443
@@ -76,7 +76,7 @@ async fn test_http_308_redirect_standard_https_port_443() {
 
     let token_clone = shutdown_token.clone();
     let server_task = tokio::spawn(async move {
-        run_http_server(listener, "weaver.test".to_string(), 443, token_clone).await;
+        run_http_server(listener, "weaver.test".to_string(), 443, None, token_clone).await;
     });
 
     let mut stream = TcpStream::connect(addr).await.unwrap();

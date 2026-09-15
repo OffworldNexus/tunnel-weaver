@@ -15,6 +15,9 @@ pub enum Commands {
     /// Configures or initializes the SQLite state store with required settings.
     #[command(alias = "init")]
     Configure(Box<ConfigureArgs>),
+
+    /// Displays the supported ACME provider catalog.
+    Providers,
 }
 
 /// Parses a socket address or bare port (e.g. "8080" or ":8080" -> "[::]:8080").
@@ -179,6 +182,9 @@ async fn main() {
             }
 
             println!("Configuration saved to {}", cli.db.display());
+        }
+        Commands::Providers => {
+            weaver_server::cert::providers::print_providers();
         }
     }
 }

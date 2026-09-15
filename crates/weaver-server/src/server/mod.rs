@@ -5,17 +5,20 @@ pub mod listener;
 use std::env;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
+use rustls::server::ResolvesServerCert;
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
+use crate::cert::{CertManager, CertResolver, ChallengeRegistry, SystemClock};
 use crate::config::{Config, ConfigError};
 use crate::edge::http::run_http_server;
 use crate::edge::https::run_https_server;
-use crate::edge::tls::{TlsError, create_self_signed_server_config};
-use crate::notify::{notify_ready, notify_stopping};
+use crate::edge::tls::{TlsError, create_server_config, generate_placeholder_certified_key};
+use crate::notify::{notify_ready_with_cert_status, notify_stopping};
 use crate::server::listener::{ListenerError, acquire_listeners};
 use crate::store::{Store, StoreError};
 
@@ -109,8 +112,28 @@ pub async fn run_server(
         }
     };
 
-    // 5. Generate in-memory self-signed TLS certificate
-    let tls_config = create_self_signed_server_config(&config.root_domain)?;
+    // 5. Initialize certificate manager and dynamic TLS resolver
+    let placeholder_key = generate_placeholder_certified_key(&config.root_domain)?;
+    let challenge_registry = Arc::new(ChallengeRegistry::new());
+    let resolver = Arc::new(CertResolver::new(
+        config.root_domain.clone(),
+        placeholder_key,
+        Arc::clone(&challenge_registry),
+    ));
+
+    let cert_manager = CertManager::new(
+        Arc::new(config.clone()),
+        Arc::new(store.clone()),
+        Arc::clone(&resolver),
+        Arc::clone(&challenge_registry),
+        Arc::new(SystemClock),
+        true,
+    );
+    cert_manager
+        .init()
+        .map_err(|e| ServerError::Activation(format!("Failed to initialize CertManager: {e}")))?;
+
+    let tls_config = create_server_config(Arc::clone(&resolver) as Arc<dyn ResolvesServerCert>)?;
 
     // 6. Pre-register termination signal handlers before declaring readiness
     #[cfg(unix)]
@@ -126,18 +149,25 @@ pub async fn run_server(
     };
 
     // 7. Notify systemd readiness
-    if let Err(err) = notify_ready() {
+    if let Err(err) = notify_ready_with_cert_status(cert_manager.root_cert_status()) {
         warn!(error = %err, "Failed to send systemd READY notification");
     }
 
-    // 8. Spawn HTTP and HTTPS server tasks
+    // 8. Spawn HTTP and HTTPS server tasks and eager issuance
     let shutdown_token = external_shutdown.unwrap_or_default();
+
+    // Spawn eager issuance for root domain after READY notification
+    cert_manager.spawn_eager_order_if_pending();
+
+    // Start background renewal loop
+    cert_manager.start_renewal_loop(shutdown_token.clone());
 
     let http_token = shutdown_token.clone();
     let http_task = tokio::spawn(run_http_server(
         listeners.http,
         config.root_domain.clone(),
         config.listen_https.port(),
+        Some(Arc::clone(&challenge_registry)),
         http_token,
     ));
 
@@ -146,6 +176,7 @@ pub async fn run_server(
         listeners.https,
         tls_config,
         config.root_domain.clone(),
+        Some(Arc::clone(&resolver)),
         https_token,
     ));
 

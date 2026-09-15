@@ -94,6 +94,25 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Configure test hostnames
+        run: |
+          echo "127.0.0.1 pebble.test root.pebble.test subdomain.pebble.test web.laptop.remy.pebble.test" | sudo tee -a /etc/hosts
+
+      - name: Start Pebble ACME server
+        run: |
+          docker run -d --name pebble --network host \
+            -e PEBBLE_VA_NOSLEEP=1 \
+            -e PEBBLE_VA_ALWAYS_VALID=0 \
+            ghcr.io/letsencrypt/pebble:latest \
+            -dnsserver 127.0.0.1:1053
+          for i in $(seq 1 30); do
+            if curl -k -s https://localhost:14000/dir >/dev/null 2>&1; then
+              echo "Pebble is ready"
+              break
+            fi
+            sleep 1
+          done
+
       - name: Install stable Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 

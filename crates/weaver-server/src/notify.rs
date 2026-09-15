@@ -40,7 +40,19 @@ pub fn notify(state: &str) -> io::Result<bool> {
 
 /// Notifies systemd that listeners are active and the daemon is ready to receive connections.
 pub fn notify_ready() -> io::Result<bool> {
-    notify("READY=1\nSTATUS=listening; certificate: pending\n")
+    notify_ready_with_cert_status("pending")
+}
+
+/// Notifies systemd that listeners are active with the specified certificate status.
+pub fn notify_ready_with_cert_status(cert_status: &str) -> io::Result<bool> {
+    notify(&format!(
+        "READY=1\nSTATUS=listening; certificate: {cert_status}\n"
+    ))
+}
+
+/// Updates systemd STATUS with the current root domain certificate state.
+pub fn notify_cert_status(state: &str) -> io::Result<bool> {
+    notify(&format!("STATUS=listening; certificate: {state}\n"))
 }
 
 /// Notifies systemd that the daemon is initiating graceful shutdown.
@@ -51,10 +63,14 @@ pub fn notify_stopping() -> io::Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
     use tempfile::tempdir;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn test_notify_noop_when_unset() {
+        let _guard = ENV_LOCK.lock().unwrap();
         // Ensure NOTIFY_SOCKET is unset in this thread/env
         unsafe {
             env::remove_var("NOTIFY_SOCKET");
@@ -65,6 +81,7 @@ mod tests {
 
     #[test]
     fn test_notify_delivers_to_socket() {
+        let _guard = ENV_LOCK.lock().unwrap();
         let dir = tempdir().unwrap();
         let sock_path = dir.path().join("notify.sock");
         let listener = UnixDatagram::bind(&sock_path).unwrap();
@@ -81,6 +98,12 @@ mod tests {
         let msg = std::str::from_utf8(&buf[..len]).unwrap();
         assert!(msg.contains("READY=1"));
         assert!(msg.contains("STATUS=listening; certificate: pending"));
+
+        let res = notify_cert_status("issued").expect("notify cert status should succeed");
+        assert!(res);
+        let (len, _) = listener.recv_from(&mut buf).unwrap();
+        let msg = std::str::from_utf8(&buf[..len]).unwrap();
+        assert!(msg.contains("STATUS=listening; certificate: issued"));
 
         let res = notify_stopping().expect("notify stopping should succeed");
         assert!(res);

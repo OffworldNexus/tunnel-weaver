@@ -221,11 +221,15 @@ fn test_startup_listen_fds_and_systemd_notify_and_shutdown() {
     }
 
     // Verify STOPPING=1 notification
-    let len = notify_listener
-        .recv(&mut buf)
-        .expect("failed to receive STOPPING notification");
-    let msg = std::str::from_utf8(&buf[..len]).unwrap();
-    assert!(msg.contains("STOPPING=1"));
+    let mut saw_stopping = false;
+    while let Ok(len) = notify_listener.recv(&mut buf) {
+        let msg = std::str::from_utf8(&buf[..len]).unwrap();
+        if msg.contains("STOPPING=1") {
+            saw_stopping = true;
+            break;
+        }
+    }
+    assert!(saw_stopping);
 
     // Wait for clean exit
     let status = child.wait().expect("failed to wait for child");
