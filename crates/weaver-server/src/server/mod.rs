@@ -6,7 +6,7 @@ use std::env;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rustls::server::ResolvesServerCert;
 use thiserror::Error;
@@ -135,7 +135,12 @@ pub async fn run_server(
 
     let tls_config = create_server_config(Arc::clone(&resolver) as Arc<dyn ResolvesServerCert>)?;
 
-    // 6. Pre-register termination signal handlers before declaring readiness
+    // 6. Bind control socket listener before declaring readiness
+    let control_socket_path = config.control_socket.clone();
+    let control_listener = crate::control::server::bind_control_listener(&control_socket_path)
+        .map_err(|e| ServerError::Activation(format!("Failed to bind control socket: {e}")))?;
+
+    // 7. Pre-register termination signal handlers before declaring readiness
     #[cfg(unix)]
     let (mut sigint, mut sigterm) = {
         use tokio::signal::unix::{SignalKind, signal};
@@ -148,16 +153,8 @@ pub async fn run_server(
         (int, term)
     };
 
-    // 7. Notify systemd readiness
-    if let Err(err) = notify_ready_with_cert_status(cert_manager.root_cert_status()) {
-        warn!(error = %err, "Failed to send systemd READY notification");
-    }
-
-    // 8. Spawn HTTP and HTTPS server tasks and eager issuance
+    // 8. Spawn HTTP, HTTPS, and control server tasks and eager issuance
     let shutdown_token = external_shutdown.unwrap_or_default();
-
-    // Spawn eager issuance for root domain after READY notification
-    cert_manager.spawn_eager_order_if_pending();
 
     // Start background renewal loop
     cert_manager.start_renewal_loop(shutdown_token.clone());
@@ -179,6 +176,35 @@ pub async fn run_server(
         Some(Arc::clone(&resolver)),
         https_token,
     ));
+
+    let control_token = shutdown_token.clone();
+    let control_start_time = Instant::now();
+    let control_config = Arc::new(config.clone());
+    let control_store = Arc::new(store.clone());
+    let control_cert_mgr = Arc::clone(&cert_manager);
+    let control_task = tokio::spawn(async move {
+        if let Err(err) = crate::control::server::run_control_server_with_listener(
+            control_listener,
+            control_socket_path,
+            control_config,
+            control_store,
+            control_cert_mgr,
+            control_start_time,
+            control_token,
+        )
+        .await
+        {
+            warn!(error = %err, "Control socket listener ended with error");
+        }
+    });
+
+    // 9. Notify systemd readiness
+    if let Err(err) = notify_ready_with_cert_status(cert_manager.root_cert_status()) {
+        warn!(error = %err, "Failed to send systemd READY notification");
+    }
+
+    // Spawn eager issuance for root domain after READY notification
+    cert_manager.spawn_eager_order_if_pending();
 
     // 9. Wait for shutdown signal
     let term_token = shutdown_token.clone();
@@ -216,7 +242,7 @@ pub async fn run_server(
     info!(drain_timeout_secs = 10, "Draining active connections");
 
     let drain = async {
-        let _ = tokio::join!(http_task, https_task);
+        let _ = tokio::join!(http_task, https_task, control_task);
     };
 
     if tokio::time::timeout(drain_timeout, drain).await.is_err() {

@@ -78,32 +78,68 @@ pub fn requires_eab(provider_id: &str) -> bool {
     find_provider(provider_id).is_some_and(|p| p.eab_required)
 }
 
+use comfy_table::modifiers::UTF8_ROUND_CORNERS;
+use comfy_table::presets::UTF8_FULL;
+use comfy_table::{Attribute, Cell, Color, ContentArrangement, Table};
+
 /// Formats the provider catalog table for display.
 pub fn format_providers_table() -> String {
-    let mut out = String::new();
-    out.push_str("| id | directory | EAB | quota (2026) | how to get credentials |\n");
-    out.push_str("| -- | -- | -- | -- | -- |\n");
+    let mut table = Table::new();
+    table
+        .load_preset(UTF8_FULL)
+        .apply_modifier(UTF8_ROUND_CORNERS)
+        .set_content_arrangement(ContentArrangement::Dynamic);
+
+    table.set_header(vec![
+        Cell::new("Provider")
+            .add_attribute(Attribute::Bold)
+            .fg(Color::Cyan),
+        Cell::new("EAB")
+            .add_attribute(Attribute::Bold)
+            .fg(Color::Cyan),
+        Cell::new("Directory")
+            .add_attribute(Attribute::Bold)
+            .fg(Color::Cyan),
+        Cell::new("Quota (2026)")
+            .add_attribute(Attribute::Bold)
+            .fg(Color::Cyan),
+        Cell::new("Credentials Guidance")
+            .add_attribute(Attribute::Bold)
+            .fg(Color::Cyan),
+    ]);
+
     for p in PROVIDERS {
-        let eab = if p.eab_required { "**yes**" } else { "no" };
-        let id_label = if p.id == "letsencrypt" {
-            "`letsencrypt` (default)"
+        let name_cell = if p.id == "letsencrypt" {
+            Cell::new(format!("{} (default)", p.id))
+                .add_attribute(Attribute::Bold)
+                .fg(Color::Green)
         } else {
-            &format!("`{}`", p.id)
+            Cell::new(p.id)
+                .add_attribute(Attribute::Bold)
+                .fg(Color::White)
         };
-        let dir = if p.id == "custom" {
-            p.directory.to_string()
+
+        let eab_cell = if p.eab_required {
+            Cell::new("required")
+                .fg(Color::Yellow)
+                .add_attribute(Attribute::Bold)
         } else {
-            format!("`{}`", p.directory)
+            Cell::new("no").fg(Color::DarkGrey)
         };
-        out.push_str(&format!(
-            "| {} | {} | {} | {} | {} |\n",
-            id_label, dir, eab, p.quota, p.guidance
-        ));
+
+        table.add_row(vec![
+            name_cell,
+            eab_cell,
+            Cell::new(p.directory).fg(Color::DarkCyan),
+            Cell::new(p.quota),
+            Cell::new(p.guidance),
+        ]);
     }
-    out
+
+    table.to_string()
 }
 
 /// Prints the provider catalog table to stdout.
 pub fn print_providers() {
-    print!("{}", format_providers_table());
+    println!("{}", format_providers_table());
 }
