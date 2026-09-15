@@ -43,21 +43,34 @@ fn build_dns_response(buf: &[u8]) -> Option<Vec<u8>> {
     if buf.len() < 12 {
         return None;
     }
-    let mut resp = Vec::with_capacity(128);
-    resp.extend_from_slice(&buf[..2]); // tx id
-    resp.extend_from_slice(b"\x81\x80"); // standard response flags
-    resp.extend_from_slice(&buf[4..6]); // question count
-    resp.extend_from_slice(b"\x00\x01\x00\x00\x00\x00"); // 1 answer
 
     let mut idx = 12;
     while idx < buf.len() && buf[idx] != 0 {
         idx += 1 + buf[idx] as usize;
     }
-    let qname_end = (idx + 5).min(buf.len());
-    resp.extend_from_slice(&buf[12..qname_end]);
+    if idx + 4 > buf.len() {
+        return None;
+    }
+    let qtype = u16::from_be_bytes([buf[idx + 1], buf[idx + 2]]);
+    let qname_end = idx + 5;
 
-    // Answer: name pointer 0xc00c, Type A (1), Class IN (1), TTL 60s, Length 4, 127.0.0.1
-    resp.extend_from_slice(b"\xc0\x0c\x00\x01\x00\x01\x00\x00\x00\x3c\x00\x04\x7f\x00\x00\x01");
+    let mut resp = Vec::with_capacity(128);
+    resp.extend_from_slice(&buf[..2]); // tx id
+    resp.extend_from_slice(b"\x81\x80"); // standard response flags
+    resp.extend_from_slice(&buf[4..6]); // question count
+
+    if qtype == 28 {
+        // AAAA (IPv6): return NOERROR with 0 answers (NODATA)
+        resp.extend_from_slice(b"\x00\x00\x00\x00\x00\x00"); // 0 answers
+        resp.extend_from_slice(&buf[12..qname_end]);
+    } else {
+        // A or other: return 1 answer with 127.0.0.1
+        resp.extend_from_slice(b"\x00\x01\x00\x00\x00\x00"); // 1 answer
+        resp.extend_from_slice(&buf[12..qname_end]);
+        // Answer: name pointer 0xc00c, Type A (1), Class IN (1), TTL 60s, Length 4, 127.0.0.1
+        resp.extend_from_slice(b"\xc0\x0c\x00\x01\x00\x01\x00\x00\x00\x3c\x00\x04\x7f\x00\x00\x01");
+    }
+
     Some(resp)
 }
 
