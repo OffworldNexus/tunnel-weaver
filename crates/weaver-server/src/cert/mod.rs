@@ -151,7 +151,7 @@ impl CertManager {
             }
         }
 
-        // 2. If root domain has no valid cached certificate, mark Pending and start eager issuance
+        // 2. If root domain has no valid cached certificate, mark Pending
         if !root_valid {
             info!(
                 root_domain = %root_domain,
@@ -162,7 +162,20 @@ impl CertManager {
                 .write()
                 .unwrap()
                 .insert(root_domain.clone(), CertState::Pending);
+        }
 
+        Ok(())
+    }
+
+    /// Spawns background eager issuance for the root domain if it is in the `Pending` state.
+    pub fn spawn_eager_order_if_pending(self: &Arc<Self>) {
+        let root_domain = self.config.root_domain.to_ascii_lowercase();
+        let is_pending = {
+            let states = self.states.read().unwrap();
+            matches!(states.get(&root_domain), Some(CertState::Pending))
+        };
+
+        if is_pending {
             let manager = Arc::clone(self);
             let root_name = root_domain.clone();
             tokio::spawn(async move {
@@ -172,8 +185,6 @@ impl CertManager {
                 }
             });
         }
-
-        Ok(())
     }
 
     /// Lazily issues a certificate for `name` if no valid certificate exists, deduplicating concurrent calls.

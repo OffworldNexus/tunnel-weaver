@@ -59,9 +59,15 @@ async fn test_graceful_shutdown_on_sigterm_with_drain() {
     notify_listener
         .set_read_timeout(Some(Duration::from_secs(5)))
         .unwrap();
-    let len = notify_listener.recv(&mut buf).unwrap();
-    let msg = std::str::from_utf8(&buf[..len]).unwrap();
-    assert!(msg.contains("READY=1"));
+    let mut saw_ready = false;
+    while let Ok(len) = notify_listener.recv(&mut buf) {
+        let msg = std::str::from_utf8(&buf[..len]).unwrap();
+        if msg.contains("READY=1") {
+            saw_ready = true;
+            break;
+        }
+    }
+    assert!(saw_ready);
 
     // Connect and send an in-flight HTTP request
     let mut stream = TcpStream::connect(format!("127.0.0.1:{http_port}"))
@@ -132,9 +138,15 @@ async fn test_graceful_shutdown_on_sigint() {
     notify_listener
         .set_read_timeout(Some(Duration::from_secs(5)))
         .unwrap();
-    let len = notify_listener.recv(&mut buf).unwrap();
-    let msg = std::str::from_utf8(&buf[..len]).unwrap();
-    assert!(msg.contains("READY=1"));
+    let mut saw_ready = false;
+    while let Ok(len) = notify_listener.recv(&mut buf) {
+        let msg = std::str::from_utf8(&buf[..len]).unwrap();
+        if msg.contains("READY=1") {
+            saw_ready = true;
+            break;
+        }
+    }
+    assert!(saw_ready);
 
     // Send SIGINT (Ctrl+C)
     unsafe {

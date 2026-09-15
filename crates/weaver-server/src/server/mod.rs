@@ -153,8 +153,11 @@ pub async fn run_server(
         warn!(error = %err, "Failed to send systemd READY notification");
     }
 
-    // 8. Spawn HTTP and HTTPS server tasks
+    // 8. Spawn HTTP and HTTPS server tasks and eager issuance
     let shutdown_token = external_shutdown.unwrap_or_default();
+
+    // Spawn eager issuance for root domain after READY notification
+    cert_manager.spawn_eager_order_if_pending();
 
     // Start background renewal loop
     cert_manager.start_renewal_loop(shutdown_token.clone());

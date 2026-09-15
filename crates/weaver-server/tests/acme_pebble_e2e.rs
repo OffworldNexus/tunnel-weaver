@@ -10,7 +10,7 @@ use std::time::Duration;
 use rustls::pki_types::{CertificateDer, ServerName};
 use tempfile::tempdir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::Mutex;
 use tokio_rustls::TlsConnector;
 use tokio_util::sync::CancellationToken;
@@ -37,6 +37,90 @@ async fn is_pebble_available() -> bool {
     tokio::net::TcpStream::connect("127.0.0.1:14000")
         .await
         .is_ok()
+}
+
+fn build_dns_response(buf: &[u8]) -> Option<Vec<u8>> {
+    if buf.len() < 12 {
+        return None;
+    }
+    let mut resp = Vec::with_capacity(128);
+    resp.extend_from_slice(&buf[..2]); // tx id
+    resp.extend_from_slice(b"\x81\x80"); // standard response flags
+    resp.extend_from_slice(&buf[4..6]); // question count
+    resp.extend_from_slice(b"\x00\x01\x00\x00\x00\x00"); // 1 answer
+
+    let mut idx = 12;
+    while idx < buf.len() && buf[idx] != 0 {
+        idx += 1 + buf[idx] as usize;
+    }
+    let qname_end = (idx + 5).min(buf.len());
+    resp.extend_from_slice(&buf[12..qname_end]);
+
+    // Answer: name pointer 0xc00c, Type A (1), Class IN (1), TTL 60s, Length 4, 127.0.0.1
+    resp.extend_from_slice(b"\xc0\x0c\x00\x01\x00\x01\x00\x00\x00\x3c\x00\x04\x7f\x00\x00\x01");
+    Some(resp)
+}
+
+/// In-test DNS server answering all UDP and TCP queries with `127.0.0.1` for Pebble's `-dnsserver 127.0.0.1:1053`.
+async fn spawn_dns_stub(token: CancellationToken) {
+    let udp = match UdpSocket::bind("127.0.0.1:1053").await {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    let tcp = match TcpListener::bind("127.0.0.1:1053").await {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+
+    let tok1 = token.clone();
+    tokio::spawn(async move {
+        let mut buf = [0u8; 512];
+        loop {
+            tokio::select! {
+                _ = tok1.cancelled() => break,
+                res = udp.recv_from(&mut buf) => {
+                    let (len, src) = match res {
+                        Ok(p) => p,
+                        Err(_) => continue,
+                    };
+                    if let Some(resp) = build_dns_response(&buf[..len]) {
+                        let _ = udp.send_to(&resp, src).await;
+                    }
+                }
+            }
+        }
+    });
+
+    let tok2 = token;
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = tok2.cancelled() => break,
+                res = tcp.accept() => {
+                    let (mut stream, _) = match res {
+                        Ok(p) => p,
+                        Err(_) => continue,
+                    };
+                    tokio::spawn(async move {
+                        let mut len_buf = [0u8; 2];
+                        if stream.read_exact(&mut len_buf).await.is_err() {
+                            return;
+                        }
+                        let msg_len = u16::from_be_bytes(len_buf) as usize;
+                        let mut msg_buf = vec![0u8; msg_len];
+                        if stream.read_exact(&mut msg_buf).await.is_err() {
+                            return;
+                        }
+                        if let Some(resp) = build_dns_response(&msg_buf) {
+                            let resp_len = (resp.len() as u16).to_be_bytes();
+                            let _ = stream.write_all(&resp_len).await;
+                            let _ = stream.write_all(&resp).await;
+                        }
+                    });
+                }
+            }
+        }
+    });
 }
 
 #[derive(Debug)]
@@ -145,6 +229,9 @@ async fn test_pebble_e2e_issuance_and_lazy_ensure() {
         return;
     }
 
+    let dns_token = CancellationToken::new();
+    spawn_dns_stub(dns_token.clone()).await;
+
     let dir = tempdir().unwrap();
     let db_path = dir.path().join("weaver.db");
     let store = Arc::new(Store::open(&db_path).unwrap());
@@ -220,6 +307,7 @@ async fn test_pebble_e2e_issuance_and_lazy_ensure() {
 
     // 1. Initial eager issuance for root domain
     manager.init().unwrap();
+    manager.spawn_eager_order_if_pending();
 
     // Wait up to 30 seconds for root domain cert to become Issued
     let mut issued = false;
@@ -261,6 +349,7 @@ async fn test_pebble_e2e_issuance_and_lazy_ensure() {
     assert!(manager.ensure(sub).await.is_ok());
 
     shutdown_token.cancel();
+    dns_token.cancel();
 }
 
 #[tokio::test]
@@ -272,6 +361,9 @@ async fn test_pebble_e2e_tls_alpn_01_with_unbound_port_80() {
         eprintln!("Skipping Pebble E2E test: Pebble not reachable on 127.0.0.1:14000");
         return;
     }
+
+    let dns_token = CancellationToken::new();
+    spawn_dns_stub(dns_token.clone()).await;
 
     let dir = tempdir().unwrap();
     let db_path = dir.path().join("weaver.db");
@@ -341,4 +433,5 @@ async fn test_pebble_e2e_tls_alpn_01_with_unbound_port_80() {
     assert!(res.is_ok());
 
     shutdown_token.cancel();
+    dns_token.cancel();
 }
