@@ -11,6 +11,7 @@ use rustls::pki_types::{CertificateDer, ServerName};
 use tempfile::tempdir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Mutex;
 use tokio_rustls::TlsConnector;
 use tokio_util::sync::CancellationToken;
 
@@ -27,6 +28,9 @@ use weaver_server::store::Store;
 
 const PEBBLE_DIR: &str = "https://localhost:14000/dir";
 const PEBBLE_ROOT_CA: &str = include_str!("../../../ci/pebble/pebble.minica.pem");
+
+/// Global lock ensuring Pebble E2E tests run sequentially on ports 5001/5002.
+static PEBBLE_TEST_LOCK: Mutex<()> = Mutex::const_new(());
 
 /// Checks if Pebble ACME server is running locally on port 14000.
 async fn is_pebble_available() -> bool {
@@ -78,14 +82,15 @@ impl rustls::client::danger::ServerCertVerifier for DangerousNoVerify {
 
 /// Fetches the dynamic Root CA from Pebble's management port `https://127.0.0.1:15000/roots/0`,
 /// falling back to the bundled `pebble.minica.pem`.
-async fn fetch_pebble_root_ca() -> String {
+async fn fetch_pebble_issuing_ca() -> Option<String> {
     let provider = rustls::crypto::ring::default_provider();
-    let client_config = rustls::ClientConfig::builder_with_provider(Arc::new(provider))
+    let mut client_config = rustls::ClientConfig::builder_with_provider(Arc::new(provider))
         .with_safe_default_protocol_versions()
         .unwrap()
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(DangerousNoVerify))
         .with_no_client_auth();
+    client_config.alpn_protocols = vec![b"http/1.1".to_vec()];
     let connector = TlsConnector::from(Arc::new(client_config));
 
     if let Ok(tcp) = TcpStream::connect("127.0.0.1:15000").await {
@@ -99,19 +104,25 @@ async fn fetch_pebble_root_ca() -> String {
                     && let Some(start) = resp.find("-----BEGIN CERTIFICATE-----")
                     && let Some(end) = resp.find("-----END CERTIFICATE-----")
                 {
-                    return resp[start..end + "-----END CERTIFICATE-----".len()].to_string();
+                    return Some(resp[start..end + "-----END CERTIFICATE-----".len()].to_string());
                 }
             }
         }
     }
-    PEBBLE_ROOT_CA.to_string()
+    None
 }
 
-fn create_pebble_trust_client_config(root_ca: &str) -> Arc<rustls::ClientConfig> {
+async fn create_pebble_trust_client_config() -> Arc<rustls::ClientConfig> {
     use rustls::pki_types::pem::PemObject;
     let mut root_store = rustls::RootCertStore::empty();
-    for cert in CertificateDer::pem_slice_iter(root_ca.as_bytes()) {
+    for cert in CertificateDer::pem_slice_iter(PEBBLE_ROOT_CA.as_bytes()) {
         root_store.add(cert.unwrap()).unwrap();
+    }
+
+    if let Some(issuing_ca) = fetch_pebble_issuing_ca().await {
+        for cert in CertificateDer::pem_slice_iter(issuing_ca.as_bytes()) {
+            let _ = root_store.add(cert.unwrap());
+        }
     }
 
     let provider = rustls::crypto::ring::default_provider();
@@ -127,12 +138,12 @@ fn create_pebble_trust_client_config(root_ca: &str) -> Arc<rustls::ClientConfig>
 #[tokio::test]
 #[ignore = "e2e"]
 async fn test_pebble_e2e_issuance_and_lazy_ensure() {
+    let _guard = PEBBLE_TEST_LOCK.lock().await;
+
     if !is_pebble_available().await {
         eprintln!("Skipping Pebble E2E test: Pebble not reachable on 127.0.0.1:14000");
         return;
     }
-
-    let pebble_ca = fetch_pebble_root_ca().await;
 
     let dir = tempdir().unwrap();
     let db_path = dir.path().join("weaver.db");
@@ -154,7 +165,7 @@ async fn test_pebble_e2e_issuance_and_lazy_ensure() {
         acme_directory: Some(PEBBLE_DIR.into()),
         acme_eab_kid: None,
         acme_eab_hmac: None,
-        acme_root_ca_pem: Some(pebble_ca.clone()),
+        acme_root_ca_pem: Some(PEBBLE_ROOT_CA.into()),
         acme_fallback_providers: Vec::new(),
     });
 
@@ -225,7 +236,7 @@ async fn test_pebble_e2e_issuance_and_lazy_ensure() {
     );
 
     // 2. Client trusting Pebble root CA connects and gets valid response with HSTS
-    let client_config = create_pebble_trust_client_config(&pebble_ca);
+    let client_config = create_pebble_trust_client_config().await;
     let connector = TlsConnector::from(client_config);
 
     let tcp = TcpStream::connect(format!("127.0.0.1:{https_port}"))
@@ -255,12 +266,12 @@ async fn test_pebble_e2e_issuance_and_lazy_ensure() {
 #[tokio::test]
 #[ignore = "e2e"]
 async fn test_pebble_e2e_tls_alpn_01_with_unbound_port_80() {
+    let _guard = PEBBLE_TEST_LOCK.lock().await;
+
     if !is_pebble_available().await {
         eprintln!("Skipping Pebble E2E test: Pebble not reachable on 127.0.0.1:14000");
         return;
     }
-
-    let pebble_ca = fetch_pebble_root_ca().await;
 
     let dir = tempdir().unwrap();
     let db_path = dir.path().join("weaver.db");
@@ -281,7 +292,7 @@ async fn test_pebble_e2e_tls_alpn_01_with_unbound_port_80() {
         acme_directory: Some(PEBBLE_DIR.into()),
         acme_eab_kid: None,
         acme_eab_hmac: None,
-        acme_root_ca_pem: Some(pebble_ca),
+        acme_root_ca_pem: Some(PEBBLE_ROOT_CA.into()),
         acme_fallback_providers: Vec::new(),
     });
 
