@@ -91,8 +91,24 @@ jobs:
   e2e-linux:
     name: e2e-linux
     runs-on: ubuntu-latest
+    services:
+      pebble:
+        image: ghcr.io/letsencrypt/pebble:latest
+        ports:
+          - 14000:14000
+          - 15000:15000
+        env:
+          PEBBLE_VA_NOSLEEP: 1
+          PEBBLE_VA_ALWAYS_VALID: 0
+        volumes:
+          - ${{ github.workspace }}/ci/pebble:/test/ci/pebble
+        options: -config /test/ci/pebble/pebble-config.json
     steps:
       - uses: actions/checkout@v4
+
+      - name: Configure test hostnames
+        run: |
+          echo "127.0.0.1 pebble.test root.pebble.test subdomain.pebble.test web.laptop.remy.pebble.test" | sudo tee -a /etc/hosts
 
       - name: Install stable Rust toolchain
         uses: dtolnay/rust-toolchain@stable

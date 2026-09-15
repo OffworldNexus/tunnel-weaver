@@ -75,7 +75,7 @@ async fn spawn_test_https_server(root_domain: &str) -> (std::net::SocketAddr, Ca
     let token_clone = shutdown_token.clone();
     let root = root_domain.to_string();
     tokio::spawn(async move {
-        run_https_server(listener, server_tls, root, token_clone).await;
+        run_https_server(listener, server_tls, root, None, token_clone).await;
     });
 
     (addr, shutdown_token)

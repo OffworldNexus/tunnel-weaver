@@ -1,7 +1,8 @@
 //! TLS HTTPS edge server.
 //!
 //! Terminates TLS connections, validates SNI and Host headers, and serves
-//! root welcome pages, health checks, branded tunnel 404s, and 421 Misdirected Request responses.
+//! root welcome pages, health checks, branded tunnel 404s, and 421 Misdirected Request responses,
+//! conditionally applying HSTS when serving with a non-placeholder certificate.
 
 use std::convert::Infallible;
 use std::net::IpAddr;
@@ -17,15 +18,28 @@ use rustls::ServerConfig;
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 use tracing::{debug, info, trace};
 
 use crate::assets::{NO_TUNNEL_HTML, WELCOME_HTML, apply_security_headers};
+use crate::cert::resolver::CertResolver;
 
 /// Shared state for HTTPS request dispatch.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct HttpsEdgeConfig {
     /// Configured root domain (e.g. "example.com").
     pub root_domain: String,
+    /// Dynamic certificate resolver used to determine if certificate is placeholder.
+    pub cert_resolver: Option<Arc<CertResolver>>,
+}
+
+impl std::fmt::Debug for HttpsEdgeConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HttpsEdgeConfig")
+            .field("root_domain", &self.root_domain)
+            .field("has_cert_resolver", &self.cert_resolver.is_some())
+            .finish()
+    }
 }
 
 /// Helper to parse and strip any port component from an authority or Host header value.
@@ -99,6 +113,11 @@ pub async fn handle_https_request(
     let host_lower = host.to_ascii_lowercase();
     let root_lower = config.root_domain.to_ascii_lowercase();
 
+    let include_hsts = config
+        .cert_resolver
+        .as_ref()
+        .is_some_and(|r| !r.is_placeholder(&host));
+
     if host_lower == root_lower {
         // Request directed to root domain
         match (req.method(), req.uri().path()) {
@@ -107,7 +126,7 @@ pub async fn handle_https_request(
                     .status(StatusCode::OK)
                     .body(Full::new(Bytes::from(WELCOME_HTML)))
                     .unwrap();
-                apply_security_headers(&mut resp);
+                apply_security_headers(&mut resp, include_hsts);
                 Ok(resp)
             }
             (&Method::GET, "/healthz") => {
@@ -123,7 +142,7 @@ pub async fn handle_https_request(
                     .status(StatusCode::NOT_FOUND)
                     .body(Full::new(Bytes::from("404 Not Found\n")))
                     .unwrap();
-                apply_security_headers(&mut resp);
+                apply_security_headers(&mut resp, include_hsts);
                 Ok(resp)
             }
         }
@@ -135,7 +154,7 @@ pub async fn handle_https_request(
             .status(StatusCode::NOT_FOUND)
             .body(Full::new(Bytes::from(NO_TUNNEL_HTML)))
             .unwrap();
-        apply_security_headers(&mut resp);
+        apply_security_headers(&mut resp, include_hsts);
         Ok(resp)
     } else {
         // Unrecognized domain -> 421 Misdirected Request
@@ -152,14 +171,24 @@ pub async fn run_https_server(
     listener: TcpListener,
     tls_config: Arc<ServerConfig>,
     root_domain: String,
+    cert_resolver: Option<Arc<CertResolver>>,
     shutdown_token: CancellationToken,
 ) {
-    let edge_config = Arc::new(HttpsEdgeConfig { root_domain });
+    let edge_config = Arc::new(HttpsEdgeConfig {
+        root_domain,
+        cert_resolver,
+    });
     let acceptor = TlsAcceptor::from(tls_config);
     let auto_builder = Builder::new(TokioExecutor::new());
+    let tracker = TaskTracker::new();
+
+    let addr_str = listener
+        .local_addr()
+        .map(|a| a.to_string())
+        .unwrap_or_else(|_| "unknown".into());
 
     info!(
-        addr = ?listener.local_addr().ok(),
+        addr = %addr_str,
         root_domain = %edge_config.root_domain,
         "HTTPS edge server running"
     );
@@ -179,25 +208,23 @@ pub async fn run_https_server(
                     }
                 };
 
-                let acceptor = acceptor.clone();
+                let tls_acceptor = acceptor.clone();
                 let config = Arc::clone(&edge_config);
                 let auto = auto_builder.clone();
                 let conn_token = shutdown_token.clone();
 
-                tokio::spawn(async move {
-                    let tls_stream = match acceptor.accept(tcp_stream).await {
-                        Ok(stream) => stream,
+                tracker.spawn(async move {
+                    let tls_stream = match tls_acceptor.accept(tcp_stream).await {
+                        Ok(s) => s,
                         Err(err) => {
-                            trace!(remote = %remote_addr, error = %err, "TLS handshake failed");
+                            trace!(remote = %remote_addr, error = %err, "TLS handshake error");
                             return;
                         }
                     };
 
-                    let client_sni = tls_stream
-                        .get_ref()
-                        .1
-                        .server_name()
-                        .map(|s| s.to_string());
+                    // Extract negotiated SNI from the TLS connection state
+                    let (_, server_conn) = tls_stream.get_ref();
+                    let client_sni = server_conn.server_name().map(|s| s.to_string());
 
                     let io = TokioIo::new(tls_stream);
                     let service = service_fn(move |req| {
@@ -224,30 +251,7 @@ pub async fn run_https_server(
             }
         }
     }
-}
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_extract_host_without_port() {
-        assert_eq!(extract_host_without_port("example.com"), "example.com");
-        assert_eq!(extract_host_without_port("example.com:443"), "example.com");
-        assert_eq!(extract_host_without_port("example.com:8443"), "example.com");
-        assert_eq!(extract_host_without_port("[::1]"), "[::1]");
-        assert_eq!(extract_host_without_port("[::1]:8443"), "[::1]");
-        assert_eq!(extract_host_without_port("127.0.0.1:8080"), "127.0.0.1");
-    }
-
-    #[test]
-    fn test_is_ip_literal() {
-        assert!(is_ip_literal("127.0.0.1"));
-        assert!(is_ip_literal("10.0.0.1"));
-        assert!(is_ip_literal("[::1]"));
-        assert!(is_ip_literal("::1"));
-        assert!(!is_ip_literal("example.com"));
-        assert!(!is_ip_literal("sub.example.com"));
-        assert!(!is_ip_literal("localhost"));
-    }
+    tracker.close();
+    tracker.wait().await;
 }

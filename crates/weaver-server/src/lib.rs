@@ -1,4 +1,5 @@
 pub mod assets;
+pub mod cert;
 pub mod config;
 pub mod edge;
 pub mod notify;

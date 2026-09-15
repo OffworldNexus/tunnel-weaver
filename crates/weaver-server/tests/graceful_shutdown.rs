@@ -79,9 +79,15 @@ async fn test_graceful_shutdown_on_sigterm_with_drain() {
     }
 
     // Verify STOPPING=1 notification sent
-    let len = notify_listener.recv(&mut buf).unwrap();
-    let msg = std::str::from_utf8(&buf[..len]).unwrap();
-    assert!(msg.contains("STOPPING=1"));
+    let mut saw_stopping = false;
+    while let Ok(len) = notify_listener.recv(&mut buf) {
+        let msg = std::str::from_utf8(&buf[..len]).unwrap();
+        if msg.contains("STOPPING=1") {
+            saw_stopping = true;
+            break;
+        }
+    }
+    assert!(saw_stopping);
 
     // In-flight request finishes cleanly during shutdown
     let mut resp = String::new();
@@ -136,9 +142,15 @@ async fn test_graceful_shutdown_on_sigint() {
     }
 
     // Verify STOPPING=1 notification sent
-    let len = notify_listener.recv(&mut buf).unwrap();
-    let msg = std::str::from_utf8(&buf[..len]).unwrap();
-    assert!(msg.contains("STOPPING=1"));
+    let mut saw_stopping = false;
+    while let Ok(len) = notify_listener.recv(&mut buf) {
+        let msg = std::str::from_utf8(&buf[..len]).unwrap();
+        if msg.contains("STOPPING=1") {
+            saw_stopping = true;
+            break;
+        }
+    }
+    assert!(saw_stopping);
 
     let status = child.wait().unwrap();
     assert!(status.success());

@@ -15,12 +15,14 @@ name = "weaver-server"
 path = "src/main.rs"
 
 [dependencies]
+base64 = { workspace = true }
 bytes = { workspace = true }
 clap = { workspace = true }
 http = { workspace = true }
 http-body-util = { workspace = true }
 hyper = { workspace = true }
 hyper-util = { workspace = true }
+instant-acme = { workspace = true }
 libc = { workspace = true }
 rcgen = { workspace = true }
 rusqlite = { workspace = true }
@@ -29,6 +31,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 socket2 = { workspace = true }
+tempfile = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-rustls = { workspace = true }
@@ -40,4 +43,3 @@ weaver-proto = { workspace = true }
 [dev-dependencies]
 hyper = { workspace = true, features = ["client"] }
 hyper-util = { workspace = true, features = ["client", "client-legacy"] }
-tempfile = { workspace = true }

@@ -12,8 +12,9 @@ pub const NO_TUNNEL_HTML: &str = include_str!("no_tunnel.html");
 /// Injects standard security headers and content-type into HTML responses.
 ///
 /// Applies strict Content-Security-Policy, anti-clickjacking, MIME type sniffing
-/// protections, and referrer policy according to the specification.
-pub fn apply_security_headers<B>(response: &mut http::Response<B>) {
+/// protections, referrer policy, and conditionally Strict-Transport-Security (HSTS)
+/// when serving with a valid non-placeholder certificate.
+pub fn apply_security_headers<B>(response: &mut http::Response<B>, include_hsts: bool) {
     let headers = response.headers_mut();
     headers.insert(
         http::header::CONTENT_TYPE,
@@ -37,6 +38,12 @@ pub fn apply_security_headers<B>(response: &mut http::Response<B>) {
         http::header::REFERRER_POLICY,
         http::HeaderValue::from_static("no-referrer"),
     );
+    if include_hsts {
+        headers.insert(
+            http::header::STRICT_TRANSPORT_SECURITY,
+            http::HeaderValue::from_static("max-age=31536000; includeSubDomains"),
+        );
+    }
 }
 
 #[cfg(test)]
@@ -57,7 +64,7 @@ mod tests {
             .status(http::StatusCode::OK)
             .body(())
             .unwrap();
-        apply_security_headers(&mut resp);
+        apply_security_headers(&mut resp, false);
 
         assert_eq!(
             resp.headers().get(http::header::CONTENT_TYPE).unwrap(),
@@ -82,6 +89,24 @@ mod tests {
         assert_eq!(
             resp.headers().get(http::header::REFERRER_POLICY).unwrap(),
             "no-referrer"
+        );
+        assert!(
+            resp.headers()
+                .get(http::header::STRICT_TRANSPORT_SECURITY)
+                .is_none()
+        );
+
+        let mut resp_hsts = http::Response::builder()
+            .status(http::StatusCode::OK)
+            .body(())
+            .unwrap();
+        apply_security_headers(&mut resp_hsts, true);
+        assert_eq!(
+            resp_hsts
+                .headers()
+                .get(http::header::STRICT_TRANSPORT_SECURITY)
+                .unwrap(),
+            "max-age=31536000; includeSubDomains"
         );
     }
 }
