@@ -101,8 +101,7 @@ jobs:
           PEBBLE_VA_NOSLEEP: 1
           PEBBLE_VA_ALWAYS_VALID: 0
         volumes:
-          - ${{ github.workspace }}/ci/pebble:/test/ci/pebble
-        options: -config /test/ci/pebble/pebble-config.json
+          - ${{ github.workspace }}/ci/pebble/pebble-config.json:/test/config/pebble-config.json
     steps:
       - uses: actions/checkout@v4
 

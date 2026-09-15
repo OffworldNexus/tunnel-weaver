@@ -35,10 +35,82 @@ async fn is_pebble_available() -> bool {
         .is_ok()
 }
 
-fn create_pebble_trust_client_config() -> Arc<rustls::ClientConfig> {
+#[derive(Debug)]
+struct DangerousNoVerify;
+impl rustls::client::danger::ServerCertVerifier for DangerousNoVerify {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        vec![
+            rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
+            rustls::SignatureScheme::ED25519,
+            rustls::SignatureScheme::RSA_PSS_SHA256,
+        ]
+    }
+}
+
+/// Fetches the dynamic Root CA from Pebble's management port `https://127.0.0.1:15000/roots/0`,
+/// falling back to the bundled `pebble.minica.pem`.
+async fn fetch_pebble_root_ca() -> String {
+    let provider = rustls::crypto::ring::default_provider();
+    let client_config = rustls::ClientConfig::builder_with_provider(Arc::new(provider))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(DangerousNoVerify))
+        .with_no_client_auth();
+    let connector = TlsConnector::from(Arc::new(client_config));
+
+    if let Ok(tcp) = TcpStream::connect("127.0.0.1:15000").await {
+        let server_name = ServerName::try_from("localhost").unwrap().to_owned();
+        if let Ok(mut tls) = connector.connect(server_name, tcp).await {
+            let req =
+                b"GET /roots/0 HTTP/1.1\r\nHost: localhost:15000\r\nConnection: close\r\n\r\n";
+            if tls.write_all(req).await.is_ok() {
+                let mut resp = String::new();
+                if tls.read_to_string(&mut resp).await.is_ok()
+                    && let Some(start) = resp.find("-----BEGIN CERTIFICATE-----")
+                    && let Some(end) = resp.find("-----END CERTIFICATE-----")
+                {
+                    return resp[start..end + "-----END CERTIFICATE-----".len()].to_string();
+                }
+            }
+        }
+    }
+    PEBBLE_ROOT_CA.to_string()
+}
+
+fn create_pebble_trust_client_config(root_ca: &str) -> Arc<rustls::ClientConfig> {
     use rustls::pki_types::pem::PemObject;
     let mut root_store = rustls::RootCertStore::empty();
-    for cert in CertificateDer::pem_slice_iter(PEBBLE_ROOT_CA.as_bytes()) {
+    for cert in CertificateDer::pem_slice_iter(root_ca.as_bytes()) {
         root_store.add(cert.unwrap()).unwrap();
     }
 
@@ -60,6 +132,8 @@ async fn test_pebble_e2e_issuance_and_lazy_ensure() {
         return;
     }
 
+    let pebble_ca = fetch_pebble_root_ca().await;
+
     let dir = tempdir().unwrap();
     let db_path = dir.path().join("weaver.db");
     let store = Arc::new(Store::open(&db_path).unwrap());
@@ -80,7 +154,7 @@ async fn test_pebble_e2e_issuance_and_lazy_ensure() {
         acme_directory: Some(PEBBLE_DIR.into()),
         acme_eab_kid: None,
         acme_eab_hmac: None,
-        acme_root_ca_pem: Some(PEBBLE_ROOT_CA.into()),
+        acme_root_ca_pem: Some(pebble_ca.clone()),
         acme_fallback_providers: Vec::new(),
     });
 
@@ -151,7 +225,7 @@ async fn test_pebble_e2e_issuance_and_lazy_ensure() {
     );
 
     // 2. Client trusting Pebble root CA connects and gets valid response with HSTS
-    let client_config = create_pebble_trust_client_config();
+    let client_config = create_pebble_trust_client_config(&pebble_ca);
     let connector = TlsConnector::from(client_config);
 
     let tcp = TcpStream::connect(format!("127.0.0.1:{https_port}"))
@@ -186,6 +260,8 @@ async fn test_pebble_e2e_tls_alpn_01_with_unbound_port_80() {
         return;
     }
 
+    let pebble_ca = fetch_pebble_root_ca().await;
+
     let dir = tempdir().unwrap();
     let db_path = dir.path().join("weaver.db");
     let store = Arc::new(Store::open(&db_path).unwrap());
@@ -205,7 +281,7 @@ async fn test_pebble_e2e_tls_alpn_01_with_unbound_port_80() {
         acme_directory: Some(PEBBLE_DIR.into()),
         acme_eab_kid: None,
         acme_eab_hmac: None,
-        acme_root_ca_pem: Some(PEBBLE_ROOT_CA.into()),
+        acme_root_ca_pem: Some(pebble_ca),
         acme_fallback_providers: Vec::new(),
     });
 
@@ -251,7 +327,6 @@ async fn test_pebble_e2e_tls_alpn_01_with_unbound_port_80() {
     if let Err(e) = &res {
         eprintln!("TLS-ALPN-01 issuance result: {e}");
     }
-    // If Pebble is running with tlsPort 5001, TLS-ALPN-01 succeeds!
     assert!(res.is_ok());
 
     shutdown_token.cancel();

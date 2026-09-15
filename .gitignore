@@ -5,6 +5,7 @@
 /fuzz/artifacts
 **/*.rs.bk
 *.pem
+!ci/pebble/*.pem
 
 # IDE and OS
 .idea/
