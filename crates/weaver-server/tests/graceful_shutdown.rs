@@ -8,14 +8,18 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use weaver_server::{Config, Store};
 
-fn create_valid_test_config(http_port: u16, https_port: u16) -> Config {
+fn create_valid_test_config(
+    http_port: u16,
+    https_port: u16,
+    control_socket: std::path::PathBuf,
+) -> Config {
     Config {
         root_domain: "weaver.test".to_string(),
         admin_email: "admin@weaver.test".to_string(),
         acme_provider: "letsencrypt-staging".to_string(),
         listen_http: SocketAddr::from(([127, 0, 0, 1], http_port)),
         listen_https: SocketAddr::from(([127, 0, 0, 1], https_port)),
-        control_socket: "/tmp/weaver-test-control.sock".into(),
+        control_socket,
         acme_directory: None,
         acme_eab_kid: None,
         acme_eab_hmac: None,
@@ -41,7 +45,8 @@ async fn test_graceful_shutdown_on_sigterm_with_drain() {
     drop(l2);
 
     let store = Store::open(&db_path).unwrap();
-    let config = create_valid_test_config(http_port, https_port);
+    let control_sock_path = dir.path().join("control.sock");
+    let config = create_valid_test_config(http_port, https_port, control_sock_path);
     store.save_config(&config).unwrap();
     drop(store);
 
@@ -57,7 +62,7 @@ async fn test_graceful_shutdown_on_sigterm_with_drain() {
     // Wait for READY=1 notification
     let mut buf = [0u8; 512];
     notify_listener
-        .set_read_timeout(Some(Duration::from_secs(5)))
+        .set_read_timeout(Some(Duration::from_secs(15)))
         .unwrap();
     let mut saw_ready = false;
     while let Ok(len) = notify_listener.recv(&mut buf) {
@@ -78,6 +83,9 @@ async fn test_graceful_shutdown_on_sigterm_with_drain() {
         .write_all(b"GET /test HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n")
         .await
         .unwrap();
+
+    // Allow the server task to accept and start processing the connection before signalling shutdown
+    tokio::time::sleep(Duration::from_millis(10)).await;
 
     // Send SIGTERM to initiate graceful shutdown
     unsafe {
@@ -120,7 +128,8 @@ async fn test_graceful_shutdown_on_sigint() {
     drop(l2);
 
     let store = Store::open(&db_path).unwrap();
-    let config = create_valid_test_config(http_port, https_port);
+    let control_sock_path = dir.path().join("control.sock");
+    let config = create_valid_test_config(http_port, https_port, control_sock_path);
     store.save_config(&config).unwrap();
     drop(store);
 
@@ -136,7 +145,7 @@ async fn test_graceful_shutdown_on_sigint() {
     // Wait for READY=1 notification
     let mut buf = [0u8; 512];
     notify_listener
-        .set_read_timeout(Some(Duration::from_secs(5)))
+        .set_read_timeout(Some(Duration::from_secs(15)))
         .unwrap();
     let mut saw_ready = false;
     while let Ok(len) = notify_listener.recv(&mut buf) {

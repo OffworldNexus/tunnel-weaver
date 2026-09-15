@@ -287,6 +287,124 @@ impl Store {
         guard.execute_batch("PRAGMA optimize;")?;
         Ok(())
     }
+
+    /// Returns the maximum applied database schema migration version.
+    pub fn schema_version(&self) -> Result<u32, StoreError> {
+        self.read(|conn| {
+            let ver: u32 = conn.query_row(
+                "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
+                [],
+                |row| row.get(0),
+            )?;
+            Ok(ver)
+        })
+    }
+
+    /// Fetches the metadata record for a certificate by hostname.
+    pub fn get_certificate(&self, name: &str) -> Result<Option<CertRecord>, StoreError> {
+        let lower = name.to_ascii_lowercase();
+        self.read(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT name, not_before, not_after, issuer, directory, obtained_at, last_active_at FROM certificates WHERE name = ?1",
+            )?;
+            let res = stmt
+                .query_row(rusqlite::params![lower], |row| {
+                    Ok(CertRecord {
+                        name: row.get(0)?,
+                        not_before: row.get(1)?,
+                        not_after: row.get(2)?,
+                        issuer: row.get(3)?,
+                        directory: row.get(4)?,
+                        obtained_at: row.get(5)?,
+                        last_active_at: row.get(6)?,
+                    })
+                })
+                .optional()?;
+            Ok(res)
+        })
+    }
+
+    /// Lists all certificate records in the store ordered alphabetically by name.
+    pub fn list_certificates(&self) -> Result<Vec<CertRecord>, StoreError> {
+        self.read(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT name, not_before, not_after, issuer, directory, obtained_at, last_active_at FROM certificates ORDER BY name ASC",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok(CertRecord {
+                    name: row.get(0)?,
+                    not_before: row.get(1)?,
+                    not_after: row.get(2)?,
+                    issuer: row.get(3)?,
+                    directory: row.get(4)?,
+                    obtained_at: row.get(5)?,
+                    last_active_at: row.get(6)?,
+                })
+            })?;
+            let mut list = Vec::new();
+            for r in rows {
+                list.push(r?);
+            }
+            Ok(list)
+        })
+    }
+
+    /// Fetches the most recent `limit` lifecycle events for a given hostname.
+    pub fn get_cert_events(
+        &self,
+        name: &str,
+        limit: usize,
+    ) -> Result<Vec<CertEventRecord>, StoreError> {
+        let lower = name.to_ascii_lowercase();
+        let limit_i64 = limit as i64;
+        self.read(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id, name, at, kind, detail FROM cert_events WHERE name = ?1 ORDER BY at DESC, id DESC LIMIT ?2",
+            )?;
+            let rows = stmt.query_map(rusqlite::params![lower, limit_i64], |row| {
+                Ok(CertEventRecord {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    at: row.get(2)?,
+                    kind: row.get(3)?,
+                    detail: row.get(4)?,
+                })
+            })?;
+            let mut list = Vec::new();
+            for r in rows {
+                list.push(r?);
+            }
+            Ok(list)
+        })
+    }
+
+    /// Fetches the single most recent lifecycle event for a given hostname.
+    pub fn get_latest_cert_event(&self, name: &str) -> Result<Option<CertEventRecord>, StoreError> {
+        let events = self.get_cert_events(name, 1)?;
+        Ok(events.into_iter().next())
+    }
+}
+
+/// Certificate database record metadata.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CertRecord {
+    pub name: String,
+    pub not_before: i64,
+    pub not_after: i64,
+    pub issuer: Option<String>,
+    pub directory: String,
+    pub obtained_at: i64,
+    pub last_active_at: Option<i64>,
+}
+
+/// Certificate event database record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CertEventRecord {
+    pub id: i64,
+    pub name: String,
+    pub at: i64,
+    pub kind: String,
+    pub detail: Option<String>,
 }
 
 impl Drop for Store {

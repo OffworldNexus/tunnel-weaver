@@ -25,6 +25,23 @@ pub use renewal::{compute_backoff, should_renew};
 pub use resolver::{CertResolver, parse_certified_key};
 pub use state::CertState;
 
+/// Error conditions that can occur during manual or batch certificate renewal.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum RenewError {
+    /// Requested hostname was not found in the certificate store.
+    #[error("Certificate for hostname '{0}' not found in store")]
+    NotFound(String),
+    /// Renewal request was rejected due to backoff rate limiting.
+    #[error("Rate limited: retry for hostname '{name}' allowed after {retry_at}")]
+    RateLimited { name: String, retry_at: i64 },
+    /// Renewal request was rejected because the global order limit has been reached.
+    #[error("Global in-flight ACME order limit reached (4 concurrent orders)")]
+    CapacityExceeded,
+    /// Store or ACME error.
+    #[error("Store error: {0}")]
+    Store(String),
+}
+
 use crate::config::Config;
 use crate::notify::notify_cert_status;
 use crate::store::Store;
@@ -51,6 +68,7 @@ pub struct CertManager {
     failure_counts: RwLock<HashMap<String, u32>>,
     order_semaphore: Arc<Semaphore>,
     in_flight: Mutex<HashMap<String, broadcast::Sender<Result<(), String>>>>,
+    state_change_tx: broadcast::Sender<(String, CertState)>,
     is_http_enabled: bool,
 }
 
@@ -71,6 +89,8 @@ impl CertManager {
             Arc::clone(&challenge_registry),
         ));
 
+        let (state_change_tx, _) = broadcast::channel(128);
+
         Arc::new(Self {
             config,
             store,
@@ -83,6 +103,7 @@ impl CertManager {
             failure_counts: RwLock::new(HashMap::new()),
             order_semaphore: Arc::new(Semaphore::new(4)),
             in_flight: Mutex::new(HashMap::new()),
+            state_change_tx,
             is_http_enabled,
         })
     }
@@ -123,10 +144,7 @@ impl CertManager {
                 match parse_certified_key(&cert_pem, &key_pem) {
                     Ok(certified_key) => {
                         self.resolver.insert_cert(&lower, certified_key);
-                        self.states
-                            .write()
-                            .unwrap()
-                            .insert(lower.clone(), CertState::Issued { not_after });
+                        self.set_state(&lower, CertState::Issued { not_after });
 
                         if last_active_at.is_some() || lower == root_domain {
                             self.active_hosts.write().unwrap().insert(lower.clone());
@@ -158,10 +176,7 @@ impl CertManager {
                 "No valid cached root certificate found; serving self-signed fallback while initiating eager ACME issuance"
             );
 
-            self.states
-                .write()
-                .unwrap()
-                .insert(root_domain.clone(), CertState::Pending);
+            self.set_state(&root_domain, CertState::Pending);
         }
 
         Ok(())
@@ -232,10 +247,7 @@ impl CertManager {
         let is_root = lower == self.config.root_domain.to_ascii_lowercase();
 
         // Update state to Ordering
-        self.states
-            .write()
-            .unwrap()
-            .insert(lower.clone(), CertState::Ordering);
+        self.set_state(&lower, CertState::Ordering);
         self.resolver.mark_ordering(&lower);
         if is_root {
             let _ = notify_cert_status("ordering");
@@ -264,8 +276,8 @@ impl CertManager {
                     .map_err(|e| AcmeError::Other(format!("Failed to parse issued key: {e}")))?;
 
                 self.resolver.insert_cert(&lower, certified_key);
-                self.states.write().unwrap().insert(
-                    lower.clone(),
+                self.set_state(
+                    &lower,
                     CertState::Issued {
                         not_after: cert.not_after,
                     },
@@ -312,8 +324,8 @@ impl CertManager {
                 let backoff = compute_backoff(count, retry_after);
                 let next_retry = self.clock.now_unix() + backoff.as_secs() as i64;
 
-                self.states.write().unwrap().insert(
-                    lower.clone(),
+                self.set_state(
+                    &lower,
                     CertState::Failed {
                         error: err.to_string(),
                         next_retry,
@@ -389,6 +401,213 @@ impl CertManager {
             .unwrap_or(CertState::Pending)
     }
 
+    /// Sets the certificate state for a hostname and broadcasts the transition.
+    pub fn set_state(&self, name: &str, state: CertState) {
+        let lower = name.to_ascii_lowercase();
+        self.states
+            .write()
+            .unwrap()
+            .insert(lower.clone(), state.clone());
+        let _ = self.state_change_tx.send((lower, state));
+    }
+
+    /// Subscribes to certificate lifecycle state transitions.
+    pub fn subscribe_state_changes(&self) -> broadcast::Receiver<(String, CertState)> {
+        self.state_change_tx.subscribe()
+    }
+
+    /// Computes per-name certificate counts partitioned mutually exclusively:
+    /// inactive names count under `inactive`; active names partition into
+    /// `issued`, `ordering`, or `failed`.
+    pub fn cert_counts(&self) -> crate::control::protocol::CertCounts {
+        let root_domain = self.config.root_domain.to_ascii_lowercase();
+        let mut all_names = HashSet::new();
+        all_names.insert(root_domain);
+
+        if let Ok(certs) = self.store.list_certificates() {
+            for c in certs {
+                all_names.insert(c.name.to_ascii_lowercase());
+            }
+        }
+
+        {
+            let states = self.states.read().unwrap();
+            for name in states.keys() {
+                all_names.insert(name.clone());
+            }
+        }
+
+        let mut counts = crate::control::protocol::CertCounts::default();
+
+        for name in all_names {
+            if !self.is_active(&name) {
+                counts.inactive += 1;
+            } else {
+                let state = self.status(&name);
+                match state {
+                    CertState::Issued { .. } | CertState::Renewing { .. } => counts.issued += 1,
+                    CertState::Ordering | CertState::Pending => counts.ordering += 1,
+                    CertState::Failed { .. } => counts.failed += 1,
+                }
+            }
+        }
+
+        counts
+    }
+
+    /// Manually triggers renewal for a specific hostname (or root domain).
+    ///
+    /// Respects the rate-limit backoff and global in-flight cap unless `force` is true.
+    /// Inactive hostnames are permitted if explicitly named.
+    pub async fn renew_hostname(
+        self: &Arc<Self>,
+        name: &str,
+        force: bool,
+    ) -> Result<(), RenewError> {
+        let root_domain = self.config.root_domain.to_ascii_lowercase();
+        let lower = if name == "root" {
+            root_domain.clone()
+        } else {
+            name.to_ascii_lowercase()
+        };
+
+        // Check if certificate exists in configuration, memory states, or DB store
+        let exists = lower == root_domain
+            || self.states.read().unwrap().contains_key(&lower)
+            || self
+                .store
+                .get_certificate(&lower)
+                .map_err(|e| RenewError::Store(e.to_string()))?
+                .is_some();
+
+        if !exists {
+            return Err(RenewError::NotFound(lower));
+        }
+
+        if !force {
+            // Check rate limits
+            let state = self.status(&lower);
+            if let CertState::Failed { next_retry, .. } = state {
+                let now = self.clock.now_unix();
+                if now < next_retry {
+                    return Err(RenewError::RateLimited {
+                        name: lower,
+                        retry_at: next_retry,
+                    });
+                }
+            }
+
+            // Check global in-flight cap (4)
+            if self.order_semaphore.available_permits() == 0 {
+                return Err(RenewError::CapacityExceeded);
+            }
+        }
+
+        let not_after = match self.status(&lower) {
+            CertState::Issued { not_after } | CertState::Renewing { not_after } => not_after,
+            _ => 0,
+        };
+
+        if not_after > 0 {
+            self.set_state(&lower, CertState::Renewing { not_after });
+        } else {
+            self.set_state(&lower, CertState::Ordering);
+        }
+
+        let mgr = Arc::clone(self);
+        let target = lower.clone();
+        tokio::spawn(async move {
+            if let Err(err) = mgr.execute_issuance(target.clone()).await {
+                tracing::warn!(hostname = %target, error = %err, "Manual certificate renewal failed");
+            }
+        });
+
+        Ok(())
+    }
+
+    /// Triggers renewal for the root domain and all active hostnames, skipping inactive ones.
+    pub async fn renew_all(
+        self: &Arc<Self>,
+        force: bool,
+    ) -> Result<crate::control::protocol::RenewResponse, RenewError> {
+        let root_domain = self.config.root_domain.to_ascii_lowercase();
+        let mut candidates = HashSet::new();
+        candidates.insert(root_domain.clone());
+
+        if let Ok(certs) = self.store.list_certificates() {
+            for c in certs {
+                candidates.insert(c.name.to_ascii_lowercase());
+            }
+        }
+
+        {
+            let states = self.states.read().unwrap();
+            for name in states.keys() {
+                candidates.insert(name.clone());
+            }
+        }
+
+        let mut to_renew = Vec::new();
+        let mut skipped = Vec::new();
+
+        for name in candidates {
+            if name == root_domain || self.is_active(&name) {
+                to_renew.push(name);
+            } else {
+                skipped.push(name);
+            }
+        }
+
+        to_renew.sort();
+        skipped.sort();
+
+        // Check guards before launching renewals if not forced
+        if !force {
+            for name in &to_renew {
+                let state = self.status(name);
+                if let CertState::Failed { next_retry, .. } = state {
+                    let now = self.clock.now_unix();
+                    if now < next_retry {
+                        return Err(RenewError::RateLimited {
+                            name: name.clone(),
+                            retry_at: next_retry,
+                        });
+                    }
+                }
+            }
+            if self.order_semaphore.available_permits() == 0 {
+                return Err(RenewError::CapacityExceeded);
+            }
+        }
+
+        for name in &to_renew {
+            let not_after = match self.status(name) {
+                CertState::Issued { not_after } | CertState::Renewing { not_after } => not_after,
+                _ => 0,
+            };
+            if not_after > 0 {
+                self.set_state(name, CertState::Renewing { not_after });
+            } else {
+                self.set_state(name, CertState::Ordering);
+            }
+
+            let mgr = Arc::clone(self);
+            let target = name.clone();
+            tokio::spawn(async move {
+                if let Err(err) = mgr.execute_issuance(target.clone()).await {
+                    tracing::warn!(hostname = %target, error = %err, "Batch certificate renewal failed");
+                }
+            });
+        }
+
+        Ok(crate::control::protocol::RenewResponse {
+            ok: true,
+            renewed: to_renew,
+            status: "queued".to_string(),
+            skipped_inactive: skipped,
+        })
+    }
+
     /// Returns a snapshot of all tracked hostname certificate states.
     pub fn list_states(&self) -> HashMap<String, CertState> {
         self.states.read().unwrap().clone()
@@ -451,10 +670,7 @@ impl CertManager {
             if should_renew(not_before, not_after, now) {
                 info!(hostname = %lower, not_before, not_after, now, "Renewing certificate");
 
-                self.states
-                    .write()
-                    .unwrap()
-                    .insert(lower.clone(), CertState::Renewing { not_after });
+                self.set_state(&lower, CertState::Renewing { not_after });
                 if is_root {
                     let _ = notify_cert_status("renewing");
                 }

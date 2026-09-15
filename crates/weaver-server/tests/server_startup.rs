@@ -8,13 +8,21 @@ use tempfile::tempdir;
 use weaver_server::{Config, Store};
 
 fn create_valid_test_config(http_port: u16, https_port: u16) -> Config {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(1);
+    let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let sock = std::env::temp_dir().join(format!(
+        "weaver-test-ctrl-{}-{}.sock",
+        std::process::id(),
+        id
+    ));
     Config {
         root_domain: "weaver.test".to_string(),
         admin_email: "admin@weaver.test".to_string(),
         acme_provider: "letsencrypt-staging".to_string(),
         listen_http: SocketAddr::from(([127, 0, 0, 1], http_port)),
         listen_https: SocketAddr::from(([127, 0, 0, 1], https_port)),
-        control_socket: "/tmp/weaver-test-control.sock".into(),
+        control_socket: sock,
         acme_directory: None,
         acme_eab_kid: None,
         acme_eab_hmac: None,

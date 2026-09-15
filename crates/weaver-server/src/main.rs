@@ -18,6 +18,94 @@ pub enum Commands {
 
     /// Displays the supported ACME provider catalog.
     Providers,
+
+    /// Displays runtime server status, listeners, and certificate counts.
+    Status {
+        /// Outputs the status response as raw JSON.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Inspects and manages certificates on the running server.
+    Cert {
+        #[command(subcommand)]
+        command: CertCommands,
+    },
+
+    /// Performs an online backup of the SQLite database to the specified path.
+    Backup {
+        /// Target destination path for SQLite VACUUM INTO backup.
+        #[arg(value_name = "PATH")]
+        path: PathBuf,
+
+        /// Outputs the backup response as raw JSON.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Initiates a graceful shutdown of the running server daemon.
+    Shutdown {
+        /// Outputs the shutdown response as raw JSON.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+/// Subcommands for certificate operations.
+#[derive(Subcommand, Debug, Clone)]
+pub enum CertCommands {
+    /// Shows certificate summary table or detailed status for a single hostname.
+    Status {
+        /// Hostname to inspect (or "root" for base domain). If omitted, displays all certificates.
+        #[arg(value_name = "NAME")]
+        name: Option<String>,
+
+        /// Maximum number of historical cert events to return in detail view (default: 10).
+        #[arg(long)]
+        limit: Option<usize>,
+
+        /// Outputs the result as raw JSON.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Streams certificate state transitions until Issued or Failed.
+    Wait {
+        /// Hostname to wait for (defaults to root domain).
+        #[arg(value_name = "NAME")]
+        name: Option<String>,
+
+        /// Maximum timeout in seconds (default: 300).
+        #[arg(long, value_name = "SECS")]
+        timeout: Option<u64>,
+
+        /// Outputs streamed transitions as raw JSON lines.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Manually triggers renewal for a hostname or all active certificates.
+    Renew {
+        /// Hostname to renew (defaults to root domain).
+        #[arg(value_name = "NAME", conflicts_with = "all")]
+        name: Option<String>,
+
+        /// Renew all active hostnames plus the root domain.
+        #[arg(long)]
+        all: bool,
+
+        /// Bypass rate limits and in-flight concurrency caps.
+        #[arg(long)]
+        force: bool,
+
+        /// Wait for renewal to complete (streams transitions until Issued or Failed).
+        #[arg(long)]
+        wait: bool,
+
+        /// Outputs the renewal response as raw JSON.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// Parses a socket address or bare port (e.g. "8080" or ":8080" -> "[::]:8080").
@@ -31,6 +119,19 @@ pub fn parse_listen_addr(s: &str) -> Result<SocketAddr, String> {
         ));
     }
     trimmed.parse::<SocketAddr>().map_err(|e| e.to_string())
+}
+
+/// Validates that a hostname argument is a valid FQDN or the alias "root".
+fn validate_cert_name(name: &Option<String>) {
+    if let Some(n) = name
+        && n != "root"
+        && !n.contains('.')
+    {
+        eprintln!(
+            "Error: Invalid hostname '{n}'. Must be a fully qualified domain name (containing '.') or 'root'."
+        );
+        std::process::exit(2);
+    }
 }
 
 /// Arguments for initializing or updating the server configuration.
@@ -67,11 +168,7 @@ pub struct ConfigureArgs {
     pub listen_https: SocketAddr,
 
     /// Filesystem path for the UNIX domain control socket.
-    #[arg(
-        long,
-        default_value = "/var/run/weaver/weaver.sock",
-        value_name = "PATH"
-    )]
+    #[arg(long, default_value = "/run/weaver/control.sock", value_name = "PATH")]
     pub control_socket: PathBuf,
 
     /// Custom ACME directory URL (required when acme_provider is "custom").
@@ -116,7 +213,14 @@ async fn main() {
 
     match cli.command {
         Commands::Run => {
-            if let Err(err) = server::run_server(cli.db, None).await {
+            let Some(db_path) = cli.db else {
+                eprintln!(
+                    "Error: Database path is required to start the server. Pass --db <PATH> or set WEAVER_DB."
+                );
+                std::process::exit(2);
+            };
+
+            if let Err(err) = server::run_server(db_path, None).await {
                 match err {
                     ServerError::MissingConfig(keys) => {
                         eprintln!("Configuration missing required keys: {}", keys.join(", "));
@@ -146,8 +250,13 @@ async fn main() {
             }
         }
         Commands::Configure(args) => {
-            let store = Store::open(&cli.db).unwrap_or_else(|err| {
-                eprintln!("Failed to open database at {}: {err}", cli.db.display());
+            let Some(db_path) = cli.db else {
+                eprintln!("Error: Database path is required. Pass --db <PATH> or set WEAVER_DB.");
+                std::process::exit(2);
+            };
+
+            let store = Store::open(&db_path).unwrap_or_else(|err| {
+                eprintln!("Failed to open database at {}: {err}", db_path.display());
                 std::process::exit(1);
             });
 
@@ -181,10 +290,85 @@ async fn main() {
                 std::process::exit(1);
             }
 
-            println!("Configuration saved to {}", cli.db.display());
+            println!("Configuration saved to {}", db_path.display());
         }
         Commands::Providers => {
             weaver_server::cert::providers::print_providers();
+        }
+        Commands::Status { json } => {
+            let socket_path = cli
+                .socket
+                .unwrap_or_else(|| PathBuf::from("/run/weaver/control.sock"));
+            let code = weaver_server::control::client::client_status(&socket_path, json).await;
+            std::process::exit(code);
+        }
+        Commands::Cert { command } => {
+            let socket_path = cli
+                .socket
+                .unwrap_or_else(|| PathBuf::from("/run/weaver/control.sock"));
+            match command {
+                CertCommands::Status { name, limit, json } => {
+                    validate_cert_name(&name);
+                    let code = weaver_server::control::client::client_cert_status(
+                        &socket_path,
+                        name,
+                        limit,
+                        json,
+                    )
+                    .await;
+                    std::process::exit(code);
+                }
+                CertCommands::Wait {
+                    name,
+                    timeout,
+                    json,
+                } => {
+                    validate_cert_name(&name);
+                    let code = weaver_server::control::client::client_cert_wait(
+                        &socket_path,
+                        name,
+                        timeout,
+                        json,
+                    )
+                    .await;
+                    std::process::exit(code);
+                }
+                CertCommands::Renew {
+                    name,
+                    all,
+                    force,
+                    wait,
+                    json,
+                } => {
+                    validate_cert_name(&name);
+                    let code = weaver_server::control::client::client_cert_renew(
+                        &socket_path,
+                        name,
+                        all,
+                        force,
+                        wait,
+                        json,
+                    )
+                    .await;
+                    std::process::exit(code);
+                }
+            }
+        }
+        Commands::Backup { path, json } => {
+            let socket_path = cli
+                .socket
+                .unwrap_or_else(|| PathBuf::from("/run/weaver/control.sock"));
+            let path_str = path.to_string_lossy().to_string();
+            let code =
+                weaver_server::control::client::client_backup(&socket_path, path_str, json).await;
+            std::process::exit(code);
+        }
+        Commands::Shutdown { json } => {
+            let socket_path = cli
+                .socket
+                .unwrap_or_else(|| PathBuf::from("/run/weaver/control.sock"));
+            let code = weaver_server::control::client::client_shutdown(&socket_path, json).await;
+            std::process::exit(code);
         }
     }
 }
@@ -197,11 +381,21 @@ pub struct Cli {
     #[arg(
         long,
         env = "WEAVER_DB",
-        default_value = "/var/lib/weaver/weaver.db",
         global = true,
-        value_name = "PATH"
+        value_name = "PATH",
+        conflicts_with = "socket"
     )]
-    pub db: PathBuf,
+    pub db: Option<PathBuf>,
+
+    /// Path to the UNIX domain control socket.
+    #[arg(
+        long,
+        env = "WEAVER_SOCKET",
+        global = true,
+        value_name = "PATH",
+        conflicts_with = "db"
+    )]
+    pub socket: Option<PathBuf>,
 
     /// Log level for structured stderr logging (e.g. "error", "warn", "info", "debug", "trace").
     #[arg(
