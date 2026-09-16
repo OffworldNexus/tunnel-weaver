@@ -564,9 +564,14 @@ async fn test_pebble_e2e_tunnel_registration_and_proxying() {
         "Root domain certificate should transition to Issued within 30s"
     );
 
-    // Write Pebble root CA to temp file for weave client
+    // Write Pebble root CA and dynamic intermediate CA to temp file for weave client
+    let mut ca_bundle = PEBBLE_ROOT_CA.to_string();
+    if let Some(issuing_ca) = fetch_pebble_issuing_ca().await {
+        ca_bundle.push('\n');
+        ca_bundle.push_str(&issuing_ca);
+    }
     let mut ca_file = tempfile::NamedTempFile::new().unwrap();
-    std::io::Write::write_all(&mut ca_file, PEBBLE_ROOT_CA.as_bytes()).unwrap();
+    std::io::Write::write_all(&mut ca_file, ca_bundle.as_bytes()).unwrap();
 
     // Start weave client
     let client_token = CancellationToken::new();
