@@ -169,14 +169,15 @@ impl CertManager {
             }
         }
 
-        // 2. If root domain has no valid cached certificate, mark Pending
+        // 2. If root domain has no valid cached certificate, mark Pending and ordering in resolver
         if !root_valid {
             info!(
                 root_domain = %root_domain,
-                "No valid cached root certificate found; serving self-signed fallback while initiating eager ACME issuance"
+                "No valid cached root certificate found; holding incoming handshakes while initiating eager ACME issuance"
             );
 
             self.set_state(&root_domain, CertState::Pending);
+            self.resolver.mark_ordering(&root_domain);
         }
 
         Ok(())
@@ -246,11 +247,21 @@ impl CertManager {
     async fn execute_issuance(self: &Arc<Self>, lower: String) -> Result<(), AcmeError> {
         let is_root = lower == self.config.root_domain.to_ascii_lowercase();
 
-        // Update state to Ordering
-        self.set_state(&lower, CertState::Ordering);
-        self.resolver.mark_ordering(&lower);
-        if is_root {
-            let _ = notify_cert_status("ordering");
+        let is_renewing = matches!(
+            self.status(&lower),
+            CertState::Renewing { not_after } if not_after > self.clock.now_unix()
+        );
+
+        if !is_renewing {
+            // Update state to Ordering and mark resolver to hold in-flight handshakes
+            self.set_state(&lower, CertState::Ordering);
+            self.resolver.mark_ordering(&lower);
+            if is_root {
+                let _ = notify_cert_status("ordering");
+            }
+        } else if is_root {
+            // Preserve Renewing state and notify systemd of renewing
+            let _ = notify_cert_status("renewing");
         }
 
         // Acquire global order permit (max 4 concurrent ACME orders)

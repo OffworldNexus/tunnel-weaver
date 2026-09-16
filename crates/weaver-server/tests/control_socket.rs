@@ -539,7 +539,6 @@ async fn test_cert_wait_streaming_failed_exit_4_and_renew_rate_limit() {
     use weaver_server::cert::{
         CertManager, CertResolver, CertState, ChallengeRegistry, SystemClock,
     };
-    use weaver_server::edge::tls::generate_placeholder_certified_key;
 
     let dir = tempdir().unwrap();
     let db_path = dir.path().join("test.db");
@@ -561,11 +560,9 @@ async fn test_cert_wait_streaming_failed_exit_4_and_renew_rate_limit() {
     });
     store.save_config(&config).unwrap();
 
-    let placeholder_key = generate_placeholder_certified_key(&config.root_domain).unwrap();
     let challenge_registry = Arc::new(ChallengeRegistry::new());
     let resolver = Arc::new(CertResolver::new(
         config.root_domain.clone(),
-        placeholder_key,
         Arc::clone(&challenge_registry),
     ));
 
