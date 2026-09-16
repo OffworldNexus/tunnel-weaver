@@ -73,7 +73,7 @@ impl rustls::client::danger::ServerCertVerifier for DangerousNoVerify {
     }
 }
 
-fn create_test_client_config() -> Arc<rustls::ClientConfig> {
+fn create_test_client_config_with_alpn(alpn: Vec<Vec<u8>>) -> Arc<rustls::ClientConfig> {
     let provider = rustls::crypto::ring::default_provider();
     let mut config = rustls::ClientConfig::builder_with_provider(Arc::new(provider))
         .with_safe_default_protocol_versions()
@@ -81,8 +81,12 @@ fn create_test_client_config() -> Arc<rustls::ClientConfig> {
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(DangerousNoVerify))
         .with_no_client_auth();
-    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    config.alpn_protocols = alpn;
     Arc::new(config)
+}
+
+fn create_test_client_config() -> Arc<rustls::ClientConfig> {
+    create_test_client_config_with_alpn(vec![b"http/1.1".to_vec()])
 }
 
 #[test]
@@ -140,30 +144,27 @@ fn test_providers_catalog() {
     assert!(table.contains("custom"));
 }
 
+// OFF-79: Public TLS handshakes for uncertified, unknown, or missing SNI terminate immediately
+// at the TCP level without completing a handshake or serving placeholder certificates.
 #[tokio::test]
 async fn test_cert_resolver_placeholder_and_hsts() {
-    let placeholder = make_dummy_certified_key("example.com");
     let registry = Arc::new(ChallengeRegistry::new());
-    let resolver = Arc::new(CertResolver::new(
-        "example.com".to_string(),
-        placeholder,
-        registry,
-    ));
+    let resolver = Arc::new(CertResolver::new("example.com".to_string(), registry));
 
-    // Initially placeholder for all domains
+    // Initially placeholder (uncertified) for all domains
     assert!(resolver.is_placeholder("example.com"));
     assert!(resolver.is_placeholder("tunnel.example.com"));
 
-    // Insert issued certificate
+    // Insert issued certificate for tunnel domain
     let issued = make_dummy_certified_key("tunnel.example.com");
     resolver.insert_cert("tunnel.example.com", issued);
 
     // tunnel.example.com is no longer placeholder
     assert!(!resolver.is_placeholder("tunnel.example.com"));
-    // root domain remains placeholder
+    // root domain remains uncertified placeholder
     assert!(resolver.is_placeholder("example.com"));
 
-    // Verify HSTS header inclusion on live HTTPS server
+    // Verify TLS behavior on live HTTPS server
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let shutdown_token = CancellationToken::new();
@@ -187,19 +188,12 @@ async fn test_cert_resolver_placeholder_and_hsts() {
     let client_config = create_test_client_config();
     let connector = TlsConnector::from(client_config);
 
-    // Request for placeholder domain: NO HSTS
+    // Request for uncertified domain: terminates at TCP level, handshake fails
     let tcp = TcpStream::connect(format!("127.0.0.1:{port}"))
         .await
         .unwrap();
     let server_name = ServerName::try_from("example.com").unwrap().to_owned();
-    let mut tls = connector.connect(server_name, tcp).await.unwrap();
-    tls.write_all(b"GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n")
-        .await
-        .unwrap();
-    let mut resp = String::new();
-    tls.read_to_string(&mut resp).await.unwrap();
-    assert!(resp.starts_with("HTTP/1.1 200 OK"));
-    assert!(!resp.contains("strict-transport-security"));
+    assert!(connector.connect(server_name, tcp).await.is_err());
 
     // Request for issued domain: branded 404 WITH HSTS
     let tcp = TcpStream::connect(format!("127.0.0.1:{port}"))
@@ -217,18 +211,33 @@ async fn test_cert_resolver_placeholder_and_hsts() {
     assert!(resp.starts_with("HTTP/1.1 404 Not Found"));
     assert!(resp.contains("strict-transport-security: max-age=31536000; includeSubDomains"));
 
+    // Now insert cert for root domain: handshake succeeds and includes HSTS
+    let root_cert = make_dummy_certified_key("example.com");
+    resolver.insert_cert("example.com", root_cert);
+    assert!(!resolver.is_placeholder("example.com"));
+
+    let tcp = TcpStream::connect(format!("127.0.0.1:{port}"))
+        .await
+        .unwrap();
+    let server_name = ServerName::try_from("example.com").unwrap().to_owned();
+    let mut tls = connector.connect(server_name, tcp).await.unwrap();
+    tls.write_all(b"GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n")
+        .await
+        .unwrap();
+    let mut resp = String::new();
+    tls.read_to_string(&mut resp).await.unwrap();
+    assert!(resp.starts_with("HTTP/1.1 200 OK"));
+    assert!(resp.contains("strict-transport-security: max-age=31536000; includeSubDomains"));
+
     shutdown_token.cancel();
 }
 
+// OFF-79: In-progress certificate issuance holds incoming client TLS handshakes and completes
+// successfully once the certificate is provisioned within the hold window.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_resolver_handshake_hold_unblocks_on_cert_insert() {
-    let placeholder = make_dummy_certified_key("example.com");
     let registry = Arc::new(ChallengeRegistry::new());
-    let resolver = Arc::new(CertResolver::new(
-        "example.com".to_string(),
-        placeholder,
-        registry,
-    ));
+    let resolver = Arc::new(CertResolver::new("example.com".to_string(), registry));
 
     let host = "wait.example.com";
     resolver.mark_ordering(host);
@@ -351,6 +360,8 @@ async fn test_challenge_registry_and_http_01_responder() {
     token.cancel();
 }
 
+// OFF-79: Incoming TLS handshakes with ALPN acme-tls/1 resolve and serve registered TLS-ALPN-01
+// challenge certificates while rejecting unmatched SNI.
 #[tokio::test]
 async fn test_tls_alpn_01_challenge_certified_key() {
     let host = "alpn.example.com";
@@ -363,8 +374,73 @@ async fn test_tls_alpn_01_challenge_certified_key() {
     assert!(registry.get_tls_alpn_01(host).is_some());
     assert!(registry.get_tls_alpn_01("other.com").is_none());
 
+    let resolver = Arc::new(CertResolver::new(
+        "example.com".to_string(),
+        Arc::clone(&registry),
+    ));
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let shutdown_token = CancellationToken::new();
+
+    let tls_config =
+        create_server_config(Arc::clone(&resolver) as Arc<dyn rustls::server::ResolvesServerCert>)
+            .unwrap();
+    let res_clone = Arc::clone(&resolver);
+    let s_tok = shutdown_token.clone();
+    tokio::spawn(async move {
+        run_https_server(
+            listener,
+            tls_config,
+            "example.com".into(),
+            Some(res_clone),
+            s_tok,
+        )
+        .await;
+    });
+
+    let client_config = create_test_client_config_with_alpn(vec![b"acme-tls/1".to_vec()]);
+    let connector = TlsConnector::from(client_config);
+
+    // 1. Handshake with matching SNI and ALPN acme-tls/1 succeeds and serves challenge certificate
+    let tcp = TcpStream::connect(format!("127.0.0.1:{port}"))
+        .await
+        .unwrap();
+    let server_name = ServerName::try_from(host).unwrap().to_owned();
+    let tls_stream = connector.connect(server_name, tcp).await.unwrap();
+    let (_, client_conn) = tls_stream.get_ref();
+    assert_eq!(client_conn.alpn_protocol(), Some(b"acme-tls/1".as_slice()));
+    let peer_certs = client_conn.peer_certificates().unwrap();
+    assert_eq!(peer_certs[0].as_ref(), cert_key.cert[0].as_ref());
+
+    // 2. Handshake with unmatched SNI and ALPN acme-tls/1 fails (terminates at TCP level)
+    let tcp = TcpStream::connect(format!("127.0.0.1:{port}"))
+        .await
+        .unwrap();
+    let unmatched_server_name = ServerName::try_from("unregistered.example.com")
+        .unwrap()
+        .to_owned();
+    let err = connector.connect(unmatched_server_name, tcp).await;
+    assert!(
+        err.is_err(),
+        "Expected ALPN acme-tls/1 handshake to fail for unregistered host"
+    );
+
+    // 3. After removing from registry, handshake for previously registered host fails
     registry.remove_tls_alpn_01(host);
     assert!(registry.get_tls_alpn_01(host).is_none());
+
+    let tcp = TcpStream::connect(format!("127.0.0.1:{port}"))
+        .await
+        .unwrap();
+    let server_name = ServerName::try_from(host).unwrap().to_owned();
+    let err = connector.connect(server_name, tcp).await;
+    assert!(
+        err.is_err(),
+        "Expected ALPN acme-tls/1 handshake to fail after challenge key removal"
+    );
+
+    shutdown_token.cancel();
 }
 
 #[tokio::test]
@@ -412,11 +488,9 @@ async fn test_sqlite_caching_and_server_restart_no_reorder() {
         acme_fallback_providers: Vec::new(),
     });
 
-    let placeholder = make_dummy_certified_key("test.example.com");
     let registry = Arc::new(ChallengeRegistry::new());
     let resolver = Arc::new(CertResolver::new(
         "test.example.com".into(),
-        placeholder,
         Arc::clone(&registry),
     ));
 
@@ -459,11 +533,9 @@ async fn test_active_inactive_renewal_policy() {
         acme_fallback_providers: Vec::new(),
     });
 
-    let placeholder = make_dummy_certified_key("example.com");
     let registry = Arc::new(ChallengeRegistry::new());
     let resolver = Arc::new(CertResolver::new(
         "example.com".into(),
-        placeholder,
         Arc::clone(&registry),
     ));
 
@@ -529,11 +601,9 @@ async fn test_forced_expiration_triggers_renewal_flow_and_event() {
         acme_fallback_providers: Vec::new(),
     });
 
-    let placeholder = make_dummy_certified_key("example.com");
     let registry = Arc::new(ChallengeRegistry::new());
     let resolver = Arc::new(CertResolver::new(
         "example.com".into(),
-        placeholder,
         Arc::clone(&registry),
     ));
 
@@ -594,11 +664,9 @@ async fn test_exponential_backoff_on_failure() {
         acme_fallback_providers: Vec::new(),
     });
 
-    let placeholder = make_dummy_certified_key("example.com");
     let registry = Arc::new(ChallengeRegistry::new());
     let resolver = Arc::new(CertResolver::new(
         "example.com".into(),
-        placeholder,
         Arc::clone(&registry),
     ));
 
@@ -625,8 +693,9 @@ async fn test_exponential_backoff_on_failure() {
         other => panic!("Expected Failed state, got {other:?}"),
     }
 
-    // Server remains operational and serves placeholder
+    // Hostname remains uncertified; ordering is cleared so requests fail immediately at TCP level
     assert!(resolver.is_placeholder("fail.example.com"));
+    assert!(!resolver.is_ordering("fail.example.com"));
 
     // Event recorded in cert_events
     let event_count: i64 = store
@@ -663,11 +732,9 @@ async fn test_concurrent_ensure_deduplication() {
         acme_fallback_providers: Vec::new(),
     });
 
-    let placeholder = make_dummy_certified_key("example.com");
     let registry = Arc::new(ChallengeRegistry::new());
     let resolver = Arc::new(CertResolver::new(
         "example.com".into(),
-        placeholder,
         Arc::clone(&registry),
     ));
 
@@ -685,4 +752,252 @@ async fn test_concurrent_ensure_deduplication() {
     // Both should complete with identical error (one leader executed, follower awaited broadcast)
     assert!(res1.is_err());
     assert!(res2.is_err());
+}
+
+// OFF-79: Incoming TLS handshake for a completely unknown SNI domain terminates immediately
+// at the TCP level without completing a TLS handshake.
+#[tokio::test]
+async fn test_strict_tls_unknown_sni_terminates_tcp() {
+    let registry = Arc::new(ChallengeRegistry::new());
+    let resolver = Arc::new(CertResolver::new("example.com".to_string(), registry));
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let shutdown_token = CancellationToken::new();
+
+    let tls_config =
+        create_server_config(Arc::clone(&resolver) as Arc<dyn rustls::server::ResolvesServerCert>)
+            .unwrap();
+    let res_clone = Arc::clone(&resolver);
+    let s_tok = shutdown_token.clone();
+    tokio::spawn(async move {
+        run_https_server(
+            listener,
+            tls_config,
+            "example.com".into(),
+            Some(res_clone),
+            s_tok,
+        )
+        .await;
+    });
+
+    let client_config = create_test_client_config();
+    let connector = TlsConnector::from(client_config);
+
+    // Completely unknown SNI domain
+    let tcp = TcpStream::connect(format!("127.0.0.1:{port}"))
+        .await
+        .unwrap();
+    let server_name = ServerName::try_from("unknown.example.org")
+        .unwrap()
+        .to_owned();
+    let err = connector.connect(server_name, tcp).await;
+    assert!(
+        err.is_err(),
+        "Expected unknown SNI domain to fail TLS handshake"
+    );
+
+    shutdown_token.cancel();
+}
+
+// OFF-79: Incoming TLS handshake with missing SNI terminates immediately at the TCP level.
+#[tokio::test]
+async fn test_strict_tls_missing_sni_terminates_tcp() {
+    let registry = Arc::new(ChallengeRegistry::new());
+    let resolver = Arc::new(CertResolver::new("example.com".to_string(), registry));
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let shutdown_token = CancellationToken::new();
+
+    let tls_config =
+        create_server_config(Arc::clone(&resolver) as Arc<dyn rustls::server::ResolvesServerCert>)
+            .unwrap();
+    let res_clone = Arc::clone(&resolver);
+    let s_tok = shutdown_token.clone();
+    tokio::spawn(async move {
+        run_https_server(
+            listener,
+            tls_config,
+            "example.com".into(),
+            Some(res_clone),
+            s_tok,
+        )
+        .await;
+    });
+
+    let client_config = create_test_client_config();
+    let connector = TlsConnector::from(client_config);
+
+    // Connecting to IP address sends no SNI extension in ClientHello
+    let tcp = TcpStream::connect(format!("127.0.0.1:{port}"))
+        .await
+        .unwrap();
+    let server_name = ServerName::try_from("127.0.0.1").unwrap().to_owned();
+    let err = connector.connect(server_name, tcp).await;
+    assert!(err.is_err(), "Expected missing SNI to fail TLS handshake");
+
+    shutdown_token.cancel();
+}
+
+// OFF-79: Incoming TLS handshake for a hostname whose certificate order has failed terminates
+// immediately at the TCP level without completing a TLS handshake.
+#[tokio::test]
+async fn test_strict_tls_failed_order_terminates_tcp() {
+    let registry = Arc::new(ChallengeRegistry::new());
+    let resolver = Arc::new(CertResolver::new("example.com".to_string(), registry));
+
+    let host = "failed-order.example.com";
+    resolver.mark_ordering(host);
+    // Issuance fails: clear ordering without inserting cert
+    resolver.clear_ordering(host);
+    assert!(!resolver.is_ordering(host));
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let shutdown_token = CancellationToken::new();
+
+    let tls_config =
+        create_server_config(Arc::clone(&resolver) as Arc<dyn rustls::server::ResolvesServerCert>)
+            .unwrap();
+    let res_clone = Arc::clone(&resolver);
+    let s_tok = shutdown_token.clone();
+    tokio::spawn(async move {
+        run_https_server(
+            listener,
+            tls_config,
+            "example.com".into(),
+            Some(res_clone),
+            s_tok,
+        )
+        .await;
+    });
+
+    let client_config = create_test_client_config();
+    let connector = TlsConnector::from(client_config);
+
+    let tcp = TcpStream::connect(format!("127.0.0.1:{port}"))
+        .await
+        .unwrap();
+    let server_name = ServerName::try_from(host).unwrap().to_owned();
+    let err = connector.connect(server_name, tcp).await;
+    assert!(
+        err.is_err(),
+        "Expected failed order to terminate at TCP level"
+    );
+
+    shutdown_token.cancel();
+}
+
+// OFF-79: Incoming TLS handshake for a hostname in the Renewing state with an existing unexpired
+// certificate completes immediately, serving the existing certificate without holding.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_strict_tls_renewing_serves_immediately_without_hold() {
+    let registry = Arc::new(ChallengeRegistry::new());
+    let resolver = Arc::new(CertResolver::new("example.com".to_string(), registry));
+
+    let host = "renew.example.com";
+    let cert = make_dummy_certified_key(host);
+    // Cert valid far in the future
+    resolver.insert_cert_with_expiry(host, cert, 2_000_000_000);
+
+    // Host transitions to background renewal (marked ordering in wait queue)
+    resolver.mark_ordering(host);
+    assert!(resolver.is_ordering(host));
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let shutdown_token = CancellationToken::new();
+
+    let tls_config =
+        create_server_config(Arc::clone(&resolver) as Arc<dyn rustls::server::ResolvesServerCert>)
+            .unwrap();
+    let res_clone = Arc::clone(&resolver);
+    let s_tok = shutdown_token.clone();
+    tokio::spawn(async move {
+        run_https_server(
+            listener,
+            tls_config,
+            "example.com".into(),
+            Some(res_clone),
+            s_tok,
+        )
+        .await;
+    });
+
+    let client_config = create_test_client_config();
+    let connector = TlsConnector::from(client_config);
+
+    let start = std::time::Instant::now();
+    let tcp = TcpStream::connect(format!("127.0.0.1:{port}"))
+        .await
+        .unwrap();
+    let server_name = ServerName::try_from(host).unwrap().to_owned();
+    let mut tls = connector.connect(server_name, tcp).await.unwrap();
+    tls.write_all(b"GET / HTTP/1.1\r\nHost: renew.example.com\r\nConnection: close\r\n\r\n")
+        .await
+        .unwrap();
+    let mut resp = String::new();
+    tls.read_to_string(&mut resp).await.unwrap();
+
+    let duration = start.elapsed();
+    assert!(resp.starts_with("HTTP/1.1 404 Not Found"));
+    assert!(resp.contains("strict-transport-security"));
+    // Verify it was served immediately without waiting on the ordering queue
+    assert!(
+        duration < Duration::from_secs(2),
+        "Handshake took too long: {duration:?}"
+    );
+
+    shutdown_token.cancel();
+}
+
+// OFF-79: Incoming TLS handshake for a hostname whose certificate order exceeds the hold timeout
+// terminates at the TCP level without completing a TLS handshake.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_strict_tls_hold_timeout_terminates_tcp() {
+    let registry = Arc::new(ChallengeRegistry::new());
+    // Use short timeout (50ms) to test timeout termination deterministically
+    let resolver = Arc::new(
+        CertResolver::new("example.com".to_string(), registry)
+            .with_hold_timeout(Duration::from_millis(50)),
+    );
+
+    let host = "timeout.example.com";
+    resolver.mark_ordering(host);
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let shutdown_token = CancellationToken::new();
+
+    let tls_config =
+        create_server_config(Arc::clone(&resolver) as Arc<dyn rustls::server::ResolvesServerCert>)
+            .unwrap();
+    let res_clone = Arc::clone(&resolver);
+    let s_tok = shutdown_token.clone();
+    tokio::spawn(async move {
+        run_https_server(
+            listener,
+            tls_config,
+            "example.com".into(),
+            Some(res_clone),
+            s_tok,
+        )
+        .await;
+    });
+
+    let client_config = create_test_client_config();
+    let connector = TlsConnector::from(client_config);
+
+    let tcp = TcpStream::connect(format!("127.0.0.1:{port}"))
+        .await
+        .unwrap();
+    let server_name = ServerName::try_from(host).unwrap().to_owned();
+    let err = connector.connect(server_name, tcp).await;
+    assert!(
+        err.is_err(),
+        "Expected timed-out handshake to terminate at TCP level"
+    );
+
+    shutdown_token.cancel();
 }

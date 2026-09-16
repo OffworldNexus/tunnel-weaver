@@ -23,7 +23,7 @@ use weaver_server::cert::state::CertState;
 use weaver_server::config::Config;
 use weaver_server::edge::http::run_http_server;
 use weaver_server::edge::https::run_https_server;
-use weaver_server::edge::tls::{create_server_config, generate_placeholder_certified_key};
+use weaver_server::edge::tls::create_server_config;
 use weaver_server::store::Store;
 
 const PEBBLE_DIR: &str = "https://localhost:14000/dir";
@@ -269,11 +269,9 @@ async fn test_pebble_e2e_issuance_and_lazy_ensure() {
         acme_fallback_providers: Vec::new(),
     });
 
-    let placeholder = generate_placeholder_certified_key(root_domain).unwrap();
     let challenge_registry = Arc::new(ChallengeRegistry::new());
     let resolver = Arc::new(CertResolver::new(
         root_domain.into(),
-        placeholder,
         Arc::clone(&challenge_registry),
     ));
 
@@ -401,11 +399,9 @@ async fn test_pebble_e2e_tls_alpn_01_with_unbound_port_80() {
         acme_fallback_providers: Vec::new(),
     });
 
-    let placeholder = generate_placeholder_certified_key(root_domain).unwrap();
     let challenge_registry = Arc::new(ChallengeRegistry::new());
     let resolver = Arc::new(CertResolver::new(
         root_domain.into(),
-        placeholder,
         Arc::clone(&challenge_registry),
     ));
 

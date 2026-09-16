@@ -17,7 +17,7 @@ use crate::cert::{CertManager, CertResolver, ChallengeRegistry, SystemClock};
 use crate::config::{Config, ConfigError};
 use crate::edge::http::run_http_server;
 use crate::edge::https::run_https_server;
-use crate::edge::tls::{TlsError, create_server_config, generate_placeholder_certified_key};
+use crate::edge::tls::{TlsError, create_server_config};
 use crate::notify::{notify_ready_with_cert_status, notify_stopping};
 use crate::server::listener::{ListenerError, acquire_listeners};
 use crate::store::{Store, StoreError};
@@ -113,11 +113,9 @@ pub async fn run_server(
     };
 
     // 5. Initialize certificate manager and dynamic TLS resolver
-    let placeholder_key = generate_placeholder_certified_key(&config.root_domain)?;
     let challenge_registry = Arc::new(ChallengeRegistry::new());
     let resolver = Arc::new(CertResolver::new(
         config.root_domain.clone(),
-        placeholder_key,
         Arc::clone(&challenge_registry),
     ));
 

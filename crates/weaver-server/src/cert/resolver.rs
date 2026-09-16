@@ -8,7 +8,16 @@ use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
 use tracing::{debug, trace};
 
+use crate::cert::acme::parse_cert_validity;
 use crate::cert::challenge::ChallengeRegistry;
+use crate::cert::clock::{Clock, SystemClock};
+
+/// In-memory stored certificate with its parsed expiration timestamp.
+#[derive(Clone)]
+struct StoredCert {
+    key: Arc<CertifiedKey>,
+    not_after: i64,
+}
 
 /// Synchronous waiter pair for holding in-flight TLS handshakes.
 struct HandshakeWaiter {
@@ -31,27 +40,40 @@ impl HandshakeWaiter {
     }
 
     fn wait_timeout(&self, timeout: Duration) {
-        let guard = self.lock.lock().unwrap();
-        if *guard {
-            return;
+        let mut guard = self.lock.lock().unwrap();
+        let start = std::time::Instant::now();
+        while !*guard {
+            let elapsed = start.elapsed();
+            if elapsed >= timeout {
+                break;
+            }
+            let remaining = timeout - elapsed;
+            let (next_guard, result) = self.cvar.wait_timeout(guard, remaining).unwrap();
+            guard = next_guard;
+            if result.timed_out() {
+                break;
+            }
         }
-        let _ = self.cvar.wait_timeout(guard, timeout);
     }
 }
+
+pub const DEFAULT_HOLD_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Dynamic TLS certificate resolver.
 ///
 /// Dispatches incoming TLS connections:
 /// - Responds to ALPN `acme-tls/1` TLS-ALPN-01 challenges via `ChallengeRegistry`
-/// - Serves valid issued ACME certificates per SNI
+/// - Serves valid unexpired issued ACME certificates per SNI
 /// - Holds handshakes up to 30s when connecting to a hostname undergoing ACME issuance
-/// - Falls back to an in-memory self-signed placeholder certificate until ACME issuance completes
+/// - Rejects unknown hostnames, missing SNI, failed orders, and timed-out orders at the TCP level
+/// - Strictly prohibits serving self-signed or placeholder certificates to public HTTPS clients
 pub struct CertResolver {
     root_domain: String,
-    placeholder_key: Arc<CertifiedKey>,
     challenge_registry: Arc<ChallengeRegistry>,
-    certs: RwLock<HashMap<String, Arc<CertifiedKey>>>,
+    certs: RwLock<HashMap<String, StoredCert>>,
     ordering_waiters: Mutex<HashMap<String, Arc<HandshakeWaiter>>>,
+    clock: Arc<dyn Clock>,
+    hold_timeout: Duration,
 }
 
 impl std::fmt::Debug for CertResolver {
@@ -64,34 +86,74 @@ impl std::fmt::Debug for CertResolver {
 }
 
 impl CertResolver {
-    /// Creates a new `CertResolver` with the given placeholder certificate and challenge registry.
-    pub fn new(
+    /// Creates a new `CertResolver` with the given root domain and challenge registry.
+    pub fn new(root_domain: String, challenge_registry: Arc<ChallengeRegistry>) -> Self {
+        Self::with_clock(root_domain, challenge_registry, Arc::new(SystemClock))
+    }
+
+    /// Creates a new `CertResolver` with an injected clock for deterministic time in tests.
+    pub fn with_clock(
         root_domain: String,
-        placeholder_key: Arc<CertifiedKey>,
         challenge_registry: Arc<ChallengeRegistry>,
+        clock: Arc<dyn Clock>,
     ) -> Self {
         Self {
             root_domain: root_domain.to_ascii_lowercase(),
-            placeholder_key,
             challenge_registry,
             certs: RwLock::new(HashMap::new()),
             ordering_waiters: Mutex::new(HashMap::new()),
+            clock,
+            hold_timeout: DEFAULT_HOLD_TIMEOUT,
         }
     }
 
-    /// Checks whether the certificate currently served for `name` is the placeholder certificate.
+    /// Overrides the handshake hold timeout (defaults to 30s).
+    pub fn with_hold_timeout(mut self, timeout: Duration) -> Self {
+        self.hold_timeout = timeout;
+        self
+    }
+
+    /// Checks whether the certificate currently served for `name` is a placeholder certificate.
+    /// Under strict TLS doctrine, placeholder certificates are never served, so this returns
+    /// `false` if an unexpired certificate exists, or `true` otherwise.
     pub fn is_placeholder(&self, name: &str) -> bool {
         let lower = name.to_ascii_lowercase();
-        !self.certs.read().unwrap().contains_key(&lower)
+        let now = self.clock.now_unix();
+        let certs = self.certs.read().unwrap();
+        match certs.get(&lower) {
+            Some(cert) => cert.not_after <= now,
+            None => true,
+        }
     }
 
     /// Stores an issued certificate for `name` and unblocks any waiting handshakes.
+    /// Automatically extracts `not_after` expiration timestamp from the leaf certificate.
     pub fn insert_cert(&self, name: &str, certified_key: Arc<CertifiedKey>) {
+        let not_after = certified_key
+            .cert
+            .first()
+            .and_then(|c| parse_cert_validity(c.as_ref()).ok())
+            .map(|(_, na)| na)
+            .unwrap_or(i64::MAX);
+        self.insert_cert_with_expiry(name, certified_key, not_after);
+    }
+
+    /// Stores an issued certificate for `name` with an explicit `not_after` expiration timestamp
+    /// and unblocks any waiting handshakes.
+    pub fn insert_cert_with_expiry(
+        &self,
+        name: &str,
+        certified_key: Arc<CertifiedKey>,
+        not_after: i64,
+    ) {
         let lower = name.to_ascii_lowercase();
-        self.certs
-            .write()
-            .unwrap()
-            .insert(lower.clone(), certified_key);
+        self.certs.write().unwrap().insert(
+            lower.clone(),
+            StoredCert {
+                key: certified_key,
+                not_after,
+            },
+        );
 
         if let Some(waiter) = self.ordering_waiters.lock().unwrap().remove(&lower) {
             waiter.notify();
@@ -119,11 +181,6 @@ impl CertResolver {
     pub fn is_ordering(&self, name: &str) -> bool {
         let lower = name.to_ascii_lowercase();
         self.ordering_waiters.lock().unwrap().contains_key(&lower)
-    }
-
-    /// Returns a reference to the placeholder certificate.
-    pub fn placeholder(&self) -> Arc<CertifiedKey> {
-        Arc::clone(&self.placeholder_key)
     }
 
     fn wait_for_ordering(&self, name: &str, timeout: Duration) {
@@ -172,27 +229,41 @@ impl ResolvesServerCert for CertResolver {
             return None;
         }
 
-        // 2. Normal TLS request: check SNI
-        let sni = client_hello.server_name().unwrap_or(&self.root_domain);
+        // 2. Normal TLS request: check SNI.
+        // Requests without SNI extension are rejected immediately at the TCP level.
+        let Some(sni) = client_hello.server_name() else {
+            debug!("Rejecting TLS handshake: SNI extension is missing");
+            return None;
+        };
         let host = sni.to_ascii_lowercase();
+        let now = self.clock.now_unix();
 
-        // Check if certificate is already available
-        if let Some(cert) = self.certs.read().unwrap().get(&host) {
-            return Some(Arc::clone(cert));
+        // 3. Check if a valid, unexpired certificate is already available.
+        // If an unexpired certificate exists (including during background renewal),
+        // serve it immediately without holding.
+        if let Some(cert) = self.certs.read().unwrap().get(&host)
+            && cert.not_after > now
+        {
+            return Some(Arc::clone(&cert.key));
         }
 
-        // If hostname is undergoing issuance, hold handshake up to 30 seconds
+        // 4. If hostname is actively undergoing issuance (and has no valid unexpired cert),
+        // hold incoming handshake up to hold_timeout (30 seconds by default).
         if self.is_ordering(&host) {
-            self.wait_for_ordering(&host, Duration::from_secs(30));
+            self.wait_for_ordering(&host, self.hold_timeout);
             // Check again after wait
-            if let Some(cert) = self.certs.read().unwrap().get(&host) {
-                return Some(Arc::clone(cert));
+            if let Some(cert) = self.certs.read().unwrap().get(&host)
+                && cert.not_after > self.clock.now_unix()
+            {
+                return Some(Arc::clone(&cert.key));
             }
         }
 
-        // 3. Fallback to placeholder certificate
-        trace!(%host, "Serving self-signed placeholder certificate");
-        Some(Arc::clone(&self.placeholder_key))
+        // 5. Strict TLS doctrine: never serve self-signed or placeholder certificates.
+        // Returning None causes rustls to abort the handshake, terminating the connection
+        // at the TCP level without exchanging certificates.
+        debug!(%host, "No valid certificate available; rejecting TLS handshake at TCP level");
+        None
     }
 }
 
