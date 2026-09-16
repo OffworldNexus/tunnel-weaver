@@ -76,13 +76,23 @@ fn build_dns_response(buf: &[u8]) -> Option<Vec<u8>> {
 
 /// In-test DNS server answering all UDP and TCP queries with `127.0.0.1` for Pebble's `-dnsserver 127.0.0.1:1053`.
 async fn spawn_dns_stub(token: CancellationToken) {
-    let udp = match UdpSocket::bind("127.0.0.1:1053").await {
-        Ok(s) => s,
-        Err(_) => return,
+    let mut udp = None;
+    let mut tcp = None;
+    for _ in 0..50 {
+        if let Ok(u) = UdpSocket::bind("127.0.0.1:1053").await
+            && let Ok(t) = TcpListener::bind("127.0.0.1:1053").await
+        {
+            udp = Some(u);
+            tcp = Some(t);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let Some(udp) = udp else {
+        return;
     };
-    let tcp = match TcpListener::bind("127.0.0.1:1053").await {
-        Ok(s) => s,
-        Err(_) => return,
+    let Some(tcp) = tcp else {
+        return;
     };
 
     let tok1 = token.clone();
@@ -361,6 +371,7 @@ async fn test_pebble_e2e_issuance_and_lazy_ensure() {
 
     shutdown_token.cancel();
     dns_token.cancel();
+    tokio::time::sleep(Duration::from_millis(200)).await;
 }
 
 #[tokio::test]
@@ -443,6 +454,7 @@ async fn test_pebble_e2e_tls_alpn_01_with_unbound_port_80() {
 
     shutdown_token.cancel();
     dns_token.cancel();
+    tokio::time::sleep(Duration::from_millis(200)).await;
 }
 
 #[tokio::test]
@@ -632,4 +644,5 @@ async fn test_pebble_e2e_tunnel_registration_and_proxying() {
 
     shutdown_token.cancel();
     dns_token.cancel();
+    tokio::time::sleep(Duration::from_millis(200)).await;
 }
