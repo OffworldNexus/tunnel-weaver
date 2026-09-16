@@ -1,0 +1,14 @@
+# weaver-server.socket — systemd owns the ports; the service never needs capabilities
+[Unit]
+Description=Tunnel Weaver relay sockets
+
+[Socket]
+ListenStream=[::]:80
+ListenStream=[::]:443
+BindIPv6Only=both
+NoDelay=true
+Backlog=1024
+Service=weaver-server.service
+
+[Install]
+WantedBy=sockets.target

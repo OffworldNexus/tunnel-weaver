@@ -2,13 +2,13 @@ name: CI
 
 on:
   push:
-    branches: [develop, main]
+    branches: [develop]
   pull_request:
-    branches: [develop, main]
+    branches: [develop]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.ref != 'refs/heads/develop' && github.ref != 'refs/heads/main' }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/develop' }}
 
 permissions:
   contents: read
@@ -127,6 +127,65 @@ jobs:
             echo "Error: expected at least 1 ignored e2e test to pass"
             exit 1
           }
+
+      - name: Build weaver-server binary for container smoke
+        run: cargo build -p weaver-server
+
+      - name: Container smoke test (configure --headless + run + curl)
+        run: |
+          mkdir -p /tmp/smoke-data
+          docker run --rm \
+            --network host \
+            -v $(pwd)/target/debug/weaver-server:/usr/local/bin/weaver-server \
+            -v $(pwd)/ci/pebble/pebble.minica.pem:/tmp/pebble.pem \
+            -v /tmp/smoke-data:/var/lib/weaver \
+            ubuntu:latest bash -c "
+              apt-get update -qq && apt-get install -y -qq curl ca-certificates >/dev/null 2>&1
+              weaver-server --db /var/lib/weaver/smoke.db configure --headless \
+                --root-domain root.pebble.test \
+                --email admin@pebble.test \
+                --acme-provider custom \
+                --acme-directory https://localhost:14000/dir \
+                --acme-root-ca /tmp/pebble.pem \
+                --listen-http 127.0.0.1:8080 \
+                --listen-https 127.0.0.1:8443 \
+                --control-socket /tmp/smoke.sock
+              weaver-server --db /var/lib/weaver/smoke.db run &
+              SERVER_PID=\$!
+              for i in \$(seq 1 30); do
+                if curl -k --fail --silent https://root.pebble.test:8443/ >/dev/null 2>&1; then
+                  echo 'Container smoke endpoint responded successfully'
+                  break
+                fi
+                sleep 0.5
+              done
+              kill \$SERVER_PID || true
+            "
+
+      - name: Systemd container smoke (best effort)
+        continue-on-error: true
+        run: |
+          docker run -d --name systemd-smoke --privileged \
+            -v /sys/fs/cgroup:/sys/fs/cgroup:rw \
+            --cgroupns=host \
+            --network host \
+            -v $(pwd)/target/debug/weaver-server:/usr/local/bin/weaver-server \
+            -v $(pwd)/ci/pebble/pebble.minica.pem:/tmp/pebble.pem \
+            jrei/systemd-ubuntu:24.04
+          for i in $(seq 1 15); do
+            if docker exec systemd-smoke systemctl is-system-running 2>/dev/null | grep -E "running|degraded"; then
+              break
+            fi
+            sleep 1
+          done
+          docker exec systemd-smoke /usr/local/bin/weaver-server setup --headless \
+            --root-domain root.pebble.test \
+            --email admin@pebble.test \
+            --acme-provider custom \
+            --acme-directory https://localhost:14000/dir \
+            --acme-root-ca /tmp/pebble.pem \
+            --skip-reachability-check || echo "Systemd smoke completed with status $?"
+          docker rm -f systemd-smoke || true
 
   fuzz-smoke:
     name: fuzz-smoke

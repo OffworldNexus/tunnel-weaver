@@ -390,7 +390,7 @@ impl AcmeEngine {
             })
             .map_err(|e| AcmeError::Other(format!("Database read failed: {e}")))?;
 
-        let builder = self.create_account_builder()?;
+        let builder = create_account_builder_from_pem(self.config.acme_root_ca_pem.as_deref())?;
 
         if let Some((creds_json, _)) = cached
             && let Ok(creds) = serde_json::from_str::<AccountCredentials>(&creds_json)
@@ -404,7 +404,7 @@ impl AcmeEngine {
         }
 
         // 2. Create new account with ECDSA P-256 key
-        let builder = self.create_account_builder()?;
+        let builder = create_account_builder_from_pem(self.config.acme_root_ca_pem.as_deref())?;
         let contact = format!("mailto:{}", self.config.admin_email);
         let new_account = NewAccount {
             contact: &[&contact],
@@ -413,9 +413,13 @@ impl AcmeEngine {
         };
 
         // Prepare External Account Binding (EAB) if configured or required
-        let eab = self.prepare_eab(provider_id)?;
+        let eab = parse_eab(
+            provider_id,
+            self.config.acme_eab_kid.as_deref(),
+            self.config.acme_eab_hmac.as_deref(),
+        )?;
 
-        let (account, credentials) = builder
+        let (account, credentials): (Account, AccountCredentials) = builder
             .create(&new_account, directory_url.to_string(), eab.as_ref())
             .await
             .map_err(Self::map_instant_acme_error)?;
@@ -446,53 +450,8 @@ impl AcmeEngine {
         Ok(account)
     }
 
-    /// Creates an `AccountBuilder` configured with custom Root CA PEM if present.
-    fn create_account_builder(&self) -> Result<AccountBuilder, AcmeError> {
-        if let Some(ca_pem) = &self.config.acme_root_ca_pem {
-            let mut temp = tempfile::NamedTempFile::new()
-                .map_err(|e| AcmeError::Other(format!("Failed to create tempfile: {e}")))?;
-            use std::io::Write;
-            temp.write_all(ca_pem.as_bytes())
-                .map_err(|e| AcmeError::Other(format!("Failed to write Root CA PEM: {e}")))?;
-
-            Account::builder_with_root(temp.path())
-                .map_err(|e| AcmeError::Other(format!("Failed to configure Root CA: {e}")))
-        } else {
-            Account::builder()
-                .map_err(|e| AcmeError::Other(format!("Failed to create AccountBuilder: {e}")))
-        }
-    }
-
-    /// Prepares External Account Binding if keys are provided or required.
-    fn prepare_eab(&self, provider_id: &str) -> Result<Option<ExternalAccountKey>, AcmeError> {
-        let kid = self.config.acme_eab_kid.as_deref();
-        let hmac = self.config.acme_eab_hmac.as_deref();
-
-        let (Some(kid_str), Some(hmac_str)) = (kid, hmac) else {
-            let provider_info = find_provider(provider_id);
-            if provider_info.is_some_and(|p| p.eab_required) {
-                return Err(AcmeError::Other(format!(
-                    "Provider '{provider_id}' mandates EAB, but acme_eab_kid/acme_eab_hmac are unset"
-                )));
-            }
-            return Ok(None);
-        };
-
-        // Decode base64 / base64url HMAC key
-        let hmac_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .decode(hmac_str)
-            .or_else(|_| base64::engine::general_purpose::STANDARD.decode(hmac_str))
-            .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(hmac_str))
-            .map_err(|e| AcmeError::Other(format!("Invalid base64 in acme_eab_hmac: {e}")))?;
-
-        Ok(Some(ExternalAccountKey::new(
-            kid_str.to_string(),
-            &hmac_bytes,
-        )))
-    }
-
     /// Converts an `instant_acme::Error` into an `AcmeError`, classifying rate limits and server errors.
-    fn map_instant_acme_error(err: instant_acme::Error) -> AcmeError {
+    pub fn map_instant_acme_error(err: instant_acme::Error) -> AcmeError {
         match err {
             instant_acme::Error::Api(problem) => {
                 let status = problem.status;
@@ -517,6 +476,94 @@ impl AcmeEngine {
             other => AcmeError::Other(other.to_string()),
         }
     }
+}
+
+/// Result of registering a new ACME account against the directory.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct RegisteredAcmeAccount {
+    /// Serialized credentials JSON suitable for persisting in the database.
+    pub creds_json: String,
+    /// Account Key Identifier (KID) assigned by the ACME server.
+    pub kid: String,
+}
+
+/// Prepares External Account Binding if keys are provided or required.
+pub fn parse_eab(
+    provider_id: &str,
+    eab_kid: Option<&str>,
+    eab_hmac: Option<&str>,
+) -> Result<Option<ExternalAccountKey>, AcmeError> {
+    let (Some(kid_str), Some(hmac_str)) = (eab_kid, eab_hmac) else {
+        let provider_info = find_provider(provider_id);
+        if provider_info.is_some_and(|p| p.eab_required) {
+            return Err(AcmeError::Other(format!(
+                "Provider '{provider_id}' mandates EAB, but acme_eab_kid/acme_eab_hmac are unset"
+            )));
+        }
+        return Ok(None);
+    };
+
+    // Decode base64 / base64url HMAC key
+    let hmac_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(hmac_str)
+        .or_else(|_| base64::engine::general_purpose::STANDARD.decode(hmac_str))
+        .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(hmac_str))
+        .map_err(|e| AcmeError::Other(format!("Invalid base64 in acme_eab_hmac: {e}")))?;
+
+    Ok(Some(ExternalAccountKey::new(
+        kid_str.to_string(),
+        &hmac_bytes,
+    )))
+}
+
+/// Creates an `AccountBuilder` configured with custom Root CA PEM if present.
+pub fn create_account_builder_from_pem(
+    root_ca_pem: Option<&str>,
+) -> Result<AccountBuilder, AcmeError> {
+    if let Some(ca_pem) = root_ca_pem {
+        let mut temp = tempfile::NamedTempFile::new()
+            .map_err(|e| AcmeError::Other(format!("Failed to create tempfile: {e}")))?;
+        use std::io::Write;
+        temp.write_all(ca_pem.as_bytes())
+            .map_err(|e| AcmeError::Other(format!("Failed to write Root CA PEM: {e}")))?;
+
+        Account::builder_with_root(temp.path())
+            .map_err(|e| AcmeError::Other(format!("Failed to configure Root CA: {e}")))
+    } else {
+        Account::builder()
+            .map_err(|e| AcmeError::Other(format!("Failed to create AccountBuilder: {e}")))
+    }
+}
+
+/// Registers a new ACME account directly against the directory without requiring database persistence.
+pub async fn register_acme_account(
+    admin_email: &str,
+    provider_id: &str,
+    directory_url: &str,
+    eab_kid: Option<&str>,
+    eab_hmac: Option<&str>,
+    root_ca_pem: Option<&str>,
+) -> Result<RegisteredAcmeAccount, AcmeError> {
+    let builder = create_account_builder_from_pem(root_ca_pem)?;
+    let contact = format!("mailto:{admin_email}");
+    let new_account = NewAccount {
+        contact: &[&contact],
+        terms_of_service_agreed: true,
+        only_return_existing: false,
+    };
+
+    let eab = parse_eab(provider_id, eab_kid, eab_hmac)?;
+
+    let (account, credentials): (Account, AccountCredentials) = builder
+        .create(&new_account, directory_url.to_string(), eab.as_ref())
+        .await
+        .map_err(AcmeEngine::map_instant_acme_error)?;
+
+    let creds_json = serde_json::to_string(&credentials)
+        .map_err(|e| AcmeError::Other(format!("Failed to serialize credentials: {e}")))?;
+    let kid = account.id().to_string();
+
+    Ok(RegisteredAcmeAccount { creds_json, kid })
 }
 
 /// Helper to parse optional SQLite results without extra imports.
