@@ -534,6 +534,24 @@ async fn test_pebble_e2e_tunnel_registration_and_proxying() {
         .await;
     });
 
+    // 1. Initial eager issuance for root domain
+    manager.init().unwrap();
+    manager.spawn_eager_order_if_pending();
+
+    // Wait up to 30 seconds for root domain cert to become Issued
+    let mut issued = false;
+    for _ in 0..60 {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        if let CertState::Issued { .. } = manager.status(root_domain) {
+            issued = true;
+            break;
+        }
+    }
+    assert!(
+        issued,
+        "Root domain certificate should transition to Issued within 30s"
+    );
+
     // Write Pebble root CA to temp file for weave client
     let mut ca_file = tempfile::NamedTempFile::new().unwrap();
     std::io::Write::write_all(&mut ca_file, PEBBLE_ROOT_CA.as_bytes()).unwrap();
