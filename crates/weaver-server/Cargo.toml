@@ -20,12 +20,15 @@ bytes = { workspace = true }
 clap = { workspace = true }
 comfy-table = { workspace = true }
 crossterm = "0.29"
+futures-util = { workspace = true }
 http = { workspace = true }
 http-body-util = { workspace = true }
 hyper = { workspace = true }
 hyper-util = { workspace = true }
 instant-acme = { workspace = true }
 libc = { workspace = true }
+rand = "0.9"
+rand_core = { workspace = true }
 rcgen = { workspace = true }
 rusqlite = { workspace = true }
 rustls = { workspace = true }
@@ -37,11 +40,16 @@ tempfile = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-rustls = { workspace = true }
+tokio-tungstenite = { workspace = true }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+weaver-mux = { workspace = true }
 weaver-proto = { workspace = true }
 
 [dev-dependencies]
+ed25519-dalek = { workspace = true }
 hyper = { workspace = true, features = ["client"] }
 hyper-util = { workspace = true, features = ["client", "client-legacy"] }
+weave = { path = "../weave" }
+weaver-mux = { workspace = true, features = ["test-util"] }

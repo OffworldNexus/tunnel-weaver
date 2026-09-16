@@ -1,16 +1,14 @@
 //! TLS HTTPS edge server.
 //!
-//! Terminates TLS connections, validates SNI and Host headers, and serves
-//! root welcome pages, health checks, branded tunnel 404s, and 421 Misdirected Request responses,
-//! conditionally applying HSTS when serving with a non-placeholder certificate.
+//! Terminates TLS connections, validates SNI and Host headers, serves root welcome pages,
+//! health checks, WebSocket upgrades for the tunnel client on `GET /_weaver/connect`,
+//! proxies incoming visitor requests to registered tunnels, and returns branded 404s.
 
 use std::convert::Infallible;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
-use bytes::Bytes;
 use http::{Method, Request, Response, StatusCode};
-use http_body_util::Full;
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto::Builder;
@@ -23,6 +21,8 @@ use tracing::{debug, info, trace};
 
 use crate::assets::{NO_TUNNEL_HTML, WELCOME_HTML, apply_security_headers};
 use crate::cert::resolver::CertResolver;
+use crate::tunnel::proxy::{BoxBody, empty_body, forward_visitor_request, full_body};
+use crate::tunnel::registry::TunnelRegistry;
 
 /// Shared state for HTTPS request dispatch.
 #[derive(Clone)]
@@ -31,6 +31,8 @@ pub struct HttpsEdgeConfig {
     pub root_domain: String,
     /// Dynamic certificate resolver used to determine if certificate is placeholder.
     pub cert_resolver: Option<Arc<CertResolver>>,
+    /// Active tunnel registry for routing subdomain requests and handling connection upgrades.
+    pub tunnel_registry: Option<Arc<TunnelRegistry>>,
 }
 
 impl std::fmt::Debug for HttpsEdgeConfig {
@@ -38,6 +40,7 @@ impl std::fmt::Debug for HttpsEdgeConfig {
         f.debug_struct("HttpsEdgeConfig")
             .field("root_domain", &self.root_domain)
             .field("has_cert_resolver", &self.cert_resolver.is_some())
+            .field("has_tunnel_registry", &self.tunnel_registry.is_some())
             .finish()
     }
 }
@@ -45,13 +48,11 @@ impl std::fmt::Debug for HttpsEdgeConfig {
 /// Helper to parse and strip any port component from an authority or Host header value.
 pub fn extract_host_without_port(raw: &str) -> String {
     let trimmed = raw.trim();
-    if trimmed.starts_with('[') {
-        // IPv6 address literal: [::1] or [::1]:8443
-        if let Some(close_bracket) = trimmed.find(']') {
-            return trimmed[..=close_bracket].to_string();
-        }
+    if trimmed.starts_with('[')
+        && let Some(close_bracket) = trimmed.find(']')
+    {
+        return trimmed[..=close_bracket].to_string();
     }
-    // Hostname or IPv4: split at ':' if present
     if let Some((host, _port)) = trimmed.split_once(':') {
         host.to_string()
     } else {
@@ -69,12 +70,53 @@ pub fn is_ip_literal(host: &str) -> bool {
     unbracketed.parse::<IpAddr>().is_ok()
 }
 
+/// Sets the TCP_NOTSENT_LOWAT socket option to ~32 KiB on Linux and Apple systems.
+#[cfg(any(
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "android"
+))]
+pub fn set_tcp_notsent_lowat(stream: &tokio::net::TcpStream) {
+    use std::os::unix::io::AsRawFd;
+    let fd = stream.as_raw_fd();
+    let val: libc::c_uint = 32768;
+    unsafe {
+        #[cfg(target_os = "linux")]
+        let _ = libc::setsockopt(
+            fd,
+            libc::IPPROTO_TCP,
+            libc::TCP_NOTSENT_LOWAT,
+            &val as *const _ as *const libc::c_void,
+            std::mem::size_of_val(&val) as libc::socklen_t,
+        );
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        let _ = libc::setsockopt(
+            fd,
+            libc::IPPROTO_TCP,
+            0x201,
+            &val as *const _ as *const libc::c_void,
+            std::mem::size_of_val(&val) as libc::socklen_t,
+        );
+    }
+}
+
+/// No-op on platforms without TCP_NOTSENT_LOWAT (e.g. Windows).
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "android"
+)))]
+pub fn set_tcp_notsent_lowat(_stream: &tokio::net::TcpStream) {}
+
 /// Dispatches an HTTPS request based on SNI and Host header validation.
 pub async fn handle_https_request(
-    req: Request<hyper::body::Incoming>,
+    mut req: Request<hyper::body::Incoming>,
     config: Arc<HttpsEdgeConfig>,
     client_sni: Option<String>,
-) -> Result<Response<Full<Bytes>>, Infallible> {
+    remote_addr: SocketAddr,
+) -> Result<Response<BoxBody>, Infallible> {
     let host_header = req
         .headers()
         .get(http::header::HOST)
@@ -89,7 +131,7 @@ pub async fn handle_https_request(
         debug!(%host, "Rejecting empty or IP literal host on HTTPS with 421");
         return Ok(Response::builder()
             .status(StatusCode::MISDIRECTED_REQUEST)
-            .body(Full::new(Bytes::from("421 Misdirected Request\n")))
+            .body(full_body("421 Misdirected Request\n"))
             .unwrap());
     }
 
@@ -98,7 +140,7 @@ pub async fn handle_https_request(
         debug!(%host, "Missing SNI on TLS connection, returning 421");
         return Ok(Response::builder()
             .status(StatusCode::MISDIRECTED_REQUEST)
-            .body(Full::new(Bytes::from("421 Misdirected Request\n")))
+            .body(full_body("421 Misdirected Request\n"))
             .unwrap());
     };
 
@@ -106,7 +148,7 @@ pub async fn handle_https_request(
         debug!(sni, %host, "SNI and Host header mismatch, returning 421");
         return Ok(Response::builder()
             .status(StatusCode::MISDIRECTED_REQUEST)
-            .body(Full::new(Bytes::from("421 Misdirected Request\n")))
+            .body(full_body("421 Misdirected Request\n"))
             .unwrap());
     }
 
@@ -119,28 +161,109 @@ pub async fn handle_https_request(
         .is_some_and(|r| !r.is_placeholder(&host));
 
     if host_lower == root_lower {
-        // Request directed to root domain
+        // Handle WebSocket upgrade endpoint GET /_weaver/connect on root domain
+        if req.uri().path() == "/_weaver/connect" {
+            if req.method() != Method::GET {
+                let mut resp = Response::builder()
+                    .status(StatusCode::METHOD_NOT_ALLOWED)
+                    .body(full_body("405 Method Not Allowed\n"))
+                    .unwrap();
+                apply_security_headers(&mut resp, include_hsts);
+                return Ok(resp);
+            }
+
+            let ws_proto = req
+                .headers()
+                .get("sec-websocket-protocol")
+                .and_then(|v| v.to_str().ok());
+            if ws_proto != Some("weaver-mux-v1") {
+                let mut resp = Response::builder()
+                    .status(StatusCode::BAD_REQUEST)
+                    .body(full_body(
+                        "400 Bad Request: Sec-WebSocket-Protocol must be weaver-mux-v1\n",
+                    ))
+                    .unwrap();
+                apply_security_headers(&mut resp, include_hsts);
+                return Ok(resp);
+            }
+
+            let key = match req
+                .headers()
+                .get("sec-websocket-key")
+                .and_then(|v| v.to_str().ok())
+            {
+                Some(k) => k,
+                None => {
+                    let mut resp = Response::builder()
+                        .status(StatusCode::BAD_REQUEST)
+                        .body(full_body("400 Bad Request: Missing Sec-WebSocket-Key\n"))
+                        .unwrap();
+                    apply_security_headers(&mut resp, include_hsts);
+                    return Ok(resp);
+                }
+            };
+
+            let accept =
+                tokio_tungstenite::tungstenite::handshake::derive_accept_key(key.as_bytes());
+            let on_upgrade = hyper::upgrade::on(&mut req);
+
+            if let Some(ref reg) = config.tunnel_registry {
+                let reg = Arc::clone(reg);
+                let root = config.root_domain.clone();
+                tokio::spawn(async move {
+                    match on_upgrade.await {
+                        Ok(upgraded) => {
+                            let io = TokioIo::new(upgraded);
+                            let ws_stream = tokio_tungstenite::WebSocketStream::from_raw_socket(
+                                io,
+                                tokio_tungstenite::tungstenite::protocol::Role::Server,
+                                None,
+                            )
+                            .await;
+                            crate::tunnel::spawn_tunnel_connection(ws_stream, reg, root);
+                        }
+                        Err(err) => {
+                            debug!(error = %err, "WebSocket upgrade failed");
+                        }
+                    }
+                });
+            }
+
+            let mut resp = Response::builder()
+                .status(StatusCode::SWITCHING_PROTOCOLS)
+                .header(http::header::CONNECTION, "Upgrade")
+                .header(http::header::UPGRADE, "websocket")
+                .header("Sec-WebSocket-Accept", accept)
+                .header("Sec-WebSocket-Protocol", "weaver-mux-v1")
+                .body(empty_body())
+                .unwrap();
+            apply_security_headers(&mut resp, include_hsts);
+            return Ok(resp);
+        }
+
+        // Standard root domain HTTP endpoints
         match (req.method(), req.uri().path()) {
             (&Method::GET, "/") => {
                 let mut resp = Response::builder()
                     .status(StatusCode::OK)
-                    .body(Full::new(Bytes::from(WELCOME_HTML)))
+                    .body(full_body(WELCOME_HTML))
                     .unwrap();
                 apply_security_headers(&mut resp, include_hsts);
                 Ok(resp)
             }
             (&Method::GET, "/healthz") => {
-                let resp = Response::builder()
+                let mut resp = Response::builder()
                     .status(StatusCode::OK)
                     .header(http::header::CONTENT_TYPE, "text/plain; charset=utf-8")
-                    .body(Full::new(Bytes::from("ok\n")))
+                    .body(full_body("ok\n"))
                     .unwrap();
+                apply_security_headers(&mut resp, include_hsts);
                 Ok(resp)
             }
             _ => {
                 let mut resp = Response::builder()
                     .status(StatusCode::NOT_FOUND)
-                    .body(Full::new(Bytes::from("404 Not Found\n")))
+                    .body(full_body("404 Not Found\n"))
                     .unwrap();
                 apply_security_headers(&mut resp, include_hsts);
                 Ok(resp)
@@ -149,10 +272,37 @@ pub async fn handle_https_request(
     } else if host_lower.ends_with(&format!(".{root_lower}"))
         && host_lower.len() > root_lower.len() + 1
     {
-        // Subdomain of root domain: return branded "no such tunnel" 404 page
+        // Check if there is an active tunnel for this subdomain
+        if let Some(ref reg) = config.tunnel_registry
+            && let Some(route) = reg.lookup(&host_lower)
+        {
+            let visitor_ip = remote_addr.ip();
+            match forward_visitor_request(req, &route, visitor_ip, &host).await {
+                Ok(mut resp) => {
+                    if include_hsts {
+                        resp.headers_mut().insert(
+                            http::header::STRICT_TRANSPORT_SECURITY,
+                            http::HeaderValue::from_static("max-age=31536000; includeSubDomains"),
+                        );
+                    }
+                    return Ok(resp);
+                }
+                Err(_) => {
+                    debug!(hostname = %host_lower, "Tunnel error 502");
+                    let mut resp = Response::builder()
+                        .status(StatusCode::BAD_GATEWAY)
+                        .body(full_body("502 Bad Gateway\n"))
+                        .unwrap();
+                    apply_security_headers(&mut resp, include_hsts);
+                    return Ok(resp);
+                }
+            }
+        }
+
+        debug!(hostname = %host_lower, "Tunnel not found");
         let mut resp = Response::builder()
             .status(StatusCode::NOT_FOUND)
-            .body(Full::new(Bytes::from(NO_TUNNEL_HTML)))
+            .body(full_body(NO_TUNNEL_HTML))
             .unwrap();
         apply_security_headers(&mut resp, include_hsts);
         Ok(resp)
@@ -161,7 +311,7 @@ pub async fn handle_https_request(
         debug!(%host, root_domain = %config.root_domain, "Unrecognized domain, returning 421");
         Ok(Response::builder()
             .status(StatusCode::MISDIRECTED_REQUEST)
-            .body(Full::new(Bytes::from("421 Misdirected Request\n")))
+            .body(full_body("421 Misdirected Request\n"))
             .unwrap())
     }
 }
@@ -174,9 +324,30 @@ pub async fn run_https_server(
     cert_resolver: Option<Arc<CertResolver>>,
     shutdown_token: CancellationToken,
 ) {
+    run_https_server_with_registry(
+        listener,
+        tls_config,
+        root_domain,
+        cert_resolver,
+        None,
+        shutdown_token,
+    )
+    .await;
+}
+
+/// Runs the HTTPS TLS edge server with an optional tunnel registry for proxying.
+pub async fn run_https_server_with_registry(
+    listener: TcpListener,
+    tls_config: Arc<ServerConfig>,
+    root_domain: String,
+    cert_resolver: Option<Arc<CertResolver>>,
+    tunnel_registry: Option<Arc<TunnelRegistry>>,
+    shutdown_token: CancellationToken,
+) {
     let edge_config = Arc::new(HttpsEdgeConfig {
         root_domain,
         cert_resolver,
+        tunnel_registry,
     });
     let acceptor = TlsAcceptor::from(tls_config);
     let auto_builder = Builder::new(TokioExecutor::new());
@@ -208,6 +379,9 @@ pub async fn run_https_server(
                     }
                 };
 
+                // Apply TCP_NOTSENT_LOWAT before TLS handshake wrapping
+                set_tcp_notsent_lowat(&tcp_stream);
+
                 let tls_acceptor = acceptor.clone();
                 let config = Arc::clone(&edge_config);
                 let auto = auto_builder.clone();
@@ -230,7 +404,7 @@ pub async fn run_https_server(
                     let service = service_fn(move |req| {
                         let cfg = Arc::clone(&config);
                         let sni = client_sni.clone();
-                        async move { handle_https_request(req, cfg, sni).await }
+                        async move { handle_https_request(req, cfg, sni, remote_addr).await }
                     });
 
                     let conn = auto.serve_connection_with_upgrades(io, service);

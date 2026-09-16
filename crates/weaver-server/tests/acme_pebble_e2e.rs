@@ -76,13 +76,23 @@ fn build_dns_response(buf: &[u8]) -> Option<Vec<u8>> {
 
 /// In-test DNS server answering all UDP and TCP queries with `127.0.0.1` for Pebble's `-dnsserver 127.0.0.1:1053`.
 async fn spawn_dns_stub(token: CancellationToken) {
-    let udp = match UdpSocket::bind("127.0.0.1:1053").await {
-        Ok(s) => s,
-        Err(_) => return,
+    let mut udp = None;
+    let mut tcp = None;
+    for _ in 0..50 {
+        if let Ok(u) = UdpSocket::bind("127.0.0.1:1053").await
+            && let Ok(t) = TcpListener::bind("127.0.0.1:1053").await
+        {
+            udp = Some(u);
+            tcp = Some(t);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let Some(udp) = udp else {
+        return;
     };
-    let tcp = match TcpListener::bind("127.0.0.1:1053").await {
-        Ok(s) => s,
-        Err(_) => return,
+    let Some(tcp) = tcp else {
+        return;
     };
 
     let tok1 = token.clone();
@@ -361,6 +371,7 @@ async fn test_pebble_e2e_issuance_and_lazy_ensure() {
 
     shutdown_token.cancel();
     dns_token.cancel();
+    tokio::time::sleep(Duration::from_millis(200)).await;
 }
 
 #[tokio::test]
@@ -443,4 +454,200 @@ async fn test_pebble_e2e_tls_alpn_01_with_unbound_port_80() {
 
     shutdown_token.cancel();
     dns_token.cancel();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+}
+
+#[tokio::test]
+#[ignore = "e2e"]
+async fn test_pebble_e2e_tunnel_registration_and_proxying() {
+    let _guard = PEBBLE_TEST_LOCK.lock().await;
+
+    if !is_pebble_available().await {
+        eprintln!("Skipping Pebble E2E test: Pebble not reachable on 127.0.0.1:14000");
+        return;
+    }
+
+    let dns_token = CancellationToken::new();
+    spawn_dns_stub(dns_token.clone()).await;
+
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("weaver.db");
+    let store = Arc::new(Store::open(&db_path).unwrap());
+
+    let http_listener = TcpListener::bind("0.0.0.0:5002").await.unwrap();
+    let https_listener = TcpListener::bind("0.0.0.0:5001").await.unwrap();
+    let https_port = https_listener.local_addr().unwrap().port();
+
+    let root_domain = "pebble.test";
+    let config = Arc::new(Config {
+        root_domain: root_domain.into(),
+        admin_email: "admin@pebble.test".into(),
+        acme_provider: "custom".into(),
+        listen_http: "0.0.0.0:5002".parse().unwrap(),
+        listen_https: format!("0.0.0.0:{https_port}").parse().unwrap(),
+        control_socket: "/tmp/sock".into(),
+        acme_directory: Some(PEBBLE_DIR.into()),
+        acme_eab_kid: None,
+        acme_eab_hmac: None,
+        acme_root_ca_pem: Some(PEBBLE_ROOT_CA.into()),
+        acme_fallback_providers: Vec::new(),
+    });
+
+    let challenge_registry = Arc::new(ChallengeRegistry::new());
+    let resolver = Arc::new(CertResolver::new(
+        root_domain.into(),
+        Arc::clone(&challenge_registry),
+    ));
+
+    let manager = CertManager::new(
+        Arc::clone(&config),
+        Arc::clone(&store),
+        Arc::clone(&resolver),
+        Arc::clone(&challenge_registry),
+        Arc::new(SystemClock),
+        true,
+    );
+
+    let registry = Arc::new(weaver_server::tunnel::TunnelRegistry::new(
+        root_domain.into(),
+        Arc::clone(&manager),
+    ));
+
+    let shutdown_token = CancellationToken::new();
+
+    let reg_clone = Arc::clone(&challenge_registry);
+    let s_tok1 = shutdown_token.clone();
+    tokio::spawn(async move {
+        run_http_server(
+            http_listener,
+            root_domain.into(),
+            https_port,
+            Some(reg_clone),
+            s_tok1,
+        )
+        .await;
+    });
+
+    let tls_config =
+        create_server_config(Arc::clone(&resolver) as Arc<dyn rustls::server::ResolvesServerCert>)
+            .unwrap();
+    let res_clone = Arc::clone(&resolver);
+    let reg_server_clone = Arc::clone(&registry);
+    let s_tok2 = shutdown_token.clone();
+    tokio::spawn(async move {
+        weaver_server::edge::https::run_https_server_with_registry(
+            https_listener,
+            tls_config,
+            root_domain.into(),
+            Some(res_clone),
+            Some(reg_server_clone),
+            s_tok2,
+        )
+        .await;
+    });
+
+    // 1. Initial eager issuance for root domain
+    manager.init().unwrap();
+    manager.spawn_eager_order_if_pending();
+
+    // Wait up to 30 seconds for root domain cert to become Issued
+    let mut issued = false;
+    for _ in 0..60 {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        if let CertState::Issued { .. } = manager.status(root_domain) {
+            issued = true;
+            break;
+        }
+    }
+    assert!(
+        issued,
+        "Root domain certificate should transition to Issued within 30s"
+    );
+
+    // Write Pebble root CA and dynamic intermediate CA to temp file for weave client
+    let mut ca_bundle = PEBBLE_ROOT_CA.to_string();
+    if let Some(issuing_ca) = fetch_pebble_issuing_ca().await {
+        ca_bundle.push('\n');
+        ca_bundle.push_str(&issuing_ca);
+    }
+    let mut ca_file = tempfile::NamedTempFile::new().unwrap();
+    std::io::Write::write_all(&mut ca_file, ca_bundle.as_bytes()).unwrap();
+
+    // Start weave client
+    let client_token = CancellationToken::new();
+    let c_tok = client_token.clone();
+    let ca_path = ca_file.path().to_path_buf();
+    let client_task = tokio::spawn(async move {
+        weave::run_poc_with_token(
+            "web".to_string(),
+            format!("pebble.test:{https_port}"),
+            Some(&ca_path),
+            c_tok,
+        )
+        .await
+    });
+
+    // Wait for certificate to be issued and service registered
+    let target_hostname = "web.laptop.poc.pebble.test";
+    let mut ready = false;
+    for _ in 0..60 {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        if registry.lookup(target_hostname).is_some()
+            && matches!(manager.status(target_hostname), CertState::Issued { .. })
+        {
+            ready = true;
+            break;
+        }
+    }
+    assert!(
+        ready,
+        "Tunnel service should register and obtain ACME cert from Pebble within 30s"
+    );
+
+    // Visitor request to tunnel endpoint
+    let client_config = create_pebble_trust_client_config().await;
+    let connector = TlsConnector::from(client_config);
+
+    let tcp = TcpStream::connect(format!("127.0.0.1:{https_port}"))
+        .await
+        .unwrap();
+    let server_name = ServerName::try_from(target_hostname).unwrap().to_owned();
+    let mut tls = connector.connect(server_name, tcp).await.unwrap();
+    tls.write_all(
+        format!("GET /hello?x=1 HTTP/1.1\r\nHost: {target_hostname}\r\nConnection: close\r\n\r\n")
+            .as_bytes(),
+    )
+    .await
+    .unwrap();
+    let mut resp = String::new();
+    tls.read_to_string(&mut resp).await.unwrap();
+    assert!(resp.starts_with("HTTP/1.1 302 Found"));
+    assert!(resp.contains("https://www.youtube.com/watch?v=dQw4w9WgXcQ"));
+
+    // Terminate client
+    client_token.cancel();
+    let _ = client_task.await;
+
+    // Verify 404 after unregister
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let tcp2 = TcpStream::connect(format!("127.0.0.1:{https_port}"))
+        .await
+        .unwrap();
+    let client_config2 = create_pebble_trust_client_config().await;
+    let connector2 = TlsConnector::from(client_config2);
+    let server_name2 = ServerName::try_from(target_hostname).unwrap().to_owned();
+    let mut tls2 = connector2.connect(server_name2, tcp2).await.unwrap();
+    tls2.write_all(
+        format!("GET /hello HTTP/1.1\r\nHost: {target_hostname}\r\nConnection: close\r\n\r\n")
+            .as_bytes(),
+    )
+    .await
+    .unwrap();
+    let mut resp2 = String::new();
+    tls2.read_to_string(&mut resp2).await.unwrap();
+    assert!(resp2.starts_with("HTTP/1.1 404 Not Found"));
+
+    shutdown_token.cancel();
+    dns_token.cancel();
+    tokio::time::sleep(Duration::from_millis(200)).await;
 }
