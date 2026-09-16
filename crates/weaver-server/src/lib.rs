@@ -7,6 +7,7 @@ pub mod notify;
 pub mod server;
 pub mod setup;
 pub mod store;
+pub mod tunnel;
 
 pub use config::{Config, ConfigError};
 pub use store::{Migration, Store, StoreError};

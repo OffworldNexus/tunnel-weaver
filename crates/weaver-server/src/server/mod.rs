@@ -16,7 +16,7 @@ use tracing::{error, info, warn};
 use crate::cert::{CertManager, CertResolver, ChallengeRegistry, SystemClock};
 use crate::config::{Config, ConfigError};
 use crate::edge::http::run_http_server;
-use crate::edge::https::run_https_server;
+use crate::edge::https::run_https_server_with_registry;
 use crate::edge::tls::{TlsError, create_server_config};
 use crate::notify::{notify_ready_with_cert_status, notify_stopping};
 use crate::server::listener::{ListenerError, acquire_listeners};
@@ -157,6 +157,11 @@ pub async fn run_server(
     // Start background renewal loop
     cert_manager.start_renewal_loop(shutdown_token.clone());
 
+    let tunnel_registry = Arc::new(crate::tunnel::TunnelRegistry::new(
+        config.root_domain.clone(),
+        Arc::clone(&cert_manager),
+    ));
+
     let http_token = shutdown_token.clone();
     let http_task = tokio::spawn(run_http_server(
         listeners.http,
@@ -167,11 +172,12 @@ pub async fn run_server(
     ));
 
     let https_token = shutdown_token.clone();
-    let https_task = tokio::spawn(run_https_server(
+    let https_task = tokio::spawn(run_https_server_with_registry(
         listeners.https,
         tls_config,
         config.root_domain.clone(),
         Some(Arc::clone(&resolver)),
+        Some(tunnel_registry),
         https_token,
     ));
 

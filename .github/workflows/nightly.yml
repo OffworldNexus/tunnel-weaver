@@ -5,7 +5,7 @@ on:
     - cron: '0 3 * * *'
   workflow_dispatch:
   pull_request:
-    types: [labeled]
+    branches: [develop]
 
 permissions:
   contents: read
@@ -13,7 +13,7 @@ permissions:
 jobs:
   nightly-e2e:
     name: DigitalOcean Staging Setup E2E
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'run-nightly'))
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     env:
       DO_TOKEN: ${{ secrets.DIGITALOCEAN_TOKEN }}
@@ -62,8 +62,8 @@ jobs:
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2
 
-      - name: Build weaver-server release binary
-        run: cargo build --release -p weaver-server
+      - name: Build release binaries (weaver-server and weave)
+        run: cargo build --release -p weaver-server -p weave
 
       - name: Generate ephemeral SSH key pair
         run: |
@@ -197,6 +197,72 @@ jobs:
 
           # Verify HTTPS reachability
           curl -k -v --fail --max-time 15 "https://$TARGET_DOMAIN/"
+
+      - name: Verify tunnel registration, certificate issuance, and HTTP proxying
+        run: |
+          IP="${{ steps.droplet.outputs.ip }}"
+          TARGET_DOMAIN="${{ steps.domain.outputs.full_domain }}"
+
+          # Download Let's Encrypt Staging CA certificate bundle
+          mkdir -p /tmp/certs
+          curl -s https://letsencrypt.org/certs/staging/letsencrypt-stg-root-x1.pem > /tmp/certs/staging-ca.pem
+          curl -s https://letsencrypt.org/certs/staging/letsencrypt-stg-root-x2.pem >> /tmp/certs/staging-ca.pem
+          curl -s https://letsencrypt.org/certs/staging/gen-y/root-ye.pem >> /tmp/certs/staging-ca.pem
+          curl -s https://letsencrypt.org/certs/staging/gen-y/root-yr.pem >> /tmp/certs/staging-ca.pem
+
+          echo "Starting weave poc client against $TARGET_DOMAIN:443..."
+          ./target/release/weave poc web --server "$TARGET_DOMAIN" --insecure-root-ca /tmp/certs/staging-ca.pem > /tmp/weave.log 2>&1 &
+          WEAVE_PID=$!
+
+          TUNNEL_HOST="web.laptop.poc.$TARGET_DOMAIN"
+          echo "Waiting for tunnel registration on $TUNNEL_HOST..."
+          for i in $(seq 1 60); do
+            if grep -q "https://$TUNNEL_HOST/" /tmp/weave.log; then
+              echo "Tunnel successfully registered: https://$TUNNEL_HOST/"
+              break
+            fi
+            sleep 1
+          done
+
+          if ! grep -q "https://$TUNNEL_HOST/" /tmp/weave.log; then
+            echo "Error: Tunnel registration timed out. Log output:"
+            cat /tmp/weave.log
+            kill $WEAVE_PID || true
+            exit 1
+          fi
+
+          echo "Querying visitor endpoint on https://$TUNNEL_HOST/hello?test=1..."
+          HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" --cacert /tmp/certs/staging-ca.pem "https://$TUNNEL_HOST/hello?test=1")
+          echo "Received HTTP status: $HTTP_STATUS"
+          if [ "$HTTP_STATUS" != "302" ]; then
+            echo "Error: Expected HTTP 302 redirect, got $HTTP_STATUS"
+            cat /tmp/weave.log
+            kill $WEAVE_PID || true
+            exit 1
+          fi
+
+          LOCATION=$(curl -s -I --cacert /tmp/certs/staging-ca.pem "https://$TUNNEL_HOST/hello?test=1" | grep -i "^location:" | tr -d '\r\n')
+          echo "Redirect location header: $LOCATION"
+          if ! echo "$LOCATION" | grep -q "youtube.com/watch?v=dQw4w9WgXcQ"; then
+            echo "Error: Unexpected location header: $LOCATION"
+            kill $WEAVE_PID || true
+            exit 1
+          fi
+
+          echo "Stopping weave client (PID $WEAVE_PID)..."
+          kill -INT $WEAVE_PID
+          wait $WEAVE_PID || true
+
+          sleep 2
+          echo "Verifying 404 after tunnel termination..."
+          POST_STATUS=$(curl -s -o /dev/null -w "%{http_code}" --cacert /tmp/certs/staging-ca.pem "https://$TUNNEL_HOST/hello")
+          echo "Received status after teardown: $POST_STATUS"
+          if [ "$POST_STATUS" != "404" ]; then
+            echo "Error: Expected HTTP 404 after tunnel shutdown, got $POST_STATUS"
+            exit 1
+          fi
+
+          echo "Tunnel E2E test passed successfully!"
 
       - name: Teardown Droplet and DNS Records
         if: always()

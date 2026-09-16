@@ -96,7 +96,7 @@ jobs:
 
       - name: Configure test hostnames
         run: |
-          echo "127.0.0.1 pebble.test root.pebble.test subdomain.pebble.test web.laptop.remy.pebble.test" | sudo tee -a /etc/hosts
+          echo "127.0.0.1 pebble.test root.pebble.test subdomain.pebble.test web.laptop.poc.pebble.test web.laptop.remy.pebble.test" | sudo tee -a /etc/hosts
 
       - name: Start Pebble ACME server
         run: |
