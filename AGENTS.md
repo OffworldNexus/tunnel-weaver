@@ -9,7 +9,7 @@
 - Clippy: `cargo clippy --workspace --all-targets -- -D warnings` (~5s, timeout 120000ms)
 - Dependency policy: `cargo deny check` (~2s, timeout 60000ms)
 - Always: quiet on success; dump failures only.
-- Last measured: 2026-09-16, full suite 6s.
+- Last measured: 2026-09-16, full suite 4s.
 
 ## Crate notes
 

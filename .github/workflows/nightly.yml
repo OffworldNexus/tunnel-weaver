@@ -1,0 +1,221 @@
+name: Nightly E2E (DigitalOcean Disposable Droplet)
+
+on:
+  schedule:
+    - cron: '0 3 * * *'
+  workflow_dispatch:
+  pull_request:
+    types: [labeled]
+
+permissions:
+  contents: read
+
+jobs:
+  nightly-e2e:
+    name: DigitalOcean Staging Setup E2E
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'run-nightly'))
+    runs-on: ubuntu-latest
+    env:
+      DO_TOKEN: ${{ secrets.DIGITALOCEAN_TOKEN }}
+      BASE_DOMAIN: ${{ secrets.NIGHTLY_DOMAIN }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Verify DigitalOcean credentials and domain secret
+        run: |
+          if [ -z "$DO_TOKEN" ]; then
+            echo "::error::DIGITALOCEAN_TOKEN secret is not set; cannot provision disposable droplet."
+            exit 1
+          fi
+          if [ -z "$BASE_DOMAIN" ]; then
+            echo "::error::NIGHTLY_DOMAIN secret is not set; cannot configure DNS."
+            exit 1
+          fi
+
+      - name: Resolve DigitalOcean DNS zone and generate test domain
+        id: domain
+        run: |
+          DOMAINS_JSON=$(curl -s -H "Authorization: Bearer $DO_TOKEN" "https://api.digitalocean.com/v2/domains")
+          ZONE=$(echo "$DOMAINS_JSON" | jq -r --arg d "$BASE_DOMAIN" '.domains[].name as $z | select($d == $z or ($d | endswith("." + $z))) | $z' | head -n 1)
+          if [ -z "$ZONE" ]; then
+            echo "::error::No matching DigitalOcean DNS zone found for $BASE_DOMAIN"
+            exit 1
+          fi
+          echo "zone=$ZONE" >> "$GITHUB_OUTPUT"
+
+          RUN_HEX=$(openssl rand -hex 4)
+          FULL_DOMAIN="t${RUN_HEX}.${BASE_DOMAIN}"
+          echo "full_domain=$FULL_DOMAIN" >> "$GITHUB_OUTPUT"
+
+          if [ "$BASE_DOMAIN" = "$ZONE" ]; then
+            REC_PREFIX="t${RUN_HEX}"
+          else
+            SUB="${BASE_DOMAIN%."$ZONE"}"
+            REC_PREFIX="t${RUN_HEX}.${SUB}"
+          fi
+          echo "rec_prefix=$REC_PREFIX" >> "$GITHUB_OUTPUT"
+
+      - name: Install stable Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build weaver-server release binary
+        run: cargo build --release -p weaver-server
+
+      - name: Generate ephemeral SSH key pair
+        run: |
+          mkdir -p ~/.ssh
+          ssh-keygen -t ed25519 -N "" -f ~/.ssh/id_nightly
+          chmod 600 ~/.ssh/id_nightly
+
+      - name: Provision disposable Droplet
+        id: droplet
+        run: |
+          DROPLET_NAME="weaver-nightly-${{ github.run_id }}"
+          PUB_KEY=$(cat ~/.ssh/id_nightly.pub)
+          USER_DATA=$(cat <<EOF
+          #cloud-config
+          ssh_authorized_keys:
+            - $PUB_KEY
+          chpasswd:
+            expire: false
+          runcmd:
+            - chage -d $(date +%Y-%m-%d) root
+            - chage -m 0 -M 99999 -I -1 -E -1 root
+          EOF
+          )
+
+          RESP=$(curl -s -X POST "https://api.digitalocean.com/v2/droplets" \
+            -H "Authorization: Bearer $DO_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"name\": \"$DROPLET_NAME\",
+              \"region\": \"fra1\",
+              \"size\": \"s-1vcpu-1gb\",
+              \"image\": \"ubuntu-24-04-x64\",
+              \"user_data\": $(printf '%s' "$USER_DATA" | jq -R -s '.')
+            }")
+          DROPLET_ID=$(echo "$RESP" | jq -r '.droplet.id // empty')
+          if [ -z "$DROPLET_ID" ]; then
+            echo "Failed to create droplet: $RESP"
+            exit 1
+          fi
+          echo "droplet_id=$DROPLET_ID" >> "$GITHUB_OUTPUT"
+
+          # Poll for active status and public IP
+          echo "Waiting for droplet $DROPLET_ID to become active..."
+          for i in $(seq 1 60); do
+            GET_RESP=$(curl -s "https://api.digitalocean.com/v2/droplets/$DROPLET_ID" \
+              -H "Authorization: Bearer $DO_TOKEN")
+            STATUS=$(echo "$GET_RESP" | jq -r '.droplet.status')
+            IP=$(echo "$GET_RESP" | jq -r '.droplet.networks.v4[]? | select(.type == "public") | .ip_address' | head -n 1)
+            if [ "$STATUS" = "active" ] && [ -n "$IP" ]; then
+              echo "Droplet is active with IP $IP"
+              echo "ip=$IP" >> "$GITHUB_OUTPUT"
+              break
+            fi
+            sleep 3
+          done
+
+      - name: Configure DNS record in DigitalOcean zone
+        id: dns
+        run: |
+          IP="${{ steps.droplet.outputs.ip }}"
+          ZONE="${{ steps.domain.outputs.zone }}"
+          RECORD_NAME="${{ steps.domain.outputs.rec_prefix }}"
+          WILDCARD_NAME="*.${{ steps.domain.outputs.rec_prefix }}"
+
+          # Base record
+          RESP_A=$(curl -s -X POST "https://api.digitalocean.com/v2/domains/$ZONE/records" \
+            -H "Authorization: Bearer $DO_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "{\"type\": \"A\", \"name\": \"$RECORD_NAME\", \"data\": \"$IP\", \"ttl\": 60}")
+          REC_A_ID=$(echo "$RESP_A" | jq -r '.domain_record.id // empty')
+
+          # Wildcard record
+          RESP_W=$(curl -s -X POST "https://api.digitalocean.com/v2/domains/$ZONE/records" \
+            -H "Authorization: Bearer $DO_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "{\"type\": \"A\", \"name\": \"$WILDCARD_NAME\", \"data\": \"$IP\", \"ttl\": 60}")
+          REC_W_ID=$(echo "$RESP_W" | jq -r '.domain_record.id // empty')
+
+          echo "zone=$ZONE" >> "$GITHUB_OUTPUT"
+          echo "rec_a_id=$REC_A_ID" >> "$GITHUB_OUTPUT"
+          echo "rec_w_id=$REC_W_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Wait for SSH and DNS propagation
+        run: |
+          IP="${{ steps.droplet.outputs.ip }}"
+          TARGET_DOMAIN="${{ steps.domain.outputs.full_domain }}"
+
+          echo "Waiting for SSH on $IP:22..."
+          for i in $(seq 1 30); do
+            if ssh -o BatchMode=yes -o StrictHostKeyChecking=no -o ConnectTimeout=5 -i ~/.ssh/id_nightly root@"$IP" "uname -a" 2>/dev/null; then
+              echo "SSH is ready"
+              break
+            fi
+            sleep 3
+          done
+
+          command -v dig || sudo apt-get install -y -qq dnsutils
+          echo "Waiting for DNS propagation of $TARGET_DOMAIN to $IP..."
+          for i in $(seq 1 40); do
+            RESOLVED=$(dig +short "$TARGET_DOMAIN" @8.8.8.8 | tail -n 1)
+            if [ "$RESOLVED" = "$IP" ]; then
+              echo "DNS propagated successfully: $TARGET_DOMAIN -> $IP"
+              break
+            fi
+            sleep 3
+          done
+
+      - name: Deploy weaver-server and run headless setup
+        run: |
+          IP="${{ steps.droplet.outputs.ip }}"
+          TARGET_DOMAIN="${{ steps.domain.outputs.full_domain }}"
+
+          scp -o StrictHostKeyChecking=no -i ~/.ssh/id_nightly \
+            target/release/weaver-server root@"$IP":/tmp/weaver-server
+
+          ssh -o StrictHostKeyChecking=no -i ~/.ssh/id_nightly root@"$IP" \
+            "install -m 755 /tmp/weaver-server /usr/local/bin/weaver-server && \
+             /usr/local/bin/weaver-server setup --headless \
+               --root-domain $TARGET_DOMAIN \
+               --email admin@$TARGET_DOMAIN \
+               --acme-provider letsencrypt-staging"
+
+      - name: Verify issued certificate and HTTPS endpoint
+        run: |
+          IP="${{ steps.droplet.outputs.ip }}"
+          TARGET_DOMAIN="${{ steps.domain.outputs.full_domain }}"
+
+          # Verify control socket cert status
+          ssh -o StrictHostKeyChecking=no -i ~/.ssh/id_nightly root@"$IP" \
+            "/usr/local/bin/weaver-server cert status --json"
+
+          # Verify HTTPS reachability
+          curl -k -v --fail --max-time 15 "https://$TARGET_DOMAIN/"
+
+      - name: Teardown Droplet and DNS Records
+        if: always()
+        run: |
+          ZONE="${{ steps.dns.outputs.zone }}"
+
+          # 1. Delete DNS records
+          if [ -n "${{ steps.dns.outputs.rec_a_id }}" ] && [ -n "$ZONE" ]; then
+            curl -s -X DELETE "https://api.digitalocean.com/v2/domains/$ZONE/records/${{ steps.dns.outputs.rec_a_id }}" \
+              -H "Authorization: Bearer $DO_TOKEN" || true
+          fi
+          if [ -n "${{ steps.dns.outputs.rec_w_id }}" ] && [ -n "$ZONE" ]; then
+            curl -s -X DELETE "https://api.digitalocean.com/v2/domains/$ZONE/records/${{ steps.dns.outputs.rec_w_id }}" \
+              -H "Authorization: Bearer $DO_TOKEN" || true
+          fi
+
+          # 2. Delete Droplet
+          if [ -n "${{ steps.droplet.outputs.droplet_id }}" ]; then
+            echo "Deleting droplet ${{ steps.droplet.outputs.droplet_id }}..."
+            curl -s -X DELETE "https://api.digitalocean.com/v2/droplets/${{ steps.droplet.outputs.droplet_id }}" \
+              -H "Authorization: Bearer $DO_TOKEN" || true
+          fi

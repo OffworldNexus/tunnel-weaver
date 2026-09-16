@@ -17,7 +17,10 @@ use tokio::sync::{Mutex, Semaphore, broadcast};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
-pub use acme::{AcmeEngine, AcmeError, IssuedCertificate, parse_cert_validity};
+pub use acme::{
+    AcmeEngine, AcmeError, IssuedCertificate, RegisteredAcmeAccount, parse_cert_validity,
+    register_acme_account,
+};
 pub use challenge::{ChallengeRegistry, create_tls_alpn_01_certified_key};
 pub use clock::{Clock, MockClock, SystemClock, format_unix_timestamp};
 pub use events::record_cert_event;
