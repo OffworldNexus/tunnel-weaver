@@ -36,6 +36,15 @@ pub enum ProtocolError {
     #[error("flow control violation on stream {0}")]
     FlowControl(u32),
 
+    /// A message under reassembly grew past the negotiated `max_message`.
+    #[error("message too large on stream {0}")]
+    MessageTooLarge(u32),
+
+    /// The peer opened a stream with a policy the mux cannot honour (e.g.
+    /// the control class).
+    #[error("invalid stream policy on stream {0}")]
+    BadPolicy(u32),
+
     /// A compressed DATA frame did not decompress, or exceeded the
     /// per-frame output cap.
     #[error("decompression failed on stream {0}")]
@@ -65,15 +74,25 @@ pub enum StreamError {
     /// The stream's local send direction is already finished.
     #[error("stream send side is closed")]
     SendClosed,
-    /// Nothing to read yet; wait for `Event::Readable`.
-    #[error("no data available")]
+    /// `recv_msg`: no complete message yet, wait for `Event::Readable`.
+    /// `send`: the message does not fit in the peer's credit, wait for
+    /// `Event::Writable`.
+    #[error("would block")]
     WouldBlock,
-    /// `set_class` was asked to put a stream in the control class.
+    /// A policy asked to put a stream in the control class.
     #[error("streams cannot be placed in the control class")]
     InvalidClass,
     /// Every stream id of this side's parity has been used.
     #[error("stream ids exhausted")]
     Exhausted,
+    /// The message is larger than the negotiated `max_message`.
+    #[error("message of {len} bytes exceeds max_message {max}")]
+    TooLarge {
+        /// Length of the offending message.
+        len: usize,
+        /// Negotiated limit.
+        max: u32,
+    },
 }
 
 /// Failure reported by a [`crate::auth::Signer`] implementation.

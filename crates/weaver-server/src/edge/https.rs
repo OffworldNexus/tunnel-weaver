@@ -70,45 +70,7 @@ pub fn is_ip_literal(host: &str) -> bool {
     unbracketed.parse::<IpAddr>().is_ok()
 }
 
-/// Sets the TCP_NOTSENT_LOWAT socket option to ~32 KiB on Linux and Apple systems.
-#[cfg(any(
-    target_os = "linux",
-    target_os = "macos",
-    target_os = "ios",
-    target_os = "android"
-))]
-pub fn set_tcp_notsent_lowat(stream: &tokio::net::TcpStream) {
-    use std::os::unix::io::AsRawFd;
-    let fd = stream.as_raw_fd();
-    let val: libc::c_uint = 32768;
-    unsafe {
-        #[cfg(target_os = "linux")]
-        let _ = libc::setsockopt(
-            fd,
-            libc::IPPROTO_TCP,
-            libc::TCP_NOTSENT_LOWAT,
-            &val as *const _ as *const libc::c_void,
-            std::mem::size_of_val(&val) as libc::socklen_t,
-        );
-        #[cfg(any(target_os = "macos", target_os = "ios"))]
-        let _ = libc::setsockopt(
-            fd,
-            libc::IPPROTO_TCP,
-            0x201,
-            &val as *const _ as *const libc::c_void,
-            std::mem::size_of_val(&val) as libc::socklen_t,
-        );
-    }
-}
-
-/// No-op on platforms without TCP_NOTSENT_LOWAT (e.g. Windows).
-#[cfg(not(any(
-    target_os = "linux",
-    target_os = "macos",
-    target_os = "ios",
-    target_os = "android"
-)))]
-pub fn set_tcp_notsent_lowat(_stream: &tokio::net::TcpStream) {}
+pub use weaver_tokio::set_tcp_notsent_lowat;
 
 /// Dispatches an HTTPS request based on SNI and Host header validation.
 pub async fn handle_https_request(
@@ -176,11 +138,11 @@ pub async fn handle_https_request(
                 .headers()
                 .get("sec-websocket-protocol")
                 .and_then(|v| v.to_str().ok());
-            if ws_proto != Some("weaver-mux-v1") {
+            if ws_proto != Some("weaver-mux-v2") {
                 let mut resp = Response::builder()
                     .status(StatusCode::BAD_REQUEST)
                     .body(full_body(
-                        "400 Bad Request: Sec-WebSocket-Protocol must be weaver-mux-v1\n",
+                        "400 Bad Request: Sec-WebSocket-Protocol must be weaver-mux-v2\n",
                     ))
                     .unwrap();
                 apply_security_headers(&mut resp, include_hsts);
@@ -234,7 +196,7 @@ pub async fn handle_https_request(
                 .header(http::header::CONNECTION, "Upgrade")
                 .header(http::header::UPGRADE, "websocket")
                 .header("Sec-WebSocket-Accept", accept)
-                .header("Sec-WebSocket-Protocol", "weaver-mux-v1")
+                .header("Sec-WebSocket-Protocol", "weaver-mux-v2")
                 .body(empty_body())
                 .unwrap();
             apply_security_headers(&mut resp, include_hsts);

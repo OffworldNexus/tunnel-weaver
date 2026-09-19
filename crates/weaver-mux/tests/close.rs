@@ -2,21 +2,21 @@ mod common;
 
 use common::*;
 use weaver_mux::{
-    CloseCode, Event, Frame, FrameType, GoAway, Head, ProtocolError, RST_CODE_CONNECTION_CLOSED,
-    StreamError,
+    CloseCode, Compress, Event, Frame, FrameType, GoAway, ProtocolError,
+    RST_CODE_CONNECTION_CLOSED, StreamError, StreamPolicy,
 };
 
 #[test]
 fn close_key_revoked() {
     let mut p = Pair::authenticated();
-    let a = p.server.open(Head::default()).unwrap();
-    let b = p.client.open(Head::default()).unwrap();
-    p.server.write(a, b"pending bulk").unwrap();
+    let a = p.server.open(StreamPolicy::default()).unwrap();
+    let b = p.client.open(StreamPolicy::default()).unwrap();
+    send(&mut p.server, a, b"pending bulk");
     p.pump();
     p.drain_events(Side::Client);
     p.drain_events(Side::Server);
     // Queue more data so the scheduler has a backlog GOAWAY must beat.
-    p.server.write(a, &[7u8; 60_000]).unwrap();
+    send(&mut p.server, a, &[7u8; 60_000]);
 
     p.server.close(GoAway {
         code: CloseCode::KeyRevoked,
@@ -48,8 +48,14 @@ fn close_key_revoked() {
         ]
     );
     // Nothing more after the close on the server side.
-    assert_eq!(p.server.open(Head::default()), Err(StreamError::Closed));
-    assert_eq!(p.server.write(a, b"x"), Err(StreamError::Closed));
+    assert_eq!(
+        p.server.open(StreamPolicy::default()),
+        Err(StreamError::Closed)
+    );
+    assert_eq!(
+        p.server.send(a, b"x", Compress::Auto),
+        Err(StreamError::Closed)
+    );
 
     // Deliver GOAWAY (and trailing RSTs) to the client.
     p.client.recv(now, &buf).unwrap_err_or_ok();
@@ -70,7 +76,10 @@ fn close_key_revoked() {
         Some(Event::Closed { reason }) if reason.code == CloseCode::KeyRevoked
             && reason.message.as_deref() == Some("key rotated")
     ));
-    assert_eq!(p.client.open(Head::default()), Err(StreamError::Closed));
+    assert_eq!(
+        p.client.open(StreamPolicy::default()),
+        Err(StreamError::Closed)
+    );
     assert!(
         !p.client.poll_transmit(now, &mut buf),
         "peer-initiated close sends nothing"

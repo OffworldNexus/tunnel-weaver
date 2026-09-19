@@ -18,19 +18,24 @@ use serde_big_array::BigArray;
 
 use crate::error::{ProtocolError, RejectCode};
 use crate::frame::FrameType;
-
-pub use crate::error::GoAway as Goaway;
+use crate::sched::Class;
 
 /// Lowest protocol version this crate accepts.
-pub const MIN_VERSION: u16 = 1;
+pub const MIN_VERSION: u16 = 2;
 /// Highest protocol version this crate speaks.
-pub const MAX_VERSION: u16 = 1;
+pub const MAX_VERSION: u16 = 2;
 
 /// Domain-separation prefix of the handshake transcript.
-pub const TRANSCRIPT_PREFIX: &[u8] = b"weaver-mux-v1";
+pub const TRANSCRIPT_PREFIX: &[u8] = b"weaver-mux-v2";
 
 /// DATA payload flag: the remaining bytes are a zstd frame.
 pub const DATA_FLAG_COMPRESSED: u8 = 0x01;
+/// DATA payload flag: this frame is not the last fragment of its message;
+/// the receiver keeps reassembling until a frame without the flag.
+pub const DATA_FLAG_MORE: u8 = 0x02;
+/// Every DATA flag bit this version understands; anything else is a
+/// decode error.
+pub const DATA_FLAGS_KNOWN: u8 = DATA_FLAG_COMPRESSED | DATA_FLAG_MORE;
 
 /// The single identity concept the mux knows about: the public key that
 /// signed the handshake. The variant is the algorithm; the bytes are the raw
@@ -92,6 +97,9 @@ pub struct Params {
     pub initial_window: u32,
     /// Server's compression stance (it may refuse, never force).
     pub compression: Compression,
+    /// Largest application message either side may send on a stream, in
+    /// bytes. Bounds the receiver's reassembly buffer.
+    pub max_message: u32,
 }
 
 /// WELCOME: server → client, completes the handshake.
@@ -112,28 +120,70 @@ pub struct Reject {
     pub message: String,
 }
 
-/// Scheduling and compression hints carried in a stream's [`Head`]. The mux
-/// reads these and nothing else from the head.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub struct Hints {
-    /// MIME type of the body, if known.
-    pub content_type: Option<String>,
-    /// Total body length, if known up front.
-    pub content_length: Option<u64>,
-    /// The stream is a protocol upgrade (WebSocket, etc.).
-    pub upgrade: bool,
-    /// Body is already encoded (gzip, br, ...): never recompress.
-    pub content_encoding: Option<String>,
+/// Bytes after which an `Interactive` stream is demoted to `Bulk` when a
+/// [`StreamPolicy`] does not say otherwise.
+pub const DEFAULT_DEMOTE_AFTER: u64 = 256 * 1024;
+
+/// OPEN payload: everything the mux is told about a stream. The layer
+/// above decides; the mux only schedules. Compression is *not* here — it
+/// is chosen per message at [`crate::Connection::send`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StreamPolicy {
+    /// Scheduling class. Never [`Class::Control`].
+    pub class: Class,
+    /// Demote an `Interactive` stream to `Bulk` once this many bytes have
+    /// been sent on it. `None` keeps the class for the stream's life.
+    pub demote_after: Option<u64>,
 }
 
-/// OPEN payload. The mux only interprets `hints`; `opaque` belongs to the
-/// layer above.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub struct Head {
-    /// Scheduling/compression hints.
-    pub hints: Hints,
-    /// Application-defined bytes, passed through untouched.
-    pub opaque: Vec<u8>,
+impl StreamPolicy {
+    /// A policy with the given class and no automatic demotion.
+    pub const fn new(class: Class) -> Self {
+        Self {
+            class,
+            demote_after: None,
+        }
+    }
+
+    /// Set the demotion threshold.
+    pub const fn demote_after(mut self, bytes: u64) -> Self {
+        self.demote_after = Some(bytes);
+        self
+    }
+
+    /// Latency-bound, never compressed by the mux, never demoted.
+    pub const fn realtime() -> Self {
+        Self::new(Class::Realtime)
+    }
+
+    /// Request/response traffic that turns into bulk once it gets big.
+    pub const fn interactive() -> Self {
+        Self::new(Class::Interactive).demote_after(DEFAULT_DEMOTE_AFTER)
+    }
+
+    /// Large transfers.
+    pub const fn bulk() -> Self {
+        Self::new(Class::Bulk)
+    }
+}
+
+impl Default for StreamPolicy {
+    fn default() -> Self {
+        Self::interactive()
+    }
+}
+
+/// Per-message compression stance passed to [`crate::Connection::send`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Compress {
+    /// The mux may compress if it judges it worthwhile (size floor,
+    /// entropy probe, raw fallback when compression does not shrink the
+    /// fragment). Never applied on `Realtime` streams.
+    #[default]
+    Auto,
+    /// Never compress this message: secrets, already-encoded bodies,
+    /// anything an attacker could probe via a compression side channel.
+    Never,
 }
 
 /// RST payload: abort both directions of a stream.
@@ -201,30 +251,25 @@ mod tests {
             sig: Signature::Ed25519([4; 64]),
         });
         round_trip(&Welcome {
-            version: 1,
+            version: 2,
             params: Params {
                 max_frame: 16 * 1024,
                 initial_window: 512 * 1024,
                 compression: Compression::BodyOnly,
+                max_message: 1 << 20,
             },
         });
         round_trip(&Reject {
             code: RejectCode::UnsupportedVersion { min: 1, max: 1 },
             message: "nope".into(),
         });
-        round_trip(&Head {
-            hints: Hints {
-                content_type: Some("text/html".into()),
-                content_length: Some(10),
-                upgrade: false,
-                content_encoding: None,
-            },
-            opaque: vec![1, 2, 3],
-        });
+        round_trip(&StreamPolicy::interactive());
+        round_trip(&StreamPolicy::bulk());
+        round_trip(&StreamPolicy::realtime().demote_after(7));
         round_trip(&Rst { code: 5 });
         round_trip(&WindowUpdate { credit: 1000 });
         round_trip(&Ping { opaque: u64::MAX });
-        round_trip(&Goaway {
+        round_trip(&crate::error::GoAway {
             code: crate::error::CloseCode::KeyRevoked,
             message: Some("bye".into()),
         });

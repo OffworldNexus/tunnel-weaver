@@ -3,7 +3,7 @@ mod common;
 use std::time::Duration;
 
 use common::*;
-use weaver_mux::{CloseCode, Event, Frame, FrameType, Head};
+use weaver_mux::{CloseCode, Event, Frame, FrameType, StreamPolicy};
 
 const PING: Duration = Duration::from_secs(15);
 const IDLE: Duration = Duration::from_secs(60);
@@ -101,7 +101,7 @@ fn any_received_frame_resets_idle() {
     let mut p = Pair::authenticated();
     p.advance(Duration::from_secs(50));
     // Client opens a stream; the OPEN reaching the server counts as liveness.
-    p.client.open(Head::default()).unwrap();
+    p.client.open(StreamPolicy::default()).unwrap();
     p.pump();
     p.advance(Duration::from_secs(50));
     assert!(!p.server.is_closed(), "idle clock was reset by the OPEN");
@@ -110,14 +110,14 @@ fn any_received_frame_resets_idle() {
 #[test]
 fn never_fin_stream_survives_pings() {
     let mut p = Pair::authenticated();
-    let id = p.client.open(Head::default()).unwrap();
+    let id = p.client.open(StreamPolicy::default()).unwrap();
     p.pump();
     for _ in 0..10 {
         p.advance(PING);
         p.pump();
     }
     assert!(!p.client.is_closed() && !p.server.is_closed());
-    assert_eq!(p.client.write(id, b"still here").unwrap(), 10);
+    send(&mut p.client, id, b"still here");
     p.pump();
     assert_eq!(read_all(&mut p.server, id), b"still here");
     assert!(!p.frames_of(Side::Client, FrameType::Ping).is_empty());

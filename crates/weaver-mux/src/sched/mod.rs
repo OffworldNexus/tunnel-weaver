@@ -7,32 +7,39 @@ pub mod qfq;
 use std::collections::VecDeque;
 
 use qfq::Qfq;
+use serde::{Deserialize, Serialize};
 
 use crate::config::Weights;
 use crate::frame::Frame;
 use crate::stream::StreamId;
 
 /// Scheduling class of a stream (or of the control queue).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+///
+/// Carried on the wire in OPEN as part of [`crate::StreamPolicy`], so the
+/// variant order is part of the protocol: append, never reorder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Class {
-    /// Connection-level frames plus OPEN/FIN/RST/WINDOW_UPDATE.
+    /// Connection-level frames plus OPEN/FIN/RST/WINDOW_UPDATE. Not a
+    /// valid stream class.
     Control,
-    /// Upgrades, event streams: latency-sensitive, never compressed.
+    /// Latency-sensitive interactive traffic (upgrades, event streams).
+    /// The mux never compresses on this class.
     Realtime,
-    /// Everything at birth.
-    Small,
+    /// Request/response traffic: the default for anything not known to be
+    /// large.
+    Interactive,
     /// Large or long-running bodies.
     Bulk,
 }
 
 impl Class {
-    const DATA: [Class; 3] = [Class::Realtime, Class::Small, Class::Bulk];
+    const DATA: [Class; 3] = [Class::Realtime, Class::Interactive, Class::Bulk];
 
     fn idx(self) -> usize {
         match self {
             Class::Control => unreachable!("control has no inner scheduler"),
             Class::Realtime => 0,
-            Class::Small => 1,
+            Class::Interactive => 1,
             Class::Bulk => 2,
         }
     }
@@ -65,7 +72,7 @@ impl SchedTree {
         let mut top = Qfq::new();
         top.add_flow(Class::Control, weights.control, lmax);
         top.add_flow(Class::Realtime, weights.realtime, lmax);
-        top.add_flow(Class::Small, weights.small, lmax);
+        top.add_flow(Class::Interactive, weights.interactive, lmax);
         top.add_flow(Class::Bulk, weights.bulk, lmax);
         Self {
             top,
@@ -194,13 +201,4 @@ impl SchedTree {
         }
         out
     }
-}
-
-/// `type/subtype` of a MIME string: lowercase, parameters stripped.
-pub(crate) fn mime_essence(ct: &str) -> String {
-    ct.split(';')
-        .next()
-        .unwrap_or("")
-        .trim()
-        .to_ascii_lowercase()
 }

@@ -27,8 +27,6 @@ hyper = { workspace = true }
 hyper-util = { workspace = true }
 instant-acme = { workspace = true }
 libc = { workspace = true }
-rand = "0.9"
-rand_core = { workspace = true }
 rcgen = { workspace = true }
 rusqlite = { workspace = true }
 rustls = { workspace = true }
@@ -46,6 +44,7 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 weaver-mux = { workspace = true }
 weaver-proto = { workspace = true }
+weaver-tokio = { workspace = true }
 
 [dev-dependencies]
 ed25519-dalek = { workspace = true }

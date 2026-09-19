@@ -2229,9 +2229,6 @@ dependencies = [
  "ed25519-dalek",
  "futures-util",
  "http",
- "libc",
- "rand",
- "rand_core 0.10.1",
  "rustls",
  "rustls-platform-verifier",
  "tokio",
@@ -2240,6 +2237,7 @@ dependencies = [
  "tokio-util",
  "weaver-mux",
  "weaver-proto",
+ "weaver-tokio",
 ]
 
 [[package]]
@@ -2262,7 +2260,6 @@ dependencies = [
 name = "weaver-proto"
 version = "0.1.0"
 dependencies = [
- "ed25519-dalek",
  "postcard",
  "serde",
  "thiserror",
@@ -2286,8 +2283,6 @@ dependencies = [
  "hyper-util",
  "instant-acme",
  "libc",
- "rand",
- "rand_core 0.10.1",
  "rcgen",
  "rusqlite",
  "rustls",
@@ -2306,6 +2301,24 @@ dependencies = [
  "weave",
  "weaver-mux",
  "weaver-proto",
+ "weaver-tokio",
+]
+
+[[package]]
+name = "weaver-tokio"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "futures-util",
+ "libc",
+ "rand",
+ "rand_core 0.10.1",
+ "socket2",
+ "thiserror",
+ "tokio",
+ "tokio-tungstenite",
+ "tracing",
+ "weaver-mux",
 ]
 
 [[package]]

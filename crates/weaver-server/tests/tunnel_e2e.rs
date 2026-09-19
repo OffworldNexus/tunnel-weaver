@@ -16,13 +16,13 @@ use tokio::time::sleep;
 use tokio_rustls::TlsConnector;
 use tokio_util::sync::CancellationToken;
 use weaver_proto::control::RefusalCode;
-use weaver_proto::poc::{POC_KEY_ID, derive_hostname};
 use weaver_server::cert::resolver::CertResolver;
 use weaver_server::cert::{CertManager, ChallengeRegistry, SystemClock};
 use weaver_server::config::Config;
 use weaver_server::edge::https::run_https_server_with_registry;
 use weaver_server::store::Store;
 use weaver_server::tunnel::TunnelRegistry;
+use weaver_server::tunnel::{Identity, PocResolver, derive_hostname};
 
 #[derive(Debug)]
 struct AllowAllVerifier;
@@ -160,6 +160,7 @@ async fn spawn_test_relay(root_domain: &str) -> TestRelay {
     let registry = Arc::new(TunnelRegistry::new(
         root_domain.to_string(),
         Arc::clone(&cert_manager),
+        Arc::new(PocResolver),
     ));
 
     let shutdown_token = CancellationToken::new();
@@ -200,7 +201,7 @@ async fn test_tunnel_registration_and_http1_http2_proxying() {
     });
 
     // 2. Wait for registration in registry
-    let expected_hostname = derive_hostname("web", "laptop", "poc", root);
+    let expected_hostname = derive_hostname("web", &poc_identity(), root);
     let mut registered = false;
     for _ in 0..50 {
         if relay.registry.lookup(&expected_hostname).is_some() {
@@ -332,7 +333,7 @@ async fn test_tunnel_supersession() {
         weave::run_poc_with_token("web".to_string(), s_addr1, Some(&ca_path1), c_tok1).await
     });
 
-    let expected_hostname = derive_hostname("web", "laptop", "poc", root);
+    let expected_hostname = derive_hostname("web", &poc_identity(), root);
     let mut reg1 = false;
     for _ in 0..50 {
         if relay.registry.lookup(&expected_hostname).is_some() {
@@ -384,28 +385,37 @@ async fn test_duplicate_registration_refusal() {
 
     let (proxy_tx, _) = tokio::sync::mpsc::channel(1);
     let (s_tx, _) = tokio::sync::oneshot::channel();
-    let conn_id = relay.registry.register_connection(POC_KEY_ID, s_tx);
+    let conn_id = relay
+        .registry
+        .register_connection(PocResolver::KEY_ID, s_tx);
 
     // First registration succeeds
     let res1 = relay
         .registry
-        .register_service(POC_KEY_ID, conn_id, "web", proxy_tx.clone())
+        .register_service(PocResolver::KEY_ID, conn_id, "web", proxy_tx.clone())
         .await;
     assert!(res1.is_ok());
 
     // Duplicate registration for same service returns AlreadyRegistered
     let res2 = relay
         .registry
-        .register_service(POC_KEY_ID, conn_id, "web", proxy_tx.clone())
+        .register_service(PocResolver::KEY_ID, conn_id, "web", proxy_tx.clone())
         .await;
     assert_eq!(res2, Err(RefusalCode::AlreadyRegistered));
 
     // Invalid DNS label returns InvalidName
     let res3 = relay
         .registry
-        .register_service(POC_KEY_ID, conn_id, "-invalid-", proxy_tx)
+        .register_service(PocResolver::KEY_ID, conn_id, "-invalid-", proxy_tx)
         .await;
     assert_eq!(res3, Err(RefusalCode::InvalidName));
 
     relay.shutdown_token.cancel();
+}
+
+fn poc_identity() -> Identity {
+    Identity {
+        person: "poc".into(),
+        machine: "laptop".into(),
+    }
 }

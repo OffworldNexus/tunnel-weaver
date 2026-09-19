@@ -11,21 +11,34 @@ pub enum RefusalCode {
     InvalidName,
     /// Client identity is unauthorized to register services.
     Unauthorized,
+    /// The client's application protocol version is not supported by the
+    /// relay. Carries the range the relay accepts.
+    UnsupportedVersion {
+        /// Lowest version the relay accepts.
+        min: u16,
+        /// Highest version the relay speaks.
+        max: u16,
+    },
     /// Other application-defined refusal reason.
     Other(String),
 }
 
-/// Control stream head sent by the client when opening stream 1.
+/// First message the client sends on its control stream.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ControlHead {
     /// Register a named service on the client's machine.
     Register {
+        /// Application protocol version the client speaks
+        /// ([`crate::PROTOCOL_VERSION`]). Negotiated independently of the
+        /// mux version: the relay refuses with
+        /// [`RefusalCode::UnsupportedVersion`] if it cannot serve it.
+        proto_version: u16,
         /// Name of the service to register (e.g. "web").
         service: String,
     },
 }
 
-/// Control stream response sent by the relay across stream 1.
+/// Control stream response sent by the relay on the same stream.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ControlReply {
     /// Service registration succeeded.

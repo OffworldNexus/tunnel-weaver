@@ -160,6 +160,7 @@ pub async fn run_server(
     let tunnel_registry = Arc::new(crate::tunnel::TunnelRegistry::new(
         config.root_domain.clone(),
         Arc::clone(&cert_manager),
+        Arc::new(crate::tunnel::PocResolver),
     ));
 
     let http_token = shutdown_token.clone();

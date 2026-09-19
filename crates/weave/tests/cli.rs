@@ -11,7 +11,7 @@ fn test_weave_version_flag() {
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("weave"));
-    assert!(stdout.contains("protocol v1"));
+    assert!(stdout.contains(&format!("protocol v{}", weaver_proto::PROTOCOL_VERSION)));
 }
 
 #[test]

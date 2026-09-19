@@ -6,45 +6,7 @@ use std::sync::Arc;
 use rustls::pki_types::pem::PemObject;
 use tokio_rustls::TlsConnector;
 
-/// Sets the TCP_NOTSENT_LOWAT socket option to ~32 KiB on Linux and Apple systems.
-#[cfg(any(
-    target_os = "linux",
-    target_os = "macos",
-    target_os = "ios",
-    target_os = "android"
-))]
-pub fn set_tcp_notsent_lowat(stream: &tokio::net::TcpStream) {
-    use std::os::unix::io::AsRawFd;
-    let fd = stream.as_raw_fd();
-    let val: libc::c_uint = 32768;
-    unsafe {
-        #[cfg(target_os = "linux")]
-        let _ = libc::setsockopt(
-            fd,
-            libc::IPPROTO_TCP,
-            libc::TCP_NOTSENT_LOWAT,
-            &val as *const _ as *const libc::c_void,
-            std::mem::size_of_val(&val) as libc::socklen_t,
-        );
-        #[cfg(any(target_os = "macos", target_os = "ios"))]
-        let _ = libc::setsockopt(
-            fd,
-            libc::IPPROTO_TCP,
-            0x201,
-            &val as *const _ as *const libc::c_void,
-            std::mem::size_of_val(&val) as libc::socklen_t,
-        );
-    }
-}
-
-/// No-op on platforms without TCP_NOTSENT_LOWAT.
-#[cfg(not(any(
-    target_os = "linux",
-    target_os = "macos",
-    target_os = "ios",
-    target_os = "android"
-)))]
-pub fn set_tcp_notsent_lowat(_stream: &tokio::net::TcpStream) {}
+pub use weaver_tokio::set_tcp_notsent_lowat;
 
 /// Parses a server string in the format `<host>` or `<host>:<port>`, defaulting to port 443.
 pub fn parse_server_address(raw: &str) -> Result<(String, u16), String> {

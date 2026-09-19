@@ -5,7 +5,9 @@
 use std::time::Duration;
 
 use weaver_mux::testing::{Ed25519TestSigner, FakeClock, MapVerifier, SeededRng};
-use weaver_mux::{Config, Connection, Event, Frame, FrameType, Signer as _};
+use weaver_mux::{
+    Compress, Config, Connection, Event, Frame, FrameType, Signer as _, StreamPolicy,
+};
 
 pub const SERVER_NAME: &str = "mux.example.test";
 
@@ -148,16 +150,26 @@ impl Pair {
     }
 }
 
-/// Read everything currently available on a stream.
-pub fn read_all(conn: &mut Connection, id: u32) -> Vec<u8> {
+/// Take every complete message currently available on a stream.
+pub fn recv_all(conn: &mut Connection, id: u32) -> Vec<Vec<u8>> {
     let mut out = Vec::new();
-    let mut buf = [0u8; 4096];
-    loop {
-        match conn.read(id, &mut buf) {
-            Ok(0) => break,
-            Ok(n) => out.extend_from_slice(&buf[..n]),
-            Err(_) => break,
-        }
+    while let Ok(m) = conn.recv_msg(id) {
+        out.push(m);
     }
     out
+}
+
+/// Concatenation of every message currently available on a stream.
+pub fn read_all(conn: &mut Connection, id: u32) -> Vec<u8> {
+    recv_all(conn, id).concat()
+}
+
+/// `send` with `Compress::Auto`; panics on anything but success.
+pub fn send(conn: &mut Connection, id: u32, msg: &[u8]) {
+    conn.send(id, msg, Compress::Auto).expect("send");
+}
+
+/// Interactive policy that never demotes, for tests that pin a class.
+pub fn pinned(class: weaver_mux::Class) -> StreamPolicy {
+    StreamPolicy::new(class)
 }

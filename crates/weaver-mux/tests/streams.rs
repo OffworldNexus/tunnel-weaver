@@ -1,21 +1,20 @@
 mod common;
 
 use common::*;
-use weaver_mux::{Event, FrameType, Head, Hints, StreamError};
+use weaver_mux::wire::DATA_FLAG_MORE;
+use weaver_mux::{Class, Compress, Event, FrameType, StreamError, StreamPolicy};
 
-fn head(opaque: &[u8]) -> Head {
-    Head {
-        hints: Hints::default(),
-        opaque: opaque.to_vec(),
-    }
+fn policy() -> StreamPolicy {
+    StreamPolicy::interactive()
 }
 
 #[test]
 fn round_trip_client_to_server() {
     let mut p = Pair::authenticated();
-    let id = p.client.open(head(b"GET /")).unwrap();
+    let id = p.client.open(policy()).unwrap();
     assert_eq!(id, 1, "client ids are odd, starting at 1");
-    assert_eq!(p.client.write(id, b"hello").unwrap(), 5);
+    send(&mut p.client, id, b"GET /");
+    send(&mut p.client, id, b"hello");
     p.client.finish(id).unwrap();
     p.pump();
 
@@ -25,24 +24,44 @@ fn round_trip_client_to_server() {
         vec![
             Event::StreamOpened {
                 id,
-                head: head(b"GET /")
+                policy: policy()
             },
             Event::Readable(id),
+        ],
+        "Finished waits until the inbox is drained"
+    );
+    assert_eq!(p.server.pending_messages(id), 2);
+    assert_eq!(p.server.recv_msg(id).unwrap(), b"GET /");
+    assert_eq!(p.server.recv_msg(id).unwrap(), b"hello");
+    assert_eq!(p.drain_events(Side::Server), vec![Event::Finished(id)]);
+    assert_eq!(p.server.recv_msg(id), Err(StreamError::WouldBlock));
+}
+
+#[test]
+fn finished_is_immediate_when_nothing_was_sent() {
+    let mut p = Pair::authenticated();
+    let id = p.client.open(policy()).unwrap();
+    p.client.finish(id).unwrap();
+    p.pump();
+    let events = p.drain_events(Side::Server);
+    assert_eq!(
+        events,
+        vec![
+            Event::StreamOpened {
+                id,
+                policy: policy()
+            },
             Event::Finished(id),
         ]
     );
-    let mut buf = [0u8; 16];
-    assert_eq!(p.server.read(id, &mut buf).unwrap(), 5);
-    assert_eq!(&buf[..5], b"hello");
-    assert_eq!(p.server.read(id, &mut buf).unwrap(), 0, "EOF after FIN");
 }
 
 #[test]
 fn round_trip_server_to_client_and_both_directions() {
     let mut p = Pair::authenticated();
-    let id = p.server.open(head(b"push")).unwrap();
+    let id = p.server.open(policy()).unwrap();
     assert_eq!(id, 2, "server ids are even, starting at 2");
-    p.server.write(id, b"from server").unwrap();
+    send(&mut p.server, id, b"from server");
     p.pump();
     assert!(matches!(
         p.client_event(),
@@ -50,40 +69,46 @@ fn round_trip_server_to_client_and_both_directions() {
     ));
     assert_eq!(read_all(&mut p.client, id), b"from server");
     // Client answers on the same stream.
-    p.client.write(id, b"from client").unwrap();
+    send(&mut p.client, id, b"from client");
     p.client.finish(id).unwrap();
     p.pump();
     assert_eq!(read_all(&mut p.server, id), b"from client");
-    let mut buf = [0u8; 1];
-    assert_eq!(p.server.read(id, &mut buf).unwrap(), 0);
     // Server side still open for writing.
-    p.server.write(id, b"more").unwrap();
+    send(&mut p.server, id, b"more");
     p.server.finish(id).unwrap();
     p.pump();
     assert_eq!(read_all(&mut p.client, id), b"more");
-    // `read_all` stopped on the `Ok(0)` EOF. Both directions are done and
-    // EOF was consumed: the stream is gone on both sides.
-    assert_eq!(p.client.write(id, b"x"), Err(StreamError::UnknownStream));
-    assert_eq!(p.server.write(id, b"x"), Err(StreamError::UnknownStream));
+    // Both directions are done and both inboxes drained: the stream is
+    // gone on both sides.
+    assert_eq!(
+        p.client.send(id, b"x", Compress::Auto),
+        Err(StreamError::UnknownStream)
+    );
+    assert_eq!(
+        p.server.send(id, b"x", Compress::Auto),
+        Err(StreamError::UnknownStream)
+    );
 }
 
 #[test]
 fn half_close_semantics() {
     let mut p = Pair::authenticated();
-    let id = p.client.open(head(b"")).unwrap();
+    let id = p.client.open(policy()).unwrap();
     p.client.finish(id).unwrap();
     p.pump();
-    // Client cannot write after FIN...
-    assert_eq!(p.client.write(id, b"x"), Err(StreamError::SendClosed));
+    // Client cannot send after FIN...
+    assert_eq!(
+        p.client.send(id, b"x", Compress::Auto),
+        Err(StreamError::SendClosed)
+    );
     assert_eq!(p.client.finish(id), Err(StreamError::SendClosed));
     // ...but the server still can.
-    let mut buf = [0u8; 8];
-    assert_eq!(p.server.read(id, &mut buf).unwrap(), 0);
-    assert_eq!(p.server.write(id, b"late").unwrap(), 4);
+    assert_eq!(p.server.recv_msg(id), Err(StreamError::WouldBlock));
+    send(&mut p.server, id, b"late");
     p.pump();
     assert_eq!(read_all(&mut p.client, id), b"late");
     assert_eq!(
-        p.client.read(id, &mut buf),
+        p.client.recv_msg(id),
         Err(StreamError::WouldBlock),
         "server has not FINed yet"
     );
@@ -92,8 +117,8 @@ fn half_close_semantics() {
 #[test]
 fn reset_mid_stream() {
     let mut p = Pair::authenticated();
-    let id = p.client.open(head(b"")).unwrap();
-    p.client.write(id, b"partial").unwrap();
+    let id = p.client.open(policy()).unwrap();
+    send(&mut p.client, id, b"partial");
     p.pump();
     p.drain_events(Side::Server);
     p.client.reset(id, 77).unwrap();
@@ -102,11 +127,11 @@ fn reset_mid_stream() {
         p.drain_events(Side::Server),
         vec![Event::Reset { id, code: 77 }]
     );
+    assert_eq!(p.server.recv_msg(id), Err(StreamError::UnknownStream));
     assert_eq!(
-        p.server.read(id, &mut [0; 8]),
+        p.client.send(id, b"x", Compress::Auto),
         Err(StreamError::UnknownStream)
     );
-    assert_eq!(p.client.write(id, b"x"), Err(StreamError::UnknownStream));
     // A late frame from the server for that id is tolerated, not fatal.
     assert!(!p.client.is_closed());
 }
@@ -117,8 +142,8 @@ fn ids_have_parity_and_are_never_reused() {
     let mut client_ids = Vec::new();
     let mut server_ids = Vec::new();
     for _ in 0..5 {
-        let c = p.client.open(head(b"")).unwrap();
-        let s = p.server.open(head(b"")).unwrap();
+        let c = p.client.open(policy()).unwrap();
+        let s = p.server.open(policy()).unwrap();
         p.client.finish(c).unwrap();
         p.server.finish(s).unwrap();
         p.pump();
@@ -126,10 +151,6 @@ fn ids_have_parity_and_are_never_reused() {
         p.server.finish(c).unwrap();
         p.client.finish(s).unwrap();
         p.pump();
-        let _ = p.server.read(c, &mut [0; 1]);
-        let _ = p.client.read(c, &mut [0; 1]);
-        let _ = p.client.read(s, &mut [0; 1]);
-        let _ = p.server.read(s, &mut [0; 1]);
         client_ids.push(c);
         server_ids.push(s);
     }
@@ -144,17 +165,34 @@ fn peer_open_with_wrong_parity_is_a_protocol_error() {
     let bogus = weaver_mux::Frame {
         stream_id: 2, // even: server parity, sent by the client
         frame_type: FrameType::Open,
-        payload: weaver_mux::wire::encode_payload(&Head::default()),
+        payload: weaver_mux::wire::encode_payload(&StreamPolicy::default()),
     };
     assert!(p.server.recv(now, &bogus.encode()).is_err());
     assert!(p.server.is_closed());
 }
 
 #[test]
-fn write_before_open_leaves_wire_emits_open_first() {
+fn control_class_is_rejected_on_both_ends() {
     let mut p = Pair::authenticated();
-    let id = p.client.open(head(b"h")).unwrap();
-    p.client.write(id, b"body").unwrap();
+    assert_eq!(
+        p.client.open(StreamPolicy::new(Class::Control)),
+        Err(StreamError::InvalidClass)
+    );
+    let now = p.clock.now();
+    let bogus = weaver_mux::Frame {
+        stream_id: 1,
+        frame_type: FrameType::Open,
+        payload: weaver_mux::wire::encode_payload(&StreamPolicy::new(Class::Control)),
+    };
+    assert!(p.server.recv(now, &bogus.encode()).is_err());
+    assert!(p.server.is_closed());
+}
+
+#[test]
+fn send_before_open_leaves_wire_emits_open_first() {
+    let mut p = Pair::authenticated();
+    let id = p.client.open(policy()).unwrap();
+    send(&mut p.client, id, b"body");
     p.pump();
     let client_frames: Vec<_> = p
         .log
@@ -167,18 +205,111 @@ fn write_before_open_leaves_wire_emits_open_first() {
 }
 
 #[test]
-fn large_writes_are_split_into_max_frame_chunks() {
+fn large_messages_are_fragmented_and_reassembled() {
     let mut p = Pair::authenticated();
-    let id = p.client.open(head(b"")).unwrap();
+    let id = p.client.open(policy()).unwrap();
     // Random-ish bytes so compression stays off and the frame count is exact.
     let data: Vec<u8> = (0..100_000u32)
         .map(|i| (i.wrapping_mul(2654435761) >> 13) as u8)
         .collect();
-    assert_eq!(p.client.write(id, &data).unwrap(), data.len());
+    send(&mut p.client, id, &data);
+    send(&mut p.client, id, b"tail");
     p.pump();
     let frames = p.frames_of(Side::Client, FrameType::Data);
     let max_frame = p.client.params().unwrap().max_frame as usize;
     assert!(frames.iter().all(|f| f.payload.len() <= max_frame));
-    assert_eq!(frames.len(), data.len().div_ceil(max_frame - 1));
-    assert_eq!(read_all(&mut p.server, id), data);
+    let n_big = data.len().div_ceil(max_frame - 1);
+    assert_eq!(frames.len(), n_big + 1);
+    // Every fragment but the last of the big message carries MORE.
+    for (i, f) in frames.iter().enumerate() {
+        let more = f.payload[0] & DATA_FLAG_MORE != 0;
+        assert_eq!(more, i + 1 < n_big, "fragment {i}");
+    }
+    assert_eq!(recv_all(&mut p.server, id), vec![data, b"tail".to_vec()]);
+}
+
+#[test]
+fn empty_message_round_trips() {
+    let mut p = Pair::authenticated();
+    let id = p.client.open(policy()).unwrap();
+    send(&mut p.client, id, b"");
+    send(&mut p.client, id, b"after");
+    p.pump();
+    assert_eq!(recv_all(&mut p.server, id), vec![vec![], b"after".to_vec()]);
+}
+
+#[test]
+fn message_over_max_message_is_refused_locally() {
+    let mut p = Pair::authenticated();
+    let id = p.client.open(policy()).unwrap();
+    let max = p.client.params().unwrap().max_message;
+    let big = vec![0u8; max as usize + 1];
+    assert_eq!(
+        p.client.send(id, &big, Compress::Never),
+        Err(StreamError::TooLarge {
+            len: max as usize + 1,
+            max
+        })
+    );
+}
+
+#[test]
+fn oversized_reassembly_from_peer_is_a_protocol_error() {
+    let mut server = server_config(1);
+    server.max_message = 16 * 1024;
+    let mut p = Pair::new(client_config(1), server);
+    p.pump();
+    let id = p.client.open(policy()).unwrap();
+    p.pump();
+    let now = p.clock.now();
+    // Hand-craft MORE fragments past the 16 KiB cap.
+    let mut payload = vec![DATA_FLAG_MORE];
+    payload.extend_from_slice(&[0u8; 8000]);
+    let f = weaver_mux::Frame {
+        stream_id: id,
+        frame_type: FrameType::Data,
+        payload,
+    }
+    .encode();
+    p.server.recv(now, &f).unwrap();
+    p.server.recv(now, &f).unwrap();
+    assert!(p.server.recv(now, &f).is_err(), "third fragment overruns");
+    assert!(p.server.is_closed());
+}
+
+#[test]
+fn fin_inside_a_message_is_a_protocol_error() {
+    let mut p = Pair::authenticated();
+    let id = p.client.open(policy()).unwrap();
+    p.pump();
+    let now = p.clock.now();
+    let frag = weaver_mux::Frame {
+        stream_id: id,
+        frame_type: FrameType::Data,
+        payload: vec![DATA_FLAG_MORE, 1, 2, 3],
+    }
+    .encode();
+    p.server.recv(now, &frag).unwrap();
+    let fin = weaver_mux::Frame {
+        stream_id: id,
+        frame_type: FrameType::Fin,
+        payload: vec![],
+    }
+    .encode();
+    assert!(p.server.recv(now, &fin).is_err());
+}
+
+#[test]
+fn unknown_data_flag_is_a_protocol_error() {
+    let mut p = Pair::authenticated();
+    let id = p.client.open(policy()).unwrap();
+    p.pump();
+    let now = p.clock.now();
+    let f = weaver_mux::Frame {
+        stream_id: id,
+        frame_type: FrameType::Data,
+        payload: vec![0x80, 1],
+    }
+    .encode();
+    assert!(p.server.recv(now, &f).is_err());
 }

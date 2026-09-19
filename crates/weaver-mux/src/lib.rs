@@ -1,11 +1,29 @@
 //! Sans-IO authenticated, fair-queued stream multiplexer for Tunnel Weaver.
 //!
 //! `weaver-mux` turns one reliable, ordered, message-delimited pipe (a
-//! WebSocket today) into many bidirectional streams with per-stream flow
-//! control, weighted fair scheduling, opportunistic zstd compression, and
-//! an SSH-style challenge/response handshake. It does **no I/O**: bytes and
-//! events go in and out of a [`Connection`], and every notion of time is
-//! the `now: Instant` the caller passes in.
+//! WebSocket today) into many bidirectional *message* streams with
+//! per-stream flow control, weighted fair scheduling, opportunistic zstd
+//! compression, and an SSH-style challenge/response handshake. It does
+//! **no I/O**: bytes and events go in and out of a [`Connection`], and
+//! every notion of time is the `now: Instant` the caller passes in.
+//!
+//! # Policy, not content
+//!
+//! The mux knows nothing about what travels on a stream. The layer above
+//! tells it *what to do*: a [`StreamPolicy`] (scheduling class, demotion
+//! threshold) at [`Connection::open`], and a [`Compress`] stance on every
+//! [`Connection::send`]. Under [`Compress::Auto`] the mux may still decline
+//! (size floor, entropy probe, `Realtime` class); under
+//! [`Compress::Never`] it never compresses — that is how the layer above
+//! keeps secrets and already-encoded bodies out of the compressor.
+//!
+//! # Messages, not bytes
+//!
+//! The transport delimits messages, so the mux does too: one
+//! [`Connection::send`] is one message, delivered whole by one
+//! [`Connection::recv_msg`]. Messages larger than `max_frame` are split
+//! into `MORE`-flagged fragments and reassembled by the receiver, bounded
+//! by the negotiated `max_message`.
 //!
 //! # What the crate does not do
 //!
@@ -30,6 +48,7 @@
 //!     }
 //!     // 4. events
 //!     while let Some(ev) = conn.poll_event() { handle(ev); }
+//!     //    on Event::Readable(id): loop conn.recv_msg(id) until WouldBlock
 //!     // 5. sleep until conn.next_timeout() or the transport is readable
 //! }
 //! ```
@@ -85,4 +104,6 @@ pub use event::Event;
 pub use frame::{Frame, FrameType};
 pub use sched::Class;
 pub use stream::{RST_CODE_CONNECTION_CLOSED, StreamId};
-pub use wire::{Compression, Head, Hints, KeyId, Params, Signature};
+pub use wire::{
+    Compress, Compression, DEFAULT_DEMOTE_AFTER, KeyId, Params, Signature, StreamPolicy,
+};

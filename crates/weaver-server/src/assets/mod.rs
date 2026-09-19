@@ -52,9 +52,8 @@ mod tests {
 
     #[test]
     fn test_assets_embedded_and_non_empty() {
-        assert!(!WELCOME_HTML.is_empty());
+        // `contains` on a non-empty needle implies the asset is non-empty.
         assert!(WELCOME_HTML.contains("Tunnel Weaver"));
-        assert!(!NO_TUNNEL_HTML.is_empty());
         assert!(NO_TUNNEL_HTML.contains("No Such Tunnel"));
     }
 

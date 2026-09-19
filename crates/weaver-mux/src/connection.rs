@@ -5,17 +5,17 @@ use std::time::{Duration, Instant};
 
 use crate::auth;
 use crate::compress::{self, ZstdCtx};
-use crate::config::{Config, MAX_WINDOW, MIN_WINDOW, Role};
+use crate::config::{Config, MAX_WINDOW, MIN_MESSAGE, MIN_WINDOW, Role};
 use crate::error::{CloseCode, GoAway, ProtocolError, RejectCode, StreamError};
 use crate::event::Event;
 use crate::frame::{Frame, FrameType};
 use crate::handshake::{self, HandshakeState};
 use crate::sched::{Class, Pick, SchedTree, classify};
-use crate::stream::{Chunk, Compress, RST_CODE_CONNECTION_CLOSED, Stream, StreamId};
+use crate::stream::{RST_CODE_CONNECTION_CLOSED, Stream, StreamId};
 use crate::timers::{Expired, Timers};
 use crate::wire::{
-    self, Challenge, Compression, DATA_FLAG_COMPRESSED, Head, Hello, KeyId, MAX_VERSION, Params,
-    Ping, Reject, Rst, Welcome, WindowUpdate,
+    self, Challenge, Compress, Compression, DATA_FLAG_COMPRESSED, DATA_FLAG_MORE, DATA_FLAGS_KNOWN,
+    Hello, KeyId, MAX_VERSION, Params, Ping, Reject, Rst, StreamPolicy, Welcome, WindowUpdate,
 };
 
 /// Multiplier of `max_frame` bounding the decompressed size of one DATA
@@ -481,6 +481,7 @@ impl Connection {
             max_frame: self.cfg.max_frame,
             initial_window: self.cfg.initial_window,
             compression: self.cfg.compression,
+            max_message: self.cfg.max_message,
         };
         self.handshake_out.push_back(Frame {
             stream_id: 0,
@@ -521,8 +522,11 @@ impl Connection {
         if !(MIN_WINDOW..=MAX_WINDOW).contains(&w.params.initial_window) {
             return Err(ProtocolError::BadParams("initial_window"));
         }
-        if w.params.max_frame == 0 {
+        if w.params.max_frame < 2 {
             return Err(ProtocolError::BadParams("max_frame"));
+        }
+        if w.params.max_message < MIN_MESSAGE {
+            return Err(ProtocolError::BadParams("max_message"));
         }
         // The scheduler's lmax is the negotiated frame size, which the
         // client only learns now. No streams exist yet, so rebuilding is
@@ -624,16 +628,18 @@ impl Connection {
         if (id % 2 == 1) != self.peer_opens_odd() || id <= self.last_peer_stream_id {
             return Err(ProtocolError::BadStreamId(id));
         }
-        let head: Head = wire::decode_payload(FrameType::Open, &frame.payload)?;
+        let policy: StreamPolicy = wire::decode_payload(FrameType::Open, &frame.payload)?;
+        if policy.class == Class::Control {
+            return Err(ProtocolError::BadPolicy(id));
+        }
         let window = self.params.expect("authenticated").initial_window;
-        let class = classify::at_birth(&head.hints, self.cfg.bulk_threshold);
         // The peer's OPEN is already on the wire, so our DATA may follow at
         // any time: `open_sent` is trivially true.
-        let stream = Stream::new(head.hints.clone(), class, window, true);
+        let stream = Stream::new(policy, window, true);
         self.streams.insert(id, stream);
-        self.sched.add_stream(id, class);
+        self.sched.add_stream(id, policy.class);
         self.last_peer_stream_id = id;
-        self.events.push_back(Event::StreamOpened { id, head });
+        self.events.push_back(Event::StreamOpened { id, policy });
         Ok(())
     }
 
@@ -642,9 +648,15 @@ impl Connection {
         let Some(&flags) = frame.payload.first() else {
             return Err(ProtocolError::Decode(FrameType::Data));
         };
-        let cap = self.params.expect("authenticated").max_frame as usize * DECOMPRESS_CAP_FACTOR;
+        if flags & !DATA_FLAGS_KNOWN != 0 {
+            return Err(ProtocolError::Decode(FrameType::Data));
+        }
+        let params = self.params.expect("authenticated");
+        let cap = params.max_frame as usize * DECOMPRESS_CAP_FACTOR;
+        let max_message = params.max_message as usize;
         let wire_len = frame.payload.len() as u32;
         let compressed = flags & DATA_FLAG_COMPRESSED != 0;
+        let more = flags & DATA_FLAG_MORE != 0;
         let body = &frame.payload[1..];
         let data = if compressed {
             self.zstd
@@ -662,19 +674,18 @@ impl Connection {
         if !stream.recv.on_data(wire_len) {
             return Err(ProtocolError::FlowControl(id));
         }
-        if data.is_empty() {
-            // Nothing for the application, but the credit was spent.
-            if let Some(credit) = stream.recv.on_consumed(wire_len) {
-                self.queue_window_update(id, credit);
-            }
+        if stream.partial.len() + data.len() > max_message {
+            return Err(ProtocolError::MessageTooLarge(id));
+        }
+        stream.partial.extend_from_slice(&data);
+        stream.partial_wire = stream.partial_wire.saturating_add(wire_len);
+        if more {
             return Ok(());
         }
+        let msg = std::mem::take(&mut stream.partial);
+        let msg_wire = std::mem::take(&mut stream.partial_wire);
         let was_empty = stream.inbox.is_empty();
-        stream.inbox.push_back(Chunk {
-            data,
-            offset: 0,
-            wire_len,
-        });
+        stream.inbox.push_back((msg, msg_wire));
         if was_empty {
             self.events.push_back(Event::Readable(id));
         }
@@ -698,7 +709,10 @@ impl Connection {
             return Err(ProtocolError::StateViolation("duplicate FIN"));
         }
         stream.remote_open = false;
-        self.events.push_back(Event::Finished(id));
+        if !stream.partial.is_empty() {
+            return Err(ProtocolError::StateViolation("FIN inside a message"));
+        }
+        self.deliver_finished(id);
         Ok(())
     }
 
@@ -741,32 +755,50 @@ impl Connection {
         Ok(())
     }
 
-    /// Open a stream toward the peer. Allowed only between WELCOME and close.
-    pub fn open(&mut self, head: Head) -> Result<StreamId, StreamError> {
+    /// Open a stream toward the peer with the given scheduling policy.
+    /// Allowed only between WELCOME and close. No application bytes travel
+    /// in OPEN: send your own head as the first message.
+    pub fn open(&mut self, policy: StreamPolicy) -> Result<StreamId, StreamError> {
         self.ready()?;
+        if policy.class == Class::Control {
+            return Err(StreamError::InvalidClass);
+        }
         let id = self.next_stream_id;
         self.next_stream_id = id.checked_add(2).ok_or(StreamError::Exhausted)?;
         let window = self.params.expect("authenticated").initial_window;
-        let class = classify::at_birth(&head.hints, self.cfg.bulk_threshold);
-        let stream = Stream::new(head.hints.clone(), class, window, false);
+        let stream = Stream::new(policy, window, false);
         self.streams.insert(id, stream);
-        self.sched.add_stream(id, class);
+        self.sched.add_stream(id, policy.class);
         self.sched.push_control(Frame {
             stream_id: id,
             frame_type: FrameType::Open,
-            payload: wire::encode_payload(&head),
+            payload: wire::encode_payload(&policy),
         });
         Ok(id)
     }
 
-    /// Queue application bytes. Returns how many were accepted — bounded by
-    /// the peer's credit, never blocking. `Ok(0)` means wait for
-    /// [`Event::Writable`].
-    pub fn write(&mut self, id: StreamId, data: &[u8]) -> Result<usize, StreamError> {
+    /// Queue one application message. The message is delivered to the
+    /// peer whole, in order with the stream's other messages. It is
+    /// accepted entirely or not at all: `WouldBlock` means the peer's
+    /// credit cannot hold it yet — wait for [`Event::Writable`] and retry
+    /// with the same message. `compress` is this message's stance; the mux
+    /// may still send raw under `Auto`.
+    pub fn send(
+        &mut self,
+        id: StreamId,
+        msg: &[u8],
+        compress: Compress,
+    ) -> Result<(), StreamError> {
         self.ready()?;
-        let max_frame = self.params.expect("authenticated").max_frame as usize;
+        let params = self.params.expect("authenticated");
+        let max_frame = params.max_frame as usize;
+        if msg.len() > params.max_message as usize {
+            return Err(StreamError::TooLarge {
+                len: msg.len(),
+                max: params.max_message,
+            });
+        }
         let compression_enabled = self.compression_enabled;
-        let bulk_threshold = self.cfg.bulk_threshold;
         let stream = self
             .streams
             .get_mut(&id)
@@ -774,58 +806,51 @@ impl Connection {
         if !stream.local_open {
             return Err(StreamError::SendClosed);
         }
-        if data.is_empty() {
-            return Ok(0);
+        // Each fragment is `flag ‖ body` with body ≤ max_frame - 1. The raw
+        // size is an upper bound on the wire size (compression only ever
+        // shrinks a fragment or is skipped), so it bounds the credit needed.
+        let chunk_max = max_frame - 1;
+        let n_frags = msg.len().div_ceil(chunk_max).max(1);
+        let worst_case = msg.len() + n_frags;
+        if worst_case > stream.free_credit() as usize {
+            stream.wants_writable = true;
+            return Err(StreamError::WouldBlock);
         }
-        if stream.compress == Compress::Undecided {
-            stream.compress = if compression_enabled
-                && compress::should_compress(stream.class, &stream.hints, data)
-            {
-                Compress::On
-            } else {
-                Compress::Off
-            };
-        }
-        let compressing = stream.compress == Compress::On;
-        let chunk_max = max_frame.saturating_sub(1).max(1);
-        let mut offset = 0;
-        while offset < data.len() {
-            let avail = stream.free_credit() as usize;
-            if avail <= 1 {
-                break;
-            }
-            let chunk_len = (data.len() - offset).min(chunk_max).min(avail - 1);
-            let chunk = &data[offset..offset + chunk_len];
-            let mut payload = Vec::with_capacity(1 + chunk_len);
-            payload.push(0);
+        let stance = if compression_enabled {
+            compress
+        } else {
+            Compress::Never
+        };
+        let class = stream.class;
+        let mut fragments: Vec<&[u8]> = if msg.is_empty() {
+            vec![&[]]
+        } else {
+            msg.chunks(chunk_max).collect()
+        };
+        let last = fragments.len() - 1;
+        for (i, chunk) in fragments.drain(..).enumerate() {
+            let mut payload = Vec::with_capacity(1 + chunk.len());
+            let more = if i < last { DATA_FLAG_MORE } else { 0 };
+            payload.push(more);
             let mut done = false;
-            if compressing && let Ok(c) = self.zstd.compress(chunk) {
-                // Incompressible chunks go out raw so the payload never
-                // exceeds the credit we reserved for it.
-                if c.len() < chunk_len {
-                    payload[0] = DATA_FLAG_COMPRESSED;
-                    payload.extend_from_slice(&c);
-                    done = true;
-                }
+            if compress::should_compress(stance, class, chunk)
+                && let Ok(c) = self.zstd.compress(chunk)
+                && c.len() < chunk.len()
+            {
+                payload[0] |= DATA_FLAG_COMPRESSED;
+                payload.extend_from_slice(&c);
+                done = true;
             }
             if !done {
                 payload.extend_from_slice(chunk);
             }
             stream.outbox_bytes += payload.len() as u32;
             stream.outbox.push_back(payload);
-            offset += chunk_len;
         }
-        if offset < data.len() {
-            stream.wants_writable = true;
-        }
-        stream.written_total += offset as u64;
-        // Demotion to bulk after enough bytes, unless the app pinned the class.
+        stream.written_total += msg.len() as u64;
+        // Demotion to bulk after enough bytes, per the stream's policy.
         let old_class = stream.class;
-        let new_class = if stream.class_pinned {
-            old_class
-        } else {
-            classify::after_write(old_class, stream.written_total, bulk_threshold)
-        };
+        let new_class = classify::after_write(old_class, stream.written_total, stream.demote_after);
         let head_len = stream.head_len();
         let open_sent = stream.open_sent;
         let was_active = stream.sched_active;
@@ -845,7 +870,7 @@ impl Connection {
             stream.sched_active = true;
             self.sched.activate_stream(id, new_class, len);
         }
-        Ok(offset)
+        Ok(())
     }
 
     /// Half-close our direction. Queued DATA still goes out first.
@@ -882,75 +907,74 @@ impl Connection {
         Ok(())
     }
 
-    /// Copy received bytes into `buf`. `Ok(0)` only after the peer's FIN
-    /// once everything has been read; otherwise `WouldBlock` until
-    /// [`Event::Readable`].
-    pub fn read(&mut self, id: StreamId, buf: &mut [u8]) -> Result<usize, StreamError> {
+    /// Take the next complete message on a stream. `WouldBlock` until
+    /// [`Event::Readable`]; `UnknownStream` once the stream is gone
+    /// (after [`Event::Finished`] with nothing left, or after a reset).
+    pub fn recv_msg(&mut self, id: StreamId) -> Result<Vec<u8>, StreamError> {
+        if self.closed.is_some() {
+            return Err(StreamError::Closed);
+        }
         let stream = self
             .streams
             .get_mut(&id)
             .ok_or(StreamError::UnknownStream)?;
-        let mut copied = 0;
-        let mut updates = Vec::new();
-        while copied < buf.len() {
-            let Some(chunk) = stream.inbox.front_mut() else {
-                break;
-            };
-            let n = (chunk.data.len() - chunk.offset).min(buf.len() - copied);
-            buf[copied..copied + n].copy_from_slice(&chunk.data[chunk.offset..chunk.offset + n]);
-            chunk.offset += n;
-            copied += n;
-            if chunk.offset == chunk.data.len() {
-                let wire_len = chunk.wire_len;
-                stream.inbox.pop_front();
-                if stream.remote_open
-                    && let Some(credit) = stream.recv.on_consumed(wire_len)
-                {
-                    updates.push(credit);
-                }
-            }
-        }
-        if copied == 0 && !buf.is_empty() {
-            if stream.remote_open {
-                return Err(StreamError::WouldBlock);
-            }
-            stream.eof_delivered = true;
-            self.maybe_forget(id);
-            return Ok(0);
-        }
-        for credit in updates {
+        let Some((msg, wire_len)) = stream.inbox.pop_front() else {
+            return Err(StreamError::WouldBlock);
+        };
+        let credit = if stream.remote_open {
+            stream.recv.on_consumed(wire_len)
+        } else {
+            None
+        };
+        if let Some(credit) = credit {
             self.queue_window_update(id, credit);
         }
-        Ok(copied)
+        self.deliver_finished(id);
+        Ok(msg)
     }
 
-    /// Pin a stream to a class. Automatic classification stops for it.
-    pub fn set_class(&mut self, id: StreamId, class: Class) -> Result<(), StreamError> {
-        if class == Class::Control {
+    /// Emit `Finished` once the peer's FIN has arrived and every message
+    /// has been consumed; then forget the stream if our side is done too.
+    fn deliver_finished(&mut self, id: StreamId) {
+        let Some(stream) = self.streams.get_mut(&id) else {
+            return;
+        };
+        if stream.remote_drained() && !stream.finished_delivered {
+            stream.finished_delivered = true;
+            self.events.push_back(Event::Finished(id));
+        }
+        self.maybe_forget(id);
+    }
+
+    /// Replace a stream's scheduling policy. Takes effect on the next
+    /// scheduling decision; queued frames keep their order.
+    pub fn set_policy(&mut self, id: StreamId, policy: StreamPolicy) -> Result<(), StreamError> {
+        self.ready()?;
+        if policy.class == Class::Control {
             return Err(StreamError::InvalidClass);
         }
         let stream = self
             .streams
             .get_mut(&id)
             .ok_or(StreamError::UnknownStream)?;
-        stream.class_pinned = true;
+        stream.demote_after = policy.demote_after;
         let old = stream.class;
-        if old != class {
-            stream.class = class;
+        if old != policy.class {
+            stream.class = policy.class;
             let head_len = if stream.open_sent {
                 stream.head_len()
             } else {
                 None
             };
             stream.sched_active = head_len.is_some();
-            self.sched.reclass(id, old, class, head_len);
+            self.sched.reclass(id, old, policy.class, head_len);
         }
         Ok(())
     }
 
-    /// Bytes waiting to be read on a stream (0 for unknown streams).
-    pub fn readable(&self, id: StreamId) -> usize {
-        self.streams.get(&id).map_or(0, Stream::readable_bytes)
+    /// Complete messages waiting on a stream (0 for unknown streams).
+    pub fn pending_messages(&self, id: StreamId) -> usize {
+        self.streams.get(&id).map_or(0, Stream::pending_messages)
     }
 
     // ------------------------------------------------------------------

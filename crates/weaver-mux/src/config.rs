@@ -26,8 +26,8 @@ pub struct Weights {
     pub control: u32,
     /// Upgrades and server-sent events.
     pub realtime: u32,
-    /// Everything at birth.
-    pub small: u32,
+    /// Request/response traffic.
+    pub interactive: u32,
     /// Large bodies, by hint or after `bulk_threshold` bytes.
     pub bulk: u32,
 }
@@ -37,7 +37,7 @@ impl Default for Weights {
         Self {
             control: 1000,
             realtime: 300,
-            small: 300,
+            interactive: 300,
             bulk: 40,
         }
     }
@@ -47,6 +47,8 @@ impl Default for Weights {
 pub const MIN_WINDOW: u32 = 64 * 1024;
 /// Largest `initial_window` a server may announce.
 pub const MAX_WINDOW: u32 = 4 * 1024 * 1024;
+/// Smallest `max_message` a server may announce.
+pub const MIN_MESSAGE: u32 = 16 * 1024;
 
 /// Everything a [`crate::Connection`] needs to know, supplied by the
 /// adapter. Keys are never held here: only a boxed [`Signer`] or
@@ -68,10 +70,11 @@ pub struct Config {
     pub max_frame: u32,
     /// Initial per-stream credit. Server value is announced in WELCOME.
     pub initial_window: u32,
+    /// Largest application message on a stream. Server value is announced
+    /// in WELCOME and bounds both sides' reassembly buffers.
+    pub max_message: u32,
     /// Scheduler class weights.
     pub weights: Weights,
-    /// Cumulative written bytes after which a `small` stream becomes `bulk`.
-    pub bulk_threshold: u64,
     /// Local zstd level; not negotiated.
     pub zstd_level: i32,
     /// Local compression stance. The server's value is announced in
@@ -99,8 +102,8 @@ impl Config {
             server_name: server_name.into(),
             max_frame: 16 * 1024,
             initial_window: 512 * 1024,
+            max_message: 1024 * 1024,
             weights: Weights::default(),
-            bulk_threshold: 256 * 1024,
             zstd_level: 3,
             compression: Compression::BodyOnly,
             handshake_timeout: Duration::from_secs(10),
@@ -138,10 +141,11 @@ impl Config {
     /// allows so a server never announces parameters the client must reject.
     pub(crate) fn normalize(&mut self) {
         self.initial_window = self.initial_window.clamp(MIN_WINDOW, MAX_WINDOW);
-        self.max_frame = self.max_frame.max(1);
+        self.max_frame = self.max_frame.max(2);
+        self.max_message = self.max_message.max(MIN_MESSAGE);
         self.weights.control = self.weights.control.max(1);
         self.weights.realtime = self.weights.realtime.max(1);
-        self.weights.small = self.weights.small.max(1);
+        self.weights.interactive = self.weights.interactive.max(1);
         self.weights.bulk = self.weights.bulk.max(1);
     }
 }
@@ -153,8 +157,8 @@ impl std::fmt::Debug for Config {
             .field("server_name", &self.server_name)
             .field("max_frame", &self.max_frame)
             .field("initial_window", &self.initial_window)
+            .field("max_message", &self.max_message)
             .field("weights", &self.weights)
-            .field("bulk_threshold", &self.bulk_threshold)
             .field("zstd_level", &self.zstd_level)
             .field("compression", &self.compression)
             .field("handshake_timeout", &self.handshake_timeout)
