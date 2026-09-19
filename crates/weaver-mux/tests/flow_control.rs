@@ -2,14 +2,14 @@ mod common;
 
 use common::*;
 use weaver_mux::wire::{self, WindowUpdate};
-use weaver_mux::{Compress, Event, Frame, FrameType, StreamError, StreamPolicy};
+use weaver_mux::{Class, Compress, Event, Frame, FrameType, StreamError};
 
 const WINDOW: u32 = 64 * 1024;
 
 /// Small window so the tests exercise credit exhaustion quickly.
 fn small_window_pair() -> Pair {
     let mut server = server_config(1);
-    server.initial_window = WINDOW;
+    server_params(&mut server, |p| p.initial_window = WINDOW);
     let mut p = Pair::new(client_config(1), server);
     p.pump();
     p.drain_events(Side::Client);
@@ -37,7 +37,7 @@ fn fill(p: &mut Pair, id: u32, msg: &[u8]) -> usize {
 #[test]
 fn sender_never_exceeds_credit() {
     let mut p = small_window_pair();
-    let id = p.client.open(StreamPolicy::default()).unwrap();
+    let id = p.client.open(Class::Interactive).unwrap();
     let msg = noise(4000);
     let accepted = fill(&mut p, id, &msg);
     // 16 messages of 4001 wire bytes fit in 64 KiB; the 17th does not.
@@ -63,7 +63,7 @@ fn sender_never_exceeds_credit() {
 #[test]
 fn window_update_cadence_and_writable() {
     let mut p = small_window_pair();
-    let id = p.client.open(StreamPolicy::default()).unwrap();
+    let id = p.client.open(Class::Interactive).unwrap();
     let msg = noise(4000);
     let first = fill(&mut p, id, &msg);
     p.pump();
@@ -106,15 +106,18 @@ fn window_update_cadence_and_writable() {
         "credit never exceeds wire bytes consumed"
     );
     // Client was blocked and now learns it may send again.
-    assert_eq!(p.drain_events(Side::Client), vec![Event::Writable(id)]);
+    assert!(matches!(
+        p.drain_events(Side::Client).as_slice(),
+        [Event::Writable { id: got, credit }] if *got == id && *credit > 0
+    ));
     p.client.send(id, &msg, Compress::Never).unwrap();
 }
 
 #[test]
 fn stalled_reader_does_not_block_other_streams() {
     let mut p = small_window_pair();
-    let stalled = p.client.open(StreamPolicy::default()).unwrap();
-    let live = p.client.open(StreamPolicy::default()).unwrap();
+    let stalled = p.client.open(Class::Interactive).unwrap();
+    let live = p.client.open(Class::Interactive).unwrap();
     fill(&mut p, stalled, &noise(4000));
     p.pump();
     // Stalled stream is out of credit; nobody reads it on the server.
@@ -135,7 +138,7 @@ fn stalled_reader_does_not_block_other_streams() {
 #[test]
 fn peer_overrunning_credit_is_a_protocol_error() {
     let mut p = small_window_pair();
-    let id = p.client.open(StreamPolicy::default()).unwrap();
+    let id = p.client.open(Class::Interactive).unwrap();
     p.pump();
     p.drain_events(Side::Server);
     // Hand-craft DATA frames beyond the window straight into the server.

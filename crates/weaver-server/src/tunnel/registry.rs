@@ -8,7 +8,6 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::info;
 use weaver_mux::KeyId;
 use weaver_proto::control::RefusalCode;
-use weaver_proto::is_valid_dns_label;
 
 use crate::cert::CertManager;
 use crate::tunnel::identity::{IdentityResolver, derive_hostname};
@@ -109,7 +108,8 @@ impl TunnelRegistry {
 
     /// Registers a service on an active connection.
     ///
-    /// Validates the service name, verifies the caller identity, checks for duplicates,
+    /// Verifies the caller identity, checks for duplicates (the service name
+    /// was validated by `ControlHead::validate` on receipt),
     /// activates the certificate in `CertManager`, and updates routing tables.
     pub async fn register_service(
         &self,
@@ -118,10 +118,6 @@ impl TunnelRegistry {
         service: &str,
         proxy_tx: mpsc::Sender<ProxyRequest>,
     ) -> Result<String, RefusalCode> {
-        if !is_valid_dns_label(service) {
-            return Err(RefusalCode::InvalidName);
-        }
-
         let Some(identity) = self.identities.identity(&key_id) else {
             return Err(RefusalCode::Unauthorized);
         };

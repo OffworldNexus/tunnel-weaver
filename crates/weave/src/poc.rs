@@ -7,8 +7,9 @@ use std::time::Instant;
 
 use tokio_rustls::client::TlsStream;
 use tokio_tungstenite::WebSocketStream;
-use weaver_mux::error::{CloseCode, GoAway, RejectCode};
-use weaver_mux::{Config, Connection, Event, StreamError, StreamId};
+use weaver_mux::{
+    CloseCode, CloseReason, Config, Connection, Event, RejectCode, StreamError, StreamId,
+};
 use weaver_proto::control::{ControlHead, ControlReply};
 use weaver_proto::http::{HttpHead, HttpResponseHead};
 use weaver_proto::{Head, policy};
@@ -91,7 +92,7 @@ pub async fn run_poc_with_token(
                 let _ = conn.finish(id);
             }
             h.shutting_down = true;
-            conn.close(GoAway::new(CloseCode::Shutdown));
+            conn.close(CloseReason::new(CloseCode::Shutdown));
         });
     });
 
@@ -130,15 +131,15 @@ impl StreamHandler for PocHandler {
     fn on_event(&mut self, conn: &mut Connection, event: Event) {
         match event {
             Event::Authenticated { .. } => {
-                let head = Head::Control(ControlHead::Register {
-                    proto_version: weaver_proto::PROTOCOL_VERSION,
-                    service: self.service.clone(),
-                });
-                let res = weaver_proto::encode(&head)
-                    .map_err(|e| format!("Failed to encode registration head: {e}"))
+                let res = ControlHead::register(self.service.clone())
+                    .map_err(|c| format!("Invalid service name: {c:?}"))
+                    .and_then(|h| {
+                        weaver_proto::encode(&Head::Control(h))
+                            .map_err(|e| format!("Failed to encode registration head: {e}"))
+                    })
                     .and_then(|bytes| {
                         let id = conn
-                            .open(policy::CONTROL_POLICY)
+                            .open(policy::CONTROL_CLASS)
                             .map_err(|e| format!("Failed to open registration stream: {e}"))?;
                         conn.send(id, &bytes, policy::CONTROL_COMPRESS)
                             .map_err(|e| format!("Failed to send registration: {e}"))?;
@@ -198,7 +199,7 @@ impl StreamHandler for PocHandler {
             Event::Reset { id, .. } => {
                 self.inflight.remove(&id);
             }
-            Event::Writable(_) | Event::Closed { .. } => {}
+            Event::Writable { .. } | Event::Closed { .. } => {}
         }
     }
 }
@@ -206,7 +207,7 @@ impl StreamHandler for PocHandler {
 impl PocHandler {
     fn fail(&mut self, conn: &mut Connection, msg: String) {
         self.failure = Some(msg);
-        conn.close(GoAway::new(CloseCode::Shutdown));
+        conn.close(CloseReason::new(CloseCode::Shutdown));
     }
 
     fn on_control_reply(&mut self, conn: &mut Connection, msg: &[u8]) {

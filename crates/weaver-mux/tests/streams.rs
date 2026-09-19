@@ -2,10 +2,10 @@ mod common;
 
 use common::*;
 use weaver_mux::wire::DATA_FLAG_MORE;
-use weaver_mux::{Class, Compress, Event, FrameType, StreamError, StreamPolicy};
+use weaver_mux::{Class, Compress, Event, FrameType, StreamError};
 
-fn policy() -> StreamPolicy {
-    StreamPolicy::interactive()
+fn policy() -> Class {
+    Class::Interactive
 }
 
 #[test]
@@ -24,13 +24,13 @@ fn round_trip_client_to_server() {
         vec![
             Event::StreamOpened {
                 id,
-                policy: policy()
+                class: policy()
             },
             Event::Readable(id),
         ],
         "Finished waits until the inbox is drained"
     );
-    assert_eq!(p.server.pending_messages(id), 2);
+    assert_eq!(p.server.pending_messages(id), Some(2));
     assert_eq!(p.server.recv_msg(id).unwrap(), b"GET /");
     assert_eq!(p.server.recv_msg(id).unwrap(), b"hello");
     assert_eq!(p.drain_events(Side::Server), vec![Event::Finished(id)]);
@@ -49,7 +49,7 @@ fn finished_is_immediate_when_nothing_was_sent() {
         vec![
             Event::StreamOpened {
                 id,
-                policy: policy()
+                class: policy()
             },
             Event::Finished(id),
         ]
@@ -165,7 +165,7 @@ fn peer_open_with_wrong_parity_is_a_protocol_error() {
     let bogus = weaver_mux::Frame {
         stream_id: 2, // even: server parity, sent by the client
         frame_type: FrameType::Open,
-        payload: weaver_mux::wire::encode_payload(&StreamPolicy::default()),
+        payload: weaver_mux::wire::encode_payload(&Class::Interactive),
     };
     assert!(p.server.recv(now, &bogus.encode()).is_err());
     assert!(p.server.is_closed());
@@ -175,14 +175,14 @@ fn peer_open_with_wrong_parity_is_a_protocol_error() {
 fn control_class_is_rejected_on_both_ends() {
     let mut p = Pair::authenticated();
     assert_eq!(
-        p.client.open(StreamPolicy::new(Class::Control)),
+        p.client.open(Class::Control),
         Err(StreamError::InvalidClass)
     );
     let now = p.clock.now();
     let bogus = weaver_mux::Frame {
         stream_id: 1,
         frame_type: FrameType::Open,
-        payload: weaver_mux::wire::encode_payload(&StreamPolicy::new(Class::Control)),
+        payload: weaver_mux::wire::encode_payload(&Class::Control),
     };
     assert!(p.server.recv(now, &bogus.encode()).is_err());
     assert!(p.server.is_closed());
@@ -256,7 +256,7 @@ fn message_over_max_message_is_refused_locally() {
 #[test]
 fn oversized_reassembly_from_peer_is_a_protocol_error() {
     let mut server = server_config(1);
-    server.max_message = 16 * 1024;
+    server_params(&mut server, |p| p.max_message = 16 * 1024);
     let mut p = Pair::new(client_config(1), server);
     p.pump();
     let id = p.client.open(policy()).unwrap();

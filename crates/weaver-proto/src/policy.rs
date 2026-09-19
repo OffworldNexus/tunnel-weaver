@@ -2,22 +2,26 @@
 //!
 //! This is the only place that knows both what an HTTP exchange looks like
 //! and what the mux can be told. The mux itself has no notion of MIME
-//! types, headers or secrets: it takes a [`StreamPolicy`] at `open` and a
-//! [`Compress`] stance on every `send`, and this module produces both.
+//! types, headers or secrets: it takes a scheduling [`Class`] at `open`
+//! (and `set_class`) and a [`Compress`] stance on every `send`; this module
+//! produces both.
 //!
 //! Heads (request and response) are always sent with [`Compress::Never`]:
 //! they carry cookies, authorization tokens and CSRF secrets, which is
 //! exactly what compression side channels (CRIME/BREACH) extract.
 
-use weaver_mux::{Class, Compress, StreamPolicy};
+use weaver_mux::{Class, Compress};
 
 use crate::http::{HttpHead, HttpResponseHead};
 
-/// Bytes after which an interactive visitor stream is treated as bulk.
+/// Declared body size above which a visitor stream is opened as bulk
+/// outright, instead of waiting for the mux's own `bulk_threshold` to
+/// demote it.
 pub const BULK_THRESHOLD: u64 = 256 * 1024;
 
-/// Scheduling policy for a control stream: interactive, never demoted.
-pub const CONTROL_POLICY: StreamPolicy = StreamPolicy::new(Class::Interactive);
+/// Scheduling class for a control stream. Control traffic is tiny, so the
+/// mux's bulk demotion never triggers on it.
+pub const CONTROL_CLASS: Class = Class::Interactive;
 
 /// Compression stance for every message on a control stream.
 pub const CONTROL_COMPRESS: Compress = Compress::Never;
@@ -25,29 +29,29 @@ pub const CONTROL_COMPRESS: Compress = Compress::Never;
 /// Compression stance for request and response heads.
 pub const HEAD_COMPRESS: Compress = Compress::Never;
 
-/// Scheduling policy for the stream carrying this request.
-pub fn stream_policy(req: &HttpHead) -> StreamPolicy {
+/// Scheduling class for the stream carrying this request.
+pub fn request_class(req: &HttpHead) -> Class {
     if is_realtime_request(req) {
-        return StreamPolicy::realtime();
+        return Class::Realtime;
     }
     if content_length(req.header("content-length")).is_some_and(|len| len > BULK_THRESHOLD) {
-        return StreamPolicy::bulk();
+        return Class::Bulk;
     }
-    StreamPolicy::interactive().demote_after(BULK_THRESHOLD)
+    Class::Interactive
 }
 
-/// Scheduling policy once the response head is known: a response that
+/// Scheduling class once the response head is known: a response that
 /// turns out to be an event stream or a large body reclassifies the
-/// stream. Returns `None` when the request-derived policy stands.
-pub fn response_policy(req: &HttpHead, resp: &HttpResponseHead) -> Option<StreamPolicy> {
+/// stream. Returns `None` when the request-derived class stands.
+pub fn response_class(req: &HttpHead, resp: &HttpResponseHead) -> Option<Class> {
     if is_realtime_request(req) {
         return None;
     }
     if is_event_stream(resp.header("content-type")) {
-        return Some(StreamPolicy::realtime());
+        return Some(Class::Realtime);
     }
     if content_length(resp.header("content-length")).is_some_and(|len| len > BULK_THRESHOLD) {
-        return Some(StreamPolicy::bulk());
+        return Some(Class::Bulk);
     }
     None
 }
@@ -174,28 +178,27 @@ mod tests {
     }
 
     #[test]
-    fn request_policy() {
-        assert_eq!(stream_policy(&req(&[])).class, Class::Interactive);
-        assert_eq!(stream_policy(&req(&[])).demote_after, Some(BULK_THRESHOLD));
+    fn request_classification() {
+        assert_eq!(request_class(&req(&[])), Class::Interactive);
         assert_eq!(
-            stream_policy(&req(&[("upgrade", "websocket")])).class,
+            request_class(&req(&[("upgrade", "websocket")])),
             Class::Realtime
         );
         assert_eq!(
-            stream_policy(&req(&[("accept", "text/event-stream")])).class,
+            request_class(&req(&[("accept", "text/event-stream")])),
             Class::Realtime
         );
         assert_eq!(
-            stream_policy(&req(&[("content-length", "300000")])).class,
+            request_class(&req(&[("content-length", "300000")])),
             Class::Bulk
         );
         assert_eq!(
-            stream_policy(&req(&[("content-length", "262144")])).class,
+            request_class(&req(&[("content-length", "262144")])),
             Class::Interactive
         );
         // Realtime wins over size.
         assert_eq!(
-            stream_policy(&req(&[("upgrade", "x"), ("content-length", "300000")])).class,
+            request_class(&req(&[("upgrade", "x"), ("content-length", "300000")])),
             Class::Realtime
         );
     }
@@ -203,22 +206,21 @@ mod tests {
     #[test]
     fn response_reclassification() {
         let r = req(&[]);
-        assert_eq!(response_policy(&r, &resp(&[])), None);
+        assert_eq!(response_class(&r, &resp(&[])), None);
         assert_eq!(
-            response_policy(
+            response_class(
                 &r,
                 &resp(&[("content-type", "text/event-stream; charset=utf-8")])
-            )
-            .map(|p| p.class),
+            ),
             Some(Class::Realtime)
         );
         assert_eq!(
-            response_policy(&r, &resp(&[("content-length", "10000000")])).map(|p| p.class),
+            response_class(&r, &resp(&[("content-length", "10000000")])),
             Some(Class::Bulk)
         );
         // An already-realtime request is not touched.
         assert_eq!(
-            response_policy(
+            response_class(
                 &req(&[("upgrade", "websocket")]),
                 &resp(&[("content-length", "10000000")])
             ),

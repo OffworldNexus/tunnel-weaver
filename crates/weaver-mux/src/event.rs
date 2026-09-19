@@ -1,8 +1,9 @@
 //! Events surfaced to the application via [`crate::Connection::poll_event`].
 
-use crate::error::{GoAway, RejectCode};
+use crate::error::{CloseReason, RejectCode};
+use crate::sched::Class;
 use crate::stream::StreamId;
-use crate::wire::{KeyId, StreamPolicy};
+use crate::wire::KeyId;
 
 /// Something the application should react to. Events are queued in order
 /// and drained with `poll_event`; none is ever dropped.
@@ -27,16 +28,23 @@ pub enum Event {
     StreamOpened {
         /// Id chosen by the peer.
         id: StreamId,
-        /// The scheduling policy the peer asked for.
-        policy: StreamPolicy,
+        /// The scheduling class the peer asked for.
+        class: Class,
     },
     /// At least one complete message is available via `recv_msg`.
     /// Edge-triggered: fired when the inbox transitions from empty to
     /// non-empty.
     Readable(StreamId),
     /// Credit became available after `send` returned `WouldBlock`.
-    /// Edge-triggered.
-    Writable(StreamId),
+    /// Edge-triggered. `credit` is the number of bytes `send` can now
+    /// accept on the stream (message length plus one flag byte per
+    /// fragment); a message larger than that will still `WouldBlock`.
+    Writable {
+        /// Which stream.
+        id: StreamId,
+        /// Wire bytes of send credit currently free.
+        credit: u32,
+    },
     /// The peer half-closed its direction and every message it sent has
     /// been consumed with `recv_msg`. Nothing more will arrive on this
     /// stream; the local side may still send.
@@ -53,6 +61,6 @@ pub enum Event {
     Closed {
         /// Why. Local closes carry the code we sent; remote closes the code
         /// we received.
-        reason: GoAway,
+        reason: CloseReason,
     },
 }

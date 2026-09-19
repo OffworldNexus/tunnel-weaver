@@ -3,7 +3,7 @@ mod common;
 use std::time::Duration;
 
 use common::*;
-use weaver_mux::{CloseCode, Event, Frame, FrameType, StreamPolicy};
+use weaver_mux::{Class, CloseCode, Event, Frame, FrameType};
 
 const PING: Duration = Duration::from_secs(15);
 const IDLE: Duration = Duration::from_secs(60);
@@ -71,7 +71,7 @@ fn no_pong_within_idle_timeout_closes_once() {
     assert_eq!(
         events,
         vec![Event::Closed {
-            reason: weaver_mux::GoAway::new(CloseCode::Timeout)
+            reason: weaver_mux::CloseReason::new(CloseCode::Timeout)
         }]
     );
     // GOAWAY goes out so the peer learns why.
@@ -101,7 +101,7 @@ fn any_received_frame_resets_idle() {
     let mut p = Pair::authenticated();
     p.advance(Duration::from_secs(50));
     // Client opens a stream; the OPEN reaching the server counts as liveness.
-    p.client.open(StreamPolicy::default()).unwrap();
+    p.client.open(Class::Interactive).unwrap();
     p.pump();
     p.advance(Duration::from_secs(50));
     assert!(!p.server.is_closed(), "idle clock was reset by the OPEN");
@@ -110,7 +110,7 @@ fn any_received_frame_resets_idle() {
 #[test]
 fn never_fin_stream_survives_pings() {
     let mut p = Pair::authenticated();
-    let id = p.client.open(StreamPolicy::default()).unwrap();
+    let id = p.client.open(Class::Interactive).unwrap();
     p.pump();
     for _ in 0..10 {
         p.advance(PING);
@@ -127,7 +127,7 @@ fn never_fin_stream_survives_pings() {
 #[test]
 fn reverify_polls_and_revokes() {
     let mut server = server_config(1);
-    server.reverify_interval = Some(Duration::from_secs(5));
+    set_reverify(&mut server, Duration::from_secs(5));
     let mut p = Pair::new(client_config(1), server);
     p.pump();
     let now = p.clock.now();
@@ -148,7 +148,7 @@ fn reverify_polls_and_revokes() {
         SERVER_NAME,
         Box::new(weaver_mux::testing::SeededRng::new(7)),
     );
-    server.reverify_interval = Some(Duration::from_secs(5));
+    set_reverify(&mut server, Duration::from_secs(5));
     let mut q = Pair::new(client_config(1), server);
     q.pump();
     assert!(matches!(
@@ -167,4 +167,13 @@ fn reverify_polls_and_revokes() {
             .iter()
             .any(|e| matches!(e, Event::Closed { reason } if reason.code == CloseCode::KeyRevoked))
     );
+}
+
+fn set_reverify(cfg: &mut weaver_mux::Config, every: Duration) {
+    match &mut cfg.role {
+        weaver_mux::Role::Server {
+            reverify_interval, ..
+        } => *reverify_interval = Some(every),
+        weaver_mux::Role::Client { .. } => unreachable!(),
+    }
 }

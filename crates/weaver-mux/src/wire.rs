@@ -2,7 +2,10 @@
 //!
 //! This module is public so that tests and fuzz targets can hand-craft
 //! frames (e.g. a HELLO advertising a future version). Applications never
-//! need it: the [`crate::Connection`] API hides frames entirely.
+//! need it: the [`crate::Connection`] API hides frames entirely. Types that
+//! are part of the application-facing API ([`KeyId`], [`Signature`],
+//! [`Params`]) are re-exported at the crate root; everything else is only
+//! reachable through this module.
 //!
 //! # Evolution rules
 //!
@@ -16,9 +19,8 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_big_array::BigArray;
 
-use crate::error::{ProtocolError, RejectCode};
+use crate::error::{CloseReason, ProtocolError, RejectCode};
 use crate::frame::FrameType;
-use crate::sched::Class;
 
 /// Lowest protocol version this crate accepts.
 pub const MIN_VERSION: u16 = 1;
@@ -78,16 +80,6 @@ pub struct Hello {
     pub sig: Signature,
 }
 
-/// Whether DATA frames may be zstd-compressed on this connection.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub enum Compression {
-    /// Per-stream decision by the sender, subject to the skip policy.
-    #[default]
-    BodyOnly,
-    /// Never compress.
-    Off,
-}
-
 /// Connection parameters chosen by the server and announced in WELCOME.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Params {
@@ -95,8 +87,9 @@ pub struct Params {
     pub max_frame: u32,
     /// Initial per-stream, per-direction credit, in bytes.
     pub initial_window: u32,
-    /// Server's compression stance (it may refuse, never force).
-    pub compression: Compression,
+    /// Whether the server allows zstd on DATA frames. It may refuse,
+    /// never force: compression happens only when both sides allow it.
+    pub compression_allowed: bool,
     /// Largest application message either side may send on a stream, in
     /// bytes. Bounds the receiver's reassembly buffer.
     pub max_message: u32,
@@ -120,71 +113,8 @@ pub struct Reject {
     pub message: String,
 }
 
-/// Bytes after which an `Interactive` stream is demoted to `Bulk` when a
-/// [`StreamPolicy`] does not say otherwise.
-pub const DEFAULT_DEMOTE_AFTER: u64 = 256 * 1024;
-
-/// OPEN payload: everything the mux is told about a stream. The layer
-/// above decides; the mux only schedules. Compression is *not* here — it
-/// is chosen per message at [`crate::Connection::send`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct StreamPolicy {
-    /// Scheduling class. Never [`Class::Control`].
-    pub class: Class,
-    /// Demote an `Interactive` stream to `Bulk` once this many bytes have
-    /// been sent on it. `None` keeps the class for the stream's life.
-    pub demote_after: Option<u64>,
-}
-
-impl StreamPolicy {
-    /// A policy with the given class and no automatic demotion.
-    pub const fn new(class: Class) -> Self {
-        Self {
-            class,
-            demote_after: None,
-        }
-    }
-
-    /// Set the demotion threshold.
-    pub const fn demote_after(mut self, bytes: u64) -> Self {
-        self.demote_after = Some(bytes);
-        self
-    }
-
-    /// Latency-bound, never compressed by the mux, never demoted.
-    pub const fn realtime() -> Self {
-        Self::new(Class::Realtime)
-    }
-
-    /// Request/response traffic that turns into bulk once it gets big.
-    pub const fn interactive() -> Self {
-        Self::new(Class::Interactive).demote_after(DEFAULT_DEMOTE_AFTER)
-    }
-
-    /// Large transfers.
-    pub const fn bulk() -> Self {
-        Self::new(Class::Bulk)
-    }
-}
-
-impl Default for StreamPolicy {
-    fn default() -> Self {
-        Self::interactive()
-    }
-}
-
-/// Per-message compression stance passed to [`crate::Connection::send`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum Compress {
-    /// The mux may compress if it judges it worthwhile (size floor,
-    /// entropy probe, raw fallback when compression does not shrink the
-    /// fragment). Never applied on `Realtime` streams.
-    #[default]
-    Auto,
-    /// Never compress this message: secrets, already-encoded bodies,
-    /// anything an attacker could probe via a compression side channel.
-    Never,
-}
+/// GOAWAY payload: the closing side's [`CloseReason`].
+pub type Goaway = CloseReason;
 
 /// RST payload: abort both directions of a stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -255,7 +185,7 @@ mod tests {
             params: Params {
                 max_frame: 16 * 1024,
                 initial_window: 512 * 1024,
-                compression: Compression::BodyOnly,
+                compression_allowed: true,
                 max_message: 1 << 20,
             },
         });
@@ -263,13 +193,11 @@ mod tests {
             code: RejectCode::UnsupportedVersion { min: 1, max: 1 },
             message: "nope".into(),
         });
-        round_trip(&StreamPolicy::interactive());
-        round_trip(&StreamPolicy::bulk());
-        round_trip(&StreamPolicy::realtime().demote_after(7));
+        round_trip(&crate::Class::Bulk);
         round_trip(&Rst { code: 5 });
         round_trip(&WindowUpdate { credit: 1000 });
         round_trip(&Ping { opaque: u64::MAX });
-        round_trip(&crate::error::GoAway {
+        round_trip(&crate::error::CloseReason {
             code: crate::error::CloseCode::KeyRevoked,
             message: Some("bye".into()),
         });

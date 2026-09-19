@@ -26,7 +26,7 @@ pub mod control;
 pub mod http;
 pub mod policy;
 
-pub use control::{ControlHead, ControlReply, RefusalCode};
+pub use control::{ControlHead, ControlReply, RefusalCode, is_valid_dns_label};
 pub use http::{HttpHead, HttpResponseHead};
 
 /// Lowest application protocol version this build accepts.
@@ -71,22 +71,6 @@ pub fn decode<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, CodecEr
     Ok(postcard::from_bytes(bytes)?)
 }
 
-/// Enforces service name validation as a single DNS label of at most 63 characters.
-///
-/// Per RFC 1035 / RFC 1123, a valid DNS label:
-/// - Has length between 1 and 63 characters (inclusive)
-/// - Contains only ASCII alphanumeric characters and hyphens
-/// - Cannot start or end with a hyphen
-pub fn is_valid_dns_label(label: &str) -> bool {
-    if label.is_empty() || label.len() > 63 {
-        return false;
-    }
-    if label.starts_with('-') || label.ends_with('-') {
-        return false;
-    }
-    label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -104,25 +88,8 @@ mod tests {
     }
 
     #[test]
-    fn test_dns_label_validation() {
-        assert!(is_valid_dns_label("web"));
-        assert!(is_valid_dns_label("api-1"));
-        assert!(is_valid_dns_label("a"));
-        assert!(!is_valid_dns_label(""));
-        assert!(!is_valid_dns_label("-leading"));
-        assert!(!is_valid_dns_label("trailing-"));
-        assert!(!is_valid_dns_label("with.dot"));
-        assert!(!is_valid_dns_label("with_underscore"));
-        assert!(!is_valid_dns_label(&"a".repeat(64)));
-        assert!(is_valid_dns_label(&"a".repeat(63)));
-    }
-
-    #[test]
     fn heads_round_trip() {
-        let control = Head::Control(ControlHead::Register {
-            proto_version: PROTOCOL_VERSION,
-            service: "web".to_string(),
-        });
+        let control = Head::Control(ControlHead::register("web").unwrap());
         let decoded: Head = decode(&encode(&control).unwrap()).unwrap();
         assert_eq!(control, decoded);
 

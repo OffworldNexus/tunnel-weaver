@@ -14,7 +14,6 @@ use std::collections::VecDeque;
 
 use crate::flow::{RecvWindow, SendWindow};
 use crate::sched::Class;
-use crate::wire::StreamPolicy;
 
 /// Stream identifier. `0` is reserved for connection-level frames; the
 /// opener chooses the id (client odd, server even).
@@ -28,8 +27,6 @@ pub const RST_CODE_CONNECTION_CLOSED: u32 = 0;
 pub(crate) struct Stream {
     /// Current scheduling class.
     pub class: Class,
-    /// Demote `Interactive` to `Bulk` past this many written bytes.
-    pub demote_after: Option<u64>,
     /// We may still send DATA/FIN (no local FIN or RST yet).
     pub local_open: bool,
     /// The peer may still send DATA/FIN (no remote FIN or RST yet).
@@ -67,10 +64,9 @@ pub(crate) struct Stream {
 }
 
 impl Stream {
-    pub fn new(policy: StreamPolicy, window: u32, open_sent: bool) -> Self {
+    pub fn new(class: Class, window: u32, open_sent: bool) -> Self {
         Self {
-            class: policy.class,
-            demote_after: policy.demote_after,
+            class,
             local_open: true,
             remote_open: true,
             open_sent,

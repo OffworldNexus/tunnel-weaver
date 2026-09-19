@@ -7,8 +7,7 @@ use futures_util::{SinkExt, StreamExt};
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, trace};
-use weaver_mux::error::{CloseCode, GoAway};
-use weaver_mux::{Connection, Event};
+use weaver_mux::{CloseCode, CloseReason, Connection, Event, ProtocolError};
 
 use crate::ws::Transport;
 
@@ -21,8 +20,8 @@ use crate::ws::Transport;
 pub trait StreamHandler: Send + 'static {
     /// One mux event. Typical reactions: `Authenticated` → open streams;
     /// `StreamOpened` → remember the stream; `Readable(id)` → loop
-    /// `conn.recv_msg(id)` until `WouldBlock`; `Writable(id)` → retry the
-    /// message that got `WouldBlock`.
+    /// `conn.recv_msg(id)` until `WouldBlock`; `Writable { id, .. }` →
+    /// retry the message that got `WouldBlock`.
     fn on_event(&mut self, conn: &mut Connection, event: Event);
 }
 
@@ -65,7 +64,7 @@ impl<H: StreamHandler> Handle<H> {
     }
 
     /// Tear the connection down with the given reason.
-    pub fn close(&self, reason: GoAway) {
+    pub fn close(&self, reason: CloseReason) {
         self.spawn_on(move |conn, _| conn.close(reason));
     }
 }
@@ -82,7 +81,7 @@ pub enum DriverError {
     /// The peer violated the mux protocol; the mux queued its GOAWAY,
     /// which the driver flushed before returning.
     #[error("protocol error: {0}")]
-    Protocol(#[from] weaver_mux::ProtocolError),
+    Protocol(#[from] ProtocolError),
 }
 
 /// Pumps one [`Connection`] over one [`Transport`] with one handler.
@@ -94,7 +93,7 @@ pub struct Driver<T, H> {
     handle: Handle<H>,
     buf: Vec<u8>,
     /// Reason from the `Event::Closed` we forwarded, if any.
-    last_close: Option<GoAway>,
+    last_close: Option<CloseReason>,
 }
 
 /// How long to sleep when the mux has no deadline armed.
@@ -126,18 +125,18 @@ impl<T: Transport, H: StreamHandler> Driver<T, H> {
     /// handler has seen `Event::Closed` and any outgoing GOAWAY has been
     /// flushed. The handler is returned alongside so callers can inspect
     /// its final state.
-    pub async fn run(mut self) -> (H, Result<GoAway, DriverError>) {
+    pub async fn run(mut self) -> (H, Result<CloseReason, DriverError>) {
         let result = self.run_inner().await;
         (self.handler, result)
     }
 
-    async fn run_inner(&mut self) -> Result<GoAway, DriverError> {
-        let mut outcome: Option<Result<GoAway, DriverError>> = None;
+    async fn run_inner(&mut self) -> Result<CloseReason, DriverError> {
+        let mut outcome: Option<Result<CloseReason, DriverError>> = None;
         loop {
             // Bytes out: one frame per poll, flushed before the next, so
             // the scheduler decides as late as possible.
             if let Err(e) = self.flush().await {
-                self.finish(GoAway::new(CloseCode::Shutdown));
+                self.finish(CloseReason::new(CloseCode::Shutdown));
                 return Err(e);
             }
             if let Some(r) = outcome.take() {
@@ -168,12 +167,12 @@ impl<T: Transport, H: StreamHandler> Driver<T, H> {
                     Some(Ok(None)) => {}
                     Some(Err(e)) => {
                         debug!(error = %e, "transport error");
-                        self.finish(GoAway::new(CloseCode::Shutdown));
+                        self.finish(CloseReason::new(CloseCode::Shutdown));
                         return Err(DriverError::Transport(Box::new(e)));
                     }
                     None => {
                         trace!("transport closed");
-                        self.finish(GoAway::new(CloseCode::Shutdown));
+                        self.finish(CloseReason::new(CloseCode::Shutdown));
                         return Err(DriverError::TransportClosed);
                     }
                 },
@@ -214,16 +213,16 @@ impl<T: Transport, H: StreamHandler> Driver<T, H> {
 
     /// The transport is gone: close the mux locally so the handler sees a
     /// terminal `Closed` and every stream gets its `Reset`.
-    fn finish(&mut self, reason: GoAway) {
+    fn finish(&mut self, reason: CloseReason) {
         if !self.conn.is_closed() {
             self.conn.close(reason);
         }
         self.dispatch_events();
     }
 
-    fn close_reason(&mut self) -> GoAway {
+    fn close_reason(&mut self) -> CloseReason {
         self.last_close
             .take()
-            .unwrap_or(GoAway::new(CloseCode::Shutdown))
+            .unwrap_or(CloseReason::new(CloseCode::Shutdown))
     }
 }

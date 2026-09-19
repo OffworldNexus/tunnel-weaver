@@ -403,12 +403,13 @@ async fn test_duplicate_registration_refusal() {
         .await;
     assert_eq!(res2, Err(RefusalCode::AlreadyRegistered));
 
-    // Invalid DNS label returns InvalidName
-    let res3 = relay
-        .registry
-        .register_service(PocResolver::KEY_ID, conn_id, "-invalid-", proxy_tx)
-        .await;
-    assert_eq!(res3, Err(RefusalCode::InvalidName));
+    // Invalid DNS labels are refused at the schema boundary, before the
+    // registry is reached.
+    drop(proxy_tx);
+    assert_eq!(
+        weaver_proto::ControlHead::register("-invalid-"),
+        Err(RefusalCode::InvalidName)
+    );
 
     relay.shutdown_token.cancel();
 }

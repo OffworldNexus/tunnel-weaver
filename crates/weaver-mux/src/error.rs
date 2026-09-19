@@ -1,4 +1,9 @@
 //! Error and close/reject code types shared across the crate.
+//!
+//! Vocabulary: a connection *closes* for a [`CloseReason`] (sent to the
+//! peer as the GOAWAY frame, see [`crate::wire::Goaway`]); a handshake is
+//! *rejected* with a [`RejectCode`]; a stream is *reset* with an
+//! application-defined `u32` code.
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -53,13 +58,9 @@ pub enum ProtocolError {
     /// The negotiated parameters were outside the allowed ranges.
     #[error("invalid negotiated parameter: {0}")]
     BadParams(&'static str),
-
-    /// The connection is already closed; the frame was ignored.
-    #[error("connection closed")]
-    Closed,
 }
 
-/// Errors returned by the per-stream API (`open`, `write`, `read`, ...).
+/// Errors returned by the per-stream API (`open`, `send`, `recv_msg`, ...).
 #[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
 pub enum StreamError {
     /// The connection has not finished authenticating yet.
@@ -100,10 +101,8 @@ pub enum StreamError {
 #[error("signing failed: {0}")]
 pub struct SignError(pub String);
 
-/// Reason a connection is being closed, carried on the wire in GOAWAY.
-///
-/// The code tells the peer *what to do next*; policy (revocation,
-/// eviction) lives outside the mux.
+/// Why a connection is closing. The code tells the peer *what to do
+/// next*; policy (revocation, eviction) lives outside the mux.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum CloseCode {
     /// The key must never be used again. Do not reconnect.
@@ -120,21 +119,31 @@ pub enum CloseCode {
     Timeout,
 }
 
-/// Payload of GOAWAY and the `reason` of [`crate::Event::Closed`].
+/// Why a connection closed: the argument of [`crate::Connection::close`]
+/// and the `reason` of [`crate::Event::Closed`]. Travels on the wire as
+/// the GOAWAY payload.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct GoAway {
+pub struct CloseReason {
     /// Why the connection is closing.
     pub code: CloseCode,
     /// Optional human-readable detail.
     pub message: Option<String>,
 }
 
-impl GoAway {
-    /// Convenience constructor for a code without message.
+impl CloseReason {
+    /// A reason with no detail message.
     pub fn new(code: CloseCode) -> Self {
         Self {
             code,
             message: None,
+        }
+    }
+
+    /// A reason with a detail message.
+    pub fn with_message(code: CloseCode, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: Some(message.into()),
         }
     }
 }

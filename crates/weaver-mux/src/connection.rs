@@ -4,18 +4,18 @@ use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
 use crate::auth;
-use crate::compress::{self, ZstdCtx};
+use crate::compress::{self, Compress, ZstdCtx};
 use crate::config::{Config, MAX_WINDOW, MIN_MESSAGE, MIN_WINDOW, Role};
-use crate::error::{CloseCode, GoAway, ProtocolError, RejectCode, StreamError};
+use crate::error::{CloseCode, CloseReason, ProtocolError, RejectCode, StreamError};
 use crate::event::Event;
 use crate::frame::{Frame, FrameType};
 use crate::handshake::{self, HandshakeState};
-use crate::sched::{Class, Pick, SchedTree, classify};
+use crate::sched::{Class, Pick, SchedTree};
 use crate::stream::{RST_CODE_CONNECTION_CLOSED, Stream, StreamId};
 use crate::timers::{Expired, Timers};
 use crate::wire::{
-    self, Challenge, Compress, Compression, DATA_FLAG_COMPRESSED, DATA_FLAG_MORE, DATA_FLAGS_KNOWN,
-    Hello, KeyId, MAX_VERSION, Params, Ping, Reject, Rst, StreamPolicy, Welcome, WindowUpdate,
+    self, Challenge, DATA_FLAG_COMPRESSED, DATA_FLAG_MORE, DATA_FLAGS_KNOWN, Goaway, Hello, KeyId,
+    MAX_VERSION, Params, Ping, Reject, Rst, Welcome, WindowUpdate,
 };
 
 /// Multiplier of `max_frame` bounding the decompressed size of one DATA
@@ -26,8 +26,11 @@ const DECOMPRESS_CAP_FACTOR: usize = 8;
 ///
 /// All methods take `&mut self` and never block. Time is only ever the
 /// `now` passed in; randomness only ever comes from `Config::rng`.
+///
+/// Every stream method (`open`, `send`, `finish`, `reset`, `recv_msg`,
+/// `set_class`) fails with `StreamError::Closed` after the connection
+/// closed and `StreamError::NotAuthenticated` before WELCOME.
 pub struct Connection {
-    role: Role,
     cfg: Config,
     hs: HandshakeState,
     nonce_s: Option<[u8; 32]>,
@@ -46,7 +49,7 @@ pub struct Connection {
     /// GOAWAY is emitted from here, ahead of the scheduler, so it is
     /// literally the next frame after `close()`.
     pending_goaway: Option<Frame>,
-    closed: Option<GoAway>,
+    closed: Option<CloseReason>,
     timers: Timers,
     events: VecDeque<Event>,
     rtt: Option<Duration>,
@@ -57,7 +60,7 @@ pub struct Connection {
 impl std::fmt::Debug for Connection {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Connection")
-            .field("role", &self.role)
+            .field("role", &self.cfg.role)
             .field("hs", &self.hs)
             .field("version", &self.version)
             .field("streams", &self.streams.len())
@@ -72,24 +75,30 @@ impl Connection {
     /// right after.
     pub fn new(mut cfg: Config, now: Instant) -> Self {
         cfg.normalize();
+        let (reverify, max_frame, hs, next_stream_id) = match &cfg.role {
+            Role::Client { .. } => (None, 0, HandshakeState::AwaitChallenge, 1),
+            Role::Server {
+                params,
+                reverify_interval,
+                ..
+            } => (
+                *reverify_interval,
+                params.max_frame,
+                HandshakeState::ChallengeSent,
+                2,
+            ),
+        };
         let timers = Timers::new(
             now,
             cfg.handshake_timeout,
             cfg.ping_interval,
             cfg.idle_timeout,
-            match cfg.role {
-                Role::Server => cfg.reverify_interval,
-                Role::Client => None,
-            },
+            reverify,
         );
-        let sched = SchedTree::new(cfg.weights, cfg.max_frame);
+        // The client learns `max_frame` from WELCOME and rebuilds then.
+        let sched = SchedTree::new(cfg.weights, max_frame.max(2));
         let zstd = ZstdCtx::new(cfg.zstd_level);
-        let (hs, next_stream_id) = match cfg.role {
-            Role::Client => (HandshakeState::AwaitChallenge, 1),
-            Role::Server => (HandshakeState::ChallengeSent, 2),
-        };
         let mut conn = Self {
-            role: cfg.role,
             cfg,
             hs,
             nonce_s: None,
@@ -110,7 +119,7 @@ impl Connection {
             ping_counter: 0,
             zstd,
         };
-        if conn.role == Role::Server {
+        if conn.cfg.role.is_server() {
             let mut nonce_s = [0u8; 32];
             conn.cfg.rng.fill_bytes(&mut nonce_s);
             conn.nonce_s = Some(nonce_s);
@@ -152,6 +161,11 @@ impl Connection {
         self.streams.get(&id).map(|s| s.class)
     }
 
+    /// Complete messages waiting on a stream, if it exists.
+    pub fn pending_messages(&self, id: StreamId) -> Option<usize> {
+        self.streams.get(&id).map(Stream::pending_messages)
+    }
+
     /// Next event for the application, in order.
     pub fn poll_event(&mut self) -> Option<Event> {
         self.events.pop_front()
@@ -177,18 +191,18 @@ impl Connection {
             match self.timers.expired(now) {
                 None => break,
                 Some(Expired::Handshake) | Some(Expired::Idle) => {
-                    self.close_internal(GoAway::new(CloseCode::Timeout), true);
+                    self.close_internal(CloseReason::new(CloseCode::Timeout), true);
                 }
                 Some(Expired::Reverify) => {
-                    let still_valid = match (&mut self.cfg.verifier, &self.key_id) {
-                        (Some(v), Some(k)) => v.still_valid(k),
+                    let still_valid = match (&mut self.cfg.role, &self.key_id) {
+                        (Role::Server { verifier, .. }, Some(k)) => verifier.still_valid(k),
                         _ => true,
                     };
                     if let Some(interval) = self.timers.reverify_interval {
                         self.timers.reverify_due = Some(now + interval);
                     }
                     if !still_valid {
-                        self.close_internal(GoAway::new(CloseCode::KeyRevoked), true);
+                        self.close_internal(CloseReason::new(CloseCode::KeyRevoked), true);
                     }
                 }
                 Some(Expired::Ping) => {
@@ -326,10 +340,11 @@ impl Connection {
 
     /// Feed one frame (exactly one transport message) from the peer. Any
     /// `Err` means the connection closed itself with `GOAWAY { ProtocolError }`.
+    /// Frames arriving after the connection closed are ignored.
     pub fn recv(&mut self, now: Instant, bytes: &[u8]) -> Result<(), ProtocolError> {
         let now = self.timers.observe(now);
         if self.closed.is_some() {
-            return Err(ProtocolError::Closed);
+            return Ok(());
         }
         let frame = match Frame::parse(bytes) {
             Ok(f) => f,
@@ -345,10 +360,7 @@ impl Connection {
     fn fail(&mut self, err: ProtocolError) -> ProtocolError {
         if self.closed.is_none() {
             self.close_internal(
-                GoAway {
-                    code: CloseCode::ProtocolError,
-                    message: Some(err.to_string()),
-                },
+                CloseReason::with_message(CloseCode::ProtocolError, err.to_string()),
                 true,
             );
         }
@@ -397,9 +409,12 @@ impl Connection {
     // --- handshake ------------------------------------------------------
 
     fn on_challenge(&mut self, frame: Frame) -> Result<(), ProtocolError> {
-        if self.role != Role::Client || self.hs != HandshakeState::AwaitChallenge {
+        if self.hs != HandshakeState::AwaitChallenge {
             return Err(ProtocolError::StateViolation("unexpected CHALLENGE"));
         }
+        let Role::Client { signer } = &mut self.cfg.role else {
+            return Err(ProtocolError::StateViolation("unexpected CHALLENGE"));
+        };
         let ch: Challenge = wire::decode_payload(FrameType::Challenge, &frame.payload)?;
         let mut nonce_c = [0u8; 32];
         self.cfg.rng.fill_bytes(&mut nonce_c);
@@ -409,11 +424,6 @@ impl Connection {
             &self.cfg.server_name,
             self.cfg.channel_binding.as_ref(),
         );
-        let signer = self
-            .cfg
-            .signer
-            .as_mut()
-            .expect("client config carries a signer");
         let key_id = signer.key_id();
         let sig = match signer.sign(&msg) {
             Ok(sig) => sig,
@@ -421,10 +431,7 @@ impl Connection {
                 // We cannot authenticate; tell the peer we are leaving and
                 // surface the reason locally as a rejection-style close.
                 self.close_internal(
-                    GoAway {
-                        code: CloseCode::Rejected,
-                        message: Some(e.to_string()),
-                    },
+                    CloseReason::with_message(CloseCode::Rejected, e.to_string()),
                     true,
                 );
                 return Ok(());
@@ -446,9 +453,21 @@ impl Connection {
     }
 
     fn on_hello(&mut self, now: Instant, frame: Frame) -> Result<(), ProtocolError> {
-        if self.role != Role::Server || self.hs != HandshakeState::ChallengeSent {
+        if self.hs != HandshakeState::ChallengeSent {
             return Err(ProtocolError::StateViolation("unexpected HELLO"));
         }
+        let Role::Server {
+            verifier, params, ..
+        } = &mut self.cfg.role
+        else {
+            return Err(ProtocolError::StateViolation("unexpected HELLO"));
+        };
+        let params = Params {
+            max_frame: params.max_frame,
+            initial_window: params.initial_window,
+            compression_allowed: params.compression_allowed,
+            max_message: params.max_message,
+        };
         let hello: Hello = wire::decode_payload(FrameType::Hello, &frame.payload)?;
         let version = match handshake::negotiate(hello.version) {
             Ok(v) => v,
@@ -457,11 +476,6 @@ impl Connection {
                 return Ok(());
             }
         };
-        let verifier = self
-            .cfg
-            .verifier
-            .as_mut()
-            .expect("server config carries a verifier");
         let Some(pk) = verifier.public_key(&hello.key_id) else {
             self.reject(RejectCode::UnknownKey, "unknown key");
             return Ok(());
@@ -477,12 +491,6 @@ impl Connection {
             self.reject(RejectCode::BadSignature, "signature verification failed");
             return Ok(());
         }
-        let params = Params {
-            max_frame: self.cfg.max_frame,
-            initial_window: self.cfg.initial_window,
-            compression: self.cfg.compression,
-            max_message: self.cfg.max_message,
-        };
         self.handshake_out.push_back(Frame {
             stream_id: 0,
             frame_type: FrameType::Welcome,
@@ -503,16 +511,13 @@ impl Connection {
             }),
         });
         self.close_internal(
-            GoAway {
-                code: CloseCode::Rejected,
-                message: Some(message.to_owned()),
-            },
+            CloseReason::with_message(CloseCode::Rejected, message),
             false,
         );
     }
 
     fn on_welcome(&mut self, now: Instant, frame: Frame) -> Result<(), ProtocolError> {
-        if self.role != Role::Client || self.hs != HandshakeState::HelloSent {
+        if self.cfg.role.is_server() || self.hs != HandshakeState::HelloSent {
             return Err(ProtocolError::StateViolation("unexpected WELCOME"));
         }
         let w: Welcome = wire::decode_payload(FrameType::Welcome, &frame.payload)?;
@@ -541,15 +546,14 @@ impl Connection {
         self.hs = HandshakeState::Done;
         self.version = Some(version);
         self.params = Some(params);
-        self.compression_enabled = self.cfg.compression == Compression::BodyOnly
-            && params.compression == Compression::BodyOnly;
+        self.compression_enabled = self.cfg.compression_allowed && params.compression_allowed;
         self.timers.on_authenticated(now);
         self.events
             .push_back(Event::Authenticated { key_id, version });
     }
 
     fn on_reject(&mut self, frame: Frame) -> Result<(), ProtocolError> {
-        if self.role != Role::Client || self.hs != HandshakeState::HelloSent {
+        if self.cfg.role.is_server() || self.hs != HandshakeState::HelloSent {
             return Err(ProtocolError::StateViolation("unexpected REJECT"));
         }
         let r: Reject = wire::decode_payload(FrameType::Reject, &frame.payload)?;
@@ -559,10 +563,7 @@ impl Connection {
         });
         // The server closes after REJECT; nothing we send would be read.
         self.close_internal(
-            GoAway {
-                code: CloseCode::Rejected,
-                message: Some(r.message),
-            },
+            CloseReason::with_message(CloseCode::Rejected, r.message),
             false,
         );
         Ok(())
@@ -592,7 +593,7 @@ impl Connection {
     }
 
     fn on_goaway(&mut self, frame: Frame) -> Result<(), ProtocolError> {
-        let g: GoAway = wire::decode_payload(FrameType::Goaway, &frame.payload)?;
+        let g: Goaway = wire::decode_payload(FrameType::Goaway, &frame.payload)?;
         self.close_internal(g, false);
         Ok(())
     }
@@ -600,7 +601,7 @@ impl Connection {
     // --- streams --------------------------------------------------------
 
     fn peer_opens_odd(&self) -> bool {
-        self.role == Role::Server
+        self.cfg.role.is_server()
     }
 
     /// Frames for a stream we no longer track are tolerated when the id is
@@ -628,18 +629,18 @@ impl Connection {
         if (id % 2 == 1) != self.peer_opens_odd() || id <= self.last_peer_stream_id {
             return Err(ProtocolError::BadStreamId(id));
         }
-        let policy: StreamPolicy = wire::decode_payload(FrameType::Open, &frame.payload)?;
-        if policy.class == Class::Control {
+        let class: Class = wire::decode_payload(FrameType::Open, &frame.payload)?;
+        if class == Class::Control {
             return Err(ProtocolError::BadPolicy(id));
         }
         let window = self.params.expect("authenticated").initial_window;
         // The peer's OPEN is already on the wire, so our DATA may follow at
         // any time: `open_sent` is trivially true.
-        let stream = Stream::new(policy, window, true);
+        let stream = Stream::new(class, window, true);
         self.streams.insert(id, stream);
-        self.sched.add_stream(id, policy.class);
+        self.sched.add_stream(id, class);
         self.last_peer_stream_id = id;
-        self.events.push_back(Event::StreamOpened { id, policy });
+        self.events.push_back(Event::StreamOpened { id, class });
         Ok(())
     }
 
@@ -734,9 +735,10 @@ impl Connection {
             return Ok(());
         };
         stream.send.grant(wu.credit);
-        if stream.wants_writable && stream.free_credit() > 0 {
+        let credit = stream.free_credit();
+        if stream.wants_writable && credit > 0 {
             stream.wants_writable = false;
-            self.events.push_back(Event::Writable(id));
+            self.events.push_back(Event::Writable { id, credit });
         }
         Ok(())
     }
@@ -755,24 +757,24 @@ impl Connection {
         Ok(())
     }
 
-    /// Open a stream toward the peer with the given scheduling policy.
-    /// Allowed only between WELCOME and close. No application bytes travel
-    /// in OPEN: send your own head as the first message.
-    pub fn open(&mut self, policy: StreamPolicy) -> Result<StreamId, StreamError> {
+    /// Open a stream toward the peer in the given scheduling class. No
+    /// application bytes travel in OPEN: send your own head as the first
+    /// message.
+    pub fn open(&mut self, class: Class) -> Result<StreamId, StreamError> {
         self.ready()?;
-        if policy.class == Class::Control {
+        if class == Class::Control {
             return Err(StreamError::InvalidClass);
         }
         let id = self.next_stream_id;
         self.next_stream_id = id.checked_add(2).ok_or(StreamError::Exhausted)?;
         let window = self.params.expect("authenticated").initial_window;
-        let stream = Stream::new(policy, window, false);
+        let stream = Stream::new(class, window, false);
         self.streams.insert(id, stream);
-        self.sched.add_stream(id, policy.class);
+        self.sched.add_stream(id, class);
         self.sched.push_control(Frame {
             stream_id: id,
             frame_type: FrameType::Open,
-            payload: wire::encode_payload(&policy),
+            payload: wire::encode_payload(&class),
         });
         Ok(id)
     }
@@ -848,9 +850,13 @@ impl Connection {
             stream.outbox.push_back(payload);
         }
         stream.written_total += msg.len() as u64;
-        // Demotion to bulk after enough bytes, per the stream's policy.
+        // The one class change the mux makes on its own: an interactive
+        // stream that has sent more than `bulk_threshold` is bulk.
         let old_class = stream.class;
-        let new_class = classify::after_write(old_class, stream.written_total, stream.demote_after);
+        let new_class = match (old_class, self.cfg.bulk_threshold) {
+            (Class::Interactive, Some(t)) if stream.written_total > t => Class::Bulk,
+            (c, _) => c,
+        };
         let head_len = stream.head_len();
         let open_sent = stream.open_sent;
         let was_active = stream.sched_active;
@@ -911,9 +917,7 @@ impl Connection {
     /// [`Event::Readable`]; `UnknownStream` once the stream is gone
     /// (after [`Event::Finished`] with nothing left, or after a reset).
     pub fn recv_msg(&mut self, id: StreamId) -> Result<Vec<u8>, StreamError> {
-        if self.closed.is_some() {
-            return Err(StreamError::Closed);
-        }
+        self.ready()?;
         let stream = self
             .streams
             .get_mut(&id)
@@ -946,35 +950,30 @@ impl Connection {
         self.maybe_forget(id);
     }
 
-    /// Replace a stream's scheduling policy. Takes effect on the next
-    /// scheduling decision; queued frames keep their order.
-    pub fn set_policy(&mut self, id: StreamId, policy: StreamPolicy) -> Result<(), StreamError> {
+    /// Move a stream to another scheduling class. Takes effect on the next
+    /// scheduling decision; queued frames keep their order. An
+    /// `Interactive` stream is still subject to `bulk_threshold` demotion.
+    pub fn set_class(&mut self, id: StreamId, class: Class) -> Result<(), StreamError> {
         self.ready()?;
-        if policy.class == Class::Control {
+        if class == Class::Control {
             return Err(StreamError::InvalidClass);
         }
         let stream = self
             .streams
             .get_mut(&id)
             .ok_or(StreamError::UnknownStream)?;
-        stream.demote_after = policy.demote_after;
         let old = stream.class;
-        if old != policy.class {
-            stream.class = policy.class;
+        if old != class {
+            stream.class = class;
             let head_len = if stream.open_sent {
                 stream.head_len()
             } else {
                 None
             };
             stream.sched_active = head_len.is_some();
-            self.sched.reclass(id, old, policy.class, head_len);
+            self.sched.reclass(id, old, class, head_len);
         }
         Ok(())
-    }
-
-    /// Complete messages waiting on a stream (0 for unknown streams).
-    pub fn pending_messages(&self, id: StreamId) -> usize {
-        self.streams.get(&id).map_or(0, Stream::pending_messages)
     }
 
     // ------------------------------------------------------------------
@@ -983,13 +982,13 @@ impl Connection {
 
     /// Tear the connection down. GOAWAY is the very next frame out, every
     /// open stream is reset, and `Event::Closed` is emitted locally.
-    pub fn close(&mut self, goaway: GoAway) {
-        self.close_internal(goaway, true);
+    pub fn close(&mut self, reason: CloseReason) {
+        self.close_internal(reason, true);
     }
 
     /// `send_goaway` is false when the peer initiated the close (or already
     /// left after REJECT): nothing we send would be read.
-    fn close_internal(&mut self, reason: GoAway, send_goaway: bool) {
+    fn close_internal(&mut self, reason: CloseReason, send_goaway: bool) {
         if self.closed.is_some() {
             return;
         }

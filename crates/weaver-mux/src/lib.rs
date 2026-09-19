@@ -10,12 +10,14 @@
 //! # Policy, not content
 //!
 //! The mux knows nothing about what travels on a stream. The layer above
-//! tells it *what to do*: a [`StreamPolicy`] (scheduling class, demotion
-//! threshold) at [`Connection::open`], and a [`Compress`] stance on every
-//! [`Connection::send`]. Under [`Compress::Auto`] the mux may still decline
-//! (size floor, entropy probe, `Realtime` class); under
+//! tells it *what to do*: a scheduling [`Class`] at [`Connection::open`]
+//! (changeable later with [`Connection::set_class`]), and a [`Compress`]
+//! stance on every [`Connection::send`]. Under [`Compress::Auto`] the mux
+//! may still decline (size floor, entropy probe, `Realtime` class); under
 //! [`Compress::Never`] it never compresses — that is how the layer above
-//! keeps secrets and already-encoded bodies out of the compressor.
+//! keeps secrets and already-encoded bodies out of the compressor. The one
+//! decision the mux takes alone: an `Interactive` stream that has sent more
+//! than `Config::bulk_threshold` bytes becomes `Bulk`.
 //!
 //! # Messages, not bytes
 //!
@@ -70,40 +72,42 @@
 //!
 //! # Structure
 //!
-//! * [`frame`] / [`wire`]: frame header and postcard payload codecs;
-//! * [`auth`]: handshake transcript and signature verification;
-//! * [`sched`]: two-level QFQ tree (classes, then streams);
-//! * [`Connection`]: the state machine tying it all together.
+//! * [`Connection`]: the state machine and the whole application API;
+//! * [`Config`] / [`Role`]: what the adapter supplies;
+//! * [`auth`]: the [`Signer`] / [`Verifier`] traits the adapter implements;
+//! * [`wire`] / [`Frame`]: payload and frame codecs, public for tests and
+//!   fuzz targets only.
 #![forbid(clippy::disallowed_methods)]
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
 pub mod auth;
-pub mod config;
+mod compress;
+mod config;
 mod connection;
-pub mod error;
-pub mod event;
-pub mod flow;
-pub mod frame;
+mod error;
+mod event;
+mod flow;
+mod frame;
 mod handshake;
-pub mod sched;
+mod sched;
 mod stream;
 mod timers;
 pub mod wire;
-
-mod compress;
 
 #[cfg(feature = "test-util")]
 pub mod testing;
 
 pub use auth::{PublicKey, Signer, Verifier};
-pub use config::{Config, Role, Weights};
+pub use compress::Compress;
+pub use config::{
+    Config, DEFAULT_BULK_THRESHOLD, MAX_WINDOW, MIN_MESSAGE, MIN_WINDOW, Role, ServerParams,
+    Weights,
+};
 pub use connection::Connection;
-pub use error::{CloseCode, GoAway, ProtocolError, RejectCode, SignError, StreamError};
+pub use error::{CloseCode, CloseReason, ProtocolError, RejectCode, SignError, StreamError};
 pub use event::Event;
 pub use frame::{Frame, FrameType};
 pub use sched::Class;
 pub use stream::{RST_CODE_CONNECTION_CLOSED, StreamId};
-pub use wire::{
-    Compress, Compression, DEFAULT_DEMOTE_AFTER, KeyId, Params, Signature, StreamPolicy,
-};
+pub use wire::{KeyId, Params, Signature};

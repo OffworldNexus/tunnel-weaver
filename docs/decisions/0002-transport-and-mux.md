@@ -99,10 +99,10 @@ Key design points:
   guarantee is QFQ's delay bound, not "always next". The one exception is
   `GOAWAY`: `close()` places it in a dedicated slot ahead of the scheduler
   so it is literally the next frame out.
-- **Classification is the caller's** (ADR 0004). `OPEN` carries a
-  `StreamPolicy { class, demote_after }` chosen by the layer above; the
-  mux applies exactly one automatic rule, demoting `interactive` to
-  `bulk` past `demote_after` bytes. `set_policy` changes it later. The
+- **Classification is the caller's** (ADR 0004, 0005). `OPEN` carries a
+  `Class` chosen by the layer above; the mux applies exactly one
+  automatic rule, demoting `interactive` to `bulk` past
+  `Config::bulk_threshold` sent bytes. `set_class` changes it later. The
   mux has no notion of MIME types, upgrades or content lengths.
 - **Compression is per message** (ADR 0004). Every `send` carries a
   `Compress::{Never, Auto}` stance. `Never` is final. Under `Auto` the mux

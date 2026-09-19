@@ -1,8 +1,7 @@
 //! Two-level QFQ scheduling tree: classes at the top, streams inside each
 //! data class, and a FIFO of control frames as the control class's backlog.
 
-pub mod classify;
-pub mod qfq;
+mod qfq;
 
 use std::collections::VecDeque;
 
@@ -15,26 +14,23 @@ use crate::stream::StreamId;
 
 /// Scheduling class of a stream (or of the control queue).
 ///
-/// Carried on the wire in OPEN as part of [`crate::StreamPolicy`], so the
-/// variant order is part of the protocol: append, never reorder.
+/// Carried on the wire as the OPEN payload, so the variant order is part
+/// of the protocol: append, never reorder.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Class {
     /// Connection-level frames plus OPEN/FIN/RST/WINDOW_UPDATE. Not a
     /// valid stream class.
     Control,
-    /// Latency-sensitive interactive traffic (upgrades, event streams).
-    /// The mux never compresses on this class.
+    /// Latency-sensitive traffic. The mux never compresses on this class.
     Realtime,
-    /// Request/response traffic: the default for anything not known to be
-    /// large.
+    /// Request/response traffic: the default. Demoted to `Bulk` once
+    /// `Config::bulk_threshold` bytes have been sent on the stream.
     Interactive,
-    /// Large or long-running bodies.
+    /// Throughput traffic.
     Bulk,
 }
 
 impl Class {
-    const DATA: [Class; 3] = [Class::Realtime, Class::Interactive, Class::Bulk];
-
     fn idx(self) -> usize {
         match self {
             Class::Control => unreachable!("control has no inner scheduler"),
@@ -89,11 +85,6 @@ impl SchedTree {
         self.top.activate(Class::Control, len);
     }
 
-    /// Number of control frames waiting.
-    pub fn control_pending(&self) -> usize {
-        self.control.len()
-    }
-
     /// Drop every queued control frame (connection closing).
     pub fn clear_control(&mut self) {
         self.control.clear();
@@ -124,16 +115,6 @@ impl SchedTree {
         if was_idle {
             let len = inner.next_head_len().unwrap_or(head_len);
             self.top.activate(class, len);
-        }
-    }
-
-    /// The stream has nothing sendable right now (empty outbox or no
-    /// credit). Not backlogged → consumes no virtual time.
-    pub fn deactivate_stream(&mut self, id: StreamId, class: Class) {
-        let inner = &mut self.inner[class.idx()];
-        inner.deactivate(id);
-        if !inner.has_backlog() {
-            self.top.deactivate(class);
         }
     }
 
@@ -181,24 +162,5 @@ impl SchedTree {
                 self.top.served(class, len, next);
             }
         }
-    }
-
-    /// Anything at all waiting to be sent?
-    pub fn has_backlog(&self) -> bool {
-        self.top.has_backlog()
-    }
-
-    /// Classes that currently have backlog (diagnostics/tests).
-    pub fn backlogged_classes(&self) -> Vec<Class> {
-        let mut out = Vec::new();
-        if !self.control.is_empty() {
-            out.push(Class::Control);
-        }
-        for c in Class::DATA {
-            if self.inner[c.idx()].has_backlog() {
-                out.push(c);
-            }
-        }
-        out
     }
 }

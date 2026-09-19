@@ -11,7 +11,19 @@
 use std::io;
 
 use crate::sched::Class;
-use crate::wire::Compress;
+
+/// Per-message compression stance passed to [`crate::Connection::send`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Compress {
+    /// The mux may compress if it judges it worthwhile (size floor,
+    /// entropy probe, raw fallback when compression does not shrink the
+    /// fragment). Never applied on `Realtime` streams.
+    #[default]
+    Auto,
+    /// Never compress this message: secrets, already-encoded bodies,
+    /// anything an attacker could probe via a compression side channel.
+    Never,
+}
 
 /// Fragments smaller than this are not worth a zstd header.
 pub const MIN_COMPRESS_LEN: usize = 1024;

@@ -4,13 +4,13 @@ Date: 2026-09-19
 
 ## Status
 
-Accepted. Supersedes the classification, compression and framing points of ADR 0002 and the stream-1 / PoC-key wording of ADR 0003.
+Accepted. Supersedes the classification, compression and framing points of ADR 0002 and the stream-1 / PoC-key wording of ADR 0003. Amended by ADR 0005: `StreamPolicy` became a bare `Class` with demotion as a connection setting, `GoAway` became `CloseReason`, `Compression` became `compression_allowed`.
 
 The wire format changes here are **breaking but unversioned**: the protocol stays `weaver-mux-v1` (mux `MIN_VERSION = MAX_VERSION = 1`, application `PROTOCOL_VERSION = 1`) until the 1.0 release. Before 1.0 there is no compatibility promise between builds; every deployment ships client and relay together.
 
 ## Context
 
-`docs/architecture-layers.md` audited the boundaries between `weaver-mux`, `weaver-proto` and the binaries and found:
+An audit of the boundaries between `weaver-mux`, `weaver-proto` and the binaries (pre-ADR tree) found:
 
 - The mux carried an HTTP vocabulary (`Hints`: MIME type, Content-Length, Upgrade, Content-Encoding) and a MIME table, so it knew about the layer above it, while proto sent `Hints::default()` and could not say anything the heuristics did not already cover — in particular "this is a secret, do not compress".
 - Compression was decided once per stream, so "uncompressed headers, compressed body" (the BREACH shape) was inexpressible.

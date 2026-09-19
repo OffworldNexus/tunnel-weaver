@@ -5,9 +5,7 @@
 use std::time::Duration;
 
 use weaver_mux::testing::{Ed25519TestSigner, FakeClock, MapVerifier, SeededRng};
-use weaver_mux::{
-    Compress, Config, Connection, Event, Frame, FrameType, Signer as _, StreamPolicy,
-};
+use weaver_mux::{Compress, Config, Connection, Event, Frame, FrameType, Signer as _};
 
 pub const SERVER_NAME: &str = "mux.example.test";
 
@@ -169,7 +167,7 @@ pub fn send(conn: &mut Connection, id: u32, msg: &[u8]) {
     conn.send(id, msg, Compress::Auto).expect("send");
 }
 
-/// Interactive policy that never demotes, for tests that pin a class.
-pub fn pinned(class: weaver_mux::Class) -> StreamPolicy {
-    StreamPolicy::new(class)
+/// Set a server's announced parameters.
+pub fn server_params(cfg: &mut Config, f: impl FnOnce(&mut weaver_mux::ServerParams)) {
+    f(cfg.server_params_mut().expect("server config"));
 }

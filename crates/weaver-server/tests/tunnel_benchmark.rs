@@ -1,6 +1,6 @@
 use std::time::{Duration, Instant};
 use weaver_mux::testing::{Ed25519TestSigner, FakeClock, MapVerifier};
-use weaver_mux::{Compress, Config, Connection, Event, Signer as _, StreamPolicy};
+use weaver_mux::{Class, Compress, Config, Connection, Event, Signer as _};
 
 /// A simulated throttled duplex pipe between client and server.
 struct ThrottledPipe {
@@ -31,7 +31,7 @@ impl ThrottledPipe {
             "weaver.test".to_string(),
             Box::new(weaver_mux::testing::SeededRng::new(43)),
         );
-        server_cfg.initial_window = 4 * 1024 * 1024;
+        server_cfg.server_params_mut().unwrap().initial_window = 4 * 1024 * 1024;
         let server = Connection::new(server_cfg, now);
 
         let mut pipe = Self {
@@ -109,7 +109,7 @@ fn test_concurrent_small_requests_during_50mb_bulk_transfer() {
     let mut baseline_latencies = Vec::new();
     for _ in 0..20 {
         let start_tick = pipe.clock.now();
-        let stream = pipe.client.open(StreamPolicy::interactive()).unwrap();
+        let stream = pipe.client.open(Class::Interactive).unwrap();
 
         let _ = pipe
             .client
@@ -151,7 +151,7 @@ fn test_concurrent_small_requests_during_50mb_bulk_transfer() {
     let p99_baseline = baseline_latencies[(baseline_latencies.len() as f64 * 0.95) as usize];
 
     // 2. Start an active 50 MB bulk transfer
-    let bulk_stream = pipe.client.open(StreamPolicy::bulk()).unwrap();
+    let bulk_stream = pipe.client.open(Class::Bulk).unwrap();
 
     let chunk = vec![0xaa; 32 * 1024];
     let _ = pipe.client.send(bulk_stream, &chunk, Compress::Never);
@@ -162,7 +162,7 @@ fn test_concurrent_small_requests_during_50mb_bulk_transfer() {
         let _ = pipe.client.send(bulk_stream, &chunk, Compress::Never);
 
         let start_tick = pipe.clock.now();
-        let small_stream = pipe.client.open(StreamPolicy::interactive()).unwrap();
+        let small_stream = pipe.client.open(Class::Interactive).unwrap();
 
         let _ = pipe.client.send(
             small_stream,

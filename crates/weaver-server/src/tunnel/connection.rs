@@ -18,8 +18,9 @@ use hyper_util::rt::TokioIo;
 use tokio::sync::{mpsc, oneshot};
 use tokio_tungstenite::WebSocketStream;
 use tracing::{debug, info, trace};
-use weaver_mux::error::{CloseCode, GoAway};
-use weaver_mux::{Compress, Config, Connection, Event, KeyId, StreamError, StreamId};
+use weaver_mux::{
+    CloseCode, CloseReason, Compress, Config, Connection, Event, KeyId, StreamError, StreamId,
+};
 use weaver_proto::control::{ControlHead, ControlReply, RefusalCode};
 use weaver_proto::http::{HttpHead, HttpResponseHead};
 use weaver_proto::{Head, policy};
@@ -117,7 +118,7 @@ impl StreamHandler for RelayHandler {
                 tokio::spawn(async move {
                     if s_rx.await.is_ok() {
                         info!("Tunnel connection superseded, closing");
-                        h.close(GoAway::new(CloseCode::Superseded));
+                        h.close(CloseReason::new(CloseCode::Superseded));
                     }
                 });
             }
@@ -135,7 +136,7 @@ impl StreamHandler for RelayHandler {
                     }
                 }
             }
-            Event::Writable(id) => {
+            Event::Writable { id, .. } => {
                 if let Some(ex) = self.inflight.get_mut(&id) {
                     Self::drain_request_body(ex, conn, id);
                 }
@@ -177,20 +178,18 @@ impl RelayHandler {
 
     /// First message on a client-opened stream must be a `Head::Control`.
     fn on_first_message(&mut self, conn: &mut Connection, id: StreamId, msg: &[u8]) {
-        let Ok(Head::Control(ControlHead::Register {
-            proto_version,
-            service,
-        })) = weaver_proto::decode::<Head>(msg)
-        else {
+        let Ok(Head::Control(head)) = weaver_proto::decode::<Head>(msg) else {
             debug!(%id, "Unexpected first message from client; resetting");
             let _ = conn.reset(id, 0);
             return;
         };
+        let ControlHead::Register { service, .. } = &head;
+        let service = service.clone();
         let (Some(key), Some(conn_id)) = (self.key, self.conn_id) else {
             let _ = conn.reset(id, 0);
             return;
         };
-        if let Err(code) = weaver_proto::accept_protocol_version(proto_version) {
+        if let Err(code) = head.validate() {
             Self::reply(conn, id, refused(code, &service));
             return;
         }
@@ -234,7 +233,7 @@ impl RelayHandler {
                 return;
             }
         };
-        let id = match conn.open(policy::stream_policy(&req.head)) {
+        let id = match conn.open(policy::request_class(&req.head)) {
             Ok(id) => id,
             Err(e) => {
                 let _ = req.response_tx.send(Err(ProxyError::Mux(e.to_string())));
@@ -307,8 +306,8 @@ impl RelayHandler {
                     return;
                 }
             };
-            if let Some(p) = policy::response_policy(&ex.req, &head) {
-                let _ = conn.set_policy(id, p);
+            if let Some(class) = policy::response_class(&ex.req, &head) {
+                let _ = conn.set_class(id, class);
             }
             let mut builder = Response::builder().status(
                 StatusCode::from_u16(head.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),

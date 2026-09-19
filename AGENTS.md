@@ -18,8 +18,9 @@
   any RNG inside it (clippy.toml + `#![forbid]` enforce this). Tests use
   `weaver_mux::testing` (feature `test-util`) for the fake clock, seeded
   RNG, and in-memory signers/verifier.
-- Layering (ADR 0004): `weaver-mux` knows policy (`StreamPolicy`,
-  `Compress`), never content (no MIME, HTTP, identities). `weaver-proto`
+- Layering (ADR 0004, 0005): `weaver-mux` knows policy (`Class`,
+  `Compress`), never content (no MIME, HTTP, identities). Public surface
+  is minimal: an item is either used by the PoC or deleted, never hidden. `weaver-proto`
   is schema + HTTP→policy rules and holds no keys. `weaver-tokio` is the
   only event loop; binaries plug a `StreamHandler` into its `Driver`.
   Streams carry whole messages (`send`/`recv_msg`); never add a length

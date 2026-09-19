@@ -136,6 +136,7 @@ impl<K: Copy + Eq + Hash> Qfq<K> {
     }
 
     /// Current system virtual time (exposed for tests and diagnostics).
+    #[cfg(test)]
     pub fn virtual_time(&self) -> u64 {
         self.v
     }
@@ -175,6 +176,7 @@ impl<K: Copy + Eq + Hash> Qfq<K> {
     }
 
     /// Does the scheduler know this flow?
+    #[cfg(test)]
     pub fn contains(&self, k: K) -> bool {
         self.flows.contains_key(&k)
     }
@@ -225,6 +227,7 @@ impl<K: Copy + Eq + Hash> Qfq<K> {
     }
 
     /// Is the flow currently backlogged?
+    #[cfg(test)]
     pub fn is_active(&self, k: K) -> bool {
         self.flows.get(&k).is_some_and(|f| f.backlogged)
     }
