@@ -4,7 +4,9 @@ Date: 2026-09-19
 
 ## Status
 
-Accepted. Supersedes the classification, compression and framing points of ADR 0002 and the stream-1 / PoC-key wording of ADR 0003. Protocol version 2 (mux and application); v1 is not supported.
+Accepted. Supersedes the classification, compression and framing points of ADR 0002 and the stream-1 / PoC-key wording of ADR 0003.
+
+The wire format changes here are **breaking but unversioned**: the protocol stays `weaver-mux-v1` (mux `MIN_VERSION = MAX_VERSION = 1`, application `PROTOCOL_VERSION = 1`) until the 1.0 release. Before 1.0 there is no compatibility promise between builds; every deployment ships client and relay together.
 
 ## Context
 
@@ -46,7 +48,7 @@ The transport delimits messages, so the mux preserves application message bounda
 
 ## Consequences
 
-- Wire: `TRANSCRIPT_PREFIX = "weaver-mux-v2"`, `MIN_VERSION = MAX_VERSION = 2`, WebSocket subprotocol `weaver-mux-v2`, `Params.max_message`, `DATA` flags `COMPRESSED | MORE`, `OPEN` payload is `StreamPolicy`.
+- Wire (still `weaver-mux-v1`, see Status): `Params.max_message`, `DATA` flags `COMPRESSED | MORE`, `OPEN` payload is `StreamPolicy`, `ControlHead::Register.proto_version`.
 - Dependency graph: `weave`, `weaver-server` → `weaver-tokio`, `weaver-proto` → `weaver-mux`. Acyclic; no crate depends on a layer above it.
 - Knowledge per layer:
 

@@ -340,9 +340,9 @@ Knowledge per layer:
 | `weaver-tokio` | how to pump a `Connection` over a `Sink+Stream` | schemas, policy rules |
 | binaries | identity, routing, certs, CLI | frame layout, scheduler |
 
-## 5. Wire changes (protocol version bump to 2)
+## 5. Wire changes (as implemented, the version stays 1 until 1.0)
 
-| Frame | v1 | v2 |
+| Frame | before | after |
 |---|---|---|
 | OPEN payload | `Head { hints: Hints, opaque }` | `StreamPolicy { class, demote_after }` |
 | DATA flags | `COMPRESSED` | `COMPRESSED`, `MORE` |
@@ -350,8 +350,9 @@ Knowledge per layer:
 | WELCOME params | `max_frame, initial_window, compression` | `+ max_message` |
 | Control `Register` | `{ service }` | `{ service, proto_version }` |
 
-Since the mux negotiates `MIN_VERSION..=MAX_VERSION` and there is one PoC
-client, v1 can be dropped rather than supported alongside v2.
+Decision at implementation time: pre-1.0 the protocol carries no
+compatibility promise, so the format changes ship under the unchanged
+`weaver-mux-v1` identifier rather than bumping to v2.
 
 ## 6. Migration order
 
@@ -367,7 +368,7 @@ Each step compiles and passes the suite on its own.
    Delete both `SystemRng` copies and reassembly buffers.
 4. **mux cleanup:** remove `Hints`, MIME table, `read`/`write`, `Goaway`
    alias; rename `Small`; make `wire` `pub(crate)` outside `test-util`.
-   Bump `MAX_VERSION` to 2, `MIN_VERSION` to 2.
+
 5. **proto/server:** move `poc` out; add `IdentityResolver`; carry
    `proto_version` in `Register`.
 6. Update ADR 0002/0003; supersede the "stream 1" wording.

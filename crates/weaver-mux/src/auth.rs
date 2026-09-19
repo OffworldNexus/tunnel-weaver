@@ -47,7 +47,7 @@ pub trait Verifier {
 }
 
 /// Build the bytes both sides sign / verify:
-/// `"weaver-mux-v2" ‖ nonce_s ‖ nonce_c ‖ server_name [‖ channel_binding]`.
+/// `"weaver-mux-v1" ‖ nonce_s ‖ nonce_c ‖ server_name [‖ channel_binding]`.
 ///
 /// Everything except `server_name` is fixed-width, so the encoding is
 /// unambiguous without length prefixes as long as both sides agree on the
@@ -107,7 +107,7 @@ mod tests {
     #[test]
     fn transcript_layout() {
         let t = transcript(&[1; 32], &[2; 32], "example.com", None);
-        assert_eq!(&t[..13], b"weaver-mux-v2");
+        assert_eq!(&t[..13], b"weaver-mux-v1");
         assert_eq!(&t[13..45], &[1; 32]);
         assert_eq!(&t[45..77], &[2; 32]);
         assert_eq!(&t[77..], b"example.com");

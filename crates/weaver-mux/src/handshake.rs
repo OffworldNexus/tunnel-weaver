@@ -45,14 +45,14 @@ mod tests {
 
     #[test]
     fn negotiation() {
-        assert_eq!(negotiate(2), Ok(2));
-        assert_eq!(negotiate(3), Ok(2), "future client falls back to ours");
+        assert_eq!(negotiate(1), Ok(1));
+        assert_eq!(negotiate(2), Ok(1), "future client falls back to ours");
         assert_eq!(
-            negotiate(1),
-            Err(RejectCode::UnsupportedVersion { min: 2, max: 2 })
+            negotiate(0),
+            Err(RejectCode::UnsupportedVersion { min: 1, max: 1 })
         );
-        assert!(accept_version(2, 2));
-        assert!(!accept_version(2, 3), "server cannot pick above our offer");
-        assert!(!accept_version(3, 1));
+        assert!(accept_version(1, 1));
+        assert!(!accept_version(1, 2), "server cannot pick above our offer");
+        assert!(!accept_version(2, 0));
     }
 }

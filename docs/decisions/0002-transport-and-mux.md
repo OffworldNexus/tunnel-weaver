@@ -61,7 +61,7 @@ Key design points:
   in postcard with append-only evolution. Stream 0 is the connection;
   client streams are odd, server streams even. One transport message is
   one frame.
-- **Messages, not bytes** (v2, ADR 0004). Streams carry application
+- **Messages, not bytes** (ADR 0004). Streams carry application
   messages: one `Connection::send` is delivered whole by one
   `Connection::recv_msg`. A message larger than `max_frame` is split into
   `DATA` fragments flagged `MORE` and reassembled by the receiver, bounded
@@ -70,7 +70,7 @@ Key design points:
 - **Authentication: the SSH model.** The server sends a `CHALLENGE`
   nonce; the client answers with a `HELLO` carrying its `KeyId`, its own
   nonce, and a signature over
-  `"weaver-mux-v2" ‖ nonce_s ‖ nonce_c ‖ server_name [‖ channel_binding]`.
+  `"weaver-mux-v1" ‖ nonce_s ‖ nonce_c ‖ server_name [‖ channel_binding]`.
   The server looks the key up through a `Verifier` trait, verifies
   (Ed25519 or ECDSA P-256 — the latter because TPMs and Secure Enclaves
   speak it), and replies `WELCOME` or `REJECT`. The mux holds no keys and
@@ -99,12 +99,12 @@ Key design points:
   guarantee is QFQ's delay bound, not "always next". The one exception is
   `GOAWAY`: `close()` places it in a dedicated slot ahead of the scheduler
   so it is literally the next frame out.
-- **Classification is the caller's** (v2, ADR 0004). `OPEN` carries a
+- **Classification is the caller's** (ADR 0004). `OPEN` carries a
   `StreamPolicy { class, demote_after }` chosen by the layer above; the
   mux applies exactly one automatic rule, demoting `interactive` to
   `bulk` past `demote_after` bytes. `set_policy` changes it later. The
   mux has no notion of MIME types, upgrades or content lengths.
-- **Compression is per message** (v2, ADR 0004). Every `send` carries a
+- **Compression is per message** (ADR 0004). Every `send` carries a
   `Compress::{Never, Auto}` stance. `Never` is final. Under `Auto` the mux
   still declines for realtime streams, fragments under 1 KiB, and
   fragments whose byte entropy is at or above 7.5 bits/byte, and sends raw

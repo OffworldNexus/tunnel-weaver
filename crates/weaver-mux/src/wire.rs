@@ -21,12 +21,12 @@ use crate::frame::FrameType;
 use crate::sched::Class;
 
 /// Lowest protocol version this crate accepts.
-pub const MIN_VERSION: u16 = 2;
+pub const MIN_VERSION: u16 = 1;
 /// Highest protocol version this crate speaks.
-pub const MAX_VERSION: u16 = 2;
+pub const MAX_VERSION: u16 = 1;
 
 /// Domain-separation prefix of the handshake transcript.
-pub const TRANSCRIPT_PREFIX: &[u8] = b"weaver-mux-v2";
+pub const TRANSCRIPT_PREFIX: &[u8] = b"weaver-mux-v1";
 
 /// DATA payload flag: the remaining bytes are a zstd frame.
 pub const DATA_FLAG_COMPRESSED: u8 = 0x01;
@@ -251,7 +251,7 @@ mod tests {
             sig: Signature::Ed25519([4; 64]),
         });
         round_trip(&Welcome {
-            version: 2,
+            version: 1,
             params: Params {
                 max_frame: 16 * 1024,
                 initial_window: 512 * 1024,

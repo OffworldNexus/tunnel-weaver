@@ -35,33 +35,33 @@ fn hello_with_version(client_max: u16) -> (Frame, Pair) {
 }
 
 #[test]
-fn matching_version_negotiates_v2() {
-    let (reply, mut p) = hello_with_version(2);
+fn matching_version_negotiates_v1() {
+    let (reply, mut p) = hello_with_version(1);
     assert_eq!(reply.frame_type, FrameType::Welcome);
     let w: wire::Welcome = wire::decode_payload(FrameType::Welcome, &reply.payload).unwrap();
-    assert_eq!(w.version, 2);
-    assert_eq!(p.server.version(), Some(2));
+    assert_eq!(w.version, 1);
+    assert_eq!(p.server.version(), Some(1));
     assert!(matches!(
         p.server_event(),
-        Some(Event::Authenticated { version: 2, .. })
+        Some(Event::Authenticated { version: 1, .. })
     ));
 }
 
 #[test]
-fn future_client_falls_back_to_v2() {
-    let (reply, p) = hello_with_version(3);
+fn future_client_falls_back_to_v1() {
+    let (reply, p) = hello_with_version(2);
     assert_eq!(reply.frame_type, FrameType::Welcome);
     let w: wire::Welcome = wire::decode_payload(FrameType::Welcome, &reply.payload).unwrap();
-    assert_eq!(w.version, 2);
-    assert_eq!(p.server.version(), Some(2));
+    assert_eq!(w.version, 1);
+    assert_eq!(p.server.version(), Some(1));
 }
 
 #[test]
 fn too_old_client_is_rejected_with_range() {
-    let (reply, p) = hello_with_version(1);
+    let (reply, p) = hello_with_version(0);
     assert_eq!(reply.frame_type, FrameType::Reject);
     let r: wire::Reject = wire::decode_payload(FrameType::Reject, &reply.payload).unwrap();
-    assert_eq!(r.code, RejectCode::UnsupportedVersion { min: 2, max: 2 });
+    assert_eq!(r.code, RejectCode::UnsupportedVersion { min: 1, max: 1 });
     assert!(p.server.is_closed());
     assert_eq!(p.server.version(), None);
 }
@@ -70,10 +70,10 @@ fn too_old_client_is_rejected_with_range() {
 fn negotiated_version_visible_on_both_sides() {
     let mut p = Pair::default_pair();
     p.pump();
-    assert_eq!(p.client.version(), Some(2));
-    assert_eq!(p.server.version(), Some(2));
+    assert_eq!(p.client.version(), Some(1));
+    assert_eq!(p.server.version(), Some(1));
     assert!(matches!(
         p.client_event(),
-        Some(Event::Authenticated { version: 2, .. })
+        Some(Event::Authenticated { version: 1, .. })
     ));
 }

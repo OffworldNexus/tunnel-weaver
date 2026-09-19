@@ -33,7 +33,7 @@ fn authenticated_pair() -> (Connection, Connection, Instant) {
             let _ = server.recv(now, &buf);
         }
     }
-    assert_eq!(server.version(), Some(2));
+    assert_eq!(server.version(), Some(1));
     (client, server, now)
 }
 

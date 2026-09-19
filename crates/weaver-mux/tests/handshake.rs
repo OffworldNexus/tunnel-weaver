@@ -21,18 +21,18 @@ fn happy_path_ed25519() {
         p.client_event(),
         Some(Event::Authenticated {
             key_id: key,
-            version: 2
+            version: 1
         })
     );
     assert_eq!(
         p.server_event(),
         Some(Event::Authenticated {
             key_id: key,
-            version: 2
+            version: 1
         })
     );
-    assert_eq!(p.client.version(), Some(2));
-    assert_eq!(p.server.version(), Some(2));
+    assert_eq!(p.client.version(), Some(1));
+    assert_eq!(p.server.version(), Some(1));
     let types: Vec<_> = p.log.iter().map(|(s, f)| (*s, f.frame_type)).collect();
     assert_eq!(
         types,
@@ -57,7 +57,7 @@ fn happy_path_p256() {
         p.server_event(),
         Some(Event::Authenticated {
             key_id: key,
-            version: 2
+            version: 1
         })
     );
 }

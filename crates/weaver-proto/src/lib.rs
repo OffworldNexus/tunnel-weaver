@@ -30,10 +30,10 @@ pub use control::{ControlHead, ControlReply, RefusalCode};
 pub use http::{HttpHead, HttpResponseHead};
 
 /// Lowest application protocol version this build accepts.
-pub const MIN_PROTOCOL_VERSION: u16 = 2;
+pub const MIN_PROTOCOL_VERSION: u16 = 1;
 /// Application protocol version this build speaks. Carried in
 /// [`ControlHead::Register`] and negotiated independently of the mux.
-pub const PROTOCOL_VERSION: u16 = 2;
+pub const PROTOCOL_VERSION: u16 = 1;
 
 /// Relay-side check of a client's advertised application version.
 pub fn accept_protocol_version(client: u16) -> Result<(), RefusalCode> {
@@ -95,7 +95,7 @@ mod tests {
     fn version_negotiation() {
         assert_eq!(accept_protocol_version(PROTOCOL_VERSION), Ok(()));
         assert_eq!(
-            accept_protocol_version(1),
+            accept_protocol_version(0),
             Err(RefusalCode::UnsupportedVersion {
                 min: MIN_PROTOCOL_VERSION,
                 max: PROTOCOL_VERSION

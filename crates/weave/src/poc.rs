@@ -18,7 +18,7 @@ use crate::connect::{connect_tls, parse_server_address};
 use crate::identity::Ed25519Signer;
 
 /// Sec-WebSocket-Protocol token both ends must agree on.
-pub const WS_SUBPROTOCOL: &str = "weaver-mux-v2";
+pub const WS_SUBPROTOCOL: &str = "weaver-mux-v1";
 
 /// Executes the `weave poc` client flow.
 pub async fn run_poc(

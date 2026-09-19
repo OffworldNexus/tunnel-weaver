@@ -138,11 +138,11 @@ pub async fn handle_https_request(
                 .headers()
                 .get("sec-websocket-protocol")
                 .and_then(|v| v.to_str().ok());
-            if ws_proto != Some("weaver-mux-v2") {
+            if ws_proto != Some("weaver-mux-v1") {
                 let mut resp = Response::builder()
                     .status(StatusCode::BAD_REQUEST)
                     .body(full_body(
-                        "400 Bad Request: Sec-WebSocket-Protocol must be weaver-mux-v2\n",
+                        "400 Bad Request: Sec-WebSocket-Protocol must be weaver-mux-v1\n",
                     ))
                     .unwrap();
                 apply_security_headers(&mut resp, include_hsts);
@@ -196,7 +196,7 @@ pub async fn handle_https_request(
                 .header(http::header::CONNECTION, "Upgrade")
                 .header(http::header::UPGRADE, "websocket")
                 .header("Sec-WebSocket-Accept", accept)
-                .header("Sec-WebSocket-Protocol", "weaver-mux-v2")
+                .header("Sec-WebSocket-Protocol", "weaver-mux-v1")
                 .body(empty_body())
                 .unwrap();
             apply_security_headers(&mut resp, include_hsts);
