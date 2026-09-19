@@ -87,8 +87,8 @@ classDiagram
     }
     class Role {
         <<enum>>
-        Client { signer }
-        Server { verifier, params: ServerParams, reverify_interval }
+        Client(signer)
+        Server(verifier, params: ServerParams, reverify_interval)
     }
     class Class {
         <<enum>>
@@ -100,14 +100,14 @@ classDiagram
     }
     class Event {
         <<enum>>
-        Authenticated { key_id, version }
-        Rejected { code: RejectCode, message }
-        StreamOpened { id, class }
+        Authenticated(key_id, version)
+        Rejected(code: RejectCode, message)
+        StreamOpened(id, class)
         Readable(id)
-        Writable { id, credit }
+        Writable(id, credit)
         Finished(id)
-        Reset { id, code }
-        Closed { reason: CloseReason }
+        Reset(id, code)
+        Closed(reason: CloseReason)
     }
     class CloseReason {
         code: CloseCode
@@ -226,7 +226,7 @@ sequenceDiagram
     participant V as dyn Verifier
 
     SA->>SC: new(Config::server(..), now)
-    Note over SC: rng → nonce_s; handshake_out ← CHALLENGE
+    Note over SC: rng → nonce_s, handshake_out ← CHALLENGE
     SA->>SC: poll_transmit
     SC-->>CA: CHALLENGE{nonce_s}
     CA->>CC: recv
@@ -317,14 +317,14 @@ classDiagram
     }
     class ControlHead {
         <<enum>>
-        Register { proto_version, service }
+        Register(proto_version, service)
         +register(service) Result~Self, RefusalCode~
         +validate() Result~(), RefusalCode~
     }
     class ControlReply {
         <<enum>>
-        Registered { hostname }
-        Refused { code: RefusalCode, message }
+        Registered(hostname)
+        Refused(code: RefusalCode, message)
     }
     class HttpHead {
         method, scheme, authority, path
@@ -359,8 +359,10 @@ classDiagram
     ControlReply --> RefusalCode
     policy ..> HttpHead
     policy ..> HttpResponseHead
-    policy ..> mux_Class["weaver_mux::Class"]
-    policy ..> mux_Compress["weaver_mux::Compress"]
+    class mux_Class["weaver_mux::Class"]
+    class mux_Compress["weaver_mux::Compress"]
+    policy ..> mux_Class
+    policy ..> mux_Compress
 ```
 
 Stream conventions (all in `weaver-proto` docs, enforced by the handlers):
@@ -462,7 +464,7 @@ sequenceDiagram
     WS-->>CM: recv ×n
     CM-->>PH: StreamOpened · Readable · Finished
     PH->>CM: recv_msg → Head::Http, body
-    PH->>CM: send(id, encode(HttpResponseHead), HEAD_COMPRESS); finish(id)
+    PH->>CM: send(id, encode(HttpResponseHead), HEAD_COMPRESS) then finish(id)
     CM-->>WS: DATA · FIN
     WS-->>SM: recv
     SM-->>RH: Readable(id)
