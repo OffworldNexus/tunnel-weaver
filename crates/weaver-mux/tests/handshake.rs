@@ -7,7 +7,7 @@ use weaver_mux::testing::{
     Ed25519TestSigner, FailingSigner, MapVerifier, P256TestSigner, SeededRng,
 };
 use weaver_mux::{
-    CloseCode, Config, Event, Frame, FrameType, Head, ProtocolError, RejectCode, Signer as _,
+    Class, CloseCode, Config, Event, Frame, FrameType, ProtocolError, RejectCode, Signer as _,
     StreamError,
 };
 
@@ -84,7 +84,7 @@ fn unknown_key_is_rejected() {
         Some(Event::Closed { reason }) if reason.code == CloseCode::Rejected
     ));
     assert!(p.client.is_closed() && p.server.is_closed());
-    assert_eq!(p.client.open(Head::default()), Err(StreamError::Closed));
+    assert_eq!(p.client.open(Class::Interactive), Err(StreamError::Closed));
 }
 
 #[test]
@@ -176,7 +176,7 @@ fn frame_before_welcome_is_a_protocol_error() {
     let open = Frame {
         stream_id: 1,
         frame_type: FrameType::Open,
-        payload: weaver_mux::wire::encode_payload(&Head::default()),
+        payload: weaver_mux::wire::encode_payload(&Class::Interactive),
     };
     let err = p.server.recv(now, &open.encode()).unwrap_err();
     assert!(matches!(err, ProtocolError::StateViolation(_)));
@@ -188,11 +188,8 @@ fn frame_before_welcome_is_a_protocol_error() {
         p.server_event(),
         Some(Event::Closed { reason }) if reason.code == CloseCode::ProtocolError
     ));
-    // Everything after a close is rejected without panicking.
-    assert_eq!(
-        p.server.recv(now, &open.encode()),
-        Err(ProtocolError::Closed)
-    );
+    // Everything after a close is ignored without panicking.
+    assert_eq!(p.server.recv(now, &open.encode()), Ok(()));
 }
 
 #[test]
@@ -238,7 +235,7 @@ fn signer_failure_closes_locally() {
 fn open_before_authenticated_fails() {
     let mut p = Pair::default_pair();
     assert_eq!(
-        p.client.open(Head::default()),
+        p.client.open(Class::Interactive),
         Err(StreamError::NotAuthenticated)
     );
 }

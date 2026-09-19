@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/weaver-mux",
     "crates/weaver-proto",
+    "crates/weaver-tokio",
     "crates/weaver-server",
     "crates/weave",
 ]
@@ -18,6 +19,7 @@ repository = "https://github.com/OffworldNexus/tunnel-weaver"
 [workspace.dependencies]
 weaver-mux = { path = "crates/weaver-mux", version = "0.1.0" }
 weaver-proto = { path = "crates/weaver-proto", version = "0.1.0" }
+weaver-tokio = { path = "crates/weaver-tokio", version = "0.1.0" }
 
 clap = { version = "4.5", features = ["derive", "env"] }
 thiserror = "2.0"

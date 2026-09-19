@@ -8,10 +8,9 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::info;
 use weaver_mux::KeyId;
 use weaver_proto::control::RefusalCode;
-use weaver_proto::is_valid_dns_label;
-use weaver_proto::poc::{derive_hostname, poc_identity};
 
 use crate::cert::CertManager;
+use crate::tunnel::identity::{IdentityResolver, derive_hostname};
 use crate::tunnel::proxy::ProxyRequest;
 
 /// Route information for a registered tunnel service.
@@ -37,6 +36,7 @@ struct ActiveConnection {
 pub struct TunnelRegistry {
     root_domain: String,
     cert_manager: Arc<CertManager>,
+    identities: Arc<dyn IdentityResolver>,
     routes: RwLock<HashMap<String, TunnelRoute>>,
     connections: Mutex<HashMap<KeyId, ActiveConnection>>,
     next_conn_id: AtomicU64,
@@ -44,10 +44,15 @@ pub struct TunnelRegistry {
 
 impl TunnelRegistry {
     /// Creates a new in-memory registry tied to the given root domain and certificate manager.
-    pub fn new(root_domain: String, cert_manager: Arc<CertManager>) -> Self {
+    pub fn new(
+        root_domain: String,
+        cert_manager: Arc<CertManager>,
+        identities: Arc<dyn IdentityResolver>,
+    ) -> Self {
         Self {
             root_domain,
             cert_manager,
+            identities,
             routes: RwLock::new(HashMap::new()),
             connections: Mutex::new(HashMap::new()),
             next_conn_id: AtomicU64::new(1),
@@ -103,7 +108,8 @@ impl TunnelRegistry {
 
     /// Registers a service on an active connection.
     ///
-    /// Validates the service name, verifies the caller identity, checks for duplicates,
+    /// Verifies the caller identity, checks for duplicates (the service name
+    /// was validated by `ControlHead::validate` on receipt),
     /// activates the certificate in `CertManager`, and updates routing tables.
     pub async fn register_service(
         &self,
@@ -112,16 +118,11 @@ impl TunnelRegistry {
         service: &str,
         proxy_tx: mpsc::Sender<ProxyRequest>,
     ) -> Result<String, RefusalCode> {
-        if !is_valid_dns_label(service) {
-            return Err(RefusalCode::InvalidName);
-        }
-
-        let Some((person, machine)) = poc_identity(&key_id) else {
+        let Some(identity) = self.identities.identity(&key_id) else {
             return Err(RefusalCode::Unauthorized);
         };
 
-        let hostname = derive_hostname(service, machine, person, &self.root_domain);
-        let host_lower = hostname.to_ascii_lowercase();
+        let host_lower = derive_hostname(service, &identity, &self.root_domain);
 
         {
             let routes = self.routes.read().unwrap();
@@ -182,6 +183,11 @@ impl TunnelRegistry {
     }
 
     /// Looks up an active tunnel route by hostname.
+    /// The identity resolver, shared with the mux `Verifier`.
+    pub fn identities(&self) -> Arc<dyn IdentityResolver> {
+        Arc::clone(&self.identities)
+    }
+
     pub fn lookup(&self, hostname: &str) -> Option<TunnelRoute> {
         let lower = hostname.to_ascii_lowercase();
         let routes = self.routes.read().unwrap();

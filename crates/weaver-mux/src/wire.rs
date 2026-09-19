@@ -2,7 +2,10 @@
 //!
 //! This module is public so that tests and fuzz targets can hand-craft
 //! frames (e.g. a HELLO advertising a future version). Applications never
-//! need it: the [`crate::Connection`] API hides frames entirely.
+//! need it: the [`crate::Connection`] API hides frames entirely. Types that
+//! are part of the application-facing API ([`KeyId`], [`Signature`],
+//! [`Params`]) are re-exported at the crate root; everything else is only
+//! reachable through this module.
 //!
 //! # Evolution rules
 //!
@@ -16,10 +19,8 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_big_array::BigArray;
 
-use crate::error::{ProtocolError, RejectCode};
+use crate::error::{CloseReason, ProtocolError, RejectCode};
 use crate::frame::FrameType;
-
-pub use crate::error::GoAway as Goaway;
 
 /// Lowest protocol version this crate accepts.
 pub const MIN_VERSION: u16 = 1;
@@ -31,6 +32,12 @@ pub const TRANSCRIPT_PREFIX: &[u8] = b"weaver-mux-v1";
 
 /// DATA payload flag: the remaining bytes are a zstd frame.
 pub const DATA_FLAG_COMPRESSED: u8 = 0x01;
+/// DATA payload flag: this frame is not the last fragment of its message;
+/// the receiver keeps reassembling until a frame without the flag.
+pub const DATA_FLAG_MORE: u8 = 0x02;
+/// Every DATA flag bit this version understands; anything else is a
+/// decode error.
+pub const DATA_FLAGS_KNOWN: u8 = DATA_FLAG_COMPRESSED | DATA_FLAG_MORE;
 
 /// The single identity concept the mux knows about: the public key that
 /// signed the handshake. The variant is the algorithm; the bytes are the raw
@@ -73,16 +80,6 @@ pub struct Hello {
     pub sig: Signature,
 }
 
-/// Whether DATA frames may be zstd-compressed on this connection.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub enum Compression {
-    /// Per-stream decision by the sender, subject to the skip policy.
-    #[default]
-    BodyOnly,
-    /// Never compress.
-    Off,
-}
-
 /// Connection parameters chosen by the server and announced in WELCOME.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Params {
@@ -90,8 +87,12 @@ pub struct Params {
     pub max_frame: u32,
     /// Initial per-stream, per-direction credit, in bytes.
     pub initial_window: u32,
-    /// Server's compression stance (it may refuse, never force).
-    pub compression: Compression,
+    /// Whether the server allows zstd on DATA frames. It may refuse,
+    /// never force: compression happens only when both sides allow it.
+    pub compression_allowed: bool,
+    /// Largest application message either side may send on a stream, in
+    /// bytes. Bounds the receiver's reassembly buffer.
+    pub max_message: u32,
 }
 
 /// WELCOME: server → client, completes the handshake.
@@ -112,29 +113,8 @@ pub struct Reject {
     pub message: String,
 }
 
-/// Scheduling and compression hints carried in a stream's [`Head`]. The mux
-/// reads these and nothing else from the head.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub struct Hints {
-    /// MIME type of the body, if known.
-    pub content_type: Option<String>,
-    /// Total body length, if known up front.
-    pub content_length: Option<u64>,
-    /// The stream is a protocol upgrade (WebSocket, etc.).
-    pub upgrade: bool,
-    /// Body is already encoded (gzip, br, ...): never recompress.
-    pub content_encoding: Option<String>,
-}
-
-/// OPEN payload. The mux only interprets `hints`; `opaque` belongs to the
-/// layer above.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub struct Head {
-    /// Scheduling/compression hints.
-    pub hints: Hints,
-    /// Application-defined bytes, passed through untouched.
-    pub opaque: Vec<u8>,
-}
+/// GOAWAY payload: the closing side's [`CloseReason`].
+pub type Goaway = CloseReason;
 
 /// RST payload: abort both directions of a stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -205,26 +185,19 @@ mod tests {
             params: Params {
                 max_frame: 16 * 1024,
                 initial_window: 512 * 1024,
-                compression: Compression::BodyOnly,
+                compression_allowed: true,
+                max_message: 1 << 20,
             },
         });
         round_trip(&Reject {
             code: RejectCode::UnsupportedVersion { min: 1, max: 1 },
             message: "nope".into(),
         });
-        round_trip(&Head {
-            hints: Hints {
-                content_type: Some("text/html".into()),
-                content_length: Some(10),
-                upgrade: false,
-                content_encoding: None,
-            },
-            opaque: vec![1, 2, 3],
-        });
+        round_trip(&crate::Class::Bulk);
         round_trip(&Rst { code: 5 });
         round_trip(&WindowUpdate { credit: 1000 });
         round_trip(&Ping { opaque: u64::MAX });
-        round_trip(&Goaway {
+        round_trip(&crate::error::CloseReason {
             code: crate::error::CloseCode::KeyRevoked,
             message: Some("bye".into()),
         });

@@ -49,7 +49,7 @@ cargo deny check
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for contribution guidelines, engineering rules, and architectural decision records (ADRs in `docs/decisions/`).
+See [CONTRIBUTING.md](CONTRIBUTING.md) for contribution guidelines, engineering rules, and architectural decision records (ADRs in `docs/decisions/`). [docs/architecture.md](docs/architecture.md) maps the crate layers and every call that crosses them.
 
 ## License
 

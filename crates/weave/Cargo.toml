@@ -20,9 +20,6 @@ clap = { workspace = true }
 ed25519-dalek = { workspace = true }
 futures-util = { workspace = true }
 http = { workspace = true }
-libc = { workspace = true }
-rand = "0.9"
-rand_core = { workspace = true }
 rustls = { workspace = true }
 rustls-platform-verifier = { workspace = true }
 tokio = { workspace = true }
@@ -31,3 +28,4 @@ tokio-tungstenite = { workspace = true }
 tokio-util = { workspace = true }
 weaver-mux = { workspace = true }
 weaver-proto = { workspace = true }
+weaver-tokio = { workspace = true }

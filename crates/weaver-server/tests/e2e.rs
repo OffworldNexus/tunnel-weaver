@@ -12,5 +12,5 @@ fn test_weaver_server_e2e_version_smoke() {
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("weaver-server"));
-    assert!(stdout.contains("protocol v1"));
+    assert!(stdout.contains(&format!("protocol v{}", weaver_proto::PROTOCOL_VERSION)));
 }

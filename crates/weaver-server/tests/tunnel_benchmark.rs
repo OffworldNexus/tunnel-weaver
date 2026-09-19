@@ -1,35 +1,6 @@
 use std::time::{Duration, Instant};
-use weaver_mux::testing::FakeClock;
-use weaver_mux::wire::Head;
-use weaver_mux::{Config, Connection, Event, Hints, SignError};
-use weaver_proto::poc::{POC_KEY_ID, POC_PUBLIC_KEY, POC_SECRET_KEY};
-
-struct InProcessPocSigner {
-    key: ed25519_dalek::SigningKey,
-}
-
-impl weaver_mux::auth::Signer for InProcessPocSigner {
-    fn key_id(&self) -> weaver_mux::KeyId {
-        POC_KEY_ID
-    }
-    fn sign(&mut self, msg: &[u8]) -> Result<weaver_mux::wire::Signature, SignError> {
-        use ed25519_dalek::Signer;
-        let sig: ed25519_dalek::Signature = self.key.sign(msg);
-        Ok(weaver_mux::wire::Signature::Ed25519(sig.to_bytes()))
-    }
-}
-
-struct InProcessPocVerifier;
-
-impl weaver_mux::auth::Verifier for InProcessPocVerifier {
-    fn public_key(&mut self, key_id: &weaver_mux::KeyId) -> Option<weaver_mux::auth::PublicKey> {
-        if key_id == &POC_KEY_ID {
-            Some(weaver_mux::auth::PublicKey::Ed25519(POC_PUBLIC_KEY))
-        } else {
-            None
-        }
-    }
-}
+use weaver_mux::testing::{Ed25519TestSigner, FakeClock, MapVerifier};
+use weaver_mux::{Class, Compress, Config, Connection, Event, Signer as _};
 
 /// A simulated throttled duplex pipe between client and server.
 struct ThrottledPipe {
@@ -46,23 +17,21 @@ impl ThrottledPipe {
         let clock = FakeClock::at(Instant::now());
         let now = clock.now();
 
-        let signer = Box::new(InProcessPocSigner {
-            key: ed25519_dalek::SigningKey::from_bytes(&POC_SECRET_KEY),
-        });
+        let signer = Ed25519TestSigner::from_seed(7);
+        let verifier = Box::new(MapVerifier::with_key(signer.key_id(), signer.public_key()));
         let client_cfg = Config::client(
-            signer,
+            Box::new(signer),
             "weaver.test".to_string(),
             Box::new(weaver_mux::testing::SeededRng::new(42)),
         );
         let client = Connection::new(client_cfg, now);
 
-        let verifier = Box::new(InProcessPocVerifier);
         let mut server_cfg = Config::server(
             verifier,
             "weaver.test".to_string(),
             Box::new(weaver_mux::testing::SeededRng::new(43)),
         );
-        server_cfg.initial_window = 4 * 1024 * 1024;
+        server_cfg.server_params_mut().unwrap().initial_window = 4 * 1024 * 1024;
         let server = Connection::new(server_cfg, now);
 
         let mut pipe = Self {
@@ -140,15 +109,11 @@ fn test_concurrent_small_requests_during_50mb_bulk_transfer() {
     let mut baseline_latencies = Vec::new();
     for _ in 0..20 {
         let start_tick = pipe.clock.now();
-        let stream = pipe
-            .client
-            .open(Head {
-                hints: Hints::default(),
-                opaque: vec![],
-            })
-            .unwrap();
+        let stream = pipe.client.open(Class::Interactive).unwrap();
 
-        let _ = pipe.client.write(stream, b"GET /hello HTTP/1.1\r\n\r\n");
+        let _ = pipe
+            .client
+            .send(stream, b"GET /hello HTTP/1.1\r\n\r\n", Compress::Never);
         let _ = pipe.client.finish(stream);
 
         let mut finished = false;
@@ -156,16 +121,21 @@ fn test_concurrent_small_requests_during_50mb_bulk_transfer() {
             pipe.tick();
             while let Some(ev) = pipe.server.poll_event() {
                 if let Event::StreamOpened { id, .. } = ev {
-                    let _ = pipe.server.write(id, b"HTTP/1.1 200 OK\r\n\r\n");
+                    let _ = pipe
+                        .server
+                        .send(id, b"HTTP/1.1 200 OK\r\n\r\n", Compress::Never);
                     let _ = pipe.server.finish(id);
                 }
             }
             while let Some(ev) = pipe.client.poll_event() {
-                if let Event::Finished(id) = ev
-                    && id == stream
-                {
-                    finished = true;
-                    break;
+                match ev {
+                    // Finished fires only once the inbox is drained.
+                    Event::Readable(id) => while pipe.client.recv_msg(id).is_ok() {},
+                    Event::Finished(id) if id == stream => {
+                        finished = true;
+                        break;
+                    }
+                    _ => {}
                 }
             }
             if finished {
@@ -181,59 +151,49 @@ fn test_concurrent_small_requests_during_50mb_bulk_transfer() {
     let p99_baseline = baseline_latencies[(baseline_latencies.len() as f64 * 0.95) as usize];
 
     // 2. Start an active 50 MB bulk transfer
-    let bulk_size = 50 * 1024 * 1024;
-    let bulk_stream = pipe
-        .client
-        .open(Head {
-            hints: Hints {
-                content_length: Some(bulk_size as u64),
-                ..Hints::default()
-            },
-            opaque: vec![],
-        })
-        .unwrap();
+    let bulk_stream = pipe.client.open(Class::Bulk).unwrap();
 
     let chunk = vec![0xaa; 32 * 1024];
-    let _ = pipe.client.write(bulk_stream, &chunk);
+    let _ = pipe.client.send(bulk_stream, &chunk, Compress::Never);
 
     // 3. Inject 20 small requests during active bulk transfer
     let mut loaded_latencies = Vec::new();
     for _ in 0..20 {
-        let _ = pipe.client.write(bulk_stream, &chunk);
+        let _ = pipe.client.send(bulk_stream, &chunk, Compress::Never);
 
         let start_tick = pipe.clock.now();
-        let small_stream = pipe
-            .client
-            .open(Head {
-                hints: Hints::default(),
-                opaque: vec![],
-            })
-            .unwrap();
+        let small_stream = pipe.client.open(Class::Interactive).unwrap();
 
-        let _ = pipe
-            .client
-            .write(small_stream, b"GET /small HTTP/1.1\r\n\r\n");
+        let _ = pipe.client.send(
+            small_stream,
+            b"GET /small HTTP/1.1\r\n\r\n",
+            Compress::Never,
+        );
         let _ = pipe.client.finish(small_stream);
 
         let mut finished = false;
         for _ in 0..100 {
-            let _ = pipe.client.write(bulk_stream, &chunk);
+            let _ = pipe.client.send(bulk_stream, &chunk, Compress::Never);
             pipe.tick();
 
             while let Some(ev) = pipe.server.poll_event() {
                 if let Event::StreamOpened { id, .. } = ev
                     && id != bulk_stream
                 {
-                    let _ = pipe.server.write(id, b"HTTP/1.1 200 OK\r\n\r\n");
+                    let _ = pipe
+                        .server
+                        .send(id, b"HTTP/1.1 200 OK\r\n\r\n", Compress::Never);
                     let _ = pipe.server.finish(id);
                 }
             }
             while let Some(ev) = pipe.client.poll_event() {
-                if let Event::Finished(id) = ev
-                    && id == small_stream
-                {
-                    finished = true;
-                    break;
+                match ev {
+                    Event::Readable(id) => while pipe.client.recv_msg(id).is_ok() {},
+                    Event::Finished(id) if id == small_stream => {
+                        finished = true;
+                        break;
+                    }
+                    _ => {}
                 }
             }
             if finished {

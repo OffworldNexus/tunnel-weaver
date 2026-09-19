@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use common::*;
 use proptest::prelude::*;
-use weaver_mux::{Class, CloseCode, Event, Frame, FrameType, GoAway, Head, Hints, StreamId};
+use weaver_mux::{Class, CloseCode, CloseReason, Compress, Event, Frame, FrameType, StreamId};
 
 /// Wire bytes per tick.
 const RATE: u32 = 64 * 1024;
@@ -43,11 +43,20 @@ struct Sim {
 
 impl Sim {
     fn new() -> Self {
+        Self::with_threshold(None)
+    }
+
+    /// `bulk_threshold` for the client; `None` pins every class.
+    fn with_threshold(bulk_threshold: Option<u64>) -> Self {
         let mut server = server_config(1);
-        server.max_frame = MAX_FRAME;
-        // Generous window so credit never throttles the scheduler.
-        server.initial_window = 4 * 1024 * 1024;
-        let mut p = Pair::new(client_config(1), server);
+        server_params(&mut server, |p| {
+            p.max_frame = MAX_FRAME;
+            // Generous window so credit never throttles the scheduler.
+            p.initial_window = 4 * 1024 * 1024;
+        });
+        let mut client = client_config(1);
+        client.bulk_threshold = bulk_threshold;
+        let mut p = Pair::new(client, server);
         p.pump();
         p.drain_events(Side::Client);
         p.drain_events(Side::Server);
@@ -61,14 +70,8 @@ impl Sim {
         }
     }
 
-    fn open(&mut self, hints: Hints) -> StreamId {
-        self.p
-            .client
-            .open(Head {
-                hints,
-                opaque: vec![],
-            })
-            .unwrap()
+    fn open(&mut self, class: Class) -> StreamId {
+        self.p.client.open(class).unwrap()
     }
 
     /// Keep this stream's outbox full for the rest of the simulation.
@@ -81,9 +84,9 @@ impl Sim {
             // Fill until the crate refuses (credit/outbox bound); ignore
             // errors for streams that were reset or finished.
             for _ in 0..8 {
-                match self.p.client.write(*id, data) {
-                    Ok(n) if n == data.len() => continue,
-                    _ => break,
+                match self.p.client.send(*id, data, Compress::Never) {
+                    Ok(()) => continue,
+                    Err(_) => break,
                 }
             }
         }
@@ -142,10 +145,7 @@ impl Sim {
 #[test]
 fn lone_bulk_stream_gets_full_rate() {
     let mut s = Sim::new();
-    let bulk = s.open(Hints {
-        content_length: Some(100 << 20),
-        ..Hints::default()
-    });
+    let bulk = s.open(Class::Bulk);
     assert_eq!(s.p.client.class_of(bulk), Some(Class::Bulk));
     s.saturate(bulk);
     s.run(50);
@@ -161,17 +161,9 @@ fn lone_bulk_stream_gets_full_rate() {
 #[test]
 fn class_shares_converge_to_weights() {
     let mut s = Sim::new();
-    let rt = s.open(Hints {
-        upgrade: true,
-        ..Hints::default()
-    });
-    let small = s.open(Hints::default());
-    let bulk = s.open(Hints {
-        content_length: Some(100 << 20),
-        ..Hints::default()
-    });
-    // Pin small so it does not demote to bulk after 256 KiB.
-    s.p.client.set_class(small, Class::Small).unwrap();
+    let rt = s.open(Class::Realtime);
+    let small = s.open(Class::Interactive);
+    let bulk = s.open(Class::Bulk);
     for id in [rt, small, bulk] {
         s.saturate(id);
     }
@@ -188,13 +180,7 @@ fn class_shares_converge_to_weights() {
 #[test]
 fn equal_shares_within_a_class() {
     let mut s = Sim::new();
-    let ids: Vec<_> = (0..4)
-        .map(|_| {
-            let id = s.open(Hints::default());
-            s.p.client.set_class(id, Class::Small).unwrap();
-            id
-        })
-        .collect();
+    let ids: Vec<_> = (0..4).map(|_| s.open(Class::Interactive)).collect();
     for &id in &ids {
         s.saturate(id);
     }
@@ -212,15 +198,12 @@ fn equal_shares_within_a_class() {
 #[test]
 fn bulk_keeps_flowing_under_interactive_load() {
     let mut s = Sim::new();
-    let bulk = s.open(Hints {
-        content_length: Some(100 << 20),
-        ..Hints::default()
-    });
+    let bulk = s.open(Class::Bulk);
     s.saturate(bulk);
     let smalls: Vec<_> = (0..8)
         .map(|_| {
-            let id = s.open(Hints::default());
-            s.p.client.set_class(id, Class::Small).unwrap();
+            let id = s.open(Class::Interactive);
+            s.p.client.set_class(id, Class::Interactive).unwrap();
             s.saturate(id);
             id
         })
@@ -252,15 +235,12 @@ fn bulk_keeps_flowing_under_interactive_load() {
 #[test]
 fn new_small_stream_is_served_promptly() {
     let mut s = Sim::new();
-    let bulk = s.open(Hints {
-        content_length: Some(100 << 20),
-        ..Hints::default()
-    });
+    let bulk = s.open(Class::Bulk);
     s.saturate(bulk);
     s.run(200); // bulk has been hogging the pipe for a while
-    let small = s.open(Hints::default());
+    let small = s.open(Class::Interactive);
     s.p.client
-        .write(small, &noise(MAX_FRAME as usize, 9))
+        .send(small, &noise(MAX_FRAME as usize - 1, 9), Compress::Never)
         .unwrap();
     let start = s.tick;
     s.run(FRAME_TIME_TICKS + 1);
@@ -274,35 +254,43 @@ fn new_small_stream_is_served_promptly() {
 }
 
 #[test]
-fn small_demotes_to_bulk_at_threshold() {
-    let mut s = Sim::new();
-    let id = s.open(Hints::default());
-    assert_eq!(s.p.client.class_of(id), Some(Class::Small));
+fn interactive_demotes_to_bulk_at_threshold() {
     let threshold = 256 * 1024usize;
-    s.p.client.write(id, &noise(threshold, 1)).unwrap();
+    let mut s = Sim::with_threshold(Some(threshold as u64));
+    let id = s.open(Class::Interactive);
+    assert_eq!(s.p.client.class_of(id), Some(Class::Interactive));
+    s.p.client
+        .send(id, &noise(threshold, 1), Compress::Never)
+        .unwrap();
     assert_eq!(
         s.p.client.class_of(id),
-        Some(Class::Small),
+        Some(Class::Interactive),
         "exactly at threshold stays"
     );
-    s.p.client.write(id, b"x").unwrap();
+    s.p.client.send(id, b"x", Compress::Never).unwrap();
     assert_eq!(s.p.client.class_of(id), Some(Class::Bulk));
-    // Pinned streams are left alone.
-    let pinned = s.open(Hints::default());
-    s.p.client.set_class(pinned, Class::Small).unwrap();
-    s.p.client.write(pinned, &noise(threshold + 10, 2)).unwrap();
-    assert_eq!(s.p.client.class_of(pinned), Some(Class::Small));
+    // Other classes are never demoted.
+    let rt = s.open(Class::Realtime);
+    s.p.client
+        .send(rt, &noise(threshold + 10, 2), Compress::Never)
+        .unwrap();
+    assert_eq!(s.p.client.class_of(rt), Some(Class::Realtime));
     // Control is not a valid target.
-    assert!(s.p.client.set_class(pinned, Class::Control).is_err());
+    assert!(s.p.client.set_class(rt, Class::Control).is_err());
+    // Without a threshold nothing is demoted.
+    let mut s = Sim::with_threshold(None);
+    let id = s.open(Class::Interactive);
+    s.p.client
+        .send(id, &noise(threshold + 10, 3), Compress::Never)
+        .unwrap();
+    assert_eq!(s.p.client.class_of(id), Some(Class::Interactive));
 }
 
 #[test]
 fn reclassification_takes_effect_on_next_selection() {
     let mut s = Sim::new();
-    let a = s.open(Hints::default());
-    let b = s.open(Hints::default());
-    s.p.client.set_class(a, Class::Small).unwrap();
-    s.p.client.set_class(b, Class::Small).unwrap();
+    let a = s.open(Class::Interactive);
+    let b = s.open(Class::Interactive);
     s.saturate(a);
     s.saturate(b);
     s.run(50);
@@ -318,10 +306,7 @@ fn reclassification_takes_effect_on_next_selection() {
 #[test]
 fn control_frames_are_not_starved_by_data() {
     let mut s = Sim::new();
-    let bulk = s.open(Hints {
-        content_length: Some(100 << 20),
-        ..Hints::default()
-    });
+    let bulk = s.open(Class::Bulk);
     s.saturate(bulk);
     s.run(20);
     // Queue a PING behind a full outbox by advancing past ping_interval.
@@ -343,7 +328,7 @@ fn control_frames_are_not_starved_by_data() {
     );
 
     // Same for RST of another stream while bulk is saturated.
-    let victim = s.open(Hints::default());
+    let victim = s.open(Class::Interactive);
     s.tick();
     s.p.client.reset(victim, 1).unwrap();
     let before = s.trace.len();
@@ -358,13 +343,10 @@ fn control_frames_are_not_starved_by_data() {
 #[test]
 fn goaway_is_the_very_next_frame() {
     let mut s = Sim::new();
-    let bulk = s.open(Hints {
-        content_length: Some(100 << 20),
-        ..Hints::default()
-    });
+    let bulk = s.open(Class::Bulk);
     s.saturate(bulk);
     s.run(20);
-    s.p.client.close(GoAway::new(CloseCode::Shutdown));
+    s.p.client.close(CloseReason::new(CloseCode::Shutdown));
     let now = s.p.clock.now();
     let mut buf = Vec::new();
     assert!(s.p.client.poll_transmit(now, &mut buf));
@@ -397,12 +379,15 @@ proptest! {
         w_bulk in 20u32..=1000,
     ) {
         let mut server = server_config(1);
-        server.max_frame = MAX_FRAME;
-        server.initial_window = 4 * 1024 * 1024;
+        server_params(&mut server, |p| {
+            p.max_frame = MAX_FRAME;
+            p.initial_window = 4 * 1024 * 1024;
+        });
         let mut client = client_config(1);
         client.weights.realtime = w_rt;
-        client.weights.small = w_small;
+        client.weights.interactive = w_small;
         client.weights.bulk = w_bulk;
+        client.bulk_threshold = None;
         let mut p = Pair::new(client, server);
         p.pump();
         p.drain_events(Side::Client);
@@ -415,10 +400,9 @@ proptest! {
             tick: 0,
             feed: Vec::new(),
         };
-        let rt = s.open(Hints { upgrade: true, ..Hints::default() });
-        let small = s.open(Hints::default());
-        s.p.client.set_class(small, Class::Small).unwrap();
-        let bulk = s.open(Hints { content_length: Some(100 << 20), ..Hints::default() });
+        let rt = s.open(Class::Realtime);
+        let small = s.open(Class::Interactive);
+        let bulk = s.open(Class::Bulk);
         for id in [rt, small, bulk] {
             s.saturate(id);
         }

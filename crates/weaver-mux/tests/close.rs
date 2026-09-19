@@ -2,23 +2,23 @@ mod common;
 
 use common::*;
 use weaver_mux::{
-    CloseCode, Event, Frame, FrameType, GoAway, Head, ProtocolError, RST_CODE_CONNECTION_CLOSED,
-    StreamError,
+    Class, CloseCode, CloseReason, Compress, Event, Frame, FrameType, ProtocolError,
+    RST_CODE_CONNECTION_CLOSED, StreamError,
 };
 
 #[test]
 fn close_key_revoked() {
     let mut p = Pair::authenticated();
-    let a = p.server.open(Head::default()).unwrap();
-    let b = p.client.open(Head::default()).unwrap();
-    p.server.write(a, b"pending bulk").unwrap();
+    let a = p.server.open(Class::Interactive).unwrap();
+    let b = p.client.open(Class::Interactive).unwrap();
+    send(&mut p.server, a, b"pending bulk");
     p.pump();
     p.drain_events(Side::Client);
     p.drain_events(Side::Server);
     // Queue more data so the scheduler has a backlog GOAWAY must beat.
-    p.server.write(a, &[7u8; 60_000]).unwrap();
+    send(&mut p.server, a, &[7u8; 60_000]);
 
-    p.server.close(GoAway {
+    p.server.close(CloseReason {
         code: CloseCode::KeyRevoked,
         message: Some("key rotated".into()),
     });
@@ -40,7 +40,7 @@ fn close_key_revoked() {
                 code: RST_CODE_CONNECTION_CLOSED
             },
             Event::Closed {
-                reason: GoAway {
+                reason: CloseReason {
                     code: CloseCode::KeyRevoked,
                     message: Some("key rotated".into()),
                 }
@@ -48,8 +48,11 @@ fn close_key_revoked() {
         ]
     );
     // Nothing more after the close on the server side.
-    assert_eq!(p.server.open(Head::default()), Err(StreamError::Closed));
-    assert_eq!(p.server.write(a, b"x"), Err(StreamError::Closed));
+    assert_eq!(p.server.open(Class::Interactive), Err(StreamError::Closed));
+    assert_eq!(
+        p.server.send(a, b"x", Compress::Auto),
+        Err(StreamError::Closed)
+    );
 
     // Deliver GOAWAY (and trailing RSTs) to the client.
     p.client.recv(now, &buf).unwrap_err_or_ok();
@@ -70,7 +73,7 @@ fn close_key_revoked() {
         Some(Event::Closed { reason }) if reason.code == CloseCode::KeyRevoked
             && reason.message.as_deref() == Some("key rotated")
     ));
-    assert_eq!(p.client.open(Head::default()), Err(StreamError::Closed));
+    assert_eq!(p.client.open(Class::Interactive), Err(StreamError::Closed));
     assert!(
         !p.client.poll_transmit(now, &mut buf),
         "peer-initiated close sends nothing"
@@ -88,8 +91,8 @@ impl<T, E> UnwrapErrOrOk for Result<T, E> {
 #[test]
 fn close_is_idempotent_and_recv_after_close_is_rejected() {
     let mut p = Pair::authenticated();
-    p.client.close(GoAway::new(CloseCode::Shutdown));
-    p.client.close(GoAway::new(CloseCode::Superseded));
+    p.client.close(CloseReason::new(CloseCode::Shutdown));
+    p.client.close(CloseReason::new(CloseCode::Superseded));
     let events = p.drain_events(Side::Client);
     assert_eq!(events.len(), 1);
     assert!(matches!(&events[0], Event::Closed { reason } if reason.code == CloseCode::Shutdown));
@@ -99,10 +102,7 @@ fn close_is_idempotent_and_recv_after_close_is_rejected() {
         frame_type: FrameType::Ping,
         payload: vec![1],
     };
-    assert_eq!(
-        p.client.recv(now, &ping.encode()),
-        Err(ProtocolError::Closed)
-    );
+    assert_eq!(p.client.recv(now, &ping.encode()), Ok(()));
     assert!(p.drain_events(Side::Client).is_empty());
 }
 
@@ -117,7 +117,7 @@ fn every_close_code_round_trips() {
         CloseCode::Timeout,
     ] {
         let mut p = Pair::authenticated();
-        p.client.close(GoAway::new(code));
+        p.client.close(CloseReason::new(code));
         p.pump();
         assert!(matches!(
             p.drain_events(Side::Server).last(),

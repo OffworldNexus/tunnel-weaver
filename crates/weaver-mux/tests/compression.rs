@@ -2,7 +2,7 @@ mod common;
 
 use common::*;
 use weaver_mux::wire::DATA_FLAG_COMPRESSED;
-use weaver_mux::{Class, Compression, Frame, FrameType, Head, Hints};
+use weaver_mux::{Class, Compress, Frame, FrameType};
 
 fn json(n: usize) -> Vec<u8> {
     let mut v = Vec::new();
@@ -19,24 +19,11 @@ fn noise(n: usize) -> Vec<u8> {
         .collect()
 }
 
-fn hints(ct: &str) -> Hints {
-    Hints {
-        content_type: Some(ct.into()),
-        ..Hints::default()
-    }
-}
-
-/// Open a stream with `hints`, write `data`, pump, and return the client's
-/// DATA frames plus what the server read.
-fn send(p: &mut Pair, hints: Hints, data: &[u8]) -> (Vec<Frame>, Vec<u8>) {
-    let id = p
-        .client
-        .open(Head {
-            hints,
-            opaque: vec![],
-        })
-        .unwrap();
-    assert_eq!(p.client.write(id, data).unwrap(), data.len());
+/// Open a stream in `class`, send `data` with `stance`, pump, and return
+/// the client's DATA frames plus what the server received.
+fn send_one(p: &mut Pair, class: Class, stance: Compress, data: &[u8]) -> (Vec<Frame>, Vec<u8>) {
+    let id = p.client.open(class).unwrap();
+    p.client.send(id, data, stance).unwrap();
     let before = p.log.len();
     p.pump();
     let frames = p.log[before..]
@@ -52,111 +39,84 @@ fn is_compressed(f: &Frame) -> bool {
 }
 
 #[test]
-fn json_body_is_compressed_and_round_trips() {
+fn auto_compresses_json_and_round_trips() {
     let mut p = Pair::authenticated();
     let data = json(50_000);
-    let (frames, got) = send(&mut p, hints("application/json"), &data);
+    let (frames, got) = send_one(&mut p, Class::Interactive, Compress::Auto, &data);
+    // Every fragment above the 1 KiB floor carries the flag; the 851-byte
+    // tail fragment legitimately goes raw.
+    let (last, body) = frames.split_last().unwrap();
     assert!(
-        frames.iter().all(is_compressed),
-        "every frame carries the flag"
+        body.iter().all(is_compressed),
+        "every full fragment is compressed"
     );
+    assert!(!is_compressed(last), "tail under the floor is raw");
     let wire: usize = frames.iter().map(|f| f.payload.len()).sum();
     assert!(wire < data.len() / 4, "wire {wire} vs {}", data.len());
     assert_eq!(got, data);
 }
 
 #[test]
-fn heads_are_never_compressed() {
+fn never_is_final() {
     let mut p = Pair::authenticated();
-    let head = Head {
-        hints: hints("application/json"),
-        opaque: json(8192),
-    };
-    p.client.open(head.clone()).unwrap();
-    p.pump();
-    let open = p.frames_of(Side::Client, FrameType::Open);
-    assert_eq!(open.len(), 1);
-    // OPEN payload is the postcard head verbatim: opaque bytes appear in it.
-    assert!(open[0].payload.len() >= head.opaque.len());
-    assert!(open[0].payload.windows(64).any(|w| w == &head.opaque[..64]));
+    let (frames, got) = send_one(&mut p, Class::Bulk, Compress::Never, &json(50_000));
+    assert!(frames.iter().all(|f| !is_compressed(f)));
+    assert_eq!(got, json(50_000));
 }
 
 #[test]
-fn realtime_streams_are_not_compressed() {
+fn stance_is_per_message_not_per_stream() {
+    // The BREACH shape: an uncompressed head followed by a compressed body
+    // on the same stream, then another uncompressed message.
     let mut p = Pair::authenticated();
-    let (frames, got) = send(
-        &mut p,
-        Hints {
-            content_type: Some("application/json".into()),
-            upgrade: true,
-            ..Hints::default()
-        },
-        &json(8192),
-    );
+    let id = p.client.open(Class::Interactive).unwrap();
+    p.client.send(id, &json(4096), Compress::Never).unwrap();
+    p.client.send(id, &json(4096), Compress::Auto).unwrap();
+    p.client.send(id, &json(4096), Compress::Never).unwrap();
+    p.pump();
+    let flags: Vec<bool> = p
+        .frames_of(Side::Client, FrameType::Data)
+        .iter()
+        .map(|f| is_compressed(f))
+        .collect();
+    assert_eq!(flags, vec![false, true, false]);
+    assert_eq!(recv_all(&mut p.server, id).len(), 3);
+}
+
+#[test]
+fn realtime_streams_are_never_compressed() {
+    let mut p = Pair::authenticated();
+    let (frames, got) = send_one(&mut p, Class::Realtime, Compress::Auto, &json(8192));
     assert!(frames.iter().all(|f| !is_compressed(f)));
     assert_eq!(got, json(8192));
-
-    let (frames, _) = send(&mut p, hints("text/event-stream"), &json(8192));
-    assert!(frames.iter().all(|f| !is_compressed(f)));
 }
 
 #[test]
-fn content_type_skip_list() {
+fn one_kib_floor_per_fragment() {
     let mut p = Pair::authenticated();
-    for ct in [
-        "image/png",
-        "video/mp4",
-        "audio/ogg",
-        "font/woff2",
-        "application/zip",
-        "application/pdf; version=1.7",
-        "application/octet-stream",
-    ] {
-        let (frames, _) = send(&mut p, hints(ct), &json(8192));
-        assert!(frames.iter().all(|f| !is_compressed(f)), "{ct} should skip");
-    }
-    for ct in ["image/svg+xml", "text/html", "application/json"] {
-        let (frames, _) = send(&mut p, hints(ct), &json(8192));
-        assert!(frames.iter().all(is_compressed), "{ct} should compress");
-    }
-    let (frames, _) = send(
-        &mut p,
-        Hints {
-            content_type: Some("text/html".into()),
-            content_encoding: Some("gzip".into()),
-            ..Hints::default()
-        },
-        &json(8192),
-    );
-    assert!(frames.iter().all(|f| !is_compressed(f)), "already encoded");
-}
-
-#[test]
-fn one_kib_floor_and_decide_once() {
-    let mut p = Pair::authenticated();
-    // A small first write turns compression off for the whole stream, even
-    // when a big compressible write follows.
-    let id = p
-        .client
-        .open(Head {
-            hints: hints("text/plain"),
-            opaque: vec![],
-        })
-        .unwrap();
-    p.client.write(id, &json(1023)).unwrap();
-    p.client.write(id, &json(20_000)).unwrap();
+    let (frames, _) = send_one(&mut p, Class::Interactive, Compress::Auto, &json(1023));
+    assert!(frames.iter().all(|f| !is_compressed(f)), "under floor");
+    let (frames, _) = send_one(&mut p, Class::Interactive, Compress::Auto, &json(1024));
+    assert!(frames.iter().all(is_compressed), "exactly 1 KiB is enough");
+    // A small message does not poison later big ones on the same stream.
+    let id = p.client.open(Class::Interactive).unwrap();
+    p.client.send(id, &json(100), Compress::Auto).unwrap();
+    p.client.send(id, &json(20_000), Compress::Auto).unwrap();
+    let before = p.log.len();
     p.pump();
-    let frames = p.frames_of(Side::Client, FrameType::Data);
-    assert!(frames.iter().all(|f| !is_compressed(f)));
-    // Exactly 1 KiB is enough.
-    let (frames, _) = send(&mut p, hints("text/plain"), &json(1024));
-    assert!(frames.iter().all(is_compressed));
+    let frames: Vec<_> = p.log[before..]
+        .iter()
+        .filter(|(s, f)| *s == Side::Client && f.frame_type == FrameType::Data)
+        .map(|(_, f)| f.clone())
+        .collect();
+    assert!(!is_compressed(&frames[0]));
+    assert!(frames[1..].iter().all(is_compressed));
 }
 
 #[test]
 fn entropy_probe_rejects_random_bytes() {
     let mut p = Pair::authenticated();
-    let (frames, got) = send(&mut p, Hints::default(), &noise(8192));
+    let (frames, got) = send_one(&mut p, Class::Interactive, Compress::Auto, &noise(8192));
     assert!(frames.iter().all(|f| !is_compressed(f)));
     assert_eq!(got, noise(8192));
 }
@@ -164,55 +124,47 @@ fn entropy_probe_rejects_random_bytes() {
 #[test]
 fn windows_count_compressed_bytes() {
     let mut server = server_config(1);
-    server.initial_window = 64 * 1024;
+    server_params(&mut server, |p| p.initial_window = 64 * 1024);
     let mut p = Pair::new(client_config(1), server);
     p.pump();
-    let id = p
-        .client
-        .open(Head {
-            hints: hints("application/json"),
-            opaque: vec![],
-        })
-        .unwrap();
-    // Far more than the window in application bytes fits because credit
-    // is spent on the compressed size.
-    let data = json(1 << 20);
-    let accepted = p.client.write(id, &data).unwrap();
-    assert!(accepted > 64 * 1024, "accepted {accepted} > window");
+    let id = p.client.open(Class::Interactive).unwrap();
+    // Credit is reserved on the raw size but spent on the wire size, so
+    // after sending, far more credit is free than raw bytes would allow.
+    let data = json(60_000);
+    p.client.send(id, &data, Compress::Auto).unwrap();
+    // A second 60 KB message would not fit raw in 64 KiB, but the first
+    // one only cost its compressed size — check by draining and looking at
+    // total wire bytes.
     p.pump();
     let wire: usize = p
         .frames_of(Side::Client, FrameType::Data)
         .iter()
         .map(|f| f.payload.len())
         .sum();
-    assert!(wire <= 64 * 1024, "wire bytes {wire} within window");
-    assert_eq!(read_all(&mut p.server, id), data[..accepted]);
+    assert!(wire < 8 * 1024, "wire bytes {wire} far under window");
+    assert_eq!(read_all(&mut p.server, id), data);
+    // Credit consumed == wire bytes, so another full message fits.
+    p.client.send(id, &data, Compress::Auto).unwrap();
 }
 
 #[test]
 fn server_can_refuse_compression() {
     let mut server = server_config(1);
-    server.compression = Compression::Off;
+    server_params(&mut server, |p| p.compression_allowed = false);
     let mut p = Pair::new(client_config(1), server);
     p.pump();
-    assert_eq!(p.client.params().unwrap().compression, Compression::Off);
-    let (frames, got) = send(&mut p, hints("application/json"), &json(8192));
+    assert!(!p.client.params().unwrap().compression_allowed);
+    let (frames, got) = send_one(&mut p, Class::Interactive, Compress::Auto, &json(8192));
     assert!(frames.iter().all(|f| !is_compressed(f)));
     assert_eq!(got, json(8192));
 }
 
 #[test]
-fn pinned_realtime_after_open_is_honoured_on_first_write() {
+fn policy_change_to_realtime_stops_compression() {
     let mut p = Pair::authenticated();
-    let id = p
-        .client
-        .open(Head {
-            hints: hints("application/json"),
-            opaque: vec![],
-        })
-        .unwrap();
+    let id = p.client.open(Class::Interactive).unwrap();
     p.client.set_class(id, Class::Realtime).unwrap();
-    p.client.write(id, &json(8192)).unwrap();
+    p.client.send(id, &json(8192), Compress::Auto).unwrap();
     p.pump();
     assert!(
         p.frames_of(Side::Client, FrameType::Data)
@@ -224,7 +176,7 @@ fn pinned_realtime_after_open_is_honoured_on_first_write() {
 #[test]
 fn hostile_compressed_frame_is_a_protocol_error() {
     let mut p = Pair::authenticated();
-    let id = p.client.open(Head::default()).unwrap();
+    let id = p.client.open(Class::Interactive).unwrap();
     p.pump();
     let now = p.clock.now();
     let mut payload = vec![DATA_FLAG_COMPRESSED];

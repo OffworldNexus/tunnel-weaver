@@ -1,71 +1,47 @@
-//! Per-stream zstd compression and the policy deciding when to skip it.
+//! zstd mechanics and the content-agnostic part of the compression policy.
 //!
-//! Compression is decided once per stream by the sender, on its first DATA
-//! frame, and signalled by a flag bit on every DATA payload. The receiver
-//! honours the flag and nothing else. All checks run cheapest-first; any
-//! hit leaves the stream uncompressed for its whole life.
+//! The mux does not know what a message *is*; the layer above says
+//! [`Compress::Never`] or [`Compress::Auto`] per message. Under `Auto` the
+//! mux still declines when compression cannot pay off: the class is
+//! `Realtime` (latency beats bytes, and compression side channels bite
+//! hardest on interactive traffic), the fragment is too small for a zstd
+//! header, or the bytes already look random. A fragment whose compressed
+//! form is not smaller goes out raw regardless.
 
 use std::io;
 
-use crate::sched::{Class, mime_essence};
-use crate::wire::Hints;
+use crate::sched::Class;
 
-/// Frames smaller than this are not worth a zstd header.
+/// Per-message compression stance passed to [`crate::Connection::send`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Compress {
+    /// The mux may compress if it judges it worthwhile (size floor,
+    /// entropy probe, raw fallback when compression does not shrink the
+    /// fragment). Never applied on `Realtime` streams.
+    #[default]
+    Auto,
+    /// Never compress this message: secrets, already-encoded bodies,
+    /// anything an attacker could probe via a compression side channel.
+    Never,
+}
+
+/// Fragments smaller than this are not worth a zstd header.
 pub const MIN_COMPRESS_LEN: usize = 1024;
-/// How much of the first frame the entropy probe looks at.
+/// How much of a fragment the entropy probe looks at.
 pub const ENTROPY_SAMPLE: usize = 4096;
 /// Bits/byte at or above which the data is considered incompressible.
 pub const ENTROPY_CUTOFF: f64 = 7.5;
 
-/// Should DATA on this stream be compressed? Evaluated exactly once, on
-/// the first chunk the application writes.
-pub fn should_compress(class: Class, hints: &Hints, first_chunk: &[u8]) -> bool {
-    // (2) Realtime streams: latency beats bytes, and CRIME/BREACH-style
-    // side channels bite hardest on interactive traffic.
-    if class == Class::Realtime {
+/// Should this fragment be compressed? `Never` is final; `Auto` is subject
+/// to the checks above, cheapest first.
+pub fn should_compress(stance: Compress, class: Class, fragment: &[u8]) -> bool {
+    if stance == Compress::Never || class == Class::Realtime {
         return false;
     }
-    // (3) Already encoded, or a MIME type that is compressed by
-    // construction.
-    if hints.content_encoding.is_some() {
+    if fragment.len() < MIN_COMPRESS_LEN {
         return false;
     }
-    if let Some(ct) = hints.content_type.as_deref()
-        && mime_is_precompressed(&mime_essence(ct))
-    {
-        return false;
-    }
-    // (4) Too small to pay for the container.
-    if first_chunk.len() < MIN_COMPRESS_LEN {
-        return false;
-    }
-    // (5) Looks random already.
-    entropy_bits_per_byte(&first_chunk[..first_chunk.len().min(ENTROPY_SAMPLE)]) < ENTROPY_CUTOFF
-}
-
-/// Types whose bytes are already compressed (or encrypted) and would only
-/// grow under zstd. `image/svg+xml` is text and stays compressible.
-fn mime_is_precompressed(essence: &str) -> bool {
-    if essence == "image/svg+xml" {
-        return false;
-    }
-    if essence.starts_with("image/")
-        || essence.starts_with("video/")
-        || essence.starts_with("audio/")
-        || essence.starts_with("font/woff")
-    {
-        return true;
-    }
-    matches!(
-        essence,
-        "application/zip"
-            | "application/gzip"
-            | "application/zstd"
-            | "application/x-xz"
-            | "application/pdf"
-            | "application/wasm"
-            | "application/octet-stream"
-    )
+    entropy_bits_per_byte(&fragment[..fragment.len().min(ENTROPY_SAMPLE)]) < ENTROPY_CUTOFF
 }
 
 /// Shannon entropy over a 256-bucket byte histogram, in bits per byte.
@@ -125,15 +101,6 @@ impl ZstdCtx {
 mod tests {
     use super::*;
 
-    fn hints(ct: Option<&str>, enc: Option<&str>) -> Hints {
-        Hints {
-            content_type: ct.map(str::to_owned),
-            content_length: None,
-            upgrade: false,
-            content_encoding: enc.map(str::to_owned),
-        }
-    }
-
     fn json(n: usize) -> Vec<u8> {
         let mut v = Vec::new();
         while v.len() < n {
@@ -164,45 +131,31 @@ mod tests {
 
     #[test]
     fn policy() {
-        let h = hints(Some("application/json"), None);
-        assert!(should_compress(Class::Small, &h, &json(2048)));
-        assert!(!should_compress(Class::Realtime, &h, &json(2048)));
-        assert!(!should_compress(
-            Class::Small,
-            &hints(Some("application/json"), Some("gzip")),
-            &json(2048)
-        ));
-        assert!(!should_compress(
-            Class::Small,
-            &hints(Some("image/png"), None),
-            &json(2048)
-        ));
         assert!(should_compress(
-            Class::Small,
-            &hints(Some("image/svg+xml"), None),
+            Compress::Auto,
+            Class::Interactive,
             &json(2048)
         ));
+        assert!(should_compress(Compress::Auto, Class::Bulk, &json(8192)));
+        assert!(!should_compress(Compress::Never, Class::Bulk, &json(8192)));
         assert!(!should_compress(
-            Class::Small,
-            &hints(Some("font/woff2"), None),
-            &json(2048)
-        ));
-        assert!(!should_compress(
-            Class::Bulk,
-            &hints(Some("Application/PDF; x=y"), None),
-            &json(2048)
-        ));
-        assert!(
-            !should_compress(Class::Small, &h, &json(1023)),
-            "1 KiB floor"
-        );
-        assert!(should_compress(Class::Small, &h, &json(1024)));
-        assert!(!should_compress(Class::Small, &h, &noise(4096)), "entropy");
-        assert!(should_compress(
-            Class::Bulk,
-            &hints(None, None),
+            Compress::Auto,
+            Class::Realtime,
             &json(8192)
         ));
+        assert!(
+            !should_compress(Compress::Auto, Class::Interactive, &json(1023)),
+            "1 KiB floor"
+        );
+        assert!(should_compress(
+            Compress::Auto,
+            Class::Interactive,
+            &json(1024)
+        ));
+        assert!(
+            !should_compress(Compress::Auto, Class::Interactive, &noise(4096)),
+            "entropy"
+        );
     }
 
     #[test]

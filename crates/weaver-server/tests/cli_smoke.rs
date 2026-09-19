@@ -14,7 +14,7 @@ fn test_weaver_server_version_exits_zero() {
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("weaver-server"));
-    assert!(stdout.contains("protocol v1"));
+    assert!(stdout.contains(&format!("protocol v{}", weaver_proto::PROTOCOL_VERSION)));
 }
 
 #[test]
