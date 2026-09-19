@@ -65,11 +65,7 @@ classDiagram
         +set_class(id, Class) Result~(), StreamError~
         +close(CloseReason)
         +is_closed() bool
-        +version() Option~u16~
-        +params() Option~Params~
-        +rtt() Option~Duration~
-        +class_of(id) Option~Class~
-        +pending_messages(id) Option~usize~
+        +version() / params() / rtt() / class_of() / pending_messages() [test-util]
     }
     class Config {
         role: Role
@@ -365,12 +361,17 @@ classDiagram
     policy ..> mux_Compress
 ```
 
-Stream conventions (all in `weaver-proto` docs, enforced by the handlers):
+Stream conventions (all in `weaver-proto` docs, enforced by the handlers).
+**The control stream is the registration lease**: a service is registered
+exactly as long as the control stream that registered it is open. The
+client drops a service by finishing that stream; the relay unregisters it
+on `Finished`/`Reset`, and unregisters everything on `Closed`. There is no
+`Unregister` message because the stream lifecycle already expresses it.
 
 ```mermaid
 flowchart LR
     subgraph control["control stream (client-opened, stays open)"]
-        c1["msg 1: Head::Control(Register)"] --> c2["msg 2: ControlReply"] --> c3["… open for the registration's lifetime"]
+        c1["msg 1: Head::Control(Register)"] --> c2["msg 2: ControlReply"] --> c3["… open = registered; FIN/RST = unregistered"]
     end
     subgraph visitor["visitor stream (relay-opened)"]
         v1["msg 1: Head::Http(HttpHead) — Never"] --> v2["msg 2..n: request body chunks — request_body_compress"] --> v3["FIN"]
@@ -420,9 +421,10 @@ flowchart LR
     loop -- "inflight[id]" --> vm["on_visitor_message:<br/>1st: decode HttpResponseHead → response_class → set_class → hyper Response<br/>then: body chunk → body_tx"]
     loop -- "new stream" --> fm["on_first_message:<br/>decode Head::Control → validate()<br/>spawn registry.register_service → ControlReply"]
     Wr["Writable{id}"] --> drain["drain_request_body: retry pending chunks"]
-    Fin["Finished(id)"] --> dropb["drop body_tx / forget control stream"]
-    Rs["Reset{id}"] --> err["response_tx ← Err(Reset)"]
-    Cl["Closed"] --> unreg["registry.unregister_connection"]
+    Fin["Finished(id)"] --> lease["release_lease: control stream → registry.unregister_service<br/>visitor stream → drop body_tx"]
+    Rs["Reset{id}"] --> lease
+    Rs --> err["response_tx ← Err(Reset)"]
+    Cl["Closed"] --> unreg["registry.unregister_connection (all leases)"]
     prx["proxy_rx: ProxyRequest (from edge)"] --> op["open(request_class(head))<br/>send(Head::Http, Never)<br/>spawn body reader → send(chunk, request_body_compress) / finish"]
 ```
 

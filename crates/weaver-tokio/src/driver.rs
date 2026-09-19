@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use thiserror::Error;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 use tracing::{debug, trace};
 use weaver_mux::{CloseCode, CloseReason, Connection, Event, ProtocolError};
 
@@ -46,21 +46,6 @@ impl<H: StreamHandler> Handle<H> {
     /// Silently dropped if the driver has already finished.
     pub fn spawn_on(&self, f: impl FnOnce(&mut Connection, &mut H) + Send + 'static) {
         let _ = self.tx.try_send(Box::new(f));
-    }
-
-    /// Run `f` and await its result. `None` if the driver finished first.
-    pub async fn call<R: Send + 'static>(
-        &self,
-        f: impl FnOnce(&mut Connection, &mut H) -> R + Send + 'static,
-    ) -> Option<R> {
-        let (tx, rx) = oneshot::channel();
-        let cmd: Command<H> = Box::new(move |conn, h| {
-            let _ = tx.send(f(conn, h));
-        });
-        if self.tx.send(cmd).await.is_err() {
-            return None;
-        }
-        rx.await.ok()
     }
 
     /// Tear the connection down with the given reason.

@@ -114,6 +114,7 @@ impl Stream {
     }
 
     /// Complete messages waiting for `recv_msg`.
+    #[cfg(any(test, feature = "test-util"))]
     pub fn pending_messages(&self) -> usize {
         self.inbox.len()
     }

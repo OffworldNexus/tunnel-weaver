@@ -186,6 +186,6 @@ fn hostile_compressed_frame_is_a_protocol_error() {
         frame_type: FrameType::Data,
         payload,
     };
-    assert!(p.server.recv(now, &f.encode()).is_err());
+    assert!(p.server.recv(now, &encode(&f)).is_err());
     assert!(p.server.is_closed());
 }

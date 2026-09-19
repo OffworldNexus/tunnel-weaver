@@ -102,7 +102,7 @@ fn close_is_idempotent_and_recv_after_close_is_rejected() {
         frame_type: FrameType::Ping,
         payload: vec![1],
     };
-    assert_eq!(p.client.recv(now, &ping.encode()), Ok(()));
+    assert_eq!(p.client.recv(now, &encode(&ping)), Ok(()));
     assert!(p.drain_events(Side::Client).is_empty());
 }
 
@@ -135,7 +135,7 @@ fn protocol_error_closes_with_goaway_protocol_error() {
         frame_type: FrameType::Pong,
         payload: vec![0xff; 20],
     };
-    let err = p.client.recv(now, &garbage.encode()).unwrap_err();
+    let err = p.client.recv(now, &encode(&garbage)).unwrap_err();
     assert_eq!(err, ProtocolError::Decode(FrameType::Pong));
     p.pump();
     assert!(matches!(

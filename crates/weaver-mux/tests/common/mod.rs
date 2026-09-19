@@ -171,3 +171,10 @@ pub fn send(conn: &mut Connection, id: u32, msg: &[u8]) {
 pub fn server_params(cfg: &mut Config, f: impl FnOnce(&mut weaver_mux::ServerParams)) {
     f(cfg.server_params_mut().expect("server config"));
 }
+
+/// Wire bytes of a hand-built frame.
+pub fn encode(frame: &Frame) -> Vec<u8> {
+    let mut buf = Vec::new();
+    frame.encode_into(&mut buf);
+    buf
+}

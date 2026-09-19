@@ -163,7 +163,7 @@ fn replayed_hello_is_rejected() {
     let now = q.clock.now();
     let mut buf = Vec::new();
     assert!(q.server.poll_transmit(now, &mut buf)); // CHALLENGE
-    q.server.recv(now, &hello.encode()).unwrap();
+    q.server.recv(now, &encode(&hello)).unwrap();
     assert!(q.server.poll_transmit(now, &mut buf));
     assert_eq!(Frame::parse(&buf).unwrap().frame_type, FrameType::Reject);
     assert!(q.server.is_closed());
@@ -178,7 +178,7 @@ fn frame_before_welcome_is_a_protocol_error() {
         frame_type: FrameType::Open,
         payload: weaver_mux::wire::encode_payload(&Class::Interactive),
     };
-    let err = p.server.recv(now, &open.encode()).unwrap_err();
+    let err = p.server.recv(now, &encode(&open)).unwrap_err();
     assert!(matches!(err, ProtocolError::StateViolation(_)));
     let mut buf = Vec::new();
     // Server has CHALLENGE queued but GOAWAY still jumps the line.
@@ -189,7 +189,7 @@ fn frame_before_welcome_is_a_protocol_error() {
         Some(Event::Closed { reason }) if reason.code == CloseCode::ProtocolError
     ));
     // Everything after a close is ignored without panicking.
-    assert_eq!(p.server.recv(now, &open.encode()), Ok(()));
+    assert_eq!(p.server.recv(now, &encode(&open)), Ok(()));
 }
 
 #[test]

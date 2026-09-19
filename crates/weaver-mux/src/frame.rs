@@ -95,13 +95,6 @@ impl Frame {
         })
     }
 
-    /// Encode the frame into its wire representation.
-    pub fn encode(&self) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(Self::HEADER_LEN + self.payload.len());
-        self.encode_into(&mut buf);
-        buf
-    }
-
     /// Append the wire representation of this frame to `buf`.
     ///
     /// Used by the transmit path so the caller-provided buffer is reused
@@ -130,7 +123,8 @@ mod tests {
             payload: b"hello world".to_vec(),
         };
 
-        let encoded = original.encode();
+        let mut encoded = Vec::new();
+        original.encode_into(&mut encoded);
         assert_eq!(encoded.len(), 5 + 11);
         assert_eq!(&encoded[0..4], &42u32.to_be_bytes());
         assert_eq!(encoded[4], FrameType::Data as u8);

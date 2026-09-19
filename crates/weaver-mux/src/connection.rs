@@ -137,11 +137,19 @@ impl Connection {
     // ------------------------------------------------------------------
 
     /// Negotiated protocol version; `None` before WELCOME.
+    ///
+    /// Test-only introspection (`test-util`); production drives the
+    /// connection through events alone.
+    #[cfg(any(test, feature = "test-util"))]
     pub fn version(&self) -> Option<u16> {
         self.version
     }
 
     /// Most recent PING → PONG round trip, measured with the caller's `now`.
+    ///
+    /// Test-only introspection (`test-util`); production drives the
+    /// connection through events alone.
+    #[cfg(any(test, feature = "test-util"))]
     pub fn rtt(&self) -> Option<Duration> {
         self.rtt
     }
@@ -152,16 +160,28 @@ impl Connection {
     }
 
     /// Parameters in force after WELCOME.
+    ///
+    /// Test-only introspection (`test-util`); production drives the
+    /// connection through events alone.
+    #[cfg(any(test, feature = "test-util"))]
     pub fn params(&self) -> Option<Params> {
         self.params
     }
 
     /// Current scheduling class of a stream, if it exists.
+    ///
+    /// Test-only introspection (`test-util`); production drives the
+    /// connection through events alone.
+    #[cfg(any(test, feature = "test-util"))]
     pub fn class_of(&self, id: StreamId) -> Option<Class> {
         self.streams.get(&id).map(|s| s.class)
     }
 
     /// Complete messages waiting on a stream, if it exists.
+    ///
+    /// Test-only introspection (`test-util`); production drives the
+    /// connection through events alone.
+    #[cfg(any(test, feature = "test-util"))]
     pub fn pending_messages(&self, id: StreamId) -> Option<usize> {
         self.streams.get(&id).map(Stream::pending_messages)
     }

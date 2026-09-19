@@ -145,12 +145,11 @@ fn peer_overrunning_credit_is_a_protocol_error() {
     let now = p.clock.now();
     let mut payload = vec![0u8];
     payload.extend_from_slice(&noise(16 * 1024 - 1));
-    let frame = Frame {
+    let frame = encode(&Frame {
         stream_id: id,
         frame_type: FrameType::Data,
         payload,
-    }
-    .encode();
+    });
     for _ in 0..4 {
         p.server.recv(now, &frame).unwrap();
     }

@@ -160,26 +160,6 @@ impl Store {
         f(&mut guard)
     }
 
-    /// Executes a read closure asynchronously via `tokio::task::spawn_blocking`.
-    pub async fn read_async<F, R>(&self, f: F) -> Result<R, StoreError>
-    where
-        F: FnOnce(&Connection) -> Result<R, StoreError> + Send + 'static,
-        R: Send + 'static,
-    {
-        let store = self.clone();
-        tokio::task::spawn_blocking(move || store.read(f)).await?
-    }
-
-    /// Executes a write closure asynchronously via `tokio::task::spawn_blocking`.
-    pub async fn write_async<F, R>(&self, f: F) -> Result<R, StoreError>
-    where
-        F: FnOnce(&mut Connection) -> Result<R, StoreError> + Send + 'static,
-        R: Send + 'static,
-    {
-        let store = self.clone();
-        tokio::task::spawn_blocking(move || store.write(f)).await?
-    }
-
     /// Saves the full configuration struct as JSON into the database.
     pub fn save_config(&self, config: &Config) -> Result<(), StoreError> {
         let json_str = serde_json::to_string(config)
@@ -197,12 +177,6 @@ impl Store {
             )?;
             Ok(())
         })
-    }
-
-    /// Saves the configuration struct asynchronously.
-    pub async fn save_config_async(&self, config: Config) -> Result<(), StoreError> {
-        let store = self.clone();
-        tokio::task::spawn_blocking(move || store.save_config(&config)).await?
     }
 
     /// Updates or inserts an individual configuration field into the JSON configuration object.
@@ -242,23 +216,9 @@ impl Store {
         })
     }
 
-    /// Updates or inserts an individual configuration field asynchronously.
-    pub async fn set_config_async(&self, key: String, value: String) -> Result<(), StoreError> {
-        let store = self.clone();
-        tokio::task::spawn_blocking(move || store.set_config(&key, &value)).await?
-    }
-
     /// Loads and validates the configuration from the database.
     pub fn load_config(&self) -> Result<Config, ConfigError> {
         Config::load(self)
-    }
-
-    /// Loads and validates the configuration asynchronously.
-    pub async fn load_config_async(&self) -> Result<Config, ConfigError> {
-        let store = self.clone();
-        tokio::task::spawn_blocking(move || store.load_config())
-            .await
-            .map_err(|e| ConfigError::Store(e.to_string()))?
     }
 
     /// Performs an online backup of the database to `dest` using `VACUUM INTO`.
@@ -273,12 +233,6 @@ impl Store {
             conn.execute("VACUUM INTO ?1", rusqlite::params![dest_str])?;
             Ok(())
         })
-    }
-
-    /// Performs an online backup asynchronously.
-    pub async fn backup_async(&self, dest: PathBuf) -> Result<(), StoreError> {
-        let store = self.clone();
-        tokio::task::spawn_blocking(move || store.backup(dest)).await?
     }
 
     /// Explicitly closes the store, optimizing database layout via `PRAGMA optimize`.

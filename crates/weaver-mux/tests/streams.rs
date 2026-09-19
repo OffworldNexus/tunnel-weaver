@@ -2,7 +2,7 @@ mod common;
 
 use common::*;
 use weaver_mux::wire::DATA_FLAG_MORE;
-use weaver_mux::{Class, Compress, Event, FrameType, StreamError};
+use weaver_mux::{Class, Compress, Event, Frame, FrameType, StreamError};
 
 fn policy() -> Class {
     Class::Interactive
@@ -162,12 +162,12 @@ fn ids_have_parity_and_are_never_reused() {
 fn peer_open_with_wrong_parity_is_a_protocol_error() {
     let mut p = Pair::authenticated();
     let now = p.clock.now();
-    let bogus = weaver_mux::Frame {
+    let bogus = Frame {
         stream_id: 2, // even: server parity, sent by the client
         frame_type: FrameType::Open,
         payload: weaver_mux::wire::encode_payload(&Class::Interactive),
     };
-    assert!(p.server.recv(now, &bogus.encode()).is_err());
+    assert!(p.server.recv(now, &encode(&bogus)).is_err());
     assert!(p.server.is_closed());
 }
 
@@ -179,12 +179,12 @@ fn control_class_is_rejected_on_both_ends() {
         Err(StreamError::InvalidClass)
     );
     let now = p.clock.now();
-    let bogus = weaver_mux::Frame {
+    let bogus = Frame {
         stream_id: 1,
         frame_type: FrameType::Open,
         payload: weaver_mux::wire::encode_payload(&Class::Control),
     };
-    assert!(p.server.recv(now, &bogus.encode()).is_err());
+    assert!(p.server.recv(now, &encode(&bogus)).is_err());
     assert!(p.server.is_closed());
 }
 
@@ -265,12 +265,11 @@ fn oversized_reassembly_from_peer_is_a_protocol_error() {
     // Hand-craft MORE fragments past the 16 KiB cap.
     let mut payload = vec![DATA_FLAG_MORE];
     payload.extend_from_slice(&[0u8; 8000]);
-    let f = weaver_mux::Frame {
+    let f = encode(&Frame {
         stream_id: id,
         frame_type: FrameType::Data,
         payload,
-    }
-    .encode();
+    });
     p.server.recv(now, &f).unwrap();
     p.server.recv(now, &f).unwrap();
     assert!(p.server.recv(now, &f).is_err(), "third fragment overruns");
@@ -283,19 +282,17 @@ fn fin_inside_a_message_is_a_protocol_error() {
     let id = p.client.open(policy()).unwrap();
     p.pump();
     let now = p.clock.now();
-    let frag = weaver_mux::Frame {
+    let frag = encode(&Frame {
         stream_id: id,
         frame_type: FrameType::Data,
         payload: vec![DATA_FLAG_MORE, 1, 2, 3],
-    }
-    .encode();
+    });
     p.server.recv(now, &frag).unwrap();
-    let fin = weaver_mux::Frame {
+    let fin = encode(&Frame {
         stream_id: id,
         frame_type: FrameType::Fin,
         payload: vec![],
-    }
-    .encode();
+    });
     assert!(p.server.recv(now, &fin).is_err());
 }
 
@@ -305,11 +302,10 @@ fn unknown_data_flag_is_a_protocol_error() {
     let id = p.client.open(policy()).unwrap();
     p.pump();
     let now = p.clock.now();
-    let f = weaver_mux::Frame {
+    let f = encode(&Frame {
         stream_id: id,
         frame_type: FrameType::Data,
         payload: vec![0x80, 1],
-    }
-    .encode();
+    });
     assert!(p.server.recv(now, &f).is_err());
 }

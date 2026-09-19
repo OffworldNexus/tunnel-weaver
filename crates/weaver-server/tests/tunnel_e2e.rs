@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use http::{Method, Request, StatusCode};
-use http_body_util::Empty;
+use http_body_util::{Empty, Full};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::pem::PemObject;
@@ -274,6 +274,46 @@ async fn test_tunnel_registration_and_http1_http2_proxying() {
         "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
     );
 
+    // 4b. A large POST body: exercises MORE-flagged fragmentation
+    // (> max_frame) and WINDOW_UPDATE (> initial_window / 2 of *wire*
+    // bytes consumed). The first half is low-entropy so zstd engages; the
+    // second half is incompressible so the wire bytes actually reach the
+    // flow-control threshold.
+    let mut body = "0123456789abcdef".repeat(20 * 1024).into_bytes(); // 320 KiB
+    let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+    body.extend((0..320 * 1024).map(|_| {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        x as u8
+    }));
+    let big = Bytes::from(body);
+    let req_post = Request::builder()
+        .method(Method::POST)
+        .uri("/upload")
+        .header("host", &expected_hostname)
+        .header("content-type", "text/plain")
+        .header("content-length", big.len().to_string())
+        .body(Full::new(big))
+        .unwrap();
+    let tcp_post = TcpStream::connect(relay.addr).await.unwrap();
+    let tls_post = TlsConnector::from(create_client_tls_config(vec![b"h2".to_vec()]))
+        .connect(
+            ServerName::try_from(expected_hostname.clone()).unwrap(),
+            tcp_post,
+        )
+        .await
+        .unwrap();
+    let (mut sender_post, conn_post) =
+        hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(tls_post))
+            .await
+            .unwrap();
+    tokio::spawn(async move {
+        let _ = conn_post.await;
+    });
+    let resp_post = sender_post.send_request(req_post).await.unwrap();
+    assert_eq!(resp_post.status(), StatusCode::FOUND);
+
     // 5. Terminate client and verify 404 within 1 second
     client_token.cancel();
     let _ = client_task.await;
@@ -313,6 +353,57 @@ async fn test_tunnel_registration_and_http1_http2_proxying() {
     let resp3 = sender3.send_request(req3).await.unwrap();
     assert_eq!(resp3.status(), StatusCode::NOT_FOUND);
 
+    relay.shutdown_token.cancel();
+}
+
+/// The control stream is the registration lease: finishing it drops the
+/// route and deactivates the cert while the tunnel connection stays up.
+#[tokio::test]
+async fn test_control_stream_is_the_registration_lease() {
+    let root = "localhost";
+    let relay = spawn_test_relay(root).await;
+
+    let shutdown = CancellationToken::new();
+    let release = CancellationToken::new();
+    let (s_tok, r_tok) = (shutdown.clone(), release.clone());
+    let server_addr = format!("localhost:{}", relay.addr.port());
+    let ca_path = relay.ca_pem_path.clone();
+    let client_task = tokio::spawn(async move {
+        weave::run_poc_with_tokens("web".to_string(), server_addr, Some(&ca_path), s_tok, r_tok)
+            .await
+    });
+
+    let hostname = derive_hostname("web", &poc_identity(), root);
+    let mut registered = false;
+    for _ in 0..50 {
+        if relay.registry.lookup(&hostname).is_some() {
+            registered = true;
+            break;
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+    assert!(registered, "service should register");
+    assert!(relay.cert_manager.is_active(&hostname));
+
+    // Drop the lease; the connection stays open.
+    release.cancel();
+    let mut released = false;
+    for _ in 0..20 {
+        if relay.registry.lookup(&hostname).is_none() {
+            released = true;
+            break;
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+    assert!(released, "finishing the control stream must unregister");
+    assert!(!relay.cert_manager.is_active(&hostname));
+    assert!(
+        !client_task.is_finished(),
+        "connection must survive the lease release"
+    );
+
+    shutdown.cancel();
+    client_task.await.unwrap().expect("clean shutdown");
     relay.shutdown_token.cancel();
 }
 

@@ -44,6 +44,26 @@ pub async fn run_poc_with_token(
     insecure_root_ca: Option<&Path>,
     shutdown_token: tokio_util::sync::CancellationToken,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    run_poc_with_tokens(
+        service,
+        server,
+        insecure_root_ca,
+        shutdown_token,
+        tokio_util::sync::CancellationToken::new(),
+    )
+    .await
+}
+
+/// Like [`run_poc_with_token`], plus a `release_token` that finishes the
+/// control stream — dropping the registration lease — while keeping the
+/// connection up. Exercises the relay's lease semantics end to end.
+pub async fn run_poc_with_tokens(
+    service: String,
+    server: String,
+    insecure_root_ca: Option<&Path>,
+    shutdown_token: tokio_util::sync::CancellationToken,
+    release_token: tokio_util::sync::CancellationToken,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let (host, port) = parse_server_address(&server)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
 
@@ -82,6 +102,19 @@ pub async fn run_poc_with_token(
     };
     let driver = Driver::new(conn, WsTransport::new(ws_stream), handler);
     let handle = driver.handle();
+
+    // Release the lease: FIN the control stream, stay connected.
+    tokio::spawn({
+        let handle = handle.clone();
+        async move {
+            release_token.cancelled().await;
+            handle.spawn_on(|conn, h: &mut PocHandler| {
+                if let Some(id) = h.control.take() {
+                    let _ = conn.finish(id);
+                }
+            });
+        }
+    });
 
     // Ctrl-C / test shutdown: FIN the control stream, GOAWAY, and let the
     // driver flush and return.

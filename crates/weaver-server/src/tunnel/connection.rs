@@ -7,9 +7,9 @@
 //! by raw body chunks, and reads back an `HttpResponseHead` followed by raw
 //! body chunks.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use http::{HeaderName, HeaderValue, Response, StatusCode};
@@ -42,13 +42,23 @@ pub fn spawn_tunnel_connection(
     tokio::spawn(run_tunnel_connection(ws_stream, registry, root_domain));
 }
 
+/// How often the mux asks the `IdentityResolver` whether the connected
+/// key is still acceptable; a `false` answer closes with `KeyRevoked`.
+const REVERIFY_INTERVAL: Duration = Duration::from_secs(60);
+
 async fn run_tunnel_connection(
     ws_stream: WebSocketStream<TokioIo<hyper::upgrade::Upgraded>>,
     registry: Arc<TunnelRegistry>,
     root_domain: String,
 ) {
     let verifier = Box::new(ResolverVerifier(registry.identities()));
-    let cfg = Config::server(verifier, root_domain, Box::new(SystemRng));
+    let mut cfg = Config::server(verifier, root_domain, Box::new(SystemRng));
+    if let weaver_mux::Role::Server {
+        reverify_interval, ..
+    } = &mut cfg.role
+    {
+        *reverify_interval = Some(REVERIFY_INTERVAL);
+    }
     let conn = Connection::new(cfg, Instant::now());
 
     let (proxy_tx, proxy_rx) = mpsc::channel::<ProxyRequest>(64);
@@ -58,7 +68,7 @@ async fn run_tunnel_connection(
         proxy_tx,
         conn_id: None,
         key: None,
-        control_streams: HashSet::new(),
+        leases: HashMap::new(),
         inflight: HashMap::new(),
     };
     let driver = Driver::new(conn, WsTransport::new(ws_stream), handler);
@@ -96,13 +106,27 @@ struct Exchange {
     body_compress: Compress,
 }
 
+/// A control stream is the lease on a registration: the service stays
+/// registered exactly as long as the stream is open. Finishing or
+/// resetting it unregisters the service; closing the connection
+/// unregisters all of them.
+enum Lease {
+    /// `register_service` is running off-loop; no hostname yet.
+    Pending,
+    /// Registered under this hostname.
+    Registered(String),
+    /// The client closed the stream while registration was still pending;
+    /// unregister as soon as the hostname is known.
+    Released,
+}
+
 pub(crate) struct RelayHandler {
     registry: Arc<TunnelRegistry>,
     handle: Option<RelayHandle>,
     proxy_tx: mpsc::Sender<ProxyRequest>,
     conn_id: Option<u64>,
     key: Option<KeyId>,
-    control_streams: HashSet<StreamId>,
+    leases: HashMap<StreamId, Lease>,
     inflight: HashMap<StreamId, Exchange>,
 }
 
@@ -129,7 +153,7 @@ impl StreamHandler for RelayHandler {
                 while let Ok(msg) = conn.recv_msg(id) {
                     if let Some(ex) = self.inflight.get_mut(&id) {
                         Self::on_visitor_message(ex, conn, id, &msg);
-                    } else if self.control_streams.contains(&id) {
+                    } else if self.leases.contains_key(&id) {
                         debug!(%id, "Unexpected message on control stream");
                     } else {
                         self.on_first_message(conn, id, &msg);
@@ -142,16 +166,14 @@ impl StreamHandler for RelayHandler {
                 }
             }
             Event::Finished(id) => {
-                if self.control_streams.remove(&id) {
-                    info!(%id, "Control registration stream closed by client");
-                }
+                self.release_lease(conn, id);
                 if let Some(ex) = self.inflight.remove(&id) {
                     drop(ex.body_tx);
                 }
             }
             Event::Reset { id, code } => {
                 trace!(%id, code, "Stream reset");
-                self.control_streams.remove(&id);
+                self.release_lease(conn, id);
                 if let Some(mut ex) = self.inflight.remove(&id)
                     && let Some(tx) = ex.response_tx.take()
                 {
@@ -176,6 +198,28 @@ impl RelayHandler {
             .expect("handle installed before the first event can fire")
     }
 
+    /// The client gave up a control stream: drop the registration it
+    /// carried. A lease still `Pending` is left in the map so the reply
+    /// path sees the stream is gone and unregisters right after
+    /// `register_service` completes.
+    fn release_lease(&mut self, conn: &mut Connection, id: StreamId) {
+        match self.leases.get(&id) {
+            Some(Lease::Registered(hostname)) => {
+                info!(%id, %hostname, "Control stream closed by client; unregistering");
+                if let Some(key) = self.key {
+                    self.registry.unregister_service(key, hostname);
+                }
+                self.leases.remove(&id);
+                // Our half was still open: finish it so the stream is freed.
+                let _ = conn.finish(id);
+            }
+            Some(Lease::Pending) => {
+                self.leases.insert(id, Lease::Released);
+            }
+            Some(Lease::Released) | None => {}
+        }
+    }
+
     /// First message on a client-opened stream must be a `Head::Control`.
     fn on_first_message(&mut self, conn: &mut Connection, id: StreamId, msg: &[u8]) {
         let Ok(Head::Control(head)) = weaver_proto::decode::<Head>(msg) else {
@@ -195,7 +239,7 @@ impl RelayHandler {
         }
         // Registration touches the cert manager (async): run it off the
         // loop and come back through the handle.
-        self.control_streams.insert(id);
+        self.leases.insert(id, Lease::Pending);
         let registry = Arc::clone(&self.registry);
         let proxy_tx = self.proxy_tx.clone();
         let handle = self.handle();
@@ -203,10 +247,29 @@ impl RelayHandler {
             let res = registry
                 .register_service(key, conn_id, &service, proxy_tx)
                 .await;
-            handle.spawn_on(move |conn, _| {
+            handle.spawn_on(move |conn, handler| {
                 let reply = match res {
-                    Ok(hostname) => ControlReply::Registered { hostname },
-                    Err(code) => refused(code, &service),
+                    Ok(hostname) => {
+                        match handler.leases.get(&id) {
+                            Some(Lease::Released) => {
+                                // The client finished the stream while we
+                                // were registering: the lease is already gone.
+                                handler.leases.remove(&id);
+                                handler.registry.unregister_service(key, &hostname);
+                                return;
+                            }
+                            _ => {
+                                handler
+                                    .leases
+                                    .insert(id, Lease::Registered(hostname.clone()));
+                            }
+                        }
+                        ControlReply::Registered { hostname }
+                    }
+                    Err(code) => {
+                        handler.leases.remove(&id);
+                        refused(code, &service)
+                    }
                 };
                 Self::reply(conn, id, reply);
             });

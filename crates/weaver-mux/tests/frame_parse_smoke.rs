@@ -7,7 +7,8 @@ fn test_frame_round_trip() {
         frame_type: FrameType::Open,
         payload: b"test payload".to_vec(),
     };
-    let encoded = frame.encode();
+    let mut encoded = Vec::new();
+    frame.encode_into(&mut encoded);
     let decoded = Frame::parse(&encoded).expect("valid frame parse");
     assert_eq!(frame, decoded);
 }

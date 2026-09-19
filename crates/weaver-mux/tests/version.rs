@@ -29,7 +29,7 @@ fn hello_with_version(client_max: u16) -> (Frame, Pair) {
         frame_type: FrameType::Hello,
         payload: wire::encode_payload(&hello),
     };
-    p.server.recv(now, &frame.encode()).unwrap();
+    p.server.recv(now, &encode(&frame)).unwrap();
     assert!(p.server.poll_transmit(now, &mut buf));
     (Frame::parse(&buf).unwrap(), p)
 }
