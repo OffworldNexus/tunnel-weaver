@@ -17,10 +17,12 @@ if [ ! -s "$report" ]; then
   exit 1
 fi
 
-# h2spec's JUnit puts the section in `package` (e.g. `http2/3.5`) and the
-# case description in `classname`; cases within a section are numbered in
-# document order, so the id we print is `<section>/<n>` matching the
-# console output (`3.5/2`).
+# h2spec's JUnit puts `<group>/<section>` in `package` (e.g. `http2/3.5`,
+# `generic/3.5`, `hpack/4.2` — the same section number exists in several
+# groups) and the case description in `classname`; cases within a section
+# are numbered in document order. The id we print is
+# `<group>/<section>/<n>`, e.g. `http2/3.5/2`. Both `<failure>` and
+# `<error>` count as failing.
 mapfile -t failed < <(
   python3 - "$report" <<'PY'
 import sys, xml.etree.ElementTree as ET
@@ -28,10 +30,10 @@ from collections import defaultdict
 root = ET.parse(sys.argv[1]).getroot()
 counter = defaultdict(int)
 for tc in root.iter("testcase"):
-    section = tc.get("package", "").split("/", 1)[-1]
-    counter[section] += 1
+    pkg = tc.get("package", "")
+    counter[pkg] += 1
     if tc.find("failure") is not None or tc.find("error") is not None:
-        print(f"{section}/{counter[section]}")
+        print(f"{pkg}/{counter[pkg]}")
 PY
 )
 

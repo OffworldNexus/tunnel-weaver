@@ -1,7 +1,7 @@
 # h2spec cases allowed to fail against the tunnel edge, one per line:
-#   <section>/<case>   <one-line justification>
+#   <group>/<section>/<case>   <one-line justification>   (e.g. http2/3.5/2)
 #
 # Keep this list as short as possible. A case that starts passing is
 # reported by check_h2spec.sh so the entry can be removed.
 
-3.5/2   hyper closes the TCP connection on an invalid preface without first sending GOAWAY(PROTOCOL_ERROR); RFC 9113 §3.4 only requires termination, h2spec is strict here. Not a proxy behaviour.
+http2/3.5/2   hyper closes the TCP connection on an invalid preface without first sending GOAWAY(PROTOCOL_ERROR); RFC 9113 §3.4 only requires termination, h2spec is strict here. Not a proxy behaviour.

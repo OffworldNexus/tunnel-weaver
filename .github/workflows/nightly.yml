@@ -291,7 +291,7 @@ jobs:
       # A test that scores worse through the tunnel than against the bare
       # origin is a translation defect; tests where the edge must legitimately
       # differ (smuggling it has to refuse) are pinned in the expectations
-      # file. The probe speaks plaintext only, so a socat shim terminates TLS
+      # file. The probe speaks plaintext only, so a small shim terminates TLS
       # on the runner and hands the raw bytes to the edge.
       - name: Set up .NET for Http11Probe
         uses: actions/setup-dotnet@v4
@@ -304,7 +304,6 @@ jobs:
         run: |
           TARGET_DOMAIN="${{ steps.domain.outputs.full_domain }}"
           TUNNEL_HOST="web.laptop.poc.$TARGET_DOMAIN"
-          sudo apt-get install -y -qq socat > /dev/null
 
           git clone --depth 1 https://github.com/MDA2AV/Http11Probe /tmp/http11probe
           (cd /tmp/http11probe && dotnet build Http11Probe.slnx -c Release -v q)
@@ -314,11 +313,13 @@ jobs:
           $PROBE --host 127.0.0.1 --port 18080 --timeout 8 --output /tmp/probe-origin.json > /tmp/probe-origin.log 2>&1 || true
           tail -n 3 /tmp/probe-origin.log
 
-          # Through the tunnel: TLS terminated by socat, raw h1 to the edge.
-          socat TCP-LISTEN:18081,reuseaddr,fork,bind=127.0.0.1 \
-            OPENSSL:"$TUNNEL_HOST":443,cafile=/tmp/certs/staging-ca.pem,servername="$TUNNEL_HOST",verify=1 \
-            > /tmp/socat.log 2>&1 &
+          # Through the tunnel. The probe cannot set Host or TLS, and the
+          # edge refuses Host≠SNI (421), so a shim terminates TLS and patches
+          # only the Host header, passing every other byte through verbatim.
+          python3 ci/conformance/h1_shim.py 18081 "$TUNNEL_HOST" "$TUNNEL_HOST" /tmp/certs/staging-ca.pem \
+            > /tmp/shim.log 2>&1 &
           sleep 1
+          cat /tmp/shim.log
           $PROBE --host 127.0.0.1 --port 18081 --timeout 8 --output /tmp/probe-tunnel.json > /tmp/probe-tunnel.log 2>&1 || true
           tail -n 3 /tmp/probe-tunnel.log
 
@@ -334,10 +335,11 @@ jobs:
           TARGET_DOMAIN="${{ steps.domain.outputs.full_domain }}"
           WS_HOST="ws.laptop.poc.$TARGET_DOMAIN"
 
-          # Echo origin: websocat in server mode, one process per connection.
+          # Echo origin. `ws-l:… mirror:` is websocat's true per-connection
+          # echo (`-s` is a broadcast "chat" mode and does not echo).
           curl -sSL -o /tmp/websocat "https://github.com/vi/websocat/releases/download/v1.13.0/websocat.x86_64-unknown-linux-musl"
           chmod +x /tmp/websocat
-          /tmp/websocat -E --binary -s 127.0.0.1:19000 > /tmp/ws-origin.log 2>&1 &
+          /tmp/websocat -E ws-l:127.0.0.1:19000 mirror: > /tmp/ws-origin.log 2>&1 &
 
           # Add the ws service on its own client (the web one is still up).
           ./target/release/weave start ws=19000 --server "$TARGET_DOMAIN" --insecure-root-ca /tmp/certs/staging-ca.pem --quiet > /tmp/weave-ws.log 2>&1 &
@@ -374,6 +376,7 @@ jobs:
             /tmp/probe-tunnel.json
             /tmp/probe-origin.log
             /tmp/probe-tunnel.log
+            /tmp/shim.log
             /tmp/autobahn/reports/
           if-no-files-found: ignore
 
