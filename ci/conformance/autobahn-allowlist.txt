@@ -1,0 +1,8 @@
+# Autobahn fuzzingclient cases allowed to be non-OK through the tunnel:
+#   <case>   <one-line justification>
+#
+# Both hops are opaque byte pipes after the 101, so WebSocket behaviour is
+# the echo origin's (websocat), not ours. Section 9 (performance/limits)
+# is excluded in fuzzingclient.json rather than listed here.
+#
+# Nothing allow-listed yet.

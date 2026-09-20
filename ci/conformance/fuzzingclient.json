@@ -1,0 +1,13 @@
+{
+  "outdir": "/reports/clients",
+  "servers": [
+    {
+      "agent": "tunnel-weaver",
+      "url": "wss://__WS_HOST__/",
+      "options": { "version": 18 }
+    }
+  ],
+  "cases": ["*"],
+  "exclude-cases": ["9.*"],
+  "exclude-agent-cases": {}
+}

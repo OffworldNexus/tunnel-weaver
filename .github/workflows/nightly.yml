@@ -210,8 +210,12 @@ jobs:
           curl -s https://letsencrypt.org/certs/staging/gen-y/root-ye.pem >> /tmp/certs/staging-ca.pem
           curl -s https://letsencrypt.org/certs/staging/gen-y/root-yr.pem >> /tmp/certs/staging-ca.pem
 
-          echo "Starting weave poc client against $TARGET_DOMAIN:443..."
-          ./target/release/weave poc web --server "$TARGET_DOMAIN" --insecure-root-ca /tmp/certs/staging-ca.pem > /tmp/weave.log 2>&1 &
+          # A trivial local origin for `weave start` to proxy to.
+          mkdir -p /tmp/origin && echo "hello from origin" > /tmp/origin/hello
+          (cd /tmp/origin && python3 -m http.server 18080 --bind 127.0.0.1 > /tmp/origin.log 2>&1 &)
+
+          echo "Starting weave start client against $TARGET_DOMAIN:443..."
+          ./target/release/weave start web=18080 --server "$TARGET_DOMAIN" --insecure-root-ca /tmp/certs/staging-ca.pem > /tmp/weave.log 2>&1 &
           WEAVE_PID=$!
 
           TUNNEL_HOST="web.laptop.poc.$TARGET_DOMAIN"
@@ -231,27 +235,98 @@ jobs:
             exit 1
           fi
 
-          echo "Querying visitor endpoint on https://$TUNNEL_HOST/hello?test=1..."
-          HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" --cacert /tmp/certs/staging-ca.pem "https://$TUNNEL_HOST/hello?test=1")
+          echo "Querying visitor endpoint on https://$TUNNEL_HOST/hello..."
+          HTTP_STATUS=$(curl -s -o /tmp/visitor.out -w "%{http_code}" --cacert /tmp/certs/staging-ca.pem "https://$TUNNEL_HOST/hello")
           echo "Received HTTP status: $HTTP_STATUS"
-          if [ "$HTTP_STATUS" != "302" ]; then
-            echo "Error: Expected HTTP 302 redirect, got $HTTP_STATUS"
+          if [ "$HTTP_STATUS" != "200" ]; then
+            echo "Error: Expected HTTP 200 from the proxied origin, got $HTTP_STATUS"
             cat /tmp/weave.log
             kill $WEAVE_PID || true
             exit 1
           fi
-
-          LOCATION=$(curl -s -I --cacert /tmp/certs/staging-ca.pem "https://$TUNNEL_HOST/hello?test=1" | grep -i "^location:" | tr -d '\r\n')
-          echo "Redirect location header: $LOCATION"
-          if ! echo "$LOCATION" | grep -q "youtube.com/watch?v=dQw4w9WgXcQ"; then
-            echo "Error: Unexpected location header: $LOCATION"
+          if ! grep -q "hello from origin" /tmp/visitor.out; then
+            echo "Error: visitor did not receive the origin body:"
+            cat /tmp/visitor.out
             kill $WEAVE_PID || true
             exit 1
           fi
 
+          # Edge WAF: scanner probes are refused before the tunnel.
+          for probe in /.env /.git/HEAD /env /actuator/env "/%2e%2e%2f%2eenv"; do
+            WAF_STATUS=$(curl -s -o /dev/null -w "%{http_code}" --cacert /tmp/certs/staging-ca.pem "https://$TUNNEL_HOST$probe")
+            if [ "$WAF_STATUS" != "403" ]; then
+              echo "Error: WAF let $probe through with $WAF_STATUS"
+              kill $WEAVE_PID || true
+              exit 1
+            fi
+          done
+          echo "WAF refused the scanner playbook with 403"
+          echo "$WEAVE_PID" > /tmp/weave.pid
+
+      # HTTP/2 conformance (RFC 7540/7541) against the public hostname,
+      # with the trivial origin still behind the tunnel. h2spec is the
+      # de-facto suite; there is no equivalent canonical HTTP/1.1 runner,
+      # h1 is covered by the behaviour-table e2e in `tunnel_e2e.rs`.
+      - name: HTTP/2 conformance (h2spec)
+        run: |
+          TARGET_DOMAIN="${{ steps.domain.outputs.full_domain }}"
+          TUNNEL_HOST="web.laptop.poc.$TARGET_DOMAIN"
+          H2SPEC_VERSION="2.6.0"
+          curl -sSL "https://github.com/summerwind/h2spec/releases/download/v${H2SPEC_VERSION}/h2spec_linux_amd64.tar.gz" | tar xz -C /tmp
+          chmod +x /tmp/h2spec
+          set +e
+          /tmp/h2spec --host "$TUNNEL_HOST" --port 443 --tls --insecure --timeout 10 --junit-report /tmp/h2spec.xml > /tmp/h2spec.log 2>&1
+          RC=$?
+          set -e
+          tail -n 30 /tmp/h2spec.log
+          # Allow-listed cases each carry a one-line justification; anything
+          # else failing fails the job.
+          ci/conformance/check_h2spec.sh /tmp/h2spec.xml ci/conformance/h2spec-allowlist.txt
+
+      # WebSocket conformance (RFC 6455 + permessage-deflate) through the
+      # tunnel: an echo origin behind `weave start`, Autobahn's fuzzingclient
+      # driving the public wss:// endpoint. Performance cases are skipped.
+      - name: WebSocket conformance (Autobahn)
+        run: |
+          TARGET_DOMAIN="${{ steps.domain.outputs.full_domain }}"
+          WS_HOST="ws.laptop.poc.$TARGET_DOMAIN"
+
+          # Echo origin: websocat in server mode, one process per connection.
+          curl -sSL -o /tmp/websocat "https://github.com/vi/websocat/releases/download/v1.13.0/websocat.x86_64-unknown-linux-musl"
+          chmod +x /tmp/websocat
+          /tmp/websocat -E --binary -s 127.0.0.1:19000 > /tmp/ws-origin.log 2>&1 &
+
+          # Add the ws service on its own client (the web one is still up).
+          ./target/release/weave start ws=19000 --server "$TARGET_DOMAIN" --insecure-root-ca /tmp/certs/staging-ca.pem --quiet > /tmp/weave-ws.log 2>&1 &
+          WS_WEAVE_PID=$!
+          for i in $(seq 1 60); do
+            if curl -s -o /dev/null --cacert /tmp/certs/staging-ca.pem "https://$WS_HOST/" ; then break; fi
+            sleep 1
+          done
+
+          mkdir -p /tmp/autobahn/reports
+          # The runner container has no access to the staging CA, and
+          # Autobahn has no CA option, so the public cert is verified with
+          # the LE staging roots mounted as the system bundle.
+          sed "s#__WS_HOST__#$WS_HOST#" ci/conformance/fuzzingclient.json > /tmp/autobahn/fuzzingclient.json
+          docker run --rm --network host \
+            -v /tmp/autobahn:/config \
+            -v /tmp/autobahn/reports:/reports \
+            -v /tmp/certs/staging-ca.pem:/etc/ssl/certs/ca-certificates.crt:ro \
+            crossbario/autobahn-testsuite \
+            wstest -m fuzzingclient -s /config/fuzzingclient.json || true
+
+          kill -INT $WS_WEAVE_PID || true
+          ci/conformance/check_autobahn.sh /tmp/autobahn/reports/clients/index.json ci/conformance/autobahn-allowlist.txt
+
+      - name: Tunnel teardown → 404
+        run: |
+          TARGET_DOMAIN="${{ steps.domain.outputs.full_domain }}"
+          TUNNEL_HOST="web.laptop.poc.$TARGET_DOMAIN"
+          WEAVE_PID=$(cat /tmp/weave.pid)
           echo "Stopping weave client (PID $WEAVE_PID)..."
           kill -INT $WEAVE_PID
-          wait $WEAVE_PID || true
+          wait $WEAVE_PID 2>/dev/null || true
 
           sleep 2
           echo "Verifying 404 after tunnel termination..."
