@@ -552,9 +552,32 @@ fn collect_forwarding(headers: &http::HeaderMap) -> Forwarding {
     out
 }
 
+/// Response headers for the relay, minus hop-by-hop fields (RFC 9110
+/// §7.6.1). `Connection: close` in particular describes the *origin*
+/// connection — an HTTP/1.0 origin closing after each reply — and must not
+/// reach the visitor, or the edge would tear down a keep-alive visitor
+/// connection and pipelined requests behind it would be lost. The pool
+/// already honours the origin's close by not reusing that connection.
+/// `Connection`-listed names are dropped too. The upgrade pair is kept for
+/// a 101 (the relay needs it to switch the visitor).
 fn collect_headers(headers: &http::HeaderMap) -> Vec<(String, Vec<u8>)> {
+    let connection_tokens: Vec<String> = headers
+        .get_all(http::header::CONNECTION)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|s| s.split(','))
+        .map(|t| t.trim().to_ascii_lowercase())
+        .filter(|t| !t.is_empty())
+        .collect();
     headers
         .iter()
+        .filter(|(n, _)| {
+            let name = n.as_str();
+            if name == "upgrade" {
+                return true;
+            }
+            !(HOP_BY_HOP.contains(&name) || connection_tokens.contains(&name.to_string()))
+        })
         .map(|(n, v)| (n.as_str().to_string(), v.as_bytes().to_vec()))
         .collect()
 }

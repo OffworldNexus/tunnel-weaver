@@ -559,6 +559,18 @@ impl RelayHandler {
                         builder = builder.header(n, v);
                     }
                 }
+                // The client strips hop-by-hop headers from the origin's
+                // reply; an h1 101 is only valid with the upgrade pair, so
+                // the edge re-adds it as this hop's own.
+                if !ex.visitor_connect {
+                    builder = builder.header(http::header::CONNECTION, "upgrade").header(
+                        http::header::UPGRADE,
+                        ex.req
+                            .header("upgrade")
+                            .and_then(|v| std::str::from_utf8(v).ok())
+                            .unwrap_or("websocket"),
+                    );
+                }
                 let response = builder
                     .body(crate::tunnel::proxy::empty_body())
                     .expect("status and headers were validated");

@@ -335,11 +335,14 @@ jobs:
           TARGET_DOMAIN="${{ steps.domain.outputs.full_domain }}"
           WS_HOST="ws.laptop.poc.$TARGET_DOMAIN"
 
-          # Echo origin. `ws-l:… mirror:` is websocat's true per-connection
-          # echo (`-s` is a broadcast "chat" mode and does not echo).
-          curl -sSL -o /tmp/websocat "https://github.com/vi/websocat/releases/download/v1.13.0/websocat.x86_64-unknown-linux-musl"
-          chmod +x /tmp/websocat
-          /tmp/websocat -E ws-l:127.0.0.1:19000 mirror: > /tmp/ws-origin.log 2>&1 &
+          # Echo origin: Python `websockets`, which implements the close
+          # handshake and permessage-deflate correctly (websocat's mirror
+          # drops the TCP connection on Close, which Autobahn scores as
+          # UNCLEAN on every case and would mask real tunnel faults).
+          pip3 install -q --user 'websockets>=13'
+          python3 ci/conformance/ws_echo.py 19000 > /tmp/ws-origin.log 2>&1 &
+          sleep 2
+          cat /tmp/ws-origin.log
 
           # Add the ws service on its own client (the web one is still up).
           ./target/release/weave start ws=19000 --server "$TARGET_DOMAIN" --insecure-root-ca /tmp/certs/staging-ca.pem --quiet > /tmp/weave-ws.log 2>&1 &
@@ -350,18 +353,24 @@ jobs:
           done
 
           mkdir -p /tmp/autobahn/reports
-          # The runner container has no access to the staging CA, and
-          # Autobahn has no CA option, so the public cert is verified with
-          # the LE staging roots mounted as the system bundle.
-          sed "s#__WS_HOST__#$WS_HOST#" ci/conformance/fuzzingclient.json > /tmp/autobahn/fuzzingclient.json
+          # The Autobahn image is Python 2 with an old TLS stack and no CA
+          # option, so TLS is terminated on the runner by the same shim used
+          # for Http11Probe: it patches only the Host header (Autobahn sends
+          # `host:443`, the edge requires Host == SNI) and passes every
+          # other byte through — after the 101 it is a pure pipe, so the
+          # WebSocket frames Autobahn fuzzes are untouched.
+          python3 ci/conformance/h1_shim.py 19080 "$WS_HOST" "$WS_HOST" /tmp/certs/staging-ca.pem \
+            > /tmp/ws-shim.log 2>&1 &
+          sleep 1
+          cp ci/conformance/fuzzingclient.json /tmp/autobahn/fuzzingclient.json
           docker run --rm --network host \
             -v /tmp/autobahn:/config \
             -v /tmp/autobahn/reports:/reports \
-            -v /tmp/certs/staging-ca.pem:/etc/ssl/certs/ca-certificates.crt:ro \
             crossbario/autobahn-testsuite \
             wstest -m fuzzingclient -s /config/fuzzingclient.json || true
 
           kill -INT $WS_WEAVE_PID || true
+          tail -n 5 /tmp/ws-shim.log
           ci/conformance/check_autobahn.sh /tmp/autobahn/reports/clients/index.json ci/conformance/autobahn-allowlist.txt
 
       - name: Upload conformance reports

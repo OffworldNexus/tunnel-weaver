@@ -68,25 +68,58 @@ def handle(client, tunnel_host: str, edge_host: str, ctx: ssl.SSLContext):
         client.close()
         return
 
-    state = {"buf": b"", "done": False}
+    # Keep-alive and pipelining: several requests share one connection, so
+    # every head on it needs its Host patched, not just the first. Bytes
+    # after a head (a body) cannot be told apart from the next head without
+    # parsing framing — which the probe deliberately makes ambiguous — so
+    # the heuristic is: patch any `Host:` line we see at the start of a
+    # header block; a body containing a literal `Host:` line at line start
+    # is exactly the smuggling shape the edge is meant to catch, and
+    # rewriting it does not change the verdict.
+    state = {"buf": b"", "pipe": False}
     thost = tunnel_host.encode()
+    method_re = re.compile(rb"^[A-Za-z]{1,20} \S+ HTTP/\d")
+    is_upgrade = re.compile(rb"(?im)^upgrade:")
 
     def to_edge(data: bytes) -> bytes:
-        if state["done"]:
+        # After a WebSocket upgrade the connection carries masked binary
+        # frames, not HTTP heads: become a pure pipe.
+        if state["pipe"]:
             return data
         state["buf"] += data
-        out, done = rewrite_head(state["buf"], thost)
-        if done:
-            state["done"] = True
-            state["buf"] = b""
-            return out
-        # Head not complete yet: hold bytes back until we can patch Host,
-        # but never buffer more than a sane head size.
-        if len(state["buf"]) > 64 * 1024:
-            state["done"] = True
-            out, state["buf"] = state["buf"], b""
-            return out
-        return b""
+        out = b""
+        while state["buf"]:
+            # Only hold bytes back while they look like the start of a
+            # request head; anything else (a body, garbage the probe sends on
+            # purpose) goes straight through.
+            first_line_end = state["buf"].find(b"\n")
+            probe = state["buf"] if first_line_end == -1 else state["buf"][:first_line_end]
+            looks_like_head = method_re.match(probe.lstrip(b"\r\n")) is not None
+            if not looks_like_head and first_line_end != -1:
+                out += state["buf"]
+                state["buf"] = b""
+                break
+            patched, done = rewrite_head(state["buf"], thost)
+            if not done:
+                if len(state["buf"]) > 64 * 1024:
+                    out, state["buf"] = out + state["buf"], b""
+                break
+            cut = None
+            for sep in (b"\r\n\r\n", b"\n\n"):
+                idx = patched.find(sep)
+                if idx != -1 and (cut is None or idx + len(sep) < cut):
+                    cut = idx + len(sep)
+            head = patched[:cut]
+            out += head
+            state["buf"] = patched[cut:]
+            if is_upgrade.search(head):
+                # Whatever follows the upgrade request (and the 101 the
+                # other direction) is opaque from here on.
+                state["pipe"] = True
+                out += state["buf"]
+                state["buf"] = b""
+                break
+        return out
 
     t = threading.Thread(target=pump, args=(edge, client), daemon=True)
     t.start()
