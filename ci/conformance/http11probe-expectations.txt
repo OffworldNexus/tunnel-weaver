@@ -1,0 +1,11 @@
+# Http11Probe verdicts the *tunnel* must produce where "same as the origin"
+# is not the right bar. One per line:
+#   <TEST-ID>   <Pass|Warn|Fail|Error|Skip>   <one-line justification>
+#
+# Tests not listed here must score at least as well through the tunnel as
+# against the origin directly (check_http11probe.sh). Add an entry only
+# when the edge is *supposed* to behave differently from a plain origin —
+# e.g. request smuggling vectors it must refuse, or edge-owned errors.
+#
+# Empty on first run on purpose: the first nightly result populates this
+# with the real ids and their justifications.

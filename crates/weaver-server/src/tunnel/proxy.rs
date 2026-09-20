@@ -110,6 +110,8 @@ pub enum UpgradeKind {
 }
 
 /// Hop-by-hop headers a proxy must not forward (RFC 9110 §7.6.1).
+/// `Trailer` is end-to-end (§6.6.2) and travels with the trailers it
+/// announces, so it is kept.
 pub const HOP_BY_HOP_HEADERS: &[&str] = &[
     "connection",
     "keep-alive",
@@ -117,7 +119,6 @@ pub const HOP_BY_HOP_HEADERS: &[&str] = &[
     "proxy-authorization",
     "proxy-connection",
     "te",
-    "trailer",
     "transfer-encoding",
     "upgrade",
 ];

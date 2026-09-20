@@ -17,18 +17,21 @@ if [ ! -s "$report" ]; then
   exit 1
 fi
 
-# JUnit: <testcase package="..." classname="5.1" name="9: ..."> with a
-# nested <failure> when it failed.
+# h2spec's JUnit puts the section in `package` (e.g. `http2/3.5`) and the
+# case description in `classname`; cases within a section are numbered in
+# document order, so the id we print is `<section>/<n>` matching the
+# console output (`3.5/2`).
 mapfile -t failed < <(
   python3 - "$report" <<'PY'
 import sys, xml.etree.ElementTree as ET
+from collections import defaultdict
 root = ET.parse(sys.argv[1]).getroot()
+counter = defaultdict(int)
 for tc in root.iter("testcase"):
+    section = tc.get("package", "").split("/", 1)[-1]
+    counter[section] += 1
     if tc.find("failure") is not None or tc.find("error") is not None:
-        cls = tc.get("classname", "")
-        name = tc.get("name", "")
-        num = name.split(":", 1)[0].strip()
-        print(f"{cls}/{num}")
+        print(f"{section}/{counter[section]}")
 PY
 )
 

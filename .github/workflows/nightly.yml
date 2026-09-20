@@ -268,6 +268,8 @@ jobs:
       # de-facto suite; there is no equivalent canonical HTTP/1.1 runner,
       # h1 is covered by the behaviour-table e2e in `tunnel_e2e.rs`.
       - name: HTTP/2 conformance (h2spec)
+        id: h2spec
+        continue-on-error: true
         run: |
           TARGET_DOMAIN="${{ steps.domain.outputs.full_domain }}"
           TUNNEL_HOST="web.laptop.poc.$TARGET_DOMAIN"
@@ -283,10 +285,51 @@ jobs:
           # else failing fails the job.
           ci/conformance/check_h2spec.sh /tmp/h2spec.xml ci/conformance/h2spec-allowlist.txt
 
+      # HTTP/1.1 conformance, *through* the tunnel, as a translation check.
+      # Http11Probe (RFC 9110/9112 + smuggling + malformed input) is run
+      # twice against the same origin: directly, and via edge → mux → weave.
+      # A test that scores worse through the tunnel than against the bare
+      # origin is a translation defect; tests where the edge must legitimately
+      # differ (smuggling it has to refuse) are pinned in the expectations
+      # file. The probe speaks plaintext only, so a socat shim terminates TLS
+      # on the runner and hands the raw bytes to the edge.
+      - name: Set up .NET for Http11Probe
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0'
+
+      - name: HTTP/1.1 translation conformance (Http11Probe)
+        id: http11probe
+        continue-on-error: true
+        run: |
+          TARGET_DOMAIN="${{ steps.domain.outputs.full_domain }}"
+          TUNNEL_HOST="web.laptop.poc.$TARGET_DOMAIN"
+          sudo apt-get install -y -qq socat > /dev/null
+
+          git clone --depth 1 https://github.com/MDA2AV/Http11Probe /tmp/http11probe
+          (cd /tmp/http11probe && dotnet build Http11Probe.slnx -c Release -v q)
+          PROBE="dotnet run --no-build -c Release --project /tmp/http11probe/src/Http11Probe.Cli --"
+
+          # Baseline: the origin the tunnel fronts, probed directly.
+          $PROBE --host 127.0.0.1 --port 18080 --timeout 8 --output /tmp/probe-origin.json > /tmp/probe-origin.log 2>&1 || true
+          tail -n 3 /tmp/probe-origin.log
+
+          # Through the tunnel: TLS terminated by socat, raw h1 to the edge.
+          socat TCP-LISTEN:18081,reuseaddr,fork,bind=127.0.0.1 \
+            OPENSSL:"$TUNNEL_HOST":443,cafile=/tmp/certs/staging-ca.pem,servername="$TUNNEL_HOST",verify=1 \
+            > /tmp/socat.log 2>&1 &
+          sleep 1
+          $PROBE --host 127.0.0.1 --port 18081 --timeout 8 --output /tmp/probe-tunnel.json > /tmp/probe-tunnel.log 2>&1 || true
+          tail -n 3 /tmp/probe-tunnel.log
+
+          ci/conformance/check_http11probe.sh /tmp/probe-origin.json /tmp/probe-tunnel.json ci/conformance/http11probe-expectations.txt
+
       # WebSocket conformance (RFC 6455 + permessage-deflate) through the
       # tunnel: an echo origin behind `weave start`, Autobahn's fuzzingclient
       # driving the public wss:// endpoint. Performance cases are skipped.
       - name: WebSocket conformance (Autobahn)
+        id: autobahn
+        continue-on-error: true
         run: |
           TARGET_DOMAIN="${{ steps.domain.outputs.full_domain }}"
           WS_HOST="ws.laptop.poc.$TARGET_DOMAIN"
@@ -318,6 +361,30 @@ jobs:
 
           kill -INT $WS_WEAVE_PID || true
           ci/conformance/check_autobahn.sh /tmp/autobahn/reports/clients/index.json ci/conformance/autobahn-allowlist.txt
+
+      - name: Upload conformance reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: conformance-reports
+          path: |
+            /tmp/h2spec.xml
+            /tmp/h2spec.log
+            /tmp/probe-origin.json
+            /tmp/probe-tunnel.json
+            /tmp/probe-origin.log
+            /tmp/probe-tunnel.log
+            /tmp/autobahn/reports/
+          if-no-files-found: ignore
+
+      - name: Conformance gate
+        run: |
+          failed=0
+          for s in h2spec:${{ steps.h2spec.outcome }} http11probe:${{ steps.http11probe.outcome }} autobahn:${{ steps.autobahn.outcome }}; do
+            echo "$s"
+            case "$s" in *:success) ;; *) failed=1 ;; esac
+          done
+          exit $failed
 
       - name: Tunnel teardown → 404
         run: |

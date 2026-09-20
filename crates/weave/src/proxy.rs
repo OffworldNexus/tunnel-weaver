@@ -40,6 +40,10 @@ pub type Body = BoxBody<Bytes, BoxError>;
 /// Hop-by-hop headers a proxy must not forward (RFC 9110 §7.6.1). The relay
 /// strips these too; doing it again here is idempotent and keeps the client
 /// correct on its own.
+///
+/// `Trailer` is deliberately *not* here: it is an end-to-end announcement
+/// of which trailer fields follow the body (RFC 9110 §6.6.2), and the
+/// trailers themselves are forwarded, so the announcement must be too.
 const HOP_BY_HOP: &[&str] = &[
     "connection",
     "keep-alive",
@@ -47,7 +51,6 @@ const HOP_BY_HOP: &[&str] = &[
     "proxy-authorization",
     "proxy-connection",
     "te",
-    "trailer",
     "transfer-encoding",
     "upgrade",
 ];
@@ -453,6 +456,13 @@ fn apply_origin_headers(
             HeaderValue::from_static("upgrade"),
         );
         headers.insert(http::header::UPGRADE, protocol);
+    } else {
+        // RFC 9110 §10.1.4: `TE: trailers` is how the *next hop* learns it may
+        // send trailer fields. The visitor's own `TE` is hop-by-hop and was
+        // stripped above; we forward trailers over the mux, so we announce
+        // acceptance ourselves — otherwise a well-behaved h1 origin silently
+        // drops them.
+        headers.insert(http::header::TE, HeaderValue::from_static("trailers"));
     }
 
     let host_value = if cfg.preserve_host {

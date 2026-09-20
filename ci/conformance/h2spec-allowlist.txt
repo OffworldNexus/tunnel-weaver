@@ -3,7 +3,5 @@
 #
 # Keep this list as short as possible. A case that starts passing is
 # reported by check_h2spec.sh so the entry can be removed.
-#
-# Nothing allow-listed yet: the edge is hyper's h2 server, which is
-# h2spec-clean. Entries here would be for behaviour the *proxy* changes
-# (e.g. a 4.3/x HPACK case if we ever re-encode headers).
+
+3.5/2   hyper closes the TCP connection on an invalid preface without first sending GOAWAY(PROTOCOL_ERROR); RFC 9113 §3.4 only requires termination, h2spec is strict here. Not a proxy behaviour.

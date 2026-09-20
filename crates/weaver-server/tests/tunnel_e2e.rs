@@ -967,6 +967,602 @@ async fn test_origin_down_502s_only_that_service() {
     relay.shutdown_token.cancel();
 }
 
+// ---------------------------------------------------------------------------
+// Translation matrix: what goes in one side must come out the other intact.
+//
+// The conformance suites in CI (h2spec, Http11Probe, Autobahn) hit the
+// *edge*; this table proves the *tunnel* is a faithful translator. A
+// recording origin captures exactly the request it received and answers
+// with a scripted response; each case is run over an h1 and an h2 visitor
+// connection and both the origin-side capture and the visitor-side reply are
+// compared field by field.
+// ---------------------------------------------------------------------------
+
+/// What the recording origin saw for one request.
+#[derive(Debug, Clone)]
+struct Seen {
+    method: String,
+    path: String,
+    /// Lowercased names, in order; hop-by-hop / forwarding headers dropped
+    /// by the assertion helper, not here.
+    headers: Vec<(String, String)>,
+    body: Vec<u8>,
+    trailers: Vec<(String, String)>,
+    version: http::Version,
+}
+
+/// A scripted reply for the origin to send.
+#[derive(Debug, Clone)]
+struct Reply {
+    status: u16,
+    headers: Vec<(&'static str, String)>,
+    body: Vec<u8>,
+    trailers: Vec<(&'static str, &'static str)>,
+}
+
+/// An origin that records each request and replies from a script, keyed by
+/// path so concurrent cases do not interfere.
+struct RecordingOrigin {
+    addr: SocketAddr,
+    seen: Arc<std::sync::Mutex<Vec<Seen>>>,
+    replies: Arc<std::sync::Mutex<std::collections::HashMap<String, Reply>>>,
+    token: CancellationToken,
+}
+
+async fn spawn_recording_origin() -> RecordingOrigin {
+    use http_body_util::StreamBody;
+    use hyper::body::Frame;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let seen: Arc<std::sync::Mutex<Vec<Seen>>> = Arc::default();
+    let replies: Arc<std::sync::Mutex<std::collections::HashMap<String, Reply>>> = Arc::default();
+    let token = CancellationToken::new();
+    let (t, s, r) = (token.clone(), Arc::clone(&seen), Arc::clone(&replies));
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = tokio::select! {
+                _ = t.cancelled() => break,
+                accepted = listener.accept() => match accepted {
+                    Ok(pair) => pair,
+                    Err(_) => continue,
+                },
+            };
+            let (s, r) = (Arc::clone(&s), Arc::clone(&r));
+            tokio::spawn(async move {
+                let service = service_fn(move |req: Request<Incoming>| {
+                    let (s, r) = (Arc::clone(&s), Arc::clone(&r));
+                    async move {
+                        let (parts, body) = req.into_parts();
+                        let path = parts
+                            .uri
+                            .path_and_query()
+                            .map(|pq| pq.as_str().to_string())
+                            .unwrap_or_default();
+                        let mut data = Vec::new();
+                        let mut trailers = Vec::new();
+                        let mut body = body;
+                        while let Some(Ok(frame)) = body.frame().await {
+                            if frame.is_data() {
+                                data.extend_from_slice(&frame.into_data().unwrap());
+                            } else if let Ok(t) = frame.into_trailers() {
+                                trailers.extend(t.iter().map(|(n, v)| {
+                                    (n.as_str().to_string(), v.to_str().unwrap().to_string())
+                                }));
+                            }
+                        }
+                        s.lock().unwrap().push(Seen {
+                            method: parts.method.to_string(),
+                            path: path.clone(),
+                            headers: parts
+                                .headers
+                                .iter()
+                                .map(|(n, v)| {
+                                    (n.as_str().to_string(), v.to_str().unwrap_or("").to_string())
+                                })
+                                .collect(),
+                            body: data,
+                            trailers,
+                            version: parts.version,
+                        });
+                        let key = path.split('?').next().unwrap_or("").to_string();
+                        let reply = r.lock().unwrap().get(&key).cloned().unwrap_or(Reply {
+                            status: 200,
+                            headers: vec![],
+                            body: b"default".to_vec(),
+                            trailers: vec![],
+                        });
+                        let mut b = Response::builder().status(reply.status);
+                        for (n, v) in &reply.headers {
+                            b = b.header(*n, v.as_str());
+                        }
+                        let mut frames: Vec<Result<Frame<Bytes>, Infallible>> = Vec::new();
+                        if !reply.body.is_empty() {
+                            frames.push(Ok(Frame::data(Bytes::from(reply.body.clone()))));
+                        }
+                        if !reply.trailers.is_empty() {
+                            let mut map = http::HeaderMap::new();
+                            for (n, v) in &reply.trailers {
+                                map.insert(
+                                    http::HeaderName::from_static(n),
+                                    http::HeaderValue::from_static(v),
+                                );
+                            }
+                            frames.push(Ok(Frame::trailers(map)));
+                        }
+                        let body = StreamBody::new(futures_util::stream::iter(frames));
+                        Ok::<_, Infallible>(b.body(body).unwrap())
+                    }
+                });
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(TokioIo::new(stream), service)
+                    .await;
+            });
+        }
+    });
+    RecordingOrigin {
+        addr,
+        seen,
+        replies,
+        token,
+    }
+}
+
+/// One matrix row: a visitor request and what must be true on both ends.
+struct Case {
+    name: &'static str,
+    method: Method,
+    path: &'static str,
+    req_headers: Vec<(&'static str, &'static str)>,
+    req_body: Vec<u8>,
+    req_trailers: Vec<(&'static str, &'static str)>,
+    reply: Reply,
+    /// Response headers the visitor must see verbatim (after any rewriting).
+    expect_resp_headers: Vec<(&'static str, String)>,
+}
+
+/// Headers the tunnel legitimately owns or strips; excluded from the
+/// "origin saw exactly the visitor's headers" comparison.
+const TUNNEL_OWNED: &[&str] = &[
+    "host",
+    "connection",
+    "keep-alive",
+    "transfer-encoding",
+    "te",
+    "trailer",
+    "upgrade",
+    "content-length",
+    "forwarded",
+    "x-forwarded-for",
+    "x-forwarded-proto",
+    "x-forwarded-host",
+    "via",
+    "user-agent",
+];
+
+async fn run_case(
+    relay: SocketAddr,
+    hostname: &str,
+    origin: &RecordingOrigin,
+    public_origin: &str,
+    h2: bool,
+    case: &Case,
+) {
+    use http_body_util::StreamBody;
+    use hyper::body::Frame;
+
+    origin.replies.lock().unwrap().insert(
+        case.path.split('?').next().unwrap().to_string(),
+        case.reply.clone(),
+    );
+
+    let alpn = if h2 {
+        b"h2".to_vec()
+    } else {
+        b"http/1.1".to_vec()
+    };
+    let connector = TlsConnector::from(create_client_tls_config(vec![alpn]));
+    let tcp = TcpStream::connect(relay).await.unwrap();
+    let tls = connector
+        .connect(ServerName::try_from(hostname.to_string()).unwrap(), tcp)
+        .await
+        .unwrap();
+
+    let mut b = Request::builder()
+        .method(case.method.clone())
+        .uri(format!("https://{hostname}{}", case.path))
+        .header("host", hostname);
+    if !h2 && !case.reply.trailers.is_empty() {
+        // An h1 client must opt in to trailers (RFC 9110 §10.1.4); hyper's
+        // server correctly withholds them otherwise. h2 needs no opt-in.
+        b = b.header("te", "trailers");
+    }
+    for (n, v) in &case.req_headers {
+        b = b.header(*n, *v);
+    }
+    let mut frames: Vec<Result<Frame<Bytes>, Infallible>> = Vec::new();
+    if !case.req_body.is_empty() {
+        frames.push(Ok(Frame::data(Bytes::from(case.req_body.clone()))));
+    }
+    if !case.req_trailers.is_empty() {
+        let mut map = http::HeaderMap::new();
+        for (n, v) in &case.req_trailers {
+            map.insert(
+                http::HeaderName::from_static(n),
+                http::HeaderValue::from_static(v),
+            );
+        }
+        frames.push(Ok(Frame::trailers(map)));
+        b = b.header(
+            "trailer",
+            case.req_trailers
+                .iter()
+                .map(|(n, _)| *n)
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
+    }
+    let req = b
+        .body(StreamBody::new(futures_util::stream::iter(frames)))
+        .unwrap();
+
+    let label = format!("{} over {}", case.name, if h2 { "h2" } else { "h1" });
+    let resp = if h2 {
+        let (mut sender, conn) =
+            hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(tls))
+                .await
+                .unwrap();
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        sender.send_request(req).await.unwrap()
+    } else {
+        let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(tls))
+            .await
+            .unwrap();
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        sender.send_request(req).await.unwrap()
+    };
+
+    // --- visitor side ---
+    assert_eq!(resp.status().as_u16(), case.reply.status, "{label}: status");
+    for (n, v) in &case.expect_resp_headers {
+        assert_eq!(
+            resp.headers().get(*n).map(|h| h.to_str().unwrap()),
+            Some(v.as_str()),
+            "{label}: response header {n}"
+        );
+    }
+    let (_parts, body) = resp.into_parts();
+    let mut got = Vec::new();
+    let mut got_trailers = Vec::new();
+    let mut body = body;
+    while let Some(frame) = body.frame().await {
+        let frame = frame.unwrap_or_else(|e| panic!("{label}: body error {e}"));
+        if frame.is_data() {
+            got.extend_from_slice(&frame.into_data().unwrap());
+        } else if let Ok(t) = frame.into_trailers() {
+            got_trailers.extend(
+                t.iter()
+                    .map(|(n, v)| (n.as_str().to_string(), v.to_str().unwrap().to_string())),
+            );
+        }
+    }
+    assert_eq!(got, case.reply.body, "{label}: response body");
+    let want_trailers: Vec<(String, String)> = case
+        .reply
+        .trailers
+        .iter()
+        .map(|(n, v)| (n.to_string(), v.to_string()))
+        .collect();
+    assert_eq!(got_trailers, want_trailers, "{label}: response trailers");
+
+    // --- origin side ---
+    let seen = {
+        let mut guard = origin.seen.lock().unwrap();
+        let idx = guard
+            .iter()
+            .position(|s| s.path == case.path)
+            .unwrap_or_else(|| panic!("{label}: origin never saw {}", case.path));
+        guard.remove(idx)
+    };
+    assert_eq!(seen.method, case.method.as_str(), "{label}: method");
+    assert_eq!(seen.path, case.path, "{label}: path+query verbatim");
+    assert_eq!(seen.body, case.req_body, "{label}: request body");
+    let want_req_trailers: Vec<(String, String)> = case
+        .req_trailers
+        .iter()
+        .map(|(n, v)| (n.to_string(), v.to_string()))
+        .collect();
+    assert_eq!(
+        seen.trailers, want_req_trailers,
+        "{label}: request trailers"
+    );
+    // Origin always speaks h1 regardless of the visitor's protocol.
+    assert_eq!(
+        seen.version,
+        http::Version::HTTP_11,
+        "{label}: origin protocol"
+    );
+    // Every visitor header (minus tunnel-owned ones) arrives exactly once.
+    for (n, v) in &case.req_headers {
+        if TUNNEL_OWNED.contains(n) {
+            continue;
+        }
+        let vals: Vec<&str> = seen
+            .headers
+            .iter()
+            .filter(|(hn, _)| hn == n)
+            .map(|(_, hv)| hv.as_str())
+            .collect();
+        assert_eq!(vals, vec![*v], "{label}: origin header {n}");
+    }
+    // Host rewritten to the target; forwarding trio + Forwarded + Via present.
+    let hv = |n: &str| {
+        seen.headers
+            .iter()
+            .find(|(hn, _)| hn == n)
+            .map(|(_, v)| v.clone())
+    };
+    assert_eq!(
+        hv("host"),
+        Some(origin.addr.to_string()),
+        "{label}: Host rewrite"
+    );
+    assert_eq!(
+        hv("x-forwarded-host"),
+        Some(hostname.to_string()),
+        "{label}: XFH"
+    );
+    assert_eq!(
+        hv("x-forwarded-proto"),
+        Some("https".to_string()),
+        "{label}: XFP"
+    );
+    assert_eq!(
+        hv("x-forwarded-for"),
+        Some("127.0.0.1".to_string()),
+        "{label}: XFF"
+    );
+    assert!(
+        hv("forwarded")
+            .is_some_and(|f| f.contains("for=\"127.0.0.1\"") && f.contains("proto=https")),
+        "{label}: Forwarded"
+    );
+    assert_eq!(
+        hv("via"),
+        Some(format!("{} weaver", if h2 { "2" } else { "1.1" })),
+        "{label}: Via records the visitor protocol"
+    );
+    // Hop-by-hop never crosses. `TE` is the exception by design: the
+    // client sets its *own* `TE: trailers` toward the origin (RFC 9110
+    // §10.1.4) so trailer fields are offered; it must be exactly that.
+    for hop in ["connection", "keep-alive", "proxy-connection"] {
+        assert!(
+            hv(hop).is_none(),
+            "{label}: hop-by-hop {hop} leaked to origin"
+        );
+    }
+    assert_eq!(
+        hv("te"),
+        Some("trailers".to_string()),
+        "{label}: TE toward origin"
+    );
+    let _ = public_origin;
+}
+
+#[tokio::test]
+async fn test_translation_matrix_h1_and_h2() {
+    let root = "localhost";
+    let relay = spawn_test_relay(root).await;
+    let origin = spawn_recording_origin().await;
+
+    let token = CancellationToken::new();
+    let c_tok = token.clone();
+    let server = format!("localhost:{}", relay.addr.port());
+    let ca = relay.ca_pem_path.clone();
+    let opts = start_options_multi(server, &ca, &[("m", origin.addr.port())]);
+    let task = tokio::spawn(async move { weave::run_start_with_token(opts, c_tok).await });
+
+    let host = derive_hostname("m", &poc_identity(), root);
+    let mut ok = false;
+    for _ in 0..50 {
+        if relay.registry.lookup(&host).is_some() {
+            ok = true;
+            break;
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+    assert!(ok);
+    let public_origin = format!("https://{host}");
+    let target_origin = format!("http://{}", origin.addr);
+
+    let big = (0..300 * 1024)
+        .map(|i| (i % 251) as u8)
+        .collect::<Vec<u8>>();
+    let cases = vec![
+        Case {
+            name: "GET with query, custom + cache + range headers pass through",
+            method: Method::GET,
+            path: "/items/42?page=2&q=a%20b&empty=",
+            req_headers: vec![
+                ("x-custom", "v1"),
+                ("accept", "application/json"),
+                ("if-none-match", "\"etag-1\""),
+                ("range", "bytes=0-99"),
+                ("cache-control", "no-cache"),
+                ("accept-encoding", "gzip, br"),
+                ("cookie", "sid=abc"),
+                ("authorization", "Bearer t"),
+            ],
+            req_body: vec![],
+            req_trailers: vec![],
+            reply: Reply {
+                status: 206,
+                headers: vec![
+                    ("content-type", "text/plain".into()),
+                    ("content-range", "bytes 0-99/1000".into()),
+                    ("etag", "\"etag-2\"".into()),
+                    ("cache-control", "max-age=60".into()),
+                    ("content-encoding", "identity".into()),
+                    ("x-origin-header", "kept".into()),
+                ],
+                body: b"partial".to_vec(),
+                trailers: vec![],
+            },
+            expect_resp_headers: vec![
+                ("content-type", "text/plain".into()),
+                ("content-range", "bytes 0-99/1000".into()),
+                ("etag", "\"etag-2\"".into()),
+                ("cache-control", "max-age=60".into()),
+                ("content-encoding", "identity".into()),
+                ("x-origin-header", "kept".into()),
+            ],
+        },
+        Case {
+            name: "POST json body",
+            method: Method::POST,
+            path: "/api/things",
+            req_headers: vec![("content-type", "application/json")],
+            req_body: br#"{"a":1,"b":[1,2,3]}"#.to_vec(),
+            req_trailers: vec![],
+            reply: Reply {
+                status: 201,
+                headers: vec![
+                    ("content-type", "application/json".into()),
+                    ("location", format!("{target_origin}/api/things/7")),
+                ],
+                body: br#"{"id":7}"#.to_vec(),
+                trailers: vec![],
+            },
+            expect_resp_headers: vec![
+                ("content-type", "application/json".into()),
+                ("location", format!("{public_origin}/api/things/7")),
+            ],
+        },
+        Case {
+            name: "PUT 300 KiB body, relative Location untouched",
+            method: Method::PUT,
+            path: "/blob",
+            req_headers: vec![("content-type", "application/octet-stream")],
+            req_body: big.clone(),
+            req_trailers: vec![],
+            reply: Reply {
+                status: 204,
+                headers: vec![("location", "/blob".into())],
+                body: vec![],
+                trailers: vec![],
+            },
+            expect_resp_headers: vec![("location", "/blob".into())],
+        },
+        Case {
+            name: "DELETE with foreign Location and Set-Cookie rewriting",
+            method: Method::DELETE,
+            path: "/session",
+            req_headers: vec![],
+            req_body: vec![],
+            req_trailers: vec![],
+            reply: Reply {
+                status: 302,
+                headers: vec![
+                    ("location", "https://other.example/bye".into()),
+                    (
+                        "set-cookie",
+                        format!("sid=; Domain={}; Path=/; Max-Age=0", origin.addr.ip()),
+                    ),
+                ],
+                body: vec![],
+                trailers: vec![],
+            },
+            expect_resp_headers: vec![
+                ("location", "https://other.example/bye".into()),
+                ("set-cookie", "sid=; Path=/; Max-Age=0; Secure".into()),
+            ],
+        },
+        Case {
+            name: "PATCH with request and response trailers",
+            method: Method::PATCH,
+            path: "/trailered",
+            req_headers: vec![("content-type", "text/plain")],
+            req_body: b"chunked-body".to_vec(),
+            req_trailers: vec![("x-req-checksum", "abc123")],
+            reply: Reply {
+                status: 200,
+                headers: vec![("trailer", "x-resp-checksum".into())],
+                body: b"ok".to_vec(),
+                trailers: vec![("x-resp-checksum", "def456")],
+            },
+            expect_resp_headers: vec![],
+        },
+        Case {
+            name: "HEAD",
+            method: Method::HEAD,
+            path: "/head",
+            req_headers: vec![],
+            req_body: vec![],
+            req_trailers: vec![],
+            reply: Reply {
+                status: 200,
+                headers: vec![("x-head", "yes".into())],
+                body: vec![],
+                trailers: vec![],
+            },
+            expect_resp_headers: vec![("x-head", "yes".into())],
+        },
+        Case {
+            name: "OPTIONS with CORS preflight headers",
+            method: Method::OPTIONS,
+            path: "/cors",
+            req_headers: vec![
+                ("origin", "https://app.example"),
+                ("access-control-request-method", "PUT"),
+            ],
+            req_body: vec![],
+            req_trailers: vec![],
+            reply: Reply {
+                status: 204,
+                headers: vec![
+                    ("access-control-allow-origin", "https://app.example".into()),
+                    ("access-control-allow-methods", "PUT".into()),
+                ],
+                body: vec![],
+                trailers: vec![],
+            },
+            expect_resp_headers: vec![
+                ("access-control-allow-origin", "https://app.example".into()),
+                ("access-control-allow-methods", "PUT".into()),
+            ],
+        },
+        Case {
+            name: "origin 5xx passes through unchanged",
+            method: Method::GET,
+            path: "/boom",
+            req_headers: vec![],
+            req_body: vec![],
+            req_trailers: vec![],
+            reply: Reply {
+                status: 503,
+                headers: vec![("retry-after", "3".into())],
+                body: b"down".to_vec(),
+                trailers: vec![],
+            },
+            expect_resp_headers: vec![("retry-after", "3".into())],
+        },
+    ];
+
+    for case in &cases {
+        run_case(relay.addr, &host, &origin, &public_origin, false, case).await;
+        run_case(relay.addr, &host, &origin, &public_origin, true, case).await;
+    }
+
+    token.cancel();
+    task.await.unwrap().expect("clean shutdown");
+    origin.token.cancel();
+    relay.shutdown_token.cancel();
+}
+
 fn poc_identity() -> Identity {
     Identity {
         person: "poc".into(),
