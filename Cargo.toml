@@ -5,6 +5,7 @@ members = [
     "crates/weaver-proto",
     "crates/weaver-tokio",
     "crates/weaver-server",
+    "crates/weaver-assets",
     "crates/weave",
 ]
 
@@ -20,6 +21,7 @@ repository = "https://github.com/OffworldNexus/tunnel-weaver"
 weaver-mux = { path = "crates/weaver-mux", version = "0.1.0" }
 weaver-proto = { path = "crates/weaver-proto", version = "0.1.0" }
 weaver-tokio = { path = "crates/weaver-tokio", version = "0.1.0" }
+weaver-assets = { path = "crates/weaver-assets", version = "0.1.0" }
 
 clap = { version = "4.5", features = ["derive", "env"] }
 thiserror = "2.0"
@@ -56,6 +58,8 @@ bytes = "1"
 socket2 = "0.6"
 libc = "0.2"
 comfy-table = "7.1"
+crossterm = "0.29"
+jiff = { version = "0.2", default-features = false, features = ["std", "tz-system"] }
 futures-util = "0.3"
 tokio-tungstenite = { version = "0.26", default-features = false, features = ["handshake"] }
 rustls-platform-verifier = "0.7"

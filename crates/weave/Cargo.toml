@@ -17,15 +17,21 @@ path = "src/lib.rs"
 [dependencies]
 bytes = { workspace = true }
 clap = { workspace = true }
+crossterm = { workspace = true }
+jiff = { workspace = true }
 ed25519-dalek = { workspace = true }
 futures-util = { workspace = true }
 http = { workspace = true }
+http-body-util = { workspace = true }
+hyper = { workspace = true, features = ["client"] }
+hyper-util = { workspace = true }
 rustls = { workspace = true }
 rustls-platform-verifier = { workspace = true }
 tokio = { workspace = true }
 tokio-rustls = { workspace = true }
 tokio-tungstenite = { workspace = true }
 tokio-util = { workspace = true }
+weaver-assets = { workspace = true }
 weaver-mux = { workspace = true }
 weaver-proto = { workspace = true }
 weaver-tokio = { workspace = true }

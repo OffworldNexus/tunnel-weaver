@@ -18,6 +18,10 @@ use crate::tunnel::registry::TunnelRoute;
 pub type BoxBody =
     http_body_util::combinators::BoxBody<Bytes, Box<dyn std::error::Error + Send + Sync>>;
 
+/// One item streamed from the tunnel client: a body frame or a failure.
+pub type BodyFrameItem =
+    Result<hyper::body::Frame<Bytes>, Box<dyn std::error::Error + Send + Sync>>;
+
 /// Helper to wrap full bytes into a BoxBody.
 pub fn full_body(bytes: impl Into<Bytes>) -> BoxBody {
     Full::new(bytes.into())
@@ -33,6 +37,10 @@ pub fn empty_body() -> BoxBody {
 /// Errors occurring on the proxy path between edge and tunnel.
 #[derive(Debug, Error)]
 pub enum ProxyError {
+    /// The service's local origin refused the connection or never answered
+    /// before the response head (mapped to 502).
+    #[error("origin unreachable")]
+    OriginUnreachable,
     /// Tunnel stream was reset before completing the exchange.
     #[error("tunnel stream reset")]
     Reset,
@@ -55,6 +63,50 @@ pub struct ProxyRequest {
     pub body: Incoming,
     /// Return channel for the visitor-facing response once headers arrive from the tunnel.
     pub response_tx: oneshot::Sender<Result<Response<BoxBody>, ProxyError>>,
+    /// Present when the visitor asked to upgrade the connection (h1
+    /// `Upgrade` or an RFC 8441 extended `CONNECT` on h2). Once the client
+    /// answers `101`, this yields the raw visitor I/O to pipe over the
+    /// stream.
+    pub on_upgrade: Option<hyper::upgrade::OnUpgrade>,
+    /// The upgrade arrived as an h2 extended `CONNECT`: the visitor expects a
+    /// `200` (not `101`) and no `Connection`/`Upgrade` headers.
+    pub visitor_connect: bool,
+}
+
+/// Whether a visitor request is an upgrade: an h1 `Upgrade` with a
+/// `Connection: upgrade` token, or an h2 extended `CONNECT` (RFC 8441)
+/// carrying a `:protocol` pseudo-header.
+pub fn upgrade_kind(req: &Request<Incoming>) -> Option<UpgradeKind> {
+    if req.method() == http::Method::CONNECT {
+        return req
+            .extensions()
+            .get::<hyper::ext::Protocol>()
+            .map(|p| UpgradeKind::ExtendedConnect(p.as_str().to_string()));
+    }
+    let wants_upgrade = req
+        .headers()
+        .get_all(http::header::CONNECTION)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|s| s.split(','))
+        .any(|t| t.trim().eq_ignore_ascii_case("upgrade"));
+    let protocol = req
+        .headers()
+        .get(http::header::UPGRADE)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    match (wants_upgrade, protocol) {
+        (true, Some(p)) => Some(UpgradeKind::Http1(p)),
+        _ => None,
+    }
+}
+
+/// How the visitor asked for an upgrade; carries the protocol token.
+pub enum UpgradeKind {
+    /// HTTP/1.1 `Upgrade: <protocol>`.
+    Http1(String),
+    /// HTTP/2 extended `CONNECT` with `:protocol = <protocol>`.
+    ExtendedConnect(String),
 }
 
 /// Hop-by-hop headers a proxy must not forward (RFC 9110 §7.6.1).
@@ -70,23 +122,31 @@ pub const HOP_BY_HOP_HEADERS: &[&str] = &[
     "upgrade",
 ];
 
-/// Body implementation that streams raw byte chunks from the tunnel client to the visitor.
+/// Forwarding headers the edge always writes itself; any visitor-supplied
+/// copy is dropped so a client cannot forge its own address or host.
+const FORWARDING_HEADERS: &[&str] = &[
+    "forwarded",
+    "x-forwarded-for",
+    "x-forwarded-proto",
+    "x-forwarded-host",
+];
+
+/// Body implementation that streams frames from the tunnel client to the visitor.
+///
+/// Frames carry both data and trailers, so the origin's trailer fields reach
+/// the visitor unchanged.
 pub struct TunnelResponseBody {
-    rx: mpsc::Receiver<Result<Bytes, Box<dyn std::error::Error + Send + Sync>>>,
+    rx: mpsc::Receiver<BodyFrameItem>,
 }
 
 impl TunnelResponseBody {
     /// Creates a new TunnelResponseBody wrapping an mpsc receiver.
-    pub fn new(
-        rx: mpsc::Receiver<Result<Bytes, Box<dyn std::error::Error + Send + Sync>>>,
-    ) -> Self {
+    pub fn new(rx: mpsc::Receiver<BodyFrameItem>) -> Self {
         Self { rx }
     }
 
     /// Wraps an mpsc receiver into a boxed hyper Body.
-    pub fn boxed(
-        rx: mpsc::Receiver<Result<Bytes, Box<dyn std::error::Error + Send + Sync>>>,
-    ) -> BoxBody {
+    pub fn boxed(rx: mpsc::Receiver<BodyFrameItem>) -> BoxBody {
         Self::new(rx).boxed()
     }
 }
@@ -99,22 +159,30 @@ impl hyper::body::Body for TunnelResponseBody {
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
-        match self.rx.poll_recv(cx) {
-            Poll::Ready(Some(Ok(bytes))) => Poll::Ready(Some(Ok(Frame::data(bytes)))),
-            Poll::Ready(Some(Err(err))) => Poll::Ready(Some(Err(err))),
-            Poll::Ready(None) => Poll::Ready(None),
-            Poll::Pending => Poll::Pending,
-        }
+        self.rx.poll_recv(cx)
     }
 }
 
 /// Prepares and forwards an incoming HTTPS visitor request to the registered tunnel.
 pub async fn forward_visitor_request(
-    req: Request<Incoming>,
+    mut req: Request<Incoming>,
     route: &TunnelRoute,
     visitor_ip: IpAddr,
     host: &str,
 ) -> Result<Response<BoxBody>, StatusCode> {
+    // Upgrades: keep a handle on the visitor's raw I/O before consuming the
+    // request, and normalize both h1 `Upgrade` and h2 extended CONNECT into
+    // the h1-shaped `Upgrade` + `Connection: upgrade` pair the client speaks
+    // to its origin. These two headers are deliberately exempt from the
+    // hop-by-hop strip below.
+    let upgrade = upgrade_kind(&req);
+    let on_upgrade = upgrade.as_ref().map(|_| hyper::upgrade::on(&mut req));
+    let visitor_connect = matches!(upgrade, Some(UpgradeKind::ExtendedConnect(_)));
+    let upgrade_protocol = match &upgrade {
+        Some(UpgradeKind::Http1(p)) | Some(UpgradeKind::ExtendedConnect(p)) => Some(p.clone()),
+        None => None,
+    };
+
     let (parts, body) = req.into_parts();
 
     // 1. Identify additional connection-specific hop-by-hop headers from "Connection" header
@@ -136,19 +204,67 @@ pub async fn forward_visitor_request(
         let name_lower = name.as_str().to_ascii_lowercase();
         if HOP_BY_HOP_HEADERS.contains(&name_lower.as_str())
             || extra_hop_by_hop.contains(&name_lower)
+            || FORWARDING_HEADERS.contains(&name_lower.as_str())
         {
             continue;
         }
         cleaned_headers.push((name_lower, value.as_bytes().to_vec()));
     }
 
-    // 3. Append forwarding metadata headers: X-Forwarded-For, X-Forwarded-Proto, X-Forwarded-Host
-    cleaned_headers.push((
-        "x-forwarded-for".to_string(),
-        visitor_ip.to_string().into_bytes(),
-    ));
+    // 3. Stamp forwarding metadata: the X-Forwarded-* trio plus RFC 7239
+    //    `Forwarded`. Inbound copies were dropped above, so these are the
+    //    only ones the origin can trust.
+    // The edge listens dual-stack, so IPv4 visitors arrive as
+    // IPv4-mapped IPv6 (`::ffff:203.0.113.9`). Report the plain IPv4.
+    let visitor = match visitor_ip {
+        IpAddr::V6(v6) => v6
+            .to_ipv4_mapped()
+            .map(|v4| v4.to_string())
+            .unwrap_or_else(|| v6.to_string()),
+        IpAddr::V4(v4) => v4.to_string(),
+    };
+    cleaned_headers.push(("x-forwarded-for".to_string(), visitor.clone().into_bytes()));
     cleaned_headers.push(("x-forwarded-proto".to_string(), b"https".to_vec()));
     cleaned_headers.push(("x-forwarded-host".to_string(), host.as_bytes().to_vec()));
+    cleaned_headers.push((
+        "forwarded".to_string(),
+        format!("for=\"{visitor}\";proto=https;host=\"{host}\"").into_bytes(),
+    ));
+    // RFC 9110 §7.6.3: a proxy records the protocol it received on. This
+    // is also how the client learns whether the visitor spoke h1 or h2.
+    let received_on = match parts.version {
+        http::Version::HTTP_2 => "2",
+        http::Version::HTTP_3 => "3",
+        http::Version::HTTP_10 => "1.0",
+        _ => "1.1",
+    };
+    cleaned_headers.push((
+        "via".to_string(),
+        format!("{received_on} weaver").into_bytes(),
+    ));
+
+    // Reconstruct the upgrade pair after the strip, and present an extended
+    // CONNECT to the client as an ordinary GET upgrade: the origin never
+    // sees h2.
+    let mut method = parts.method.as_str().to_string();
+    if let Some(protocol) = &upgrade_protocol {
+        cleaned_headers.push(("connection".to_string(), b"upgrade".to_vec()));
+        cleaned_headers.push(("upgrade".to_string(), protocol.as_bytes().to_vec()));
+        if visitor_connect {
+            method = "GET".to_string();
+            // RFC 8441 §5: the h2 handshake has no `Sec-WebSocket-Key`, but
+            // an h1 origin requires one. Synthesize it here; the matching
+            // `Sec-WebSocket-Accept` is dropped on the way back.
+            if protocol.eq_ignore_ascii_case("websocket")
+                && !cleaned_headers
+                    .iter()
+                    .any(|(n, _)| n == "sec-websocket-key")
+            {
+                let key = tokio_tungstenite::tungstenite::handshake::client::generate_key();
+                cleaned_headers.push(("sec-websocket-key".to_string(), key.into_bytes()));
+            }
+        }
+    }
 
     let path = parts
         .uri
@@ -158,7 +274,7 @@ pub async fn forward_visitor_request(
         .to_string();
 
     let head = HttpHead {
-        method: parts.method.as_str().to_string(),
+        method,
         scheme: "https".to_string(),
         authority: host.to_string(),
         path,
@@ -170,6 +286,8 @@ pub async fn forward_visitor_request(
         head,
         body,
         response_tx,
+        on_upgrade,
+        visitor_connect,
     };
 
     if route.proxy_tx.send(proxy_req).await.is_err() {

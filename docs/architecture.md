@@ -14,7 +14,7 @@ protocol), 0004 (stream policy and messages), 0005 (minimal mux surface).
 ```mermaid
 flowchart TB
     subgraph L4["L4 - Binaries: identity, routing, certs, CLI"]
-        weave["weave<br/>PocHandler, Ed25519Signer, WS+TLS dial"]
+        weave["weave<br/>ProxyHandler, origin pool, Ed25519Signer, WS+TLS dial"]
         server["weaver-server<br/>RelayHandler, TunnelRegistry, IdentityResolver,<br/>edge http/https, cert manager, control socket"]
     end
     subgraph L3["L3 - weaver-tokio: the only event loop"]
@@ -332,6 +332,19 @@ classDiagram
         headers
         +header(name)
     }
+    class BodyFrame {
+        <<enum>>
+        Chunk(Vec~u8~)
+        Trailers(Vec~(String, Vec~u8~)~)
+    }
+    class ResetCode {
+        <<enum>>
+        OriginUnreachable = 1
+        OriginClosed = 2
+        Cancelled = 3
+        +as_u32() u32
+        +from_u32(u32) Option~Self~
+    }
     class codec {
         <<fns>>
         encode(&T) Result~Vec~u8~, CodecError~
@@ -355,6 +368,8 @@ classDiagram
     ControlReply --> RefusalCode
     policy ..> HttpHead
     policy ..> HttpResponseHead
+    BodyFrame ..> HttpHead : body for the preceding head
+    ResetCode ..> BodyFrame : mid-body failure
     class mux_Class["weaver_mux::Class"]
     class mux_Compress["weaver_mux::Compress"]
     policy ..> mux_Class
@@ -362,11 +377,15 @@ classDiagram
 ```
 
 Stream conventions (all in `weaver-proto` docs, enforced by the handlers).
-**The control stream is the registration lease**: a service is registered
-exactly as long as the control stream that registered it is open. The
-client drops a service by finishing that stream; the relay unregisters it
-on `Finished`/`Reset`, and unregisters everything on `Closed`. There is no
-`Unregister` message because the stream lifecycle already expresses it.
+After the head, every message is a `BodyFrame` decoded from stream state —
+never from a tag; `Trailers` is the optional final frame before FIN. A
+mid-body origin failure travels as a typed `ResetCode` on the mux reset
+frame. **The control stream is the registration lease**: a service is
+registered exactly as long as the control stream that registered it is
+open. The client drops a service by finishing that stream; the relay
+unregisters it on `Finished`/`Reset`, and unregisters everything on
+`Closed`. There is no `Unregister` message because the stream lifecycle
+already expresses it.
 
 ```mermaid
 flowchart LR
@@ -374,8 +393,9 @@ flowchart LR
         c1["msg 1: Head::Control(Register)"] --> c2["msg 2: ControlReply"] --> c3["… open = registered; FIN/RST = unregistered"]
     end
     subgraph visitor["visitor stream (relay-opened)"]
-        v1["msg 1: Head::Http(HttpHead) — Never"] --> v2["msg 2..n: request body chunks — request_body_compress"] --> v3["FIN"]
-        v4["msg 1 back: HttpResponseHead — Never"] --> v5["msg 2..n back: response body chunks — response_body_compress"] --> v6["FIN"]
+        v1["msg 1: Head::Http(HttpHead) — Never"] --> v2["msg 2..n: BodyFrame::Chunk — request_body_compress"] --> v3["opt: BodyFrame::Trailers"] --> v4["FIN"]
+        v5["msg 1 back: HttpResponseHead — Never<br/>(repeats for 1xx; first non-1xx is final)"] --> v6["msg 2..n back: BodyFrame::Chunk — response_body_compress"] --> v7["opt: BodyFrame::Trailers"] --> v8["FIN"]
+        v9["after 101 / extended CONNECT: raw BodyFrame::Chunk both ways until FIN"]
     end
 ```
 
@@ -418,27 +438,35 @@ Public surface: `Driver`, `Handle<H>` (`spawn_on`, `call`, `close`),
 flowchart LR
     Auth["Authenticated{key_id}"] --> reg["registry.register_connection → conn_id<br/>spawn: superseded → Handle::close(Superseded)"]
     Rd["Readable(id)"] --> loop["loop recv_msg"]
-    loop -- "inflight[id]" --> vm["on_visitor_message:<br/>1st: decode HttpResponseHead → response_class → set_class → hyper Response<br/>then: body chunk → body_tx"]
+    loop -- "inflight[id]" --> vm["on_visitor_message:<br/>repeated heads (1xx logged/dropped); final → response_class → set_class → hyper Response<br/>then: BodyFrame::Chunk/Trailers → body_tx"]
     loop -- "new stream" --> fm["on_first_message:<br/>decode Head::Control → validate()<br/>spawn registry.register_service → ControlReply"]
     Wr["Writable{id}"] --> drain["drain_request_body: retry pending chunks"]
     Fin["Finished(id)"] --> lease["release_lease: control stream → registry.unregister_service<br/>visitor stream → drop body_tx"]
     Rs["Reset{id}"] --> lease
     Rs --> err["response_tx ← Err(Reset)"]
     Cl["Closed"] --> unreg["registry.unregister_connection (all leases)"]
-    prx["proxy_rx: ProxyRequest (from edge)"] --> op["open(request_class(head))<br/>send(Head::Http, Never)<br/>spawn body reader → send(chunk, request_body_compress) / finish"]
+    prx["proxy_rx: ProxyRequest (from edge)"] --> op["open(request_class(head))<br/>send(Head::Http, Never)<br/>spawn body reader → send(encode(BodyFrame), request_body_compress) / finish"]
 ```
 
-### 5.2 Client (`weave/src/poc.rs`)
+### 5.2 Client (`weave/src/start.rs`)
+
+One `weave start <service>=<target>…` invocation registers every service on
+a single connection: one control stream per service, one `Driver`. Each
+visitor stream is answered by an origin task (`weave/src/proxy.rs`) that
+drives one outbound hyper request through the per-target pool
+(`weave/src/pool.rs`).
 
 ```mermaid
 flowchart LR
-    Auth["Authenticated"] --> openc["ControlHead::register(service)<br/>open(CONTROL_CLASS); send(Head::Control, Never)"]
-    Rej["Rejected{code}"] --> f1["failure = version mismatch | rejected"]
-    SO["StreamOpened{id}"] --> track["inflight.insert(id)"]
+    Auth["Authenticated"] --> openc["for each service:<br/>ControlHead::register; open(CONTROL_CLASS); send(Head::Control, Never)"]
+    Rej["Rejected{code}"] --> f1["failure = rejected"]
     Rd["Readable(id)"] --> which{"control?"}
-    which -- yes --> ctl["decode ControlReply → print URL | failure"]
-    which -- no --> body["1st: decode Head::Http; then: append body"]
-    Fin["Finished(id)"] --> resp["dump request; send(HttpResponseHead 302, Never); finish"]
+    which -- yes --> ctl["decode ControlReply → print 'svc url → target'<br/>Refused → record failure, others keep running"]
+    which -- no --> start["resolve service from authority<br/>(first DNS label; no Registered race)<br/>spawn run_exchange; insert Exchange"]
+    start --> drain["drain_stream: decode BodyFrame → req_body_tx<br/>pause + resume on full (backpressure)"]
+    Wr["Writable{id}"] --> pump["pump_out: flush encoded head/frames on credit"]
+    out["run_exchange: pool.acquire → hyper h1/h2 →<br/>send head(s) + BodyFrame::Chunk/Trailers + End"] --> pump
+    Fin["Finished(id)"] --> drop["drop req_body_tx (FIN the request body)"]
     Rs["Reset{id}"] --> rm["inflight.remove"]
 ```
 
@@ -454,7 +482,8 @@ sequenceDiagram
     participant SM as mux (server)
     participant WS as WebSocket/TLS
     participant CM as mux (client)
-    participant PH as PocHandler
+    participant PH as ProxyHandler
+    participant Origin as local origin
 
     Vis->>Edge: GET https://web.laptop.poc.root/
     Edge->>Reg: lookup(host) → proxy_tx
@@ -465,15 +494,17 @@ sequenceDiagram
     SM-->>WS: OPEN{class} · DATA … · FIN
     WS-->>CM: recv ×n
     CM-->>PH: StreamOpened · Readable · Finished
-    PH->>CM: recv_msg → Head::Http, body
-    PH->>CM: send(id, encode(HttpResponseHead), HEAD_COMPRESS) then finish(id)
+    PH->>CM: recv_msg → Head::Http, BodyFrame
+    PH->>Origin: hyper request (pool, h1/h2, Host rewritten)
+    Origin-->>PH: HttpResponseHead + body frames (+ trailers)
+    PH->>CM: send(id, encode(HttpResponseHead), HEAD_COMPRESS) then BodyFrame… then finish(id)
     CM-->>WS: DATA · FIN
     WS-->>SM: recv
     SM-->>RH: Readable(id)
-    RH->>SM: recv_msg → HttpResponseHead
+    RH->>SM: recv_msg → HttpResponseHead, BodyFrame
     RH->>SM: set_class(id, response_class(..)) if any
     RH->>Edge: response_tx ← Response
-    Edge-->>Vis: 302
+    Edge-->>Vis: 200 (origin's status)
     SM-->>RH: Finished(id) → drop body_tx
 ```
 
