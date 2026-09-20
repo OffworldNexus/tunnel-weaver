@@ -120,8 +120,13 @@ fn test_weaver_server_configure_command() {
     assert!(stdout.contains("Configuration saved"));
 
     // Verify store loads valid config with dual-stack bare ports parsed
-    let store = Store::open(&db_path).unwrap();
-    let config = store.load_config().unwrap();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let config = rt.block_on(async {
+        let store = Store::open(&db_path).await.unwrap();
+        let cfg = store.load_config().await.unwrap();
+        store.close().await.unwrap();
+        cfg
+    });
     assert_eq!(config.root_domain, "test.example.com");
     assert_eq!(config.admin_email, "admin@example.com");
     assert_eq!(config.acme_provider, "letsencrypt");
@@ -149,7 +154,10 @@ fn test_weaver_server_configure_command() {
         .expect("failed to execute weaver-server configure --headless");
 
     assert!(headless_output.status.success());
-    let config2 = store.load_config().unwrap();
+    let config2 = rt.block_on(async {
+        let store = Store::open(&db_path).await.unwrap();
+        store.load_config().await.unwrap()
+    });
     assert_eq!(config2.root_domain, "headless.example.com");
     assert_eq!(config2.admin_email, "headless@example.com");
     assert_eq!(config2.acme_provider, "letsencrypt");

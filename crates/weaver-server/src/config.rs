@@ -1,7 +1,6 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
-use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -60,18 +59,11 @@ pub struct Config {
 }
 
 impl Config {
-    /// Loads and validates configuration from the SQLite store.
-    pub fn load(store: &Store) -> Result<Self, ConfigError> {
+    /// Loads and validates configuration from the store.
+    pub async fn load(store: &Store) -> Result<Self, ConfigError> {
         let raw_json = store
-            .read(|conn| {
-                let res = conn
-                    .query_row("SELECT config_json FROM config WHERE id = 1", [], |row| {
-                        row.get::<_, String>(0)
-                    })
-                    .optional()
-                    .map_err(|e| ConfigError::Store(e.to_string()))?;
-                Ok(res)
-            })
+            .load_config_json()
+            .await
             .map_err(|e| ConfigError::Store(e.to_string()))?;
 
         let Some(json_str) = raw_json else {

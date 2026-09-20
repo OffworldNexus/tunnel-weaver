@@ -98,7 +98,7 @@ pub struct InstallResult {
 }
 
 /// Executes idempotent installation steps according to the plan.
-pub fn execute_install(
+pub async fn execute_install(
     plan: &Plan,
     gathered: &GatheredConfig,
     registered_account: Option<&RegisteredAcmeAccount>,
@@ -240,7 +240,9 @@ pub fn execute_install(
         "  {} Initializing database and configuration...",
         "•".blue()
     );
-    let store = Store::open(&db_path).map_err(|e| format!("failed to open database: {e}"))?;
+    let store = Store::open(&db_path)
+        .await
+        .map_err(|e| format!("failed to open database: {e}"))?;
 
     let root_ca_pem = match &gathered.acme_root_ca_path {
         Some(path) => match fs::read_to_string(path) {
@@ -271,6 +273,7 @@ pub fn execute_install(
 
     store
         .save_config(&config)
+        .await
         .map_err(|e| format!("failed to save config: {e}"))?;
 
     if let Some(acct) = registered_account {
@@ -286,20 +289,14 @@ pub fn execute_install(
             .as_secs() as i64;
 
         store
-            .write(|conn| {
-                conn.execute(
-                    "INSERT OR REPLACE INTO acme_account (directory, email, key_pem, kid, created_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5)",
-                    rusqlite::params![
-                        dir_url,
-                        config.admin_email,
-                        acct.creds_json,
-                        acct.kid,
-                        now,
-                    ],
-                )?;
-                Ok(())
-            })
+            .upsert_acme_account(
+                &dir_url,
+                &config.admin_email,
+                &acct.creds_json,
+                Some(&acct.kid),
+                now,
+            )
+            .await
             .map_err(|e| format!("failed to store pre-registered ACME credentials: {e}"))?;
     }
 

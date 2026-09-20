@@ -113,40 +113,23 @@ impl CertManager {
         })
     }
 
-    /// Initializes cached certificates from SQLite and triggers eager root domain issuance if needed.
-    pub fn init(self: &Arc<Self>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    /// Initializes cached certificates from the store and triggers eager root domain issuance if needed.
+    pub async fn init(self: &Arc<Self>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let root_domain = self.config.root_domain.to_ascii_lowercase();
 
         // 1. Read all cached certificates from the database
-        let certs = self.store.read(|conn| {
-            let mut stmt = conn.prepare(
-                "SELECT name, cert_pem, key_pem, not_before, not_after, last_active_at FROM certificates",
-            )?;
-            let rows = stmt.query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, i64>(3)?,
-                    row.get::<_, i64>(4)?,
-                    row.get::<_, Option<i64>>(5)?,
-                ))
-            })?;
-            let mut result = Vec::new();
-            for r in rows {
-                result.push(r?);
-            }
-            Ok(result)
-        })?;
+        let certs = self.store.list_certificates_full().await?;
 
         let now = self.clock.now_unix();
         let mut root_valid = false;
 
-        for (name, cert_pem, key_pem, _not_before, not_after, last_active_at) in certs {
-            let lower = name.to_ascii_lowercase();
+        for cert in certs {
+            let lower = cert.name.to_ascii_lowercase();
+            let not_after = cert.not_after;
+            let last_active_at = cert.last_active_at;
 
             if not_after > now {
-                match parse_certified_key(&cert_pem, &key_pem) {
+                match parse_certified_key(&cert.cert_pem, &cert.key_pem) {
                     Ok(certified_key) => {
                         self.resolver.insert_cert(&lower, certified_key);
                         self.set_state(&lower, CertState::Issued { not_after });
@@ -358,7 +341,8 @@ impl CertManager {
                     self.clock.now_unix(),
                     "failed",
                     Some(&err.to_string()),
-                );
+                )
+                .await;
 
                 // Notify in-flight waiters of error
                 let mut in_flight = self.in_flight.lock().await;
@@ -381,23 +365,20 @@ impl CertManager {
 
         if active {
             self.active_hosts.write().unwrap().insert(lower.clone());
-            let _ = self.store.write(|conn| {
-                conn.execute(
-                    "UPDATE certificates SET last_active_at = ?1 WHERE name = ?2",
-                    rusqlite::params![now, lower],
-                )?;
-                Ok(())
-            });
         } else {
             self.active_hosts.write().unwrap().remove(&lower);
-            let _ = self.store.write(|conn| {
-                conn.execute(
-                    "UPDATE certificates SET last_active_at = NULL WHERE name = ?2",
-                    rusqlite::params![lower],
-                )?;
-                Ok(())
-            });
         }
+
+        // The in-memory set is the source of truth for the running process;
+        // the DB column only needs to catch up eventually so it can survive a
+        // restart. Callers hold std locks, so the write is detached.
+        let store = self.store.clone();
+        let active_at = active.then_some(now);
+        tokio::spawn(async move {
+            if let Err(err) = store.set_cert_active(&lower, active_at).await {
+                warn!(hostname = %lower, error = %err, "Failed to persist certificate active flag");
+            }
+        });
     }
 
     /// Returns true if `name` is currently marked as active.
@@ -435,12 +416,12 @@ impl CertManager {
     /// Computes per-name certificate counts partitioned mutually exclusively:
     /// inactive names count under `inactive`; active names partition into
     /// `issued`, `ordering`, or `failed`.
-    pub fn cert_counts(&self) -> crate::control::protocol::CertCounts {
+    pub async fn cert_counts(&self) -> crate::control::protocol::CertCounts {
         let root_domain = self.config.root_domain.to_ascii_lowercase();
         let mut all_names = HashSet::new();
         all_names.insert(root_domain);
 
-        if let Ok(certs) = self.store.list_certificates() {
+        if let Ok(certs) = self.store.list_certificates().await {
             for c in certs {
                 all_names.insert(c.name.to_ascii_lowercase());
             }
@@ -493,6 +474,7 @@ impl CertManager {
             || self
                 .store
                 .get_certificate(&lower)
+                .await
                 .map_err(|e| RenewError::Store(e.to_string()))?
                 .is_some();
 
@@ -550,7 +532,7 @@ impl CertManager {
         let mut candidates = HashSet::new();
         candidates.insert(root_domain.clone());
 
-        if let Ok(certs) = self.store.list_certificates() {
+        if let Ok(certs) = self.store.list_certificates().await {
             for c in certs {
                 candidates.insert(c.name.to_ascii_lowercase());
             }
@@ -641,23 +623,7 @@ impl CertManager {
         let now = self.clock.now_unix();
 
         // Query certificates from database
-        let certs_res = self.store.read(|conn| {
-            let mut stmt = conn
-                .prepare("SELECT name, not_before, not_after, last_active_at FROM certificates")?;
-            let rows = stmt.query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, i64>(1)?,
-                    row.get::<_, i64>(2)?,
-                    row.get::<_, Option<i64>>(3)?,
-                ))
-            })?;
-            let mut list = Vec::new();
-            for r in rows {
-                list.push(r?);
-            }
-            Ok(list)
-        });
+        let certs_res = self.store.list_certificates().await;
 
         let certs = match certs_res {
             Ok(c) => c,
@@ -669,8 +635,10 @@ impl CertManager {
 
         let mut results = Vec::new();
 
-        for (name, not_before, not_after, last_active_at) in certs {
-            let lower = name.to_ascii_lowercase();
+        for cert in certs {
+            let lower = cert.name.to_ascii_lowercase();
+            let (not_before, not_after, last_active_at) =
+                (cert.not_before, cert.not_after, cert.last_active_at);
             let is_root = lower == root_domain;
             let is_active = is_root
                 || last_active_at.is_some()
@@ -700,7 +668,8 @@ impl CertManager {
                             self.clock.now_unix(),
                             "renewed",
                             None,
-                        );
+                        )
+                        .await;
                         results.push(Ok(lower));
                     }
                     Err(e) => {

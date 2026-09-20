@@ -244,12 +244,17 @@ async fn handle_connection(
                 https: config.listen_https.to_string(),
             };
             let root_cert = cert_manager.root_cert_status().to_string();
-            let cert_counts = cert_manager.cert_counts();
-            let db_path = store.path().display().to_string();
-            let db_size = std::fs::metadata(store.path())
+            let cert_counts = cert_manager.cert_counts().await;
+            let db_path = store
+                .path()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| store.url().to_string());
+            let db_size = store
+                .path()
+                .and_then(|p| std::fs::metadata(p).ok())
                 .map(|m| m.len())
                 .unwrap_or(0);
-            let schema_version = store.schema_version().unwrap_or(0);
+            let schema_version = store.schema_version().await.unwrap_or(0);
 
             let resp = StatusResponse {
                 ok: true,
@@ -279,7 +284,7 @@ async fn handle_connection(
                     let mut names = std::collections::BTreeSet::new();
                     names.insert(root_domain.clone());
 
-                    if let Ok(records) = store.list_certificates() {
+                    if let Ok(records) = store.list_certificates().await {
                         for r in records {
                             names.insert(r.name.to_ascii_lowercase());
                         }
@@ -300,20 +305,22 @@ async fn handle_connection(
                     let mut summaries = Vec::with_capacity(ordered_names.len());
                     for name in ordered_names {
                         let state = cert_manager.status(&name).label().to_string();
-                        let cert_rec = store.get_certificate(&name).ok().flatten();
+                        let cert_rec = store.get_certificate(&name).await.ok().flatten();
                         let not_after = cert_rec
                             .as_ref()
                             .map(|c| c.not_after)
                             .or_else(|| cert_manager.status(&name).not_after());
                         let active = cert_manager.is_active(&name);
-                        let last_event =
-                            store.get_latest_cert_event(&name).ok().flatten().map(|e| {
-                                CertEventSummary {
-                                    id: e.id,
-                                    at: e.at,
-                                    kind: e.kind,
-                                    detail: e.detail,
-                                }
+                        let last_event = store
+                            .get_latest_cert_event(&name)
+                            .await
+                            .ok()
+                            .flatten()
+                            .map(|e| CertEventSummary {
+                                id: e.id,
+                                at: e.at,
+                                kind: e.kind,
+                                detail: e.detail,
                             });
 
                         summaries.push(CertSummary {
@@ -341,7 +348,7 @@ async fn handle_connection(
                         name.to_ascii_lowercase()
                     };
 
-                    let cert_rec = store.get_certificate(&target).ok().flatten();
+                    let cert_rec = store.get_certificate(&target).await.ok().flatten();
                     let in_states = cert_manager.list_states().contains_key(&target);
 
                     if target != root_domain && cert_rec.is_none() && !in_states {
@@ -358,6 +365,7 @@ async fn handle_connection(
                     let limit = req.limit.unwrap_or(10);
                     let cert_events = store
                         .get_cert_events(&target, limit)
+                        .await
                         .unwrap_or_default()
                         .into_iter()
                         .map(|e| CertEventSummary {
@@ -414,6 +422,7 @@ async fn handle_connection(
                 || cert_manager.list_states().contains_key(&target)
                 || store
                     .get_certificate(&target)
+                    .await
                     .map(|opt| opt.is_some())
                     .unwrap_or(false);
 
@@ -574,7 +583,7 @@ async fn handle_connection(
             };
 
             let backup_path = PathBuf::from(&path_str);
-            match store.backup(&backup_path) {
+            match store.backup(&backup_path).await {
                 Ok(()) => {
                     let size = std::fs::metadata(&backup_path)
                         .map(|m| m.len())

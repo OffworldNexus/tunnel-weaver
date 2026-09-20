@@ -44,11 +44,11 @@ async fn test_graceful_shutdown_on_sigterm_with_drain() {
     drop(l1);
     drop(l2);
 
-    let store = Store::open(&db_path).unwrap();
+    let store = Store::open(&db_path).await.unwrap();
     let control_sock_path = dir.path().join("control.sock");
     let config = create_valid_test_config(http_port, https_port, control_sock_path);
-    store.save_config(&config).unwrap();
-    drop(store);
+    store.save_config(&config).await.unwrap();
+    store.close().await.unwrap();
 
     let bin_path = env!("CARGO_BIN_EXE_weaver-server");
     let mut child = Command::new(bin_path)
@@ -127,11 +127,11 @@ async fn test_graceful_shutdown_on_sigint() {
     drop(l1);
     drop(l2);
 
-    let store = Store::open(&db_path).unwrap();
+    let store = Store::open(&db_path).await.unwrap();
     let control_sock_path = dir.path().join("control.sock");
     let config = create_valid_test_config(http_port, https_port, control_sock_path);
-    store.save_config(&config).unwrap();
-    drop(store);
+    store.save_config(&config).await.unwrap();
+    store.close().await.unwrap();
 
     let bin_path = env!("CARGO_BIN_EXE_weaver-server");
     let mut child = Command::new(bin_path)

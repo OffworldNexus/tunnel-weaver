@@ -257,7 +257,7 @@ async fn test_pebble_e2e_issuance_and_lazy_ensure() {
 
     let dir = tempdir().unwrap();
     let db_path = dir.path().join("weaver.db");
-    let store = Arc::new(Store::open(&db_path).unwrap());
+    let store = Arc::new(Store::open(&db_path).await.unwrap());
 
     // Bind HTTP port 5002 (Pebble's default httpPort) and HTTPS port 5001 (Pebble's tlsPort)
     let http_listener = TcpListener::bind("0.0.0.0:5002").await.unwrap();
@@ -327,7 +327,7 @@ async fn test_pebble_e2e_issuance_and_lazy_ensure() {
     });
 
     // 1. Initial eager issuance for root domain
-    manager.init().unwrap();
+    manager.init().await.unwrap();
     manager.spawn_eager_order_if_pending();
 
     // Wait up to 30 seconds for root domain cert to become Issued
@@ -389,7 +389,7 @@ async fn test_pebble_e2e_tls_alpn_01_with_unbound_port_80() {
 
     let dir = tempdir().unwrap();
     let db_path = dir.path().join("weaver.db");
-    let store = Arc::new(Store::open(&db_path).unwrap());
+    let store = Arc::new(Store::open(&db_path).await.unwrap());
 
     // Port 80 listener is UNBOUND. Port 5001 is bound for HTTPS.
     let https_listener = TcpListener::bind("0.0.0.0:5001").await.unwrap();
@@ -472,7 +472,7 @@ async fn test_pebble_e2e_tunnel_registration_and_proxying() {
 
     let dir = tempdir().unwrap();
     let db_path = dir.path().join("weaver.db");
-    let store = Arc::new(Store::open(&db_path).unwrap());
+    let store = Arc::new(Store::open(&db_path).await.unwrap());
 
     let http_listener = TcpListener::bind("0.0.0.0:5002").await.unwrap();
     let https_listener = TcpListener::bind("0.0.0.0:5001").await.unwrap();
@@ -548,7 +548,7 @@ async fn test_pebble_e2e_tunnel_registration_and_proxying() {
     });
 
     // 1. Initial eager issuance for root domain
-    manager.init().unwrap();
+    manager.init().await.unwrap();
     manager.spawn_eager_order_if_pending();
 
     // Wait up to 30 seconds for root domain cert to become Issued

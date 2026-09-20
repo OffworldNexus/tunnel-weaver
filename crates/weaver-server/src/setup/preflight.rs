@@ -33,13 +33,13 @@ pub fn is_supported_arch() -> bool {
 }
 
 /// Inspects the target database path to check for an existing installation.
-pub fn detect_existing_install(db_path: &Path) -> Option<ExistingInstall> {
+pub async fn detect_existing_install(db_path: &Path) -> Option<ExistingInstall> {
     if !db_path.exists() {
         return None;
     }
 
-    let store = Store::open(db_path).ok()?;
-    let config = store.load_config().ok()?;
+    let store = Store::open(db_path).await.ok()?;
+    let config = store.load_config().await.ok()?;
     Some(ExistingInstall {
         root_domain: config.root_domain,
     })

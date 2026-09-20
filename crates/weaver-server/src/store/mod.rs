@@ -1,65 +1,72 @@
+//! Persistent state store built on SeaORM.
+//!
+//! The store is backend-agnostic by construction: every query goes through
+//! SeaORM entities or the `sea-query` builder, and the connection is opened
+//! from a URL. Today only SQLite is compiled in; enabling PostgreSQL is a
+//! matter of adding the `sqlx-postgres` feature and passing a `postgres://`
+//! URL to [`Store::connect`]. The handful of SQLite-only niceties (pragmas,
+//! file permissions, `VACUUM INTO` backups) are gated on the detected backend.
+
+pub mod entity;
 pub mod error;
 pub mod migration;
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
-use rusqlite::{Connection, OpenFlags, OptionalExtension};
+use sea_orm::sea_query::{Expr, OnConflict};
+use sea_orm::{
+    ActiveModelTrait, ColumnTrait, ConnectOptions, ConnectionTrait, Database, DatabaseConnection,
+    DbBackend, EntityTrait, QueryFilter, QueryOrder, QuerySelect, Set, Statement,
+};
+use sea_orm_migration::MigratorTrait;
 
 pub use error::StoreError;
-pub use migration::Migration;
+pub use migration::Migrator;
 
 use crate::config::{Config, ConfigError};
+use entity::{acme_account, cert_event, certificate, config};
 
-const MAX_READER_POOL_SIZE: usize = 4;
+/// Upper bound on pooled connections. SQLite serializes writers anyway; a
+/// small pool lets concurrent readers proceed without contention.
+const MAX_CONNECTIONS: u32 = 5;
 
-/// SQLite connection pragma configuration.
-fn apply_pragmas(conn: &Connection) -> Result<(), rusqlite::Error> {
-    conn.execute_batch(
-        "PRAGMA journal_mode = WAL;
-         PRAGMA synchronous = NORMAL;
-         PRAGMA foreign_keys = ON;
-         PRAGMA busy_timeout = 5000;
-         PRAGMA wal_autocheckpoint = 1000;
-         PRAGMA temp_store = MEMORY;",
-    )?;
-    Ok(())
-}
+/// How long a connection waits on a locked SQLite database before failing.
+const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Pragmas suitable for read-only connections.
-fn apply_read_pragmas(conn: &Connection) -> Result<(), rusqlite::Error> {
-    conn.execute_batch(
-        "PRAGMA synchronous = NORMAL;
-         PRAGMA foreign_keys = ON;
-         PRAGMA busy_timeout = 5000;
-         PRAGMA temp_store = MEMORY;",
-    )?;
-    Ok(())
-}
-
-/// SQLite state store managing database access, embedded migrations, and configuration.
+/// Handle to the state database. Cheap to clone; all clones share one pool.
 #[derive(Clone)]
 pub struct Store {
-    path: PathBuf,
-    writer: Arc<Mutex<Connection>>,
-    readers: Arc<Mutex<Vec<Connection>>>,
+    url: String,
+    /// Filesystem location when the backend is a file-based SQLite database.
+    path: Option<PathBuf>,
+    db: DatabaseConnection,
 }
 
 impl std::fmt::Debug for Store {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Store")
-            .field("path", &self.path)
+            .field("url", &self.url)
             .finish_non_exhaustive()
     }
 }
 
+/// Current Unix time in seconds, used for `updated_at`/`created_at` stamps.
+fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
+}
+
 impl Store {
-    /// Opens the SQLite database at `path`, creating parent directories (mode 0700)
-    /// and file (mode 0600 on Linux), applying required pragmas, and running pending migrations.
-    pub fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
+    /// Opens (creating if needed) the SQLite database file at `path`.
+    ///
+    /// Creates parent directories with mode 0700 and forces the file to 0600
+    /// on Unix, since the store holds private keys. Runs pending migrations.
+    pub async fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
         let path = path.as_ref().to_path_buf();
 
-        // 1. Create parent directory if missing with mode 0700 on Unix
         if let Some(parent) = path.parent()
             && !parent.as_os_str().is_empty()
             && !parent.exists()
@@ -78,268 +85,328 @@ impl Store {
             }
         }
 
-        let file_existed = path.exists();
+        let path_str = path
+            .to_str()
+            .ok_or_else(|| StoreError::InvalidPath("database path is not valid UTF-8".into()))?;
+        let url = format!("sqlite://{path_str}?mode=rwc");
 
-        // 2. Open writer connection
-        let mut conn = Connection::open(&path)?;
+        let store = Self::connect(&url).await?;
 
-        // 3. Ensure 0600 permissions on Unix
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            if !file_existed || path.exists() {
-                let metadata = std::fs::metadata(&path)?;
-                let mut perms = metadata.permissions();
-                if perms.mode() & 0o777 != 0o600 {
-                    perms.set_mode(0o600);
-                    std::fs::set_permissions(&path, perms)?;
-                }
+            let metadata = std::fs::metadata(&path)?;
+            let mut perms = metadata.permissions();
+            if perms.mode() & 0o777 != 0o600 {
+                perms.set_mode(0o600);
+                std::fs::set_permissions(&path, perms)?;
             }
         }
 
-        // 4. Set pragmas
-        apply_pragmas(&conn)?;
+        Ok(Self {
+            path: Some(path),
+            ..store
+        })
+    }
 
-        // 5. Run forward-only migrations
-        migration::run_migrations(&mut conn)?;
+    /// Connects to any database URL SeaORM understands and runs pending migrations.
+    ///
+    /// This is the backend-agnostic entry point; [`Store::open`] is a thin
+    /// SQLite-file convenience over it.
+    pub async fn connect(url: &str) -> Result<Self, StoreError> {
+        let mut opts = ConnectOptions::new(url);
+        opts.max_connections(MAX_CONNECTIONS).sqlx_logging(false);
+
+        // Pragmas must be applied per pooled connection, hence at the sqlx
+        // options level rather than as a one-off statement after connect.
+        opts.map_sqlx_sqlite_opts(|o| {
+            use sqlx::sqlite::{SqliteJournalMode, SqliteSynchronous};
+            o.journal_mode(SqliteJournalMode::Wal)
+                .synchronous(SqliteSynchronous::Normal)
+                .foreign_keys(true)
+                .busy_timeout(SQLITE_BUSY_TIMEOUT)
+                .pragma("wal_autocheckpoint", "1000")
+                .pragma("temp_store", "MEMORY")
+        });
+
+        let db = Database::connect(opts).await?;
+        Migrator::up(&db, None).await?;
 
         Ok(Self {
-            path,
-            writer: Arc::new(Mutex::new(conn)),
-            readers: Arc::new(Mutex::new(Vec::with_capacity(MAX_READER_POOL_SIZE))),
+            url: url.to_string(),
+            path: None,
+            db,
         })
     }
 
-    /// Returns the path to the database file.
-    pub fn path(&self) -> &Path {
-        &self.path
+    /// Returns the path to the database file, if the backend is file-based SQLite.
+    pub fn path(&self) -> Option<&Path> {
+        self.path.as_deref()
     }
 
-    /// Borrows a connection from the read pool or opens a new read-only connection.
-    fn acquire_reader(&self) -> Result<Connection, StoreError> {
-        let mut pool = self.readers.lock().map_err(|_| StoreError::LockPoisoned)?;
-        if let Some(conn) = pool.pop() {
-            return Ok(conn);
-        }
-        drop(pool);
-
-        let conn = Connection::open_with_flags(
-            &self.path,
-            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )?;
-        apply_read_pragmas(&conn)?;
-        Ok(conn)
+    /// Returns the connection URL the store was opened with.
+    pub fn url(&self) -> &str {
+        &self.url
     }
 
-    /// Returns a connection to the read pool if space is available.
-    fn release_reader(&self, conn: Connection) {
-        if let Ok(mut pool) = self.readers.lock()
-            && pool.len() < MAX_READER_POOL_SIZE
-        {
-            pool.push(conn);
-        }
+    /// Returns the underlying connection for ad-hoc queries (tests, seeding).
+    pub fn db(&self) -> &DatabaseConnection {
+        &self.db
     }
 
-    /// Executes a read closure using a pooled or read-only connection.
-    pub fn read<F, R>(&self, f: F) -> Result<R, StoreError>
-    where
-        F: FnOnce(&Connection) -> Result<R, StoreError>,
-    {
-        let conn = self.acquire_reader()?;
-        let result = f(&conn);
-        self.release_reader(conn);
-        result
+    fn backend(&self) -> DbBackend {
+        self.db.get_database_backend()
     }
 
-    /// Executes a write closure using the mutex-guarded writer connection.
-    pub fn write<F, R>(&self, f: F) -> Result<R, StoreError>
-    where
-        F: FnOnce(&mut Connection) -> Result<R, StoreError>,
-    {
-        let mut guard = self.writer.lock().map_err(|_| StoreError::LockPoisoned)?;
-        f(&mut guard)
-    }
-
-    /// Saves the full configuration struct as JSON into the database.
-    pub fn save_config(&self, config: &Config) -> Result<(), StoreError> {
-        let json_str = serde_json::to_string(config)
-            .map_err(|e| ConfigError::DeserializationFailed(e.to_string()))?;
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64;
-
-        self.write(|conn| {
-            conn.execute(
-                "INSERT INTO config (id, config_json, updated_at) VALUES (1, ?1, ?2)
-                 ON CONFLICT(id) DO UPDATE SET config_json = excluded.config_json, updated_at = excluded.updated_at",
-                rusqlite::params![json_str, now],
-            )?;
-            Ok(())
-        })
-    }
-
-    /// Updates or inserts an individual configuration field into the JSON configuration object.
-    pub fn set_config(&self, key: &str, value: &str) -> Result<(), StoreError> {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64;
-
-        let key = key.to_string();
-        let value = value.to_string();
-
-        self.write(|conn| {
-            let mut obj: serde_json::Map<String, serde_json::Value> = conn
-                .query_row(
-                    "SELECT config_json FROM config WHERE id = 1",
-                    [],
-                    |row| row.get::<_, String>(0),
-                )
-                .optional()?
-                .and_then(|s| serde_json::from_str(&s).ok())
-                .unwrap_or_default();
-
-            let json_val = serde_json::from_str(&value)
-                .unwrap_or(serde_json::Value::String(value));
-            obj.insert(key, json_val);
-
-            let json_str = serde_json::to_string(&obj)
-                .map_err(|e| ConfigError::DeserializationFailed(e.to_string()))?;
-
-            conn.execute(
-                "INSERT INTO config (id, config_json, updated_at) VALUES (1, ?1, ?2)
-                 ON CONFLICT(id) DO UPDATE SET config_json = excluded.config_json, updated_at = excluded.updated_at",
-                rusqlite::params![json_str, now],
-            )?;
-            Ok(())
-        })
-    }
-
-    /// Loads and validates the configuration from the database.
-    pub fn load_config(&self) -> Result<Config, ConfigError> {
-        Config::load(self)
-    }
-
-    /// Performs an online backup of the database to `dest` using `VACUUM INTO`.
-    pub fn backup(&self, dest: impl AsRef<Path>) -> Result<(), StoreError> {
-        let dest_path = dest.as_ref();
-        let dest_str = dest_path
-            .to_str()
-            .ok_or_else(|| StoreError::InvalidPath("destination path is not valid UTF-8".into()))?;
-
-        self.write(|conn| {
-            // VACUUM INTO supports expression / bind parameter in SQLite 3.27+
-            conn.execute("VACUUM INTO ?1", rusqlite::params![dest_str])?;
-            Ok(())
-        })
-    }
-
-    /// Explicitly closes the store, optimizing database layout via `PRAGMA optimize`.
-    pub fn close(self) -> Result<(), StoreError> {
-        let guard = self.writer.lock().map_err(|_| StoreError::LockPoisoned)?;
-        guard.execute_batch("PRAGMA optimize;")?;
+    /// Writes `config_json` into the singleton config row, creating or replacing it.
+    async fn write_config_json(&self, json_str: String) -> Result<(), StoreError> {
+        let model = config::ActiveModel {
+            id: Set(config::SINGLETON_ID),
+            config_json: Set(json_str),
+            updated_at: Set(now_unix()),
+        };
+        config::Entity::insert(model)
+            .on_conflict(
+                OnConflict::column(config::Column::Id)
+                    .update_columns([config::Column::ConfigJson, config::Column::UpdatedAt])
+                    .to_owned(),
+            )
+            .exec_without_returning(&self.db)
+            .await?;
         Ok(())
     }
 
-    /// Returns the maximum applied database schema migration version.
-    pub fn schema_version(&self) -> Result<u32, StoreError> {
-        self.read(|conn| {
-            let ver: u32 = conn.query_row(
-                "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
-                [],
-                |row| row.get(0),
-            )?;
-            Ok(ver)
-        })
+    /// Reads the raw configuration JSON, if any has been saved.
+    pub async fn load_config_json(&self) -> Result<Option<String>, StoreError> {
+        let row = config::Entity::find_by_id(config::SINGLETON_ID)
+            .one(&self.db)
+            .await?;
+        Ok(row.map(|r| r.config_json))
     }
+
+    /// Saves the full configuration struct as JSON into the database.
+    pub async fn save_config(&self, config: &Config) -> Result<(), StoreError> {
+        let json_str = serde_json::to_string(config)
+            .map_err(|e| ConfigError::DeserializationFailed(e.to_string()))?;
+        self.write_config_json(json_str).await
+    }
+
+    /// Updates or inserts an individual configuration field into the JSON configuration object.
+    pub async fn set_config(&self, key: &str, value: &str) -> Result<(), StoreError> {
+        let mut obj: serde_json::Map<String, serde_json::Value> = self
+            .load_config_json()
+            .await?
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default();
+
+        let json_val =
+            serde_json::from_str(value).unwrap_or(serde_json::Value::String(value.to_string()));
+        obj.insert(key.to_string(), json_val);
+
+        let json_str = serde_json::to_string(&obj)
+            .map_err(|e| ConfigError::DeserializationFailed(e.to_string()))?;
+        self.write_config_json(json_str).await
+    }
+
+    /// Loads and validates the configuration from the database.
+    pub async fn load_config(&self) -> Result<Config, ConfigError> {
+        Config::load(self).await
+    }
+
+    /// Performs an online backup of the database to `dest`.
+    ///
+    /// Implemented via `VACUUM INTO`, which only exists on SQLite; other
+    /// backends return [`StoreError::UnsupportedBackend`].
+    pub async fn backup(&self, dest: impl AsRef<Path>) -> Result<(), StoreError> {
+        let backend = self.backend();
+        if backend != DbBackend::Sqlite {
+            return Err(StoreError::UnsupportedBackend("backup", backend));
+        }
+        let dest_str = dest
+            .as_ref()
+            .to_str()
+            .ok_or_else(|| StoreError::InvalidPath("destination path is not valid UTF-8".into()))?;
+        self.db
+            .execute_raw(Statement::from_sql_and_values(
+                backend,
+                "VACUUM INTO ?",
+                [dest_str.into()],
+            ))
+            .await?;
+        Ok(())
+    }
+
+    /// Closes the pool, first letting SQLite refresh its planner statistics.
+    pub async fn close(self) -> Result<(), StoreError> {
+        if self.backend() == DbBackend::Sqlite {
+            self.db.execute_unprepared("PRAGMA optimize;").await?;
+        }
+        self.db.close().await?;
+        Ok(())
+    }
+
+    /// Returns the number of schema migrations applied to the database.
+    pub async fn schema_version(&self) -> Result<u32, StoreError> {
+        let applied = Migrator::get_applied_migrations(&self.db).await?;
+        Ok(applied.len() as u32)
+    }
+
+    // ----- certificates -----
 
     /// Fetches the metadata record for a certificate by hostname.
-    pub fn get_certificate(&self, name: &str) -> Result<Option<CertRecord>, StoreError> {
-        let lower = name.to_ascii_lowercase();
-        self.read(|conn| {
-            let mut stmt = conn.prepare(
-                "SELECT name, not_before, not_after, issuer, directory, obtained_at, last_active_at FROM certificates WHERE name = ?1",
-            )?;
-            let res = stmt
-                .query_row(rusqlite::params![lower], |row| {
-                    Ok(CertRecord {
-                        name: row.get(0)?,
-                        not_before: row.get(1)?,
-                        not_after: row.get(2)?,
-                        issuer: row.get(3)?,
-                        directory: row.get(4)?,
-                        obtained_at: row.get(5)?,
-                        last_active_at: row.get(6)?,
-                    })
-                })
-                .optional()?;
-            Ok(res)
-        })
+    pub async fn get_certificate(&self, name: &str) -> Result<Option<CertRecord>, StoreError> {
+        let row = certificate::Entity::find_by_id(name.to_ascii_lowercase())
+            .one(&self.db)
+            .await?;
+        Ok(row.map(CertRecord::from))
     }
 
-    /// Lists all certificate records in the store ordered alphabetically by name.
-    pub fn list_certificates(&self) -> Result<Vec<CertRecord>, StoreError> {
-        self.read(|conn| {
-            let mut stmt = conn.prepare(
-                "SELECT name, not_before, not_after, issuer, directory, obtained_at, last_active_at FROM certificates ORDER BY name ASC",
-            )?;
-            let rows = stmt.query_map([], |row| {
-                Ok(CertRecord {
-                    name: row.get(0)?,
-                    not_before: row.get(1)?,
-                    not_after: row.get(2)?,
-                    issuer: row.get(3)?,
-                    directory: row.get(4)?,
-                    obtained_at: row.get(5)?,
-                    last_active_at: row.get(6)?,
-                })
-            })?;
-            let mut list = Vec::new();
-            for r in rows {
-                list.push(r?);
-            }
-            Ok(list)
-        })
+    /// Lists all certificate records (without key material) ordered by name.
+    pub async fn list_certificates(&self) -> Result<Vec<CertRecord>, StoreError> {
+        let rows = self.list_certificates_full().await?;
+        Ok(rows.into_iter().map(CertRecord::from).collect())
+    }
+
+    /// Lists all certificates including PEM material, ordered by name.
+    ///
+    /// Used at startup to repopulate the in-memory TLS resolver.
+    pub async fn list_certificates_full(&self) -> Result<Vec<certificate::Model>, StoreError> {
+        Ok(certificate::Entity::find()
+            .order_by_asc(certificate::Column::Name)
+            .all(&self.db)
+            .await?)
+    }
+
+    /// Inserts or replaces a certificate row keyed by hostname.
+    pub async fn upsert_certificate(&self, cert: certificate::Model) -> Result<(), StoreError> {
+        let active: certificate::ActiveModel = cert.into();
+        certificate::Entity::insert(active)
+            .on_conflict(
+                OnConflict::column(certificate::Column::Name)
+                    .update_columns([
+                        certificate::Column::CertPem,
+                        certificate::Column::KeyPem,
+                        certificate::Column::NotBefore,
+                        certificate::Column::NotAfter,
+                        certificate::Column::Issuer,
+                        certificate::Column::Directory,
+                        certificate::Column::ObtainedAt,
+                        certificate::Column::LastActiveAt,
+                    ])
+                    .to_owned(),
+            )
+            .exec_without_returning(&self.db)
+            .await?;
+        Ok(())
+    }
+
+    /// Sets or clears `last_active_at` for a hostname's certificate.
+    pub async fn set_cert_active(
+        &self,
+        name: &str,
+        active_at: Option<i64>,
+    ) -> Result<(), StoreError> {
+        certificate::Entity::update_many()
+            .col_expr(certificate::Column::LastActiveAt, Expr::value(active_at))
+            .filter(certificate::Column::Name.eq(name.to_ascii_lowercase()))
+            .exec(&self.db)
+            .await?;
+        Ok(())
+    }
+
+    // ----- certificate events -----
+
+    /// Appends a certificate lifecycle event.
+    pub async fn record_cert_event(
+        &self,
+        name: &str,
+        at: i64,
+        kind: &str,
+        detail: Option<&str>,
+    ) -> Result<(), StoreError> {
+        cert_event::ActiveModel {
+            name: Set(name.to_string()),
+            at: Set(at),
+            kind: Set(kind.to_string()),
+            detail: Set(detail.map(str::to_string)),
+            ..Default::default()
+        }
+        .insert(&self.db)
+        .await?;
+        Ok(())
     }
 
     /// Fetches the most recent `limit` lifecycle events for a given hostname.
-    pub fn get_cert_events(
+    pub async fn get_cert_events(
         &self,
         name: &str,
         limit: usize,
     ) -> Result<Vec<CertEventRecord>, StoreError> {
-        let lower = name.to_ascii_lowercase();
-        let limit_i64 = limit as i64;
-        self.read(|conn| {
-            let mut stmt = conn.prepare(
-                "SELECT id, name, at, kind, detail FROM cert_events WHERE name = ?1 ORDER BY at DESC, id DESC LIMIT ?2",
-            )?;
-            let rows = stmt.query_map(rusqlite::params![lower, limit_i64], |row| {
-                Ok(CertEventRecord {
-                    id: row.get(0)?,
-                    name: row.get(1)?,
-                    at: row.get(2)?,
-                    kind: row.get(3)?,
-                    detail: row.get(4)?,
-                })
-            })?;
-            let mut list = Vec::new();
-            for r in rows {
-                list.push(r?);
-            }
-            Ok(list)
-        })
+        let rows = cert_event::Entity::find()
+            .filter(cert_event::Column::Name.eq(name.to_ascii_lowercase()))
+            .order_by_desc(cert_event::Column::At)
+            .order_by_desc(cert_event::Column::Id)
+            .limit(limit as u64)
+            .all(&self.db)
+            .await?;
+        Ok(rows.into_iter().map(CertEventRecord::from).collect())
     }
 
     /// Fetches the single most recent lifecycle event for a given hostname.
-    pub fn get_latest_cert_event(&self, name: &str) -> Result<Option<CertEventRecord>, StoreError> {
-        let events = self.get_cert_events(name, 1)?;
+    pub async fn get_latest_cert_event(
+        &self,
+        name: &str,
+    ) -> Result<Option<CertEventRecord>, StoreError> {
+        let events = self.get_cert_events(name, 1).await?;
         Ok(events.into_iter().next())
+    }
+
+    // ----- ACME accounts -----
+
+    /// Fetches the stored ACME account for a directory URL.
+    pub async fn get_acme_account(
+        &self,
+        directory: &str,
+    ) -> Result<Option<acme_account::Model>, StoreError> {
+        Ok(acme_account::Entity::find_by_id(directory.to_string())
+            .one(&self.db)
+            .await?)
+    }
+
+    /// Inserts or replaces the ACME account registered against `directory`.
+    pub async fn upsert_acme_account(
+        &self,
+        directory: &str,
+        email: &str,
+        credentials_json: &str,
+        kid: Option<&str>,
+        created_at: i64,
+    ) -> Result<(), StoreError> {
+        let model = acme_account::ActiveModel {
+            directory: Set(directory.to_string()),
+            email: Set(email.to_string()),
+            credentials_json: Set(credentials_json.to_string()),
+            kid: Set(kid.map(str::to_string)),
+            created_at: Set(created_at),
+        };
+        acme_account::Entity::insert(model)
+            .on_conflict(
+                OnConflict::column(acme_account::Column::Directory)
+                    .update_columns([
+                        acme_account::Column::Email,
+                        acme_account::Column::CredentialsJson,
+                        acme_account::Column::Kid,
+                        acme_account::Column::CreatedAt,
+                    ])
+                    .to_owned(),
+            )
+            .exec_without_returning(&self.db)
+            .await?;
+        Ok(())
     }
 }
 
-/// Certificate database record metadata.
+/// Certificate database record metadata (no key material).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CertRecord {
     pub name: String,
@@ -349,6 +416,20 @@ pub struct CertRecord {
     pub directory: String,
     pub obtained_at: i64,
     pub last_active_at: Option<i64>,
+}
+
+impl From<certificate::Model> for CertRecord {
+    fn from(m: certificate::Model) -> Self {
+        Self {
+            name: m.name,
+            not_before: m.not_before,
+            not_after: m.not_after,
+            issuer: m.issuer,
+            directory: m.directory,
+            obtained_at: m.obtained_at,
+            last_active_at: m.last_active_at,
+        }
+    }
 }
 
 /// Certificate event database record.
@@ -361,12 +442,14 @@ pub struct CertEventRecord {
     pub detail: Option<String>,
 }
 
-impl Drop for Store {
-    fn drop(&mut self) {
-        if Arc::strong_count(&self.writer) == 1
-            && let Ok(guard) = self.writer.lock()
-        {
-            let _ = guard.execute_batch("PRAGMA optimize;");
+impl From<cert_event::Model> for CertEventRecord {
+    fn from(m: cert_event::Model) -> Self {
+        Self {
+            id: m.id,
+            name: m.name,
+            at: m.at,
+            kind: m.kind,
+            detail: m.detail,
         }
     }
 }

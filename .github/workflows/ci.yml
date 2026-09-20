@@ -45,9 +45,6 @@ jobs:
       - name: Cargo deny
         run: cargo deny check
 
-      - name: Migrations lint
-        run: cargo test -p weaver-server --test migrations_lint
-
   test:
     name: test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}

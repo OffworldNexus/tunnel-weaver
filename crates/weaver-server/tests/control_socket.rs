@@ -141,9 +141,9 @@ async fn test_control_socket_daemon_suite() {
     drop(l1);
     drop(l2);
 
-    let store = Store::open(&db_path).unwrap();
+    let store = Store::open(&db_path).await.unwrap();
     let config = create_valid_test_config(http_port, https_port, control_sock_path.clone());
-    store.save_config(&config).unwrap();
+    store.save_config(&config).await.unwrap();
 
     // Generate valid self-signed certificates using rcgen
     let root_rcgen = rcgen::generate_simple_self_signed(vec!["weaver.test".to_string()]).unwrap();
@@ -167,60 +167,70 @@ async fn test_control_socket_daemon_suite() {
         .unwrap()
         .as_secs() as i64;
 
+    let seed_cert = |name: &str, cert_pem: &str, key_pem: &str, days: i64, active: bool| {
+        weaver_server::store::entity::certificate::Model {
+            name: name.to_string(),
+            cert_pem: cert_pem.to_string(),
+            key_pem: key_pem.to_string(),
+            not_before: now - 3600,
+            not_after: now + 86400 * days,
+            issuer: Some("Test Issuer".to_string()),
+            directory: "letsencrypt-staging".to_string(),
+            obtained_at: now - 3600,
+            last_active_at: active.then_some(now - 3600),
+        }
+    };
     store
-        .write(|conn| {
-            // Root cert
-            conn.execute(
-                "INSERT INTO certificates (name, cert_pem, key_pem, not_before, not_after, issuer, directory, obtained_at, last_active_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, 'Test Issuer', 'letsencrypt-staging', ?4, ?4)",
-                rusqlite::params![
-                    "weaver.test",
-                    root_cert_pem,
-                    root_key_pem,
-                    now - 3600,
-                    now + 86400 * 90
-                ],
-            )?;
-            // Active tunnel
-            conn.execute(
-                "INSERT INTO certificates (name, cert_pem, key_pem, not_before, not_after, issuer, directory, obtained_at, last_active_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, 'Test Issuer', 'letsencrypt-staging', ?4, ?4)",
-                rusqlite::params![
-                    "tunnel-active.weaver.test",
-                    tunnel_cert_pem,
-                    tunnel_key_pem,
-                    now - 3600,
-                    now + 86400 * 60
-                ],
-            )?;
-            // Inactive tunnel
-            conn.execute(
-                "INSERT INTO certificates (name, cert_pem, key_pem, not_before, not_after, issuer, directory, obtained_at, last_active_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, 'Test Issuer', 'letsencrypt-staging', ?4, NULL)",
-                rusqlite::params![
-                    "tunnel-inactive.weaver.test",
-                    inactive_cert_pem,
-                    inactive_key_pem,
-                    now - 3600,
-                    now + 86400 * 30
-                ],
-            )?;
-            // Cert events
-            conn.execute(
-                "INSERT INTO cert_events (id, name, at, kind, detail)
-                 VALUES (1, 'weaver.test', ?1, 'issued', 'Certificate successfully issued')",
-                rusqlite::params![now - 3600],
-            )?;
-            conn.execute(
-                "INSERT INTO cert_events (id, name, at, kind, detail)
-                 VALUES (2, 'tunnel-active.weaver.test', ?1, 'issued', 'Issued for tunnel')",
-                rusqlite::params![now - 3600],
-            )?;
-            Ok(())
-        })
+        .upsert_certificate(seed_cert(
+            "weaver.test",
+            &root_cert_pem,
+            &root_key_pem,
+            90,
+            true,
+        ))
+        .await
+        .unwrap();
+    store
+        .upsert_certificate(seed_cert(
+            "tunnel-active.weaver.test",
+            &tunnel_cert_pem,
+            &tunnel_key_pem,
+            60,
+            true,
+        ))
+        .await
+        .unwrap();
+    store
+        .upsert_certificate(seed_cert(
+            "tunnel-inactive.weaver.test",
+            &inactive_cert_pem,
+            &inactive_key_pem,
+            30,
+            false,
+        ))
+        .await
+        .unwrap();
+    // Cert events
+    store
+        .record_cert_event(
+            "weaver.test",
+            now - 3600,
+            "issued",
+            Some("Certificate successfully issued"),
+        )
+        .await
+        .unwrap();
+    store
+        .record_cert_event(
+            "tunnel-active.weaver.test",
+            now - 3600,
+            "issued",
+            Some("Issued for tunnel"),
+        )
+        .await
         .unwrap();
 
-    drop(store);
+    store.close().await.unwrap();
 
     let bin_path = env!("CARGO_BIN_EXE_weaver-server");
     let mut child = Command::new(bin_path)
@@ -544,7 +554,7 @@ async fn test_cert_wait_streaming_failed_exit_4_and_renew_rate_limit() {
     let db_path = dir.path().join("test.db");
     let control_sock_path = dir.path().join("control.sock");
 
-    let store = Arc::new(Store::open(&db_path).unwrap());
+    let store = Arc::new(Store::open(&db_path).await.unwrap());
     let config = Arc::new(Config {
         root_domain: "weaver.test".to_string(),
         admin_email: "admin@weaver.test".to_string(),
@@ -558,7 +568,7 @@ async fn test_cert_wait_streaming_failed_exit_4_and_renew_rate_limit() {
         acme_root_ca_pem: None,
         acme_fallback_providers: Vec::new(),
     });
-    store.save_config(&config).unwrap();
+    store.save_config(&config).await.unwrap();
 
     let challenge_registry = Arc::new(ChallengeRegistry::new());
     let resolver = Arc::new(CertResolver::new(

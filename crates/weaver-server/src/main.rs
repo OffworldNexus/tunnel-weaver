@@ -446,7 +446,7 @@ async fn main() {
                 (rd, email)
             };
 
-            let store = Store::open(&db_path).unwrap_or_else(|err| {
+            let store = Store::open(&db_path).await.unwrap_or_else(|err| {
                 eprintln!("Failed to open database at {}: {err}", db_path.display());
                 std::process::exit(1);
             });
@@ -476,7 +476,7 @@ async fn main() {
                 acme_fallback_providers: Vec::new(),
             };
 
-            if let Err(err) = store.save_config(&config) {
+            if let Err(err) = store.save_config(&config).await {
                 eprintln!("Failed to write configuration: {err}");
                 std::process::exit(1);
             }
@@ -769,7 +769,7 @@ async fn handle_setup(args: SetupArgs, db_path: PathBuf) {
         std::process::exit(1);
     }
 
-    let existing_install = weaver_server::setup::preflight::detect_existing_install(&db_path);
+    let existing_install = weaver_server::setup::preflight::detect_existing_install(&db_path).await;
 
     // 5. Public DNS verification
     println!(
@@ -900,7 +900,9 @@ async fn handle_setup(args: SetupArgs, db_path: PathBuf) {
         &plan,
         &gathered,
         Some(&registered_account),
-    ) {
+    )
+    .await
+    {
         Ok(r) => r,
         Err(err) => {
             eprintln!("{} Installation failed: {err}", "✗ Error:".red().bold());

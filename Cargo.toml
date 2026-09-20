@@ -11,7 +11,7 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.98"
 authors = ["Offworld Nexus Authors"]
 license = "Apache-2.0"
 repository = "https://github.com/OffworldNexus/tunnel-weaver"
@@ -31,7 +31,11 @@ p256 = { version = "0.14", default-features = false, features = ["ecdsa", "alloc
 rand_core = "0.10"
 zstd = { version = "0.14", default-features = false }
 proptest = { version = "1.11", default-features = false, features = ["std"] }
-rusqlite = { version = "0.40", default-features = false, features = ["bundled"] }
+# SeaORM abstracts the SQL backend: SQLite today, PostgreSQL later by enabling
+# `sqlx-postgres` and changing the connection URL, with no code changes.
+sea-orm = { version = "2.0", default-features = false, features = ["sqlx-sqlite", "runtime-tokio-rustls", "macros", "with-json"] }
+sea-orm-migration = { version = "2.0", default-features = false, features = ["sqlx-sqlite", "runtime-tokio-rustls"] }
+sqlx = { version = "0.9", default-features = false, features = ["sqlite-bundled"] }
 tokio = { version = "1.43", features = ["sync", "rt", "fs", "macros", "net", "time", "signal", "rt-multi-thread", "io-util"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 sha2 = { version = "0.11", default-features = false }

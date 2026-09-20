@@ -93,7 +93,7 @@ async fn spawn_test_relay(root_domain: &str) -> TestRelay {
     let addr = listener.local_addr().unwrap();
 
     let temp_db = NamedTempFile::new().unwrap();
-    let store = Arc::new(Store::open(temp_db.path()).unwrap());
+    let store = Arc::new(Store::open(temp_db.path()).await.unwrap());
 
     let config = Arc::new(Config {
         root_domain: root_domain.to_string(),

@@ -31,6 +31,21 @@ fn create_valid_test_config(http_port: u16, https_port: u16) -> Config {
     }
 }
 
+/// Opens the store at `path`, runs `f` against it, and closes it before
+/// returning so a subprocess can take over the database file.
+fn seed_db<F, Fut>(path: &std::path::Path, f: F)
+where
+    F: FnOnce(Store) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let store = Store::open(path).await.unwrap();
+        f(store.clone()).await;
+        store.close().await.unwrap();
+    });
+}
+
 // OFF-70: Server startup aborts immediately with exit code 78 and lists missing keys when database is unconfigured.
 #[test]
 fn test_startup_unconfigured_db_exits_78() {
@@ -38,8 +53,7 @@ fn test_startup_unconfigured_db_exits_78() {
     let db_path = dir.path().join("unconfigured.db");
 
     // Open store to create DB schema, but leave config table empty
-    let store = Store::open(&db_path).unwrap();
-    drop(store);
+    seed_db(&db_path, |_| async {});
 
     let bin_path = env!("CARGO_BIN_EXE_weaver-server");
     let output = Command::new(bin_path)
@@ -72,10 +86,10 @@ fn test_startup_address_in_use_exits_1() {
     let free_port = free_listener.local_addr().unwrap().port();
     drop(free_listener);
 
-    let store = Store::open(&db_path).unwrap();
     let config = create_valid_test_config(conflicting_port, free_port);
-    store.save_config(&config).unwrap();
-    drop(store);
+    seed_db(&db_path, |store| async move {
+        store.save_config(&config).await.unwrap();
+    });
 
     let bin_path = env!("CARGO_BIN_EXE_weaver-server");
     let output = Command::new(bin_path)
@@ -95,21 +109,12 @@ fn test_startup_validation_failure_exits_78() {
     let dir = tempdir().unwrap();
     let db_path = dir.path().join("invalid.db");
 
-    let store = Store::open(&db_path).unwrap();
     let mut config = create_valid_test_config(8080, 8443);
     config.admin_email = "not-an-email".to_string();
-    // Use raw insert to bypass store validation if any
-    let json_str = serde_json::to_string(&config).unwrap();
-    store
-        .write(|conn| {
-            conn.execute(
-                "INSERT INTO config (id, config_json, updated_at) VALUES (1, ?1, 100)",
-                rusqlite::params![json_str],
-            )?;
-            Ok(())
-        })
-        .unwrap();
-    drop(store);
+    // save_config does not validate; validation happens on load at startup
+    seed_db(&db_path, |store| async move {
+        store.save_config(&config).await.unwrap();
+    });
 
     let bin_path = env!("CARGO_BIN_EXE_weaver-server");
     let output = Command::new(bin_path)
@@ -130,10 +135,10 @@ fn test_startup_listen_fds_invalid_count_exits_1() {
     let dir = tempdir().unwrap();
     let db_path = dir.path().join("test.db");
 
-    let store = Store::open(&db_path).unwrap();
     let config = create_valid_test_config(8080, 8443);
-    store.save_config(&config).unwrap();
-    drop(store);
+    seed_db(&db_path, |store| async move {
+        store.save_config(&config).await.unwrap();
+    });
 
     let bin_path = env!("CARGO_BIN_EXE_weaver-server");
     let output = Command::new(bin_path)
@@ -161,10 +166,10 @@ fn test_startup_listen_fds_and_systemd_notify_and_shutdown() {
     let http_port = s1.local_addr().unwrap().port();
     let https_port = s2.local_addr().unwrap().port();
 
-    let store = Store::open(&db_path).unwrap();
     let config = create_valid_test_config(http_port, https_port);
-    store.save_config(&config).unwrap();
-    drop(store);
+    seed_db(&db_path, |store| async move {
+        store.save_config(&config).await.unwrap();
+    });
 
     let fd1 = s1.as_raw_fd();
     let fd2 = s2.as_raw_fd();
