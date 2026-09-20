@@ -317,35 +317,20 @@ impl AcmeEngine {
 
         let now = self.clock.now_unix();
 
-        // 8. Persist into SQLite certificates table
+        // 8. Persist into the certificates table
         self.store
-            .write(|conn| {
-                conn.execute(
-                    "INSERT INTO certificates (name, cert_pem, key_pem, not_before, not_after, issuer, directory, obtained_at, last_active_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
-                     ON CONFLICT(name) DO UPDATE SET
-                        cert_pem = excluded.cert_pem,
-                        key_pem = excluded.key_pem,
-                        not_before = excluded.not_before,
-                        not_after = excluded.not_after,
-                        issuer = excluded.issuer,
-                        directory = excluded.directory,
-                        obtained_at = excluded.obtained_at,
-                        last_active_at = excluded.last_active_at",
-                    rusqlite::params![
-                        hostname,
-                        cert_pem,
-                        key_pem,
-                        not_before,
-                        not_after,
-                        Option::<String>::None,
-                        directory_url,
-                        now,
-                        now,
-                    ],
-                )?;
-                Ok(())
+            .upsert_certificate(crate::store::entity::certificate::Model {
+                name: hostname.to_string(),
+                cert_pem: cert_pem.clone(),
+                key_pem: key_pem.clone(),
+                not_before,
+                not_after,
+                issuer: None,
+                directory: directory_url.to_string(),
+                obtained_at: now,
+                last_active_at: Some(now),
             })
+            .await
             .map_err(|e| AcmeError::Other(format!("Failed to save certificate: {e}")))?;
 
         // Record event
@@ -355,7 +340,8 @@ impl AcmeEngine {
             now,
             "issued",
             Some(&format!("directory: {directory_url}")),
-        );
+        )
+        .await;
 
         Ok(IssuedCertificate {
             name: hostname.to_string(),
@@ -373,27 +359,17 @@ impl AcmeEngine {
         provider_id: &str,
         directory_url: &str,
     ) -> Result<Account, AcmeError> {
-        let dir_key = directory_url.to_string();
-
         // 1. Check if account already exists in DB
         let cached = self
             .store
-            .read(|conn| {
-                let mut stmt =
-                    conn.prepare("SELECT key_pem, kid FROM acme_account WHERE directory = ?1")?;
-                let res = stmt
-                    .query_row(rusqlite::params![dir_key], |row| {
-                        Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
-                    })
-                    .rusqlite_optional()?;
-                Ok(res)
-            })
+            .get_acme_account(directory_url)
+            .await
             .map_err(|e| AcmeError::Other(format!("Database read failed: {e}")))?;
 
         let builder = create_account_builder_from_pem(self.config.acme_root_ca_pem.as_deref())?;
 
-        if let Some((creds_json, _)) = cached
-            && let Ok(creds) = serde_json::from_str::<AccountCredentials>(&creds_json)
+        if let Some(account) = cached
+            && let Ok(creds) = serde_json::from_str::<AccountCredentials>(&account.credentials_json)
         {
             match builder.from_credentials(creds).await {
                 Ok(account) => return Ok(account),
@@ -429,22 +405,16 @@ impl AcmeEngine {
         let kid = account.id().to_string();
         let now = self.clock.now_unix();
 
-        // Persist into SQLite acme_account
+        // Persist into acme_account
         self.store
-            .write(|conn| {
-                conn.execute(
-                    "INSERT OR REPLACE INTO acme_account (directory, email, key_pem, kid, created_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5)",
-                    rusqlite::params![
-                        directory_url,
-                        self.config.admin_email,
-                        creds_json,
-                        kid,
-                        now,
-                    ],
-                )?;
-                Ok(())
-            })
+            .upsert_acme_account(
+                directory_url,
+                &self.config.admin_email,
+                &creds_json,
+                Some(&kid),
+                now,
+            )
+            .await
             .map_err(|e| AcmeError::Other(format!("Failed to save account: {e}")))?;
 
         Ok(account)
@@ -564,21 +534,6 @@ pub async fn register_acme_account(
     let kid = account.id().to_string();
 
     Ok(RegisteredAcmeAccount { creds_json, kid })
-}
-
-/// Helper to parse optional SQLite results without extra imports.
-trait RusqliteOptional<T> {
-    fn rusqlite_optional(self) -> Result<Option<T>, rusqlite::Error>;
-}
-
-impl<T> RusqliteOptional<T> for Result<T, rusqlite::Error> {
-    fn rusqlite_optional(self) -> Result<Option<T>, rusqlite::Error> {
-        match self {
-            Ok(val) => Ok(Some(val)),
-            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(err) => Err(err),
-        }
-    }
 }
 
 /// Minimal DER ASN.1 parser to extract `not_before` and `not_after` Unix timestamps from an X.509 certificate.

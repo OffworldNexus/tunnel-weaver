@@ -66,7 +66,7 @@ pub fn check_root_warning() {
 
 /// Runs the main `weaver-server` daemon.
 ///
-/// Validates root execution environment, opens SQLite database, validates configuration,
+/// Validates root execution environment, opens the state store, validates configuration,
 /// acquires listeners, generates self-signed TLS certificates, notifies systemd of readiness,
 /// and serves HTTP/HTTPS traffic until a termination signal or cancellation token triggers shutdown.
 pub async fn run_server(
@@ -76,11 +76,11 @@ pub async fn run_server(
     // 1. Check root UID warning
     check_root_warning();
 
-    // 2. Open SQLite store (creates directories and applies migrations)
-    let store = Store::open(&db_path)?;
+    // 2. Open the store (creates directories and applies migrations)
+    let store = Store::open(&db_path).await?;
 
     // 3. Load and validate configuration
-    let config = match Config::load(&store) {
+    let config = match Config::load(&store).await {
         Ok(cfg) => cfg,
         Err(ConfigError::MissingKeys(keys)) => return Err(ServerError::MissingConfig(keys)),
         Err(ConfigError::ValidationFailed(issues)) => {
@@ -129,6 +129,7 @@ pub async fn run_server(
     );
     cert_manager
         .init()
+        .await
         .map_err(|e| ServerError::Activation(format!("Failed to initialize CertManager: {e}")))?;
 
     let tls_config = create_server_config(Arc::clone(&resolver) as Arc<dyn ResolvesServerCert>)?;
@@ -254,9 +255,9 @@ pub async fn run_server(
         warn!("Connection drain timed out after 10 seconds; proceeding to close");
     }
 
-    // Close SQLite store
-    if let Err(err) = store.close() {
-        error!(error = %err, "Error closing SQLite store");
+    // Close the store
+    if let Err(err) = store.close().await {
+        error!(error = %err, "Error closing store");
     }
 
     info!("Server shutdown complete");

@@ -2,17 +2,23 @@
 
 ## Testing
 
-- Full suite (fast): `cargo test --workspace` (~6s, timeout 60000ms)
-- CI-strength property tests: `PROPTEST_CASES=2000 PROPTEST_RNG_SEED=67 cargo test -p weaver-mux` (~45s, timeout 300000ms)
-- Ignored e2e suite: `cargo test --workspace -- --ignored` (~1s, timeout 60000ms)
+- Full suite (fast): `cargo test --workspace` (~6s tests + ~30s compile after a dep change, timeout 120000ms)
+- CI-strength property tests: `PROPTEST_CASES=2000 PROPTEST_RNG_SEED=67 cargo test -p weaver-mux` (~70s, timeout 300000ms)
+- Ignored e2e suite: `cargo test --workspace -- --ignored` (~6s, timeout 60000ms)
 - Format check: `cargo fmt --check` (~1s, timeout 30000ms)
 - Clippy: `cargo clippy --workspace --all-targets -- -D warnings` (~5s, timeout 120000ms)
 - Dependency policy: `cargo deny check` (~2s, timeout 60000ms)
 - Always: quiet on success; dump failures only.
 - Fuzz crate compiles: `(cd fuzz && cargo check)` (~1s, timeout 60000ms)
-- Last measured: 2026-09-19, full suite 6s.
+- Last measured: 2026-09-20, full suite 6s (36s incl. compile).
 
 ## Crate notes
+
+- `weaver-server` persists state through SeaORM 2 (`src/store/`): entities in
+  `store/entity/`, schema-builder migrations in `store/migration/`. Never write
+  raw SQL outside `store/`; add a typed `Store` method instead. SQLite-only
+  behaviour (pragmas, `VACUUM INTO`, file perms) must be gated on
+  `DbBackend::Sqlite` so a future `sqlx-postgres` feature needs no code change.
 
 - `weaver-mux` is sans-IO: never call `Instant::now`/`SystemTime::now` or
   any RNG inside it (clippy.toml + `#![forbid]` enforce this). Tests use

@@ -14,7 +14,7 @@ The project is structured as a Cargo workspace:
 
 ## Prerequisites
 
-- **Rust**: 1.85+ (Rust edition 2024).
+- **Rust**: 1.98+ (Rust edition 2024).
 
 ## Building & Testing
 

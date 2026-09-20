@@ -447,7 +447,7 @@ async fn test_tls_alpn_01_challenge_certified_key() {
 async fn test_sqlite_caching_and_server_restart_no_reorder() {
     let dir = tempdir().unwrap();
     let db_path = dir.path().join("weaver.db");
-    let store = Arc::new(Store::open(&db_path).unwrap());
+    let store = Arc::new(Store::open(&db_path).await.unwrap());
 
     let rcgen_cert = generate_simple_self_signed(vec!["test.example.com".to_string()]).unwrap();
     let cert_pem = rcgen_cert.cert.pem();
@@ -456,23 +456,20 @@ async fn test_sqlite_caching_and_server_restart_no_reorder() {
     let clock = Arc::new(MockClock::new(1_700_000_000));
 
     // Seed database with a valid cached certificate
-    store.write(|conn| {
-        conn.execute(
-            "INSERT INTO certificates (name, cert_pem, key_pem, not_before, not_after, directory, obtained_at, last_active_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            rusqlite::params![
-                "test.example.com",
-                cert_pem,
-                key_pem,
-                1_690_000_000i64,
-                1_790_000_000i64, // valid until far in future
-                "https://acme-staging-v02.api.letsencrypt.org/directory",
-                1_700_000_000i64,
-                1_700_000_000i64,
-            ],
-        )?;
-        Ok(())
-    }).unwrap();
+    store
+        .upsert_certificate(weaver_server::store::entity::certificate::Model {
+            name: "test.example.com".into(),
+            cert_pem: cert_pem.clone(),
+            key_pem: key_pem.clone(),
+            not_before: 1_690_000_000,
+            not_after: 1_790_000_000, // valid until far in future
+            issuer: None,
+            directory: "https://acme-staging-v02.api.letsencrypt.org/directory".into(),
+            obtained_at: 1_700_000_000,
+            last_active_at: Some(1_700_000_000),
+        })
+        .await
+        .unwrap();
 
     let config = Arc::new(Config {
         root_domain: "test.example.com".into(),
@@ -497,7 +494,7 @@ async fn test_sqlite_caching_and_server_restart_no_reorder() {
     let manager = CertManager::new(config, store, resolver, registry, clock, true);
 
     // Initialize manager
-    manager.init().unwrap();
+    manager.init().await.unwrap();
 
     // Verify certificate was loaded from SQLite into resolver
     assert_eq!(
@@ -516,7 +513,7 @@ async fn test_sqlite_caching_and_server_restart_no_reorder() {
 async fn test_active_inactive_renewal_policy() {
     let dir = tempdir().unwrap();
     let db_path = dir.path().join("weaver.db");
-    let store = Arc::new(Store::open(&db_path).unwrap());
+    let store = Arc::new(Store::open(&db_path).await.unwrap());
     let clock = Arc::new(MockClock::new(1_700_000_000));
 
     let config = Arc::new(Config {
@@ -558,7 +555,7 @@ async fn test_active_inactive_renewal_policy() {
 async fn test_forced_expiration_triggers_renewal_flow_and_event() {
     let dir = tempdir().unwrap();
     let db_path = dir.path().join("weaver.db");
-    let store = Arc::new(Store::open(&db_path).unwrap());
+    let store = Arc::new(Store::open(&db_path).await.unwrap());
 
     // Clock set to 1_700_000_000
     let clock = Arc::new(MockClock::new(1_700_000_000));
@@ -569,23 +566,20 @@ async fn test_forced_expiration_triggers_renewal_flow_and_event() {
     let cert_pem = rcgen_cert.cert.pem();
     let key_pem = rcgen_cert.signing_key.serialize_pem();
 
-    store.write(|conn| {
-        conn.execute(
-            "INSERT INTO certificates (name, cert_pem, key_pem, not_before, not_after, directory, obtained_at, last_active_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            rusqlite::params![
-                "example.com",
-                cert_pem,
-                key_pem,
-                1_600_000_000i64,
-                1_710_000_000i64,
-                "https://acme-staging-v02.api.letsencrypt.org/directory",
-                1_600_000_000i64,
-                1_700_000_000i64,
-            ],
-        )?;
-        Ok(())
-    }).unwrap();
+    store
+        .upsert_certificate(weaver_server::store::entity::certificate::Model {
+            name: "example.com".into(),
+            cert_pem: cert_pem.clone(),
+            key_pem: key_pem.clone(),
+            not_before: 1_600_000_000,
+            not_after: 1_710_000_000,
+            issuer: None,
+            directory: "https://acme-staging-v02.api.letsencrypt.org/directory".into(),
+            obtained_at: 1_600_000_000,
+            last_active_at: Some(1_700_000_000),
+        })
+        .await
+        .unwrap();
 
     let config = Arc::new(Config {
         root_domain: "example.com".into(),
@@ -609,7 +603,7 @@ async fn test_forced_expiration_triggers_renewal_flow_and_event() {
 
     let manager = CertManager::new(config, Arc::clone(&store), resolver, registry, clock, true);
 
-    manager.init().unwrap();
+    manager.init().await.unwrap();
 
     // Verify renewal condition
     assert!(weaver_server::cert::should_renew(
@@ -626,18 +620,16 @@ async fn test_forced_expiration_triggers_renewal_flow_and_event() {
         "renewed",
         Some("hot-swapped"),
     )
+    .await
     .unwrap();
 
-    let event_count: i64 = store
-        .read(|conn| {
-            let count = conn.query_row(
-                "SELECT count(*) FROM cert_events WHERE name = 'example.com' AND kind = 'renewed'",
-                [],
-                |row| row.get(0),
-            )?;
-            Ok(count)
-        })
-        .unwrap();
+    let event_count = store
+        .get_cert_events("example.com", 100)
+        .await
+        .unwrap()
+        .iter()
+        .filter(|e| e.kind == "renewed")
+        .count();
 
     assert_eq!(event_count, 1);
 }
@@ -646,7 +638,7 @@ async fn test_forced_expiration_triggers_renewal_flow_and_event() {
 async fn test_exponential_backoff_on_failure() {
     let dir = tempdir().unwrap();
     let db_path = dir.path().join("weaver.db");
-    let store = Arc::new(Store::open(&db_path).unwrap());
+    let store = Arc::new(Store::open(&db_path).await.unwrap());
     let clock = Arc::new(MockClock::new(1_700_000_000));
 
     // Attempting invalid directory causes failure
@@ -698,16 +690,13 @@ async fn test_exponential_backoff_on_failure() {
     assert!(!resolver.is_ordering("fail.example.com"));
 
     // Event recorded in cert_events
-    let event_count: i64 = store
-        .read(|conn| {
-            let count = conn.query_row(
-            "SELECT count(*) FROM cert_events WHERE name = 'fail.example.com' AND kind = 'failed'",
-            [],
-            |row| row.get(0),
-        )?;
-            Ok(count)
-        })
-        .unwrap();
+    let event_count = store
+        .get_cert_events("fail.example.com", 100)
+        .await
+        .unwrap()
+        .iter()
+        .filter(|e| e.kind == "failed")
+        .count();
     assert_eq!(event_count, 1);
 }
 
@@ -715,7 +704,7 @@ async fn test_exponential_backoff_on_failure() {
 async fn test_concurrent_ensure_deduplication() {
     let dir = tempdir().unwrap();
     let db_path = dir.path().join("weaver.db");
-    let store = Arc::new(Store::open(&db_path).unwrap());
+    let store = Arc::new(Store::open(&db_path).await.unwrap());
     let clock = Arc::new(MockClock::new(1_700_000_000));
 
     let config = Arc::new(Config {

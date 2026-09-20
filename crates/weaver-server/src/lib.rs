@@ -10,4 +10,4 @@ pub mod store;
 pub mod tunnel;
 
 pub use config::{Config, ConfigError};
-pub use store::{Migration, Store, StoreError};
+pub use store::{Migrator, Store, StoreError};

@@ -8,6 +8,7 @@ allow = [
     "Unicode-3.0",
     "ISC",
     "CDLA-Permissive-2.0",
+    "Zlib",
 ]
 confidence-threshold = 0.8
 
