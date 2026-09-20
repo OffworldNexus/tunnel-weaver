@@ -1,89 +1,25 @@
-//! Implementation of the `weave poc` command.
+//! Implementation of the `weave poc` command: register one service and
+//! answer every proxied request with a fixed redirect.
 
 use std::collections::HashMap;
-use std::convert::Infallible;
 use std::path::Path;
 use std::time::Instant;
 
-use bytes::Bytes;
-use ed25519_dalek::Signer as DalekSigner;
-use futures_util::{SinkExt, StreamExt};
-use rand_core::TryRng;
 use tokio_rustls::client::TlsStream;
 use tokio_tungstenite::WebSocketStream;
-use tokio_tungstenite::tungstenite::Message;
-use weaver_mux::error::{CloseCode, GoAway, RejectCode};
-use weaver_mux::{Config, Connection, Event, KeyId, SignError, StreamId};
+use weaver_mux::{
+    CloseCode, CloseReason, Config, Connection, Event, RejectCode, StreamError, StreamId,
+};
 use weaver_proto::control::{ControlHead, ControlReply};
-use weaver_proto::framing::{decode_length_prefixed, encode_length_prefixed};
-use weaver_proto::http::HttpResponseHead;
-use weaver_proto::poc::{POC_KEY_ID, POC_SECRET_KEY};
+use weaver_proto::http::{HttpHead, HttpResponseHead};
+use weaver_proto::{Head, policy};
+use weaver_tokio::{Driver, DriverError, StreamHandler, SystemRng, WsTransport};
 
 use crate::connect::{connect_tls, parse_server_address};
+use crate::identity::Ed25519Signer;
 
-struct PocSigner {
-    key: ed25519_dalek::SigningKey,
-}
-
-impl weaver_mux::auth::Signer for PocSigner {
-    fn key_id(&self) -> KeyId {
-        POC_KEY_ID
-    }
-
-    fn sign(&mut self, msg: &[u8]) -> Result<weaver_mux::wire::Signature, SignError> {
-        let sig: ed25519_dalek::Signature = self.key.sign(msg);
-        Ok(weaver_mux::wire::Signature::Ed25519(sig.to_bytes()))
-    }
-}
-
-struct SystemRng;
-
-impl TryRng for SystemRng {
-    type Error = Infallible;
-
-    fn try_next_u32(&mut self) -> Result<u32, Infallible> {
-        let mut b = [0u8; 4];
-        let _ = self.try_fill_bytes(&mut b);
-        Ok(u32::from_le_bytes(b))
-    }
-
-    fn try_next_u64(&mut self) -> Result<u64, Infallible> {
-        let mut b = [0u8; 8];
-        let _ = self.try_fill_bytes(&mut b);
-        Ok(u64::from_le_bytes(b))
-    }
-
-    fn try_fill_bytes(&mut self, dst: &mut [u8]) -> Result<(), Infallible> {
-        use rand::Rng;
-        rand::rng().fill(dst);
-        Ok(())
-    }
-}
-
-struct InflightHttp {
-    head: weaver_proto::HttpHead,
-    body: Vec<u8>,
-}
-
-fn dump_request_http1_wire(head: &weaver_proto::HttpHead, body: &[u8]) {
-    println!("{} {} HTTP/1.1", head.method, head.path);
-    for (name, val) in &head.headers {
-        let val_str = String::from_utf8_lossy(val);
-        println!("{name}: {val_str}");
-    }
-    println!();
-    println!("[Body: {} bytes]", body.len());
-    if !body.is_empty()
-        && let Ok(text) = std::str::from_utf8(body)
-    {
-        let preview = if text.len() > 1024 {
-            &text[..1024]
-        } else {
-            text
-        };
-        println!("{preview}");
-    }
-}
+/// Sec-WebSocket-Protocol token both ends must agree on.
+pub const WS_SUBPROTOCOL: &str = "weaver-mux-v1";
 
 /// Executes the `weave poc` client flow.
 pub async fn run_poc(
@@ -108,6 +44,26 @@ pub async fn run_poc_with_token(
     insecure_root_ca: Option<&Path>,
     shutdown_token: tokio_util::sync::CancellationToken,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    run_poc_with_tokens(
+        service,
+        server,
+        insecure_root_ca,
+        shutdown_token,
+        tokio_util::sync::CancellationToken::new(),
+    )
+    .await
+}
+
+/// Like [`run_poc_with_token`], plus a `release_token` that finishes the
+/// control stream — dropping the registration lease — while keeping the
+/// connection up. Exercises the relay's lease semantics end to end.
+pub async fn run_poc_with_tokens(
+    service: String,
+    server: String,
+    insecure_root_ca: Option<&Path>,
+    shutdown_token: tokio_util::sync::CancellationToken,
+    release_token: tokio_util::sync::CancellationToken,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let (host, port) = parse_server_address(&server)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
 
@@ -125,190 +81,221 @@ pub async fn run_poc_with_token(
             "Sec-WebSocket-Key",
             tokio_tungstenite::tungstenite::handshake::client::generate_key(),
         )
-        .header("Sec-WebSocket-Protocol", "weaver-mux-v1")
+        .header("Sec-WebSocket-Protocol", WS_SUBPROTOCOL)
         .body(())?;
 
     let (ws_stream, _): (WebSocketStream<TlsStream<tokio::net::TcpStream>>, _) =
         tokio_tungstenite::client_async_with_config(req, tls_stream, None).await?;
-    let (mut ws_write, mut ws_read) = ws_stream.split();
 
-    let signer = Box::new(PocSigner {
-        key: ed25519_dalek::SigningKey::from_bytes(&POC_SECRET_KEY),
-    });
-    let rng = Box::new(SystemRng);
-    let cfg = Config::client(signer, host.clone(), rng);
-    let mut conn = Connection::new(cfg, Instant::now());
+    let cfg = Config::client(
+        Box::new(Ed25519Signer::dev()),
+        host.clone(),
+        Box::new(SystemRng),
+    );
+    let conn = Connection::new(cfg, Instant::now());
+    let handler = PocHandler {
+        service,
+        control: None,
+        inflight: HashMap::new(),
+        failure: None,
+        shutting_down: false,
+    };
+    let driver = Driver::new(conn, WsTransport::new(ws_stream), handler);
+    let handle = driver.handle();
 
-    let mut control_stream_id: Option<StreamId> = None;
-    let mut control_read_buf = Vec::new();
-    let mut inflight_http: HashMap<StreamId, InflightHttp> = HashMap::new();
-    let mut transmit_buf = Vec::with_capacity(64 * 1024);
-
-    loop {
-        let now = Instant::now();
-        let timeout_at = conn
-            .next_timeout()
-            .unwrap_or_else(|| now + std::time::Duration::from_secs(60));
-        let sleep_duration = timeout_at.saturating_duration_since(now);
-
-        tokio::select! {
-            _ = shutdown_token.cancelled() => {
-                if let Some(id) = control_stream_id {
+    // Release the lease: FIN the control stream, stay connected.
+    tokio::spawn({
+        let handle = handle.clone();
+        async move {
+            release_token.cancelled().await;
+            handle.spawn_on(|conn, h: &mut PocHandler| {
+                if let Some(id) = h.control.take() {
                     let _ = conn.finish(id);
                 }
-                conn.close(GoAway::new(CloseCode::Shutdown));
-                let now = Instant::now();
-                while conn.poll_transmit(now, &mut transmit_buf) {
-                    let msg = Message::Binary(Bytes::from(std::mem::take(&mut transmit_buf)));
-                    let _ = ws_write.send(msg).await;
-                }
-                return Ok(());
-            }
-            _ = tokio::time::sleep(sleep_duration) => {
-                conn.handle_timeout(Instant::now());
-            }
-            ws_msg = ws_read.next() => {
-                match ws_msg {
-                    Some(Ok(Message::Binary(bytes))) => {
-                        let now = Instant::now();
-                        if let Err(err) = conn.recv(now, &bytes) {
-                            return Err(format!("Mux protocol error: {err}").into());
-                        }
-                    }
-                    Some(Ok(Message::Close(_))) | None => {
-                        return Err("Connection closed by relay".into());
-                    }
-                    Some(Ok(Message::Ping(payload))) => {
-                        let _ = ws_write.send(Message::Pong(payload)).await;
-                    }
-                    Some(Ok(_)) => {}
-                    Some(Err(err)) => {
-                        return Err(format!("WebSocket read error: {err}").into());
-                    }
-                }
-            }
+            });
         }
+    });
 
-        while let Some(ev) = conn.poll_event() {
-            match ev {
-                Event::Authenticated { .. } => {
-                    let reg_head = weaver_proto::Head::Control(ControlHead::Register {
-                        service: service.clone(),
+    // Ctrl-C / test shutdown: FIN the control stream, GOAWAY, and let the
+    // driver flush and return.
+    tokio::spawn(async move {
+        shutdown_token.cancelled().await;
+        handle.spawn_on(|conn, h: &mut PocHandler| {
+            if let Some(id) = h.control {
+                let _ = conn.finish(id);
+            }
+            h.shutting_down = true;
+            conn.close(CloseReason::new(CloseCode::Shutdown));
+        });
+    });
+
+    let (handler, result) = driver.run().await;
+    if let Some(err) = handler.failure {
+        return Err(err.into());
+    }
+    match result {
+        Ok(reason) if handler.shutting_down => {
+            debug_assert_eq!(reason.code, CloseCode::Shutdown);
+            Ok(())
+        }
+        Ok(reason) => Err(format!("Connection closed by server: {:?}", reason.code).into()),
+        Err(DriverError::TransportClosed) if handler.shutting_down => Ok(()),
+        Err(DriverError::TransportClosed) => Err("Connection closed by relay".into()),
+        Err(DriverError::Protocol(e)) => Err(format!("Mux protocol error: {e}").into()),
+        Err(DriverError::Transport(e)) => Err(format!("WebSocket error: {e}").into()),
+    }
+}
+
+struct PocHandler {
+    service: String,
+    control: Option<StreamId>,
+    inflight: HashMap<StreamId, InflightHttp>,
+    /// A fatal application-level condition to report after the driver ends.
+    failure: Option<String>,
+    shutting_down: bool,
+}
+
+struct InflightHttp {
+    head: Option<HttpHead>,
+    body: Vec<u8>,
+}
+
+impl StreamHandler for PocHandler {
+    fn on_event(&mut self, conn: &mut Connection, event: Event) {
+        match event {
+            Event::Authenticated { .. } => {
+                let res = ControlHead::register(self.service.clone())
+                    .map_err(|c| format!("Invalid service name: {c:?}"))
+                    .and_then(|h| {
+                        weaver_proto::encode(&Head::Control(h))
+                            .map_err(|e| format!("Failed to encode registration head: {e}"))
+                    })
+                    .and_then(|bytes| {
+                        let id = conn
+                            .open(policy::CONTROL_CLASS)
+                            .map_err(|e| format!("Failed to open registration stream: {e}"))?;
+                        conn.send(id, &bytes, policy::CONTROL_COMPRESS)
+                            .map_err(|e| format!("Failed to send registration: {e}"))?;
+                        Ok(id)
                     });
-                    match reg_head.to_mux_head() {
-                        Ok(mux_head) => match conn.open(mux_head) {
-                            Ok(id) => {
-                                control_stream_id = Some(id);
+                match res {
+                    Ok(id) => self.control = Some(id),
+                    Err(msg) => self.fail(conn, msg),
+                }
+            }
+            Event::Rejected { code, message } => {
+                self.failure = Some(if matches!(code, RejectCode::UnsupportedVersion { .. }) {
+                    format!("Error: Protocol version mismatch: {message}")
+                } else {
+                    format!("Error: Connection rejected: {message} ({code:?})")
+                });
+            }
+            Event::StreamOpened { id, .. } => {
+                self.inflight.insert(
+                    id,
+                    InflightHttp {
+                        head: None,
+                        body: Vec::new(),
+                    },
+                );
+            }
+            Event::Readable(id) => {
+                while let Ok(msg) = conn.recv_msg(id) {
+                    if Some(id) == self.control {
+                        self.on_control_reply(conn, &msg);
+                    } else if let Some(req) = self.inflight.get_mut(&id) {
+                        if req.head.is_none() {
+                            match weaver_proto::decode::<Head>(&msg) {
+                                Ok(Head::Http(h)) => req.head = Some(h),
+                                _ => {
+                                    self.inflight.remove(&id);
+                                    let _ = conn.reset(id, 0);
+                                    break;
+                                }
                             }
-                            Err(err) => {
-                                return Err(
-                                    format!("Failed to open registration stream: {err}").into()
-                                );
-                            }
-                        },
-                        Err(err) => {
-                            return Err(format!("Failed to encode registration head: {err}").into());
+                        } else {
+                            req.body.extend_from_slice(&msg);
                         }
                     }
                 }
-                Event::Rejected { code, message } => {
-                    if matches!(code, RejectCode::UnsupportedVersion { .. }) {
-                        return Err(format!("Error: Protocol version mismatch: {message}").into());
-                    } else {
-                        return Err(
-                            format!("Error: Connection rejected: {message} ({code:?})").into()
-                        );
-                    }
-                }
-                Event::StreamOpened { id, head } => {
-                    if let Ok(weaver_proto::Head::Http(http_head)) =
-                        weaver_proto::Head::from_mux_head(&head)
-                    {
-                        inflight_http.insert(
-                            id,
-                            InflightHttp {
-                                head: http_head,
-                                body: Vec::new(),
-                            },
-                        );
+            }
+            Event::Finished(id) => {
+                if let Some(req) = self.inflight.remove(&id) {
+                    if let Some(head) = &req.head {
+                        dump_request_http1_wire(head, &req.body);
+                        self.respond(conn, id, head);
                     } else {
                         let _ = conn.reset(id, 0);
                     }
                 }
-                Event::Readable(id) => {
-                    if Some(id) == control_stream_id {
-                        let mut buf = [0u8; 1024];
-                        while let Ok(n) = conn.read(id, &mut buf) {
-                            if n == 0 {
-                                break;
-                            }
-                            control_read_buf.extend_from_slice(&buf[..n]);
-                            if let Ok(Some((reply, _))) =
-                                decode_length_prefixed::<ControlReply>(&control_read_buf)
-                            {
-                                match reply {
-                                    ControlReply::Registered { hostname } => {
-                                        println!("https://{hostname}/");
-                                    }
-                                    ControlReply::Refused { code, message } => {
-                                        return Err(format!(
-                                            "Registration refused: {message} ({code:?})"
-                                        )
-                                        .into());
-                                    }
-                                }
-                            }
-                        }
-                    } else if let Some(req) = inflight_http.get_mut(&id) {
-                        let mut buf = [0u8; 8192];
-                        while let Ok(n) = conn.read(id, &mut buf) {
-                            if n == 0 {
-                                break;
-                            }
-                            req.body.extend_from_slice(&buf[..n]);
-                        }
-                    }
-                }
-                Event::Finished(id) => {
-                    if let Some(req) = inflight_http.remove(&id) {
-                        dump_request_http1_wire(&req.head, &req.body);
-
-                        let resp = HttpResponseHead {
-                            status: 302,
-                            headers: vec![
-                                (
-                                    "location".to_string(),
-                                    b"https://www.youtube.com/watch?v=dQw4w9WgXcQ".to_vec(),
-                                ),
-                                ("content-length".to_string(), b"0".to_vec()),
-                            ],
-                        };
-                        if let Ok(encoded) = encode_length_prefixed(&resp) {
-                            let _ = conn.write(id, &encoded);
-                        }
-                        let _ = conn.finish(id);
-                    }
-                }
-                Event::Reset { id, .. } => {
-                    inflight_http.remove(&id);
-                }
-                Event::Closed { reason } => {
-                    return Err(format!("Connection closed by server: {:?}", reason.code).into());
-                }
-                _ => {}
             }
+            Event::Reset { id, .. } => {
+                self.inflight.remove(&id);
+            }
+            Event::Writable { .. } | Event::Closed { .. } => {}
         }
+    }
+}
 
-        let now = Instant::now();
-        while conn.poll_transmit(now, &mut transmit_buf) {
-            let msg = Message::Binary(Bytes::from(std::mem::take(&mut transmit_buf)));
-            ws_write.send(msg).await?;
-        }
+impl PocHandler {
+    fn fail(&mut self, conn: &mut Connection, msg: String) {
+        self.failure = Some(msg);
+        conn.close(CloseReason::new(CloseCode::Shutdown));
+    }
 
-        if conn.is_closed() {
-            break;
+    fn on_control_reply(&mut self, conn: &mut Connection, msg: &[u8]) {
+        match weaver_proto::decode::<ControlReply>(msg) {
+            Ok(ControlReply::Registered { hostname }) => {
+                println!("https://{hostname}/");
+            }
+            Ok(ControlReply::Refused { code, message }) => {
+                self.fail(conn, format!("Registration refused: {message} ({code:?})"));
+            }
+            Err(e) => self.fail(conn, format!("Bad control reply: {e}")),
         }
     }
 
-    Ok(())
+    /// Answer every request with a redirect: head first (never
+    /// compressed), no body, FIN.
+    fn respond(&mut self, conn: &mut Connection, id: StreamId, req: &HttpHead) {
+        let resp = HttpResponseHead {
+            status: 302,
+            headers: vec![
+                (
+                    "location".to_string(),
+                    b"https://www.youtube.com/watch?v=dQw4w9WgXcQ".to_vec(),
+                ),
+                ("content-length".to_string(), b"0".to_vec()),
+            ],
+        };
+        let _ = policy::response_body_compress(req, &resp); // no body to send
+        match weaver_proto::encode(&resp) {
+            Ok(bytes) => match conn.send(id, &bytes, policy::HEAD_COMPRESS) {
+                Ok(()) | Err(StreamError::UnknownStream) => {}
+                Err(e) => eprintln!("failed to send response head: {e}"),
+            },
+            Err(e) => eprintln!("failed to encode response head: {e}"),
+        }
+        let _ = conn.finish(id);
+    }
+}
+
+fn dump_request_http1_wire(head: &HttpHead, body: &[u8]) {
+    println!("{} {} HTTP/1.1", head.method, head.path);
+    for (name, val) in &head.headers {
+        let val_str = String::from_utf8_lossy(val);
+        println!("{name}: {val_str}");
+    }
+    println!();
+    println!("[Body: {} bytes]", body.len());
+    if !body.is_empty()
+        && let Ok(text) = std::str::from_utf8(body)
+    {
+        let preview = if text.len() > 1024 {
+            &text[..1024]
+        } else {
+            text
+        };
+        println!("{preview}");
+    }
 }

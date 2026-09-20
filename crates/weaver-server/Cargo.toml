@@ -14,6 +14,10 @@ path = "src/lib.rs"
 name = "weaver-server"
 path = "src/main.rs"
 
+[features]
+## Test-only helpers (`MockClock`).
+test-util = []
+
 [dependencies]
 base64 = { workspace = true }
 bytes = { workspace = true }
@@ -27,8 +31,6 @@ hyper = { workspace = true }
 hyper-util = { workspace = true }
 instant-acme = { workspace = true }
 libc = { workspace = true }
-rand = "0.9"
-rand_core = { workspace = true }
 rcgen = { workspace = true }
 rusqlite = { workspace = true }
 rustls = { workspace = true }
@@ -46,8 +48,10 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 weaver-mux = { workspace = true }
 weaver-proto = { workspace = true }
+weaver-tokio = { workspace = true }
 
 [dev-dependencies]
+weaver-server = { path = ".", features = ["test-util"] }
 ed25519-dalek = { workspace = true }
 hyper = { workspace = true, features = ["client"] }
 hyper-util = { workspace = true, features = ["client", "client-legacy"] }

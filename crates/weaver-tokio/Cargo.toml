@@ -1,0 +1,28 @@
+[package]
+name = "weaver-tokio"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Tokio adapter driving a weaver-mux Connection over a message-delimited transport"
+
+[dependencies]
+weaver-mux = { workspace = true }
+bytes = { workspace = true }
+futures-util = { workspace = true }
+rand = "0.9"
+rand_core = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-tungstenite = { workspace = true }
+tracing = { workspace = true }
+
+[target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
+socket2 = { workspace = true, features = ["all"] }
+
+[target.'cfg(target_vendor = "apple")'.dependencies]
+libc = { workspace = true }
+
+[dev-dependencies]
+weaver-mux = { workspace = true, features = ["test-util"] }

@@ -1,8 +1,9 @@
 //! Events surfaced to the application via [`crate::Connection::poll_event`].
 
-use crate::error::{GoAway, RejectCode};
+use crate::error::{CloseReason, RejectCode};
+use crate::sched::Class;
 use crate::stream::StreamId;
-use crate::wire::{Head, KeyId};
+use crate::wire::KeyId;
 
 /// Something the application should react to. Events are queued in order
 /// and drained with `poll_event`; none is ever dropped.
@@ -22,21 +23,31 @@ pub enum Event {
         /// Server-provided detail.
         message: String,
     },
-    /// The peer opened a stream.
+    /// The peer opened a stream. No application bytes travel in OPEN; by
+    /// convention the layer above sends its own head as the first message.
     StreamOpened {
         /// Id chosen by the peer.
         id: StreamId,
-        /// The peer's OPEN payload.
-        head: Head,
+        /// The scheduling class the peer asked for.
+        class: Class,
     },
-    /// Bytes are available to `read` on the stream. Edge-triggered: fired
-    /// when the inbox transitions from empty to non-empty.
+    /// At least one complete message is available via `recv_msg`.
+    /// Edge-triggered: fired when the inbox transitions from empty to
+    /// non-empty.
     Readable(StreamId),
-    /// Credit became available after `write` returned fewer bytes than
-    /// requested. Edge-triggered.
-    Writable(StreamId),
-    /// The peer half-closed its direction; `read` returns `Ok(0)` once the
-    /// inbox drains.
+    /// Credit became available after `send` returned `WouldBlock`.
+    /// Edge-triggered. `credit` is the number of bytes `send` can now
+    /// accept on the stream (message length plus one flag byte per
+    /// fragment); a message larger than that will still `WouldBlock`.
+    Writable {
+        /// Which stream.
+        id: StreamId,
+        /// Wire bytes of send credit currently free.
+        credit: u32,
+    },
+    /// The peer half-closed its direction and every message it sent has
+    /// been consumed with `recv_msg`. Nothing more will arrive on this
+    /// stream; the local side may still send.
     Finished(StreamId),
     /// The stream was aborted (by the peer, or locally because the
     /// connection closed).
@@ -50,6 +61,6 @@ pub enum Event {
     Closed {
         /// Why. Local closes carry the code we sent; remote closes the code
         /// we received.
-        reason: GoAway,
+        reason: CloseReason,
     },
 }

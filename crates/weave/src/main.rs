@@ -5,14 +5,24 @@ use std::path::PathBuf;
 use clap::{Args, Parser, Subcommand};
 
 pub mod connect;
+pub mod identity;
 pub mod poc;
 
-const VERSION_STR: &str = concat!(env!("CARGO_PKG_VERSION"), " (protocol v", "1", ")");
+fn version_str() -> &'static str {
+    Box::leak(
+        format!(
+            "{} (protocol v{})",
+            env!("CARGO_PKG_VERSION"),
+            weaver_proto::PROTOCOL_VERSION
+        )
+        .into_boxed_str(),
+    )
+}
 
 #[derive(Parser, Debug)]
 #[command(
     name = "weave",
-    version = VERSION_STR,
+    version = version_str(),
     about = "Client for Tunnel Weaver reverse proxy and tunnels"
 )]
 struct Cli {

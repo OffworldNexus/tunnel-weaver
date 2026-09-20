@@ -61,6 +61,12 @@ Key design points:
   in postcard with append-only evolution. Stream 0 is the connection;
   client streams are odd, server streams even. One transport message is
   one frame.
+- **Messages, not bytes** (ADR 0004). Streams carry application
+  messages: one `Connection::send` is delivered whole by one
+  `Connection::recv_msg`. A message larger than `max_frame` is split into
+  `DATA` fragments flagged `MORE` and reassembled by the receiver, bounded
+  by the negotiated `max_message`. Nothing above the mux adds a length
+  prefix.
 - **Authentication: the SSH model.** The server sends a `CHALLENGE`
   nonce; the client answers with a `HELLO` carrying its `KeyId`, its own
   nonce, and a signature over
@@ -82,7 +88,7 @@ Key design points:
 - **Scheduling: Quick Fair Queueing.** `poll_transmit` emits one frame per
   call and chooses it with QFQ (Checconi, Valente, Rizzo 2013 — the
   algorithm behind Linux `sch_qfq`) over a two-level tree: four classes
-  (`control` 1000, `realtime` 300, `small` 300, `bulk` 40 by default), then
+  (`control` 1000, `realtime` 300, `interactive` 300, `bulk` 40 by default), then
   equal-weight streams inside each data class. QFQ gives weighted shares
   with an O(1) per-packet delay bound, which is what keeps a new small
   stream's first frames from waiting behind a bulk backlog. Round-robin
@@ -93,24 +99,22 @@ Key design points:
   guarantee is QFQ's delay bound, not "always next". The one exception is
   `GOAWAY`: `close()` places it in a dedicated slot ahead of the scheduler
   so it is literally the next frame out.
-- **Classification.** Streams are born `small`; an upgrade or an
-  `text/event-stream` content type makes them `realtime`; a declared
-  length over 256 KiB, or 256 KiB of cumulative writes, makes them
-  `bulk`. The application can pin a class with `set_class`.
-- **Compression.** zstd per `DATA` frame, decided once per stream on the
-  first write and signalled by a flag bit. Skipped, cheapest test first,
-  for realtime streams, already-encoded or precompressed content types
-  (`image/*` except SVG, `video/*`, `audio/*`, `font/woff*`, zip/gzip/
-  zstd/xz/pdf/wasm/octet-stream), frames under 1 KiB, and first frames
-  whose byte entropy is at or above 7.5 bits/byte. The server may refuse
+- **Classification is the caller's** (ADR 0004, 0005). `OPEN` carries a
+  `Class` chosen by the layer above; the mux applies exactly one
+  automatic rule, demoting `interactive` to `bulk` past
+  `Config::bulk_threshold` sent bytes. `set_class` changes it later. The
+  mux has no notion of MIME types, upgrades or content lengths.
+- **Compression is per message** (ADR 0004). Every `send` carries a
+  `Compress::{Never, Auto}` stance. `Never` is final. Under `Auto` the mux
+  still declines for realtime streams, fragments under 1 KiB, and
+  fragments whose byte entropy is at or above 7.5 bits/byte, and sends raw
+  when zstd does not shrink the fragment. The server may refuse
   compression in `WELCOME` but can never force it.
 
   **BREACH note.** Compressing attacker-influenced data next to a secret
-  is the CRIME/BREACH class of side channel. The mux mitigates the
-  obvious cases (no compression on heads, none on realtime streams), but
-  the layer that knows a response carries a secret must disable
-  compression for that stream via `Compression::Off` or `set_class(…,
-  Realtime)`. The mux cannot know.
+  is the CRIME/BREACH class of side channel. The mux cannot know what a
+  message is, so the layer that does (`weaver-proto::policy`) sends heads
+  with `Never` and decides body stances from the HTTP exchange.
 - **Close codes.** `KeyRevoked` (never reconnect), `Rejected` (keep key,
   no auto-reconnect), `Superseded` (another connection took over),
   `Shutdown` (reconnect with backoff), `ProtocolError`, `Timeout`. The mux

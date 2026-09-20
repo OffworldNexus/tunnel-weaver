@@ -118,7 +118,7 @@ fn extract_host_name(raw: &str) -> &str {
 
 /// Computes the target redirect host.
 ///
-/// Rewrites localhost / 127.0.0.1 / [::1] loopback addresses to `root_domain`.
+/// Rewrites localhost / 127.0.0.1 / `[::1]` loopback addresses to `root_domain`.
 /// If the effective host does not specify an explicit port and https_port != 443,
 /// appends `:{https_port}`.
 pub fn format_target_host(incoming_host: &str, root_domain: &str, https_port: u16) -> String {

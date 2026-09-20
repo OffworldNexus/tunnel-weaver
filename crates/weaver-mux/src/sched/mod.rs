@@ -1,38 +1,41 @@
 //! Two-level QFQ scheduling tree: classes at the top, streams inside each
 //! data class, and a FIFO of control frames as the control class's backlog.
 
-pub mod classify;
-pub mod qfq;
+mod qfq;
 
 use std::collections::VecDeque;
 
 use qfq::Qfq;
+use serde::{Deserialize, Serialize};
 
 use crate::config::Weights;
 use crate::frame::Frame;
 use crate::stream::StreamId;
 
 /// Scheduling class of a stream (or of the control queue).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+///
+/// Carried on the wire as the OPEN payload, so the variant order is part
+/// of the protocol: append, never reorder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Class {
-    /// Connection-level frames plus OPEN/FIN/RST/WINDOW_UPDATE.
+    /// Connection-level frames plus OPEN/FIN/RST/WINDOW_UPDATE. Not a
+    /// valid stream class.
     Control,
-    /// Upgrades, event streams: latency-sensitive, never compressed.
+    /// Latency-sensitive traffic. The mux never compresses on this class.
     Realtime,
-    /// Everything at birth.
-    Small,
-    /// Large or long-running bodies.
+    /// Request/response traffic: the default. Demoted to `Bulk` once
+    /// `Config::bulk_threshold` bytes have been sent on the stream.
+    Interactive,
+    /// Throughput traffic.
     Bulk,
 }
 
 impl Class {
-    const DATA: [Class; 3] = [Class::Realtime, Class::Small, Class::Bulk];
-
     fn idx(self) -> usize {
         match self {
             Class::Control => unreachable!("control has no inner scheduler"),
             Class::Realtime => 0,
-            Class::Small => 1,
+            Class::Interactive => 1,
             Class::Bulk => 2,
         }
     }
@@ -65,7 +68,7 @@ impl SchedTree {
         let mut top = Qfq::new();
         top.add_flow(Class::Control, weights.control, lmax);
         top.add_flow(Class::Realtime, weights.realtime, lmax);
-        top.add_flow(Class::Small, weights.small, lmax);
+        top.add_flow(Class::Interactive, weights.interactive, lmax);
         top.add_flow(Class::Bulk, weights.bulk, lmax);
         Self {
             top,
@@ -80,11 +83,6 @@ impl SchedTree {
         let len = frame.wire_len() as u32;
         self.control.push_back(frame);
         self.top.activate(Class::Control, len);
-    }
-
-    /// Number of control frames waiting.
-    pub fn control_pending(&self) -> usize {
-        self.control.len()
     }
 
     /// Drop every queued control frame (connection closing).
@@ -117,16 +115,6 @@ impl SchedTree {
         if was_idle {
             let len = inner.next_head_len().unwrap_or(head_len);
             self.top.activate(class, len);
-        }
-    }
-
-    /// The stream has nothing sendable right now (empty outbox or no
-    /// credit). Not backlogged → consumes no virtual time.
-    pub fn deactivate_stream(&mut self, id: StreamId, class: Class) {
-        let inner = &mut self.inner[class.idx()];
-        inner.deactivate(id);
-        if !inner.has_backlog() {
-            self.top.deactivate(class);
         }
     }
 
@@ -175,32 +163,4 @@ impl SchedTree {
             }
         }
     }
-
-    /// Anything at all waiting to be sent?
-    pub fn has_backlog(&self) -> bool {
-        self.top.has_backlog()
-    }
-
-    /// Classes that currently have backlog (diagnostics/tests).
-    pub fn backlogged_classes(&self) -> Vec<Class> {
-        let mut out = Vec::new();
-        if !self.control.is_empty() {
-            out.push(Class::Control);
-        }
-        for c in Class::DATA {
-            if self.inner[c.idx()].has_backlog() {
-                out.push(c);
-            }
-        }
-        out
-    }
-}
-
-/// `type/subtype` of a MIME string: lowercase, parameters stripped.
-pub(crate) fn mime_essence(ct: &str) -> String {
-    ct.split(';')
-        .next()
-        .unwrap_or("")
-        .trim()
-        .to_ascii_lowercase()
 }

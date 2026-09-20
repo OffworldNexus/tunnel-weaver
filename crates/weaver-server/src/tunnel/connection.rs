@@ -1,427 +1,428 @@
-//! Async task driving a single client multiplexer connection over an upgraded WebSocket.
+//! One client connection: a [`weaver_tokio::Driver`] over the upgraded
+//! WebSocket plus the relay's [`StreamHandler`].
+//!
+//! Stream conventions (see `weaver_proto`): the client opens a control
+//! stream whose first message is `Head::Control`; the relay opens one
+//! stream per visitor request whose first message is `Head::Http`, followed
+//! by raw body chunks, and reads back an `HttpResponseHead` followed by raw
+//! body chunks.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use futures_util::{SinkExt, StreamExt};
 use http::{HeaderName, HeaderValue, Response, StatusCode};
 use http_body_util::BodyExt;
 use hyper_util::rt::TokioIo;
 use tokio::sync::{mpsc, oneshot};
 use tokio_tungstenite::WebSocketStream;
-use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, info, trace};
-use weaver_mux::auth::PublicKey;
-use weaver_mux::error::{CloseCode, GoAway};
-use weaver_mux::{Config, Connection, Event, KeyId, StreamId};
+use weaver_mux::{
+    CloseCode, CloseReason, Compress, Config, Connection, Event, KeyId, StreamError, StreamId,
+};
 use weaver_proto::control::{ControlHead, ControlReply, RefusalCode};
-use weaver_proto::framing::{decode_length_prefixed, encode_length_prefixed};
-use weaver_proto::http::HttpResponseHead;
-use weaver_proto::poc::{POC_KEY_ID, POC_PUBLIC_KEY};
+use weaver_proto::http::{HttpHead, HttpResponseHead};
+use weaver_proto::{Head, policy};
+use weaver_tokio::{Driver, Handle, StreamHandler, SystemRng, WsTransport};
 
+use crate::tunnel::identity::ResolverVerifier;
 use crate::tunnel::proxy::{BoxBody, ProxyError, ProxyRequest, TunnelResponseBody};
 use crate::tunnel::registry::TunnelRegistry;
 
-/// Verifier authenticating incoming connections against the hard-coded PoC key.
-pub struct PocVerifier;
+type RelayHandle = Handle<RelayHandler>;
 
-impl weaver_mux::auth::Verifier for PocVerifier {
-    fn public_key(&mut self, key_id: &KeyId) -> Option<PublicKey> {
-        if key_id == &POC_KEY_ID {
-            Some(PublicKey::Ed25519(POC_PUBLIC_KEY))
-        } else {
-            None
-        }
-    }
-}
-
-enum BodyChunkMsg {
-    Data(StreamId, Bytes),
-    Fin(StreamId),
-    Error(StreamId),
-}
-
-struct InflightExchange {
-    response_tx: Option<oneshot::Sender<Result<Response<BoxBody>, ProxyError>>>,
-    body_tx: Option<mpsc::Sender<Result<Bytes, Box<dyn std::error::Error + Send + Sync>>>>,
-    read_buf: Vec<u8>,
-    head_parsed: bool,
-    pending_request_body: Vec<Bytes>,
-}
-
-/// Spawns a background task driving the multiplexer over the upgraded WebSocket stream.
+/// Spawns a background task driving the multiplexer over the upgraded
+/// WebSocket stream.
 pub fn spawn_tunnel_connection(
     ws_stream: WebSocketStream<TokioIo<hyper::upgrade::Upgraded>>,
     registry: Arc<TunnelRegistry>,
     root_domain: String,
 ) {
-    tokio::spawn(async move {
-        if let Err(err) = run_tunnel_connection(ws_stream, registry, root_domain).await {
-            debug!(error = %err, "Tunnel connection finished with error");
-        }
-    });
+    tokio::spawn(run_tunnel_connection(ws_stream, registry, root_domain));
 }
 
-use rand_core::TryRng;
-use std::convert::Infallible;
-
-struct SystemRng;
-
-impl TryRng for SystemRng {
-    type Error = Infallible;
-
-    fn try_next_u32(&mut self) -> Result<u32, Infallible> {
-        let mut b = [0u8; 4];
-        let _ = self.try_fill_bytes(&mut b);
-        Ok(u32::from_le_bytes(b))
-    }
-
-    fn try_next_u64(&mut self) -> Result<u64, Infallible> {
-        let mut b = [0u8; 8];
-        let _ = self.try_fill_bytes(&mut b);
-        Ok(u64::from_le_bytes(b))
-    }
-
-    fn try_fill_bytes(&mut self, dst: &mut [u8]) -> Result<(), Infallible> {
-        use rand::Rng;
-        rand::rng().fill(dst);
-        Ok(())
-    }
-}
+/// How often the mux asks the `IdentityResolver` whether the connected
+/// key is still acceptable; a `false` answer closes with `KeyRevoked`.
+const REVERIFY_INTERVAL: Duration = Duration::from_secs(60);
 
 async fn run_tunnel_connection(
     ws_stream: WebSocketStream<TokioIo<hyper::upgrade::Upgraded>>,
     registry: Arc<TunnelRegistry>,
     root_domain: String,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let verifier = Box::new(PocVerifier);
-    let rng = Box::new(SystemRng);
-    let cfg = Config::server(verifier, root_domain.clone(), rng);
-    let mut conn = Connection::new(cfg, Instant::now());
+) {
+    let verifier = Box::new(ResolverVerifier(registry.identities()));
+    let mut cfg = Config::server(verifier, root_domain, Box::new(SystemRng));
+    if let weaver_mux::Role::Server {
+        reverify_interval, ..
+    } = &mut cfg.role
+    {
+        *reverify_interval = Some(REVERIFY_INTERVAL);
+    }
+    let conn = Connection::new(cfg, Instant::now());
 
-    let (mut ws_write, mut ws_read) = ws_stream.split();
-    let (proxy_tx, mut proxy_rx) = mpsc::channel::<ProxyRequest>(64);
-    let mut superseded_rx: Option<oneshot::Receiver<()>> = None;
-    let (chunk_tx, mut chunk_rx) = mpsc::channel::<BodyChunkMsg>(64);
+    let (proxy_tx, proxy_rx) = mpsc::channel::<ProxyRequest>(64);
+    let handler = RelayHandler {
+        registry: Arc::clone(&registry),
+        handle: None,
+        proxy_tx,
+        conn_id: None,
+        key: None,
+        leases: HashMap::new(),
+        inflight: HashMap::new(),
+    };
+    let driver = Driver::new(conn, WsTransport::new(ws_stream), handler);
+    let handle = driver.handle();
+    handle.spawn_on({
+        let h = handle.clone();
+        move |_, handler| handler.handle = Some(h)
+    });
+    // Visitor requests arrive from hyper tasks; feed them to the driver.
+    tokio::spawn(forward_proxy_requests(proxy_rx, handle));
 
-    let mut conn_id: Option<u64> = None;
-    let mut authenticated_key: Option<KeyId> = None;
-    let mut active_control_streams: HashSet<StreamId> = HashSet::new();
-    let mut inflight: HashMap<StreamId, InflightExchange> = HashMap::new();
-    let mut transmit_buf = Vec::with_capacity(64 * 1024);
+    let (_handler, result) = driver.run().await;
+    match result {
+        Ok(reason) => info!(?reason, "Tunnel connection closed"),
+        Err(err) => debug!(error = %err, "Tunnel connection ended"),
+    }
+}
 
-    // Initial transmit (sends CHALLENGE)
-    let now = Instant::now();
-    while conn.poll_transmit(now, &mut transmit_buf) {
-        let msg = Message::Binary(Bytes::from(std::mem::take(&mut transmit_buf)));
-        ws_write.send(msg).await?;
+/// Turns each `ProxyRequest` into a stream open inside the driver's loop.
+async fn forward_proxy_requests(mut rx: mpsc::Receiver<ProxyRequest>, handle: RelayHandle) {
+    while let Some(req) = rx.recv().await {
+        handle.spawn_on(move |conn, h| h.open_visitor_stream(conn, req));
+    }
+}
+
+/// A visitor exchange in progress on one stream.
+struct Exchange {
+    req: HttpHead,
+    response_tx: Option<oneshot::Sender<Result<Response<BoxBody>, ProxyError>>>,
+    body_tx: Option<mpsc::Sender<Result<Bytes, Box<dyn std::error::Error + Send + Sync>>>>,
+    /// Request body chunks accepted from hyper but not yet sent (credit).
+    pending_body: Vec<Bytes>,
+    /// The request body reader has ended; FIN once `pending_body` drains.
+    body_done: bool,
+    body_compress: Compress,
+}
+
+/// A control stream is the lease on a registration: the service stays
+/// registered exactly as long as the stream is open. Finishing or
+/// resetting it unregisters the service; closing the connection
+/// unregisters all of them.
+enum Lease {
+    /// `register_service` is running off-loop; no hostname yet.
+    Pending,
+    /// Registered under this hostname.
+    Registered(String),
+    /// The client closed the stream while registration was still pending;
+    /// unregister as soon as the hostname is known.
+    Released,
+}
+
+pub(crate) struct RelayHandler {
+    registry: Arc<TunnelRegistry>,
+    handle: Option<RelayHandle>,
+    proxy_tx: mpsc::Sender<ProxyRequest>,
+    conn_id: Option<u64>,
+    key: Option<KeyId>,
+    leases: HashMap<StreamId, Lease>,
+    inflight: HashMap<StreamId, Exchange>,
+}
+
+impl StreamHandler for RelayHandler {
+    fn on_event(&mut self, conn: &mut Connection, event: Event) {
+        match event {
+            Event::Authenticated { key_id, version } => {
+                info!(?key_id, version, "Tunnel connection authenticated");
+                self.key = Some(key_id);
+                let (s_tx, s_rx) = oneshot::channel();
+                self.conn_id = Some(self.registry.register_connection(key_id, s_tx));
+                let h = self.handle();
+                tokio::spawn(async move {
+                    if s_rx.await.is_ok() {
+                        info!("Tunnel connection superseded, closing");
+                        h.close(CloseReason::new(CloseCode::Superseded));
+                    }
+                });
+            }
+            Event::StreamOpened { id, .. } => {
+                trace!(%id, "Peer opened stream; awaiting head");
+            }
+            Event::Readable(id) => {
+                while let Ok(msg) = conn.recv_msg(id) {
+                    if let Some(ex) = self.inflight.get_mut(&id) {
+                        Self::on_visitor_message(ex, conn, id, &msg);
+                    } else if self.leases.contains_key(&id) {
+                        debug!(%id, "Unexpected message on control stream");
+                    } else {
+                        self.on_first_message(conn, id, &msg);
+                    }
+                }
+            }
+            Event::Writable { id, .. } => {
+                if let Some(ex) = self.inflight.get_mut(&id) {
+                    Self::drain_request_body(ex, conn, id);
+                }
+            }
+            Event::Finished(id) => {
+                self.release_lease(conn, id);
+                if let Some(ex) = self.inflight.remove(&id) {
+                    drop(ex.body_tx);
+                }
+            }
+            Event::Reset { id, code } => {
+                trace!(%id, code, "Stream reset");
+                self.release_lease(conn, id);
+                if let Some(mut ex) = self.inflight.remove(&id)
+                    && let Some(tx) = ex.response_tx.take()
+                {
+                    let _ = tx.send(Err(ProxyError::Reset));
+                }
+            }
+            Event::Closed { reason } => {
+                debug!(?reason, "Mux closed");
+                if let (Some(k), Some(c)) = (self.key, self.conn_id) {
+                    self.registry.unregister_connection(k, c);
+                }
+            }
+            Event::Rejected { .. } => {}
+        }
+    }
+}
+
+impl RelayHandler {
+    fn handle(&self) -> RelayHandle {
+        self.handle
+            .clone()
+            .expect("handle installed before the first event can fire")
     }
 
-    loop {
-        let now = Instant::now();
-        let timeout_at = conn
-            .next_timeout()
-            .unwrap_or_else(|| now + std::time::Duration::from_secs(60));
-        let sleep_duration = timeout_at.saturating_duration_since(now);
+    /// The client gave up a control stream: drop the registration it
+    /// carried. A lease still `Pending` is left in the map so the reply
+    /// path sees the stream is gone and unregisters right after
+    /// `register_service` completes.
+    fn release_lease(&mut self, conn: &mut Connection, id: StreamId) {
+        match self.leases.get(&id) {
+            Some(Lease::Registered(hostname)) => {
+                info!(%id, %hostname, "Control stream closed by client; unregistering");
+                if let Some(key) = self.key {
+                    self.registry.unregister_service(key, hostname);
+                }
+                self.leases.remove(&id);
+                // Our half was still open: finish it so the stream is freed.
+                let _ = conn.finish(id);
+            }
+            Some(Lease::Pending) => {
+                self.leases.insert(id, Lease::Released);
+            }
+            Some(Lease::Released) | None => {}
+        }
+    }
 
-        tokio::select! {
-            _ = async {
-                if let Some(ref mut rx) = superseded_rx {
-                    let _ = rx.await;
-                } else {
-                    futures_util::future::pending::<()>().await;
-                }
-            } => {
-                info!(key_id = ?authenticated_key, "Tunnel connection superseded, closing");
-                conn.close(GoAway::new(CloseCode::Superseded));
-                let now = Instant::now();
-                while conn.poll_transmit(now, &mut transmit_buf) {
-                    let msg = Message::Binary(Bytes::from(std::mem::take(&mut transmit_buf)));
-                    let _ = ws_write.send(msg).await;
-                }
-                break;
-            }
-            _ = tokio::time::sleep(sleep_duration) => {
-                conn.handle_timeout(Instant::now());
-            }
-            ws_msg = ws_read.next() => {
-                match ws_msg {
-                    Some(Ok(Message::Binary(bytes))) => {
-                        let now = Instant::now();
-                        if let Err(err) = conn.recv(now, &bytes) {
-                            debug!(error = %err, "Protocol error on mux recv");
-                            break;
-                        }
-                    }
-                    Some(Ok(Message::Close(_))) | None => {
-                        info!("WebSocket stream closed by client");
-                        break;
-                    }
-                    Some(Ok(Message::Ping(payload))) => {
-                        let _ = ws_write.send(Message::Pong(payload)).await;
-                    }
-                    Some(Ok(_)) => {}
-                    Some(Err(err)) => {
-                        debug!(error = %err, "WebSocket read error");
-                        break;
-                    }
-                }
-            }
-            req_opt = proxy_rx.recv() => {
-                if let Some(req) = req_opt {
-                    let head = weaver_proto::Head::Http(req.head);
-                    match head.to_mux_head() {
-                        Ok(mux_head) => {
-                            match conn.open(mux_head) {
-                                Ok(stream_id) => {
-                                    inflight.insert(
-                                        stream_id,
-                                        InflightExchange {
-                                            response_tx: Some(req.response_tx),
-                                            body_tx: None,
-                                            read_buf: Vec::new(),
-                                            head_parsed: false,
-                                            pending_request_body: Vec::new(),
-                                        },
-                                    );
-
-                                    // Stream visitor request body in background task to chunk_tx
-                                    let c_tx = chunk_tx.clone();
-                                    tokio::spawn(async move {
-                                        let mut body = req.body;
-                                        while let Some(frame_res) = body.frame().await {
-                                            match frame_res {
-                                                Ok(frame) => {
-                                                    if let Ok(data) = frame.into_data()
-                                                        && !data.is_empty()
-                                                        && c_tx
-                                                            .send(BodyChunkMsg::Data(stream_id, data))
-                                                            .await
-                                                            .is_err()
-                                                    {
-                                                        return;
-                                                    }
-                                                }
-                                                Err(_) => {
-                                                    let _ = c_tx.send(BodyChunkMsg::Error(stream_id)).await;
-                                                    return;
-                                                }
-                                            }
-                                        }
-                                        let _ = c_tx.send(BodyChunkMsg::Fin(stream_id)).await;
-                                    });
-                                }
-                                Err(err) => {
-                                    debug!(error = %err, "Failed to open mux stream for proxy request");
-                                    let _ = req.response_tx.send(Err(ProxyError::Mux(err.to_string())));
-                                }
+    /// First message on a client-opened stream must be a `Head::Control`.
+    fn on_first_message(&mut self, conn: &mut Connection, id: StreamId, msg: &[u8]) {
+        let Ok(Head::Control(head)) = weaver_proto::decode::<Head>(msg) else {
+            debug!(%id, "Unexpected first message from client; resetting");
+            let _ = conn.reset(id, 0);
+            return;
+        };
+        let ControlHead::Register { service, .. } = &head;
+        let service = service.clone();
+        let (Some(key), Some(conn_id)) = (self.key, self.conn_id) else {
+            let _ = conn.reset(id, 0);
+            return;
+        };
+        if let Err(code) = head.validate() {
+            Self::reply(conn, id, refused(code, &service));
+            return;
+        }
+        // Registration touches the cert manager (async): run it off the
+        // loop and come back through the handle.
+        self.leases.insert(id, Lease::Pending);
+        let registry = Arc::clone(&self.registry);
+        let proxy_tx = self.proxy_tx.clone();
+        let handle = self.handle();
+        tokio::spawn(async move {
+            let res = registry
+                .register_service(key, conn_id, &service, proxy_tx)
+                .await;
+            handle.spawn_on(move |conn, handler| {
+                let reply = match res {
+                    Ok(hostname) => {
+                        match handler.leases.get(&id) {
+                            Some(Lease::Released) => {
+                                // The client finished the stream while we
+                                // were registering: the lease is already gone.
+                                handler.leases.remove(&id);
+                                handler.registry.unregister_service(key, &hostname);
+                                return;
+                            }
+                            _ => {
+                                handler
+                                    .leases
+                                    .insert(id, Lease::Registered(hostname.clone()));
                             }
                         }
-                        Err(err) => {
-                            let _ = req.response_tx.send(Err(ProxyError::Codec(err.to_string())));
-                        }
+                        ControlReply::Registered { hostname }
                     }
-                }
+                    Err(code) => {
+                        handler.leases.remove(&id);
+                        refused(code, &service)
+                    }
+                };
+                Self::reply(conn, id, reply);
+            });
+        });
+    }
+
+    fn reply(conn: &mut Connection, id: StreamId, reply: ControlReply) {
+        let refused = matches!(reply, ControlReply::Refused { .. });
+        if let Ok(bytes) = weaver_proto::encode(&reply) {
+            let _ = conn.send(id, &bytes, policy::CONTROL_COMPRESS);
+        }
+        if refused {
+            let _ = conn.finish(id);
+        }
+    }
+
+    /// Open a stream for a visitor request: policy from the request, head
+    /// as the first message, body chunks streamed in from hyper.
+    fn open_visitor_stream(&mut self, conn: &mut Connection, req: ProxyRequest) {
+        let head_bytes = match weaver_proto::encode(&Head::Http(req.head.clone())) {
+            Ok(b) => b,
+            Err(e) => {
+                let _ = req.response_tx.send(Err(ProxyError::Codec(e.to_string())));
+                return;
             }
-            chunk_opt = chunk_rx.recv() => {
-                match chunk_opt {
-                    Some(BodyChunkMsg::Data(id, data)) => {
-                        if let Some(ex) = inflight.get_mut(&id) {
-                            match conn.write(id, &data) {
-                                Ok(n) if n == data.len() => {}
-                                Ok(n) => {
-                                    ex.pending_request_body.push(data.slice(n..));
-                                }
-                                Err(err) => {
-                                    debug!(%id, error = %err, "Error writing body data to stream");
-                                }
-                            }
-                        }
-                    }
-                    Some(BodyChunkMsg::Fin(id)) => {
-                        if let Some(ex) = inflight.get_mut(&id)
-                            && ex.pending_request_body.is_empty()
+        };
+        let id = match conn.open(policy::request_class(&req.head)) {
+            Ok(id) => id,
+            Err(e) => {
+                let _ = req.response_tx.send(Err(ProxyError::Mux(e.to_string())));
+                return;
+            }
+        };
+        // A fresh stream has a full window (≥ 64 KiB) and the head is
+        // bounded by max_message: failure here is an error, not backpressure.
+        if let Err(e) = conn.send(id, &head_bytes, policy::HEAD_COMPRESS) {
+            let _ = conn.reset(id, 0);
+            let _ = req.response_tx.send(Err(ProxyError::Mux(e.to_string())));
+            return;
+        }
+        self.inflight.insert(
+            id,
+            Exchange {
+                body_compress: policy::request_body_compress(&req.head),
+                req: req.head,
+                response_tx: Some(req.response_tx),
+                body_tx: None,
+                pending_body: Vec::new(),
+                body_done: false,
+            },
+        );
+        // Stream the visitor's request body into the loop chunk by chunk.
+        let h = self.handle();
+        let mut body = req.body;
+        tokio::spawn(async move {
+            while let Some(frame) = body.frame().await {
+                match frame {
+                    Ok(f) => {
+                        if let Ok(data) = f.into_data()
+                            && !data.is_empty()
                         {
-                            let _ = conn.finish(id);
+                            h.spawn_on(move |conn, handler| {
+                                if let Some(ex) = handler.inflight.get_mut(&id) {
+                                    ex.pending_body.push(data);
+                                    Self::drain_request_body(ex, conn, id);
+                                }
+                            });
                         }
                     }
-                    Some(BodyChunkMsg::Error(id)) => {
-                        let _ = conn.reset(id, 0);
-                        inflight.remove(&id);
-                    }
-                    None => {}
-                }
-            }
-        }
-
-        // Process all queued events
-        while let Some(ev) = conn.poll_event() {
-            match ev {
-                Event::Authenticated { key_id, version } => {
-                    info!(?key_id, version, "Tunnel connection authenticated");
-                    authenticated_key = Some(key_id);
-                    let (s_tx, s_rx) = oneshot::channel();
-                    superseded_rx = Some(s_rx);
-                    conn_id = Some(registry.register_connection(key_id, s_tx));
-                }
-                Event::StreamOpened { id, head } => {
-                    trace!(%id, "Peer opened stream");
-                    match weaver_proto::Head::from_mux_head(&head) {
-                        Ok(weaver_proto::Head::Control(ControlHead::Register { service })) => {
-                            if let (Some(k), Some(c)) = (authenticated_key, conn_id) {
-                                let reg_res = registry
-                                    .register_service(k, c, &service, proxy_tx.clone())
-                                    .await;
-                                let reply = match reg_res {
-                                    Ok(hostname) => {
-                                        active_control_streams.insert(id);
-                                        ControlReply::Registered { hostname }
-                                    }
-                                    Err(code) => {
-                                        let msg = match code {
-                                            RefusalCode::AlreadyRegistered => {
-                                                format!("Service '{service}' is already registered")
-                                            }
-                                            RefusalCode::InvalidName => {
-                                                format!(
-                                                    "Service '{service}' is not a valid DNS label"
-                                                )
-                                            }
-                                            RefusalCode::Unauthorized => {
-                                                "Unauthorized client identity".to_string()
-                                            }
-                                            RefusalCode::Other(ref s) => s.clone(),
-                                        };
-                                        ControlReply::Refused { code, message: msg }
-                                    }
-                                };
-
-                                if let Ok(encoded) = encode_length_prefixed(&reply) {
-                                    let _ = conn.write(id, &encoded);
-                                }
-                                if matches!(reply, ControlReply::Refused { .. }) {
-                                    let _ = conn.finish(id);
-                                }
-                            }
-                        }
-                        _ => {
-                            // Unexpected stream type from client
+                    Err(_) => {
+                        h.spawn_on(move |conn, handler| {
+                            handler.inflight.remove(&id);
                             let _ = conn.reset(id, 0);
-                        }
+                        });
+                        return;
                     }
                 }
-                Event::Readable(id) => {
-                    let mut read_buf = [0u8; 8192];
-                    while let Ok(n) = conn.read(id, &mut read_buf) {
-                        if n == 0 {
-                            break;
-                        }
-                        if let Some(ex) = inflight.get_mut(&id) {
-                            if !ex.head_parsed {
-                                ex.read_buf.extend_from_slice(&read_buf[..n]);
-                                if let Ok(Some((head, consumed))) =
-                                    decode_length_prefixed::<HttpResponseHead>(&ex.read_buf)
-                                {
-                                    ex.head_parsed = true;
-                                    let leftover = ex.read_buf[consumed..].to_vec();
-                                    ex.read_buf.clear();
+            }
+            h.spawn_on(move |conn, handler| {
+                if let Some(ex) = handler.inflight.get_mut(&id) {
+                    ex.body_done = true;
+                    Self::drain_request_body(ex, conn, id);
+                }
+            });
+        });
+    }
 
-                                    let mut builder = Response::builder().status(
-                                        StatusCode::from_u16(head.status)
-                                            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
-                                    );
+    fn on_visitor_message(ex: &mut Exchange, conn: &mut Connection, id: StreamId, msg: &[u8]) {
+        if let Some(tx) = ex.response_tx.take() {
+            // First message back is the response head.
+            let head: HttpResponseHead = match weaver_proto::decode(msg) {
+                Ok(h) => h,
+                Err(e) => {
+                    debug!(%id, error = %e, "Bad response head from client");
+                    let _ = tx.send(Err(ProxyError::Codec(e.to_string())));
+                    let _ = conn.reset(id, 0);
+                    return;
+                }
+            };
+            if let Some(class) = policy::response_class(&ex.req, &head) {
+                let _ = conn.set_class(id, class);
+            }
+            let mut builder = Response::builder().status(
+                StatusCode::from_u16(head.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+            );
+            for (name, val) in &head.headers {
+                if let (Ok(n), Ok(v)) = (
+                    HeaderName::from_bytes(name.as_bytes()),
+                    HeaderValue::from_bytes(val),
+                ) {
+                    builder = builder.header(n, v);
+                }
+            }
+            let (body_tx, body_rx) = mpsc::channel(16);
+            let response = builder
+                .body(TunnelResponseBody::boxed(body_rx))
+                .expect("status and headers were validated");
+            let _ = tx.send(Ok(response));
+            ex.body_tx = Some(body_tx);
+        } else if let Some(body_tx) = &ex.body_tx {
+            let _ = body_tx.try_send(Ok(Bytes::copy_from_slice(msg)));
+        }
+    }
 
-                                    for (name, val) in head.headers {
-                                        if let (Ok(h_name), Ok(h_val)) = (
-                                            HeaderName::from_bytes(name.as_bytes()),
-                                            HeaderValue::from_bytes(&val),
-                                        ) {
-                                            builder = builder.header(h_name, h_val);
-                                        }
-                                    }
-
-                                    let (body_tx, body_rx) = mpsc::channel(16);
-                                    let body = TunnelResponseBody::boxed(body_rx);
-                                    let response = builder.body(body).unwrap();
-
-                                    if let Some(tx) = ex.response_tx.take() {
-                                        let _ = tx.send(Ok(response));
-                                    }
-
-                                    ex.body_tx = Some(body_tx.clone());
-                                    if !leftover.is_empty() {
-                                        let _ = body_tx.try_send(Ok(Bytes::from(leftover)));
-                                    }
-                                }
-                            } else if let Some(ref body_tx) = ex.body_tx {
-                                let bytes = Bytes::copy_from_slice(&read_buf[..n]);
-                                let _ = body_tx.try_send(Ok(bytes));
-                            }
-                        }
-                    }
+    fn drain_request_body(ex: &mut Exchange, conn: &mut Connection, id: StreamId) {
+        while let Some(chunk) = ex.pending_body.first() {
+            match conn.send(id, chunk, ex.body_compress) {
+                Ok(()) => {
+                    ex.pending_body.remove(0);
                 }
-                Event::Writable(id) => {
-                    if let Some(ex) = inflight.get_mut(&id) {
-                        while !ex.pending_request_body.is_empty() {
-                            let next_chunk = &ex.pending_request_body[0];
-                            match conn.write(id, next_chunk) {
-                                Ok(n) if n == next_chunk.len() => {
-                                    ex.pending_request_body.remove(0);
-                                }
-                                Ok(n) => {
-                                    let rem = next_chunk.slice(n..);
-                                    ex.pending_request_body[0] = rem;
-                                    break;
-                                }
-                                Err(_) => break,
-                            }
-                        }
-                    }
+                Err(StreamError::WouldBlock) => return,
+                Err(e) => {
+                    debug!(%id, error = %e, "Error sending request body");
+                    ex.pending_body.clear();
+                    return;
                 }
-                Event::Finished(id) => {
-                    if active_control_streams.remove(&id) {
-                        info!(%id, "Control registration stream closed by client");
-                    }
-                    if let Some(ex) = inflight.remove(&id) {
-                        drop(ex.body_tx);
-                    }
-                }
-                Event::Reset { id, code } => {
-                    trace!(%id, code, "Stream reset");
-                    if active_control_streams.remove(&id) {
-                        info!(%id, "Control registration stream reset");
-                    }
-                    if let Some(mut ex) = inflight.remove(&id)
-                        && let Some(tx) = ex.response_tx.take()
-                    {
-                        let _ = tx.send(Err(ProxyError::Reset));
-                    }
-                }
-                Event::Closed { reason } => {
-                    info!(?reason, "Tunnel connection closed");
-                    break;
-                }
-                _ => {}
             }
         }
-
-        // Flush all pending frames to WebSocket sink (strictly unbuffered)
-        let now = Instant::now();
-        while conn.poll_transmit(now, &mut transmit_buf) {
-            let msg = Message::Binary(Bytes::from(std::mem::take(&mut transmit_buf)));
-            ws_write.send(msg).await?;
-        }
-
-        if conn.is_closed() {
-            break;
+        if ex.body_done {
+            let _ = conn.finish(id);
         }
     }
+}
 
-    if let (Some(k), Some(c)) = (authenticated_key, conn_id) {
-        registry.unregister_connection(k, c);
-    }
-
-    Ok(())
+fn refused(code: RefusalCode, service: &str) -> ControlReply {
+    let message = match &code {
+        RefusalCode::AlreadyRegistered => format!("Service '{service}' is already registered"),
+        RefusalCode::InvalidName => format!("Service '{service}' is not a valid DNS label"),
+        RefusalCode::Unauthorized => "Unauthorized client identity".into(),
+        RefusalCode::UnsupportedVersion { min, max } => {
+            format!("unsupported application protocol version (relay accepts {min}..={max})")
+        }
+        RefusalCode::Other(s) => s.clone(),
+    };
+    ControlReply::Refused { code, message }
 }

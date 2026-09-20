@@ -1,4 +1,6 @@
+#[cfg(any(test, feature = "test-util"))]
 use std::sync::Arc;
+#[cfg(any(test, feature = "test-util"))]
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -21,12 +23,14 @@ impl Clock for SystemClock {
     }
 }
 
-/// Injected mock clock for unit tests and deterministic simulation.
+/// Injected mock clock for tests and deterministic simulation.
+#[cfg(any(test, feature = "test-util"))]
 #[derive(Debug, Clone)]
 pub struct MockClock {
     now: Arc<AtomicI64>,
 }
 
+#[cfg(any(test, feature = "test-util"))]
 impl MockClock {
     /// Creates a mock clock initialized to the specified timestamp.
     pub fn new(initial: i64) -> Self {
@@ -46,6 +50,7 @@ impl MockClock {
     }
 }
 
+#[cfg(any(test, feature = "test-util"))]
 impl Clock for MockClock {
     fn now_unix(&self) -> i64 {
         self.now.load(Ordering::SeqCst)

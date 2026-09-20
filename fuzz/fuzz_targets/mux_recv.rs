@@ -10,7 +10,7 @@
 use libfuzzer_sys::fuzz_target;
 use std::time::{Duration, Instant};
 use weaver_mux::testing::{Ed25519TestSigner, MapVerifier, SeededRng};
-use weaver_mux::{Config, Connection, Head, Signer as _};
+use weaver_mux::{Compress, Config, Connection, Signer as _, Class};
 
 fn authenticated_pair() -> (Connection, Connection, Instant) {
     let signer = Ed25519TestSigner::from_seed(1);
@@ -41,15 +41,14 @@ fuzz_target!(|data: &[u8]| {
     let (mut client, mut server, mut now) = authenticated_pair();
     // A stream the peer legitimately opened, so DATA/FIN/RST on id 1 hit
     // real state rather than the "unknown id" fast path.
-    let id = client.open(Head::default()).unwrap();
-    let _ = client.write(id, b"seed");
+    let id = client.open(Class::Interactive).unwrap();
+    let _ = client.send(id, b"seed", Compress::Auto);
     let mut buf = Vec::new();
     while client.poll_transmit(now, &mut buf) {
         let _ = server.recv(now, &buf);
     }
 
     let mut rest = data;
-    let mut scratch = [0u8; 4096];
     while rest.len() >= 2 {
         let len = usize::from(u16::from_be_bytes([rest[0], rest[1]]));
         rest = &rest[2..];
@@ -61,8 +60,8 @@ fuzz_target!(|data: &[u8]| {
         server.handle_timeout(now);
         while server.poll_transmit(now, &mut buf) {}
         while server.poll_event().is_some() {}
-        let _ = server.read(id, &mut scratch);
-        let _ = server.write(id, b"echo");
+        while server.recv_msg(id).is_ok() {}
+        let _ = server.send(id, b"echo", Compress::Auto);
         if server.is_closed() {
             break;
         }

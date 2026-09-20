@@ -22,7 +22,9 @@ pub use acme::{
     register_acme_account,
 };
 pub use challenge::{ChallengeRegistry, create_tls_alpn_01_certified_key};
-pub use clock::{Clock, MockClock, SystemClock, format_unix_timestamp};
+#[cfg(any(test, feature = "test-util"))]
+pub use clock::MockClock;
+pub use clock::{Clock, SystemClock, format_unix_timestamp};
 pub use events::record_cert_event;
 pub use renewal::{compute_backoff, should_renew};
 pub use resolver::{CertResolver, parse_certified_key};

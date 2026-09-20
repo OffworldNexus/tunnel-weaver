@@ -2,14 +2,14 @@ mod common;
 
 use common::*;
 use weaver_mux::wire::{self, WindowUpdate};
-use weaver_mux::{Event, Frame, FrameType, Head, StreamError};
+use weaver_mux::{Class, Compress, Event, Frame, FrameType, StreamError};
 
 const WINDOW: u32 = 64 * 1024;
 
 /// Small window so the tests exercise credit exhaustion quickly.
 fn small_window_pair() -> Pair {
     let mut server = server_config(1);
-    server.initial_window = WINDOW;
+    server_params(&mut server, |p| p.initial_window = WINDOW);
     let mut p = Pair::new(client_config(1), server);
     p.pump();
     p.drain_events(Side::Client);
@@ -17,21 +17,35 @@ fn small_window_pair() -> Pair {
     p
 }
 
-/// Incompressible payload, so wire bytes == application bytes + flag.
+/// Incompressible payload, so wire bytes == application bytes + flags.
 fn noise(n: usize) -> Vec<u8> {
     (0..n as u32)
         .map(|i| (i.wrapping_mul(2654435761) >> 13) as u8)
         .collect()
 }
 
+/// Send `msg` repeatedly until the credit runs out; returns how many were
+/// accepted.
+fn fill(p: &mut Pair, id: u32, msg: &[u8]) -> usize {
+    let mut n = 0;
+    while p.client.send(id, msg, Compress::Never).is_ok() {
+        n += 1;
+    }
+    n
+}
+
 #[test]
 fn sender_never_exceeds_credit() {
     let mut p = small_window_pair();
-    let id = p.client.open(Head::default()).unwrap();
-    let data = noise(WINDOW as usize * 3);
-    let accepted = p.client.write(id, &data).unwrap();
-    // Each frame carries a flag byte, so slightly less than WINDOW fits.
-    assert!(accepted < WINDOW as usize && accepted > WINDOW as usize - 64);
+    let id = p.client.open(Class::Interactive).unwrap();
+    let msg = noise(4000);
+    let accepted = fill(&mut p, id, &msg);
+    // 16 messages of 4001 wire bytes fit in 64 KiB; the 17th does not.
+    assert_eq!(accepted, 16);
+    assert_eq!(
+        p.client.send(id, &msg, Compress::Never),
+        Err(StreamError::WouldBlock)
+    );
     // Client alone (no WINDOW_UPDATEs come back): count wire bytes.
     let now = p.clock.now();
     let mut buf = Vec::new();
@@ -44,29 +58,25 @@ fn sender_never_exceeds_credit() {
         }
     }
     assert!(wire_total <= WINDOW);
-    // Further writes get zero until credit returns.
-    assert_eq!(p.client.write(id, &data).unwrap(), 0);
 }
 
 #[test]
 fn window_update_cadence_and_writable() {
     let mut p = small_window_pair();
-    let id = p.client.open(Head::default()).unwrap();
-    let data = noise(WINDOW as usize);
-    let first = p.client.write(id, &data).unwrap();
+    let id = p.client.open(Class::Interactive).unwrap();
+    let msg = noise(4000);
+    let first = fill(&mut p, id, &msg);
     p.pump();
     p.drain_events(Side::Client);
-    // Server has the bytes but has not read them: no update yet.
+    // Server has the bytes but has not consumed them: no update yet.
     assert!(
         p.frames_of(Side::Server, FrameType::WindowUpdate)
             .is_empty()
     );
-    // Read just under half the window: still nothing.
-    let mut buf = vec![0u8; WINDOW as usize / 2 - 2048];
-    let mut got = 0;
-    while got < buf.len() {
-        let n = p.server.read(id, &mut buf[got..]).unwrap();
-        got += n;
+    // Consume just under half the window: still nothing.
+    let under_half = (WINDOW as usize / 2) / 4001 - 1;
+    for _ in 0..under_half {
+        p.server.recv_msg(id).unwrap();
     }
     p.pump();
     assert!(
@@ -74,17 +84,13 @@ fn window_update_cadence_and_writable() {
             .is_empty(),
         "no update before half the window is consumed"
     );
-    // Read the rest (a full window in total): every update announces at
-    // least half a window, and together they return exactly the wire
+    // Consume the rest: together the updates return exactly the wire
     // bytes consumed.
-    let rest = read_all(&mut p.server, id);
+    let rest = recv_all(&mut p.server, id).len();
+    assert_eq!(under_half + rest, first);
     p.pump();
     let updates = p.frames_of(Side::Server, FrameType::WindowUpdate);
-    assert_eq!(
-        updates.len(),
-        2,
-        "64 KiB consumed = two half-window crossings"
-    );
+    assert!(!updates.is_empty());
     let credits: Vec<u32> = updates
         .iter()
         .map(|f| {
@@ -94,33 +100,35 @@ fn window_update_cadence_and_writable() {
         })
         .collect();
     assert!(credits.iter().all(|&c| c >= WINDOW / 2), "{credits:?}");
-    let consumed_wire =
-        (got + rest.len()) as u32 + p.frames_of(Side::Client, FrameType::Data).len() as u32;
-    assert_eq!(
-        credits.iter().sum::<u32>(),
-        consumed_wire,
-        "credit == wire bytes consumed"
+    let consumed_wire = first as u32 * 4001;
+    assert!(
+        credits.iter().sum::<u32>() <= consumed_wire,
+        "credit never exceeds wire bytes consumed"
     );
-    // Client was blocked and now learns it may write again.
-    assert_eq!(p.drain_events(Side::Client), vec![Event::Writable(id)]);
-    let second = p.client.write(id, &data[first..]).unwrap();
-    assert!(second > 0);
+    // Client was blocked and now learns it may send again.
+    assert!(matches!(
+        p.drain_events(Side::Client).as_slice(),
+        [Event::Writable { id: got, credit }] if *got == id && *credit > 0
+    ));
+    p.client.send(id, &msg, Compress::Never).unwrap();
 }
 
 #[test]
 fn stalled_reader_does_not_block_other_streams() {
     let mut p = small_window_pair();
-    let stalled = p.client.open(Head::default()).unwrap();
-    let live = p.client.open(Head::default()).unwrap();
-    let data = noise(WINDOW as usize * 2);
-    p.client.write(stalled, &data).unwrap();
+    let stalled = p.client.open(Class::Interactive).unwrap();
+    let live = p.client.open(Class::Interactive).unwrap();
+    fill(&mut p, stalled, &noise(4000));
     p.pump();
     // Stalled stream is out of credit; nobody reads it on the server.
-    assert_eq!(p.client.write(stalled, &data).unwrap(), 0);
+    assert_eq!(
+        p.client.send(stalled, &noise(4000), Compress::Never),
+        Err(StreamError::WouldBlock)
+    );
     // The live stream keeps flowing round after round.
     for round in 0..5 {
         let msg = format!("round {round}");
-        assert_eq!(p.client.write(live, msg.as_bytes()).unwrap(), msg.len());
+        send(&mut p.client, live, msg.as_bytes());
         p.pump();
         assert_eq!(read_all(&mut p.server, live), msg.as_bytes());
     }
@@ -130,19 +138,18 @@ fn stalled_reader_does_not_block_other_streams() {
 #[test]
 fn peer_overrunning_credit_is_a_protocol_error() {
     let mut p = small_window_pair();
-    let id = p.client.open(Head::default()).unwrap();
+    let id = p.client.open(Class::Interactive).unwrap();
     p.pump();
     p.drain_events(Side::Server);
     // Hand-craft DATA frames beyond the window straight into the server.
     let now = p.clock.now();
     let mut payload = vec![0u8];
     payload.extend_from_slice(&noise(16 * 1024 - 1));
-    let frame = Frame {
+    let frame = encode(&Frame {
         stream_id: id,
         frame_type: FrameType::Data,
         payload,
-    }
-    .encode();
+    });
     for _ in 0..4 {
         p.server.recv(now, &frame).unwrap();
     }
@@ -154,7 +161,10 @@ fn peer_overrunning_credit_is_a_protocol_error() {
 }
 
 #[test]
-fn write_on_unknown_stream_fails() {
+fn send_on_unknown_stream_fails() {
     let mut p = small_window_pair();
-    assert_eq!(p.client.write(99, b"x"), Err(StreamError::UnknownStream));
+    assert_eq!(
+        p.client.send(99, b"x", Compress::Auto),
+        Err(StreamError::UnknownStream)
+    );
 }

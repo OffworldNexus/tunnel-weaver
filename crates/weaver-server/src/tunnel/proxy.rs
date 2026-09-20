@@ -163,7 +163,6 @@ pub async fn forward_visitor_request(
         authority: host.to_string(),
         path,
         headers: cleaned_headers,
-        hints: weaver_mux::Hints::default(),
     };
 
     let (response_tx, response_rx) = oneshot::channel();

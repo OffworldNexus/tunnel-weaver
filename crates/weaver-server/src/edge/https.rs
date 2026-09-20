@@ -70,45 +70,7 @@ pub fn is_ip_literal(host: &str) -> bool {
     unbracketed.parse::<IpAddr>().is_ok()
 }
 
-/// Sets the TCP_NOTSENT_LOWAT socket option to ~32 KiB on Linux and Apple systems.
-#[cfg(any(
-    target_os = "linux",
-    target_os = "macos",
-    target_os = "ios",
-    target_os = "android"
-))]
-pub fn set_tcp_notsent_lowat(stream: &tokio::net::TcpStream) {
-    use std::os::unix::io::AsRawFd;
-    let fd = stream.as_raw_fd();
-    let val: libc::c_uint = 32768;
-    unsafe {
-        #[cfg(target_os = "linux")]
-        let _ = libc::setsockopt(
-            fd,
-            libc::IPPROTO_TCP,
-            libc::TCP_NOTSENT_LOWAT,
-            &val as *const _ as *const libc::c_void,
-            std::mem::size_of_val(&val) as libc::socklen_t,
-        );
-        #[cfg(any(target_os = "macos", target_os = "ios"))]
-        let _ = libc::setsockopt(
-            fd,
-            libc::IPPROTO_TCP,
-            0x201,
-            &val as *const _ as *const libc::c_void,
-            std::mem::size_of_val(&val) as libc::socklen_t,
-        );
-    }
-}
-
-/// No-op on platforms without TCP_NOTSENT_LOWAT (e.g. Windows).
-#[cfg(not(any(
-    target_os = "linux",
-    target_os = "macos",
-    target_os = "ios",
-    target_os = "android"
-)))]
-pub fn set_tcp_notsent_lowat(_stream: &tokio::net::TcpStream) {}
+pub use weaver_tokio::set_tcp_notsent_lowat;
 
 /// Dispatches an HTTPS request based on SNI and Host header validation.
 pub async fn handle_https_request(
