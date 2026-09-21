@@ -131,6 +131,11 @@ impl SchedTree {
         }
     }
 
+    /// True when any class has a frame waiting.
+    pub fn has_backlog(&self) -> bool {
+        self.top.has_backlog()
+    }
+
     /// Choose what to send next. Does not consume anything: the caller
     /// pops the frame and then reports it via [`SchedTree::served`].
     pub fn pick(&mut self) -> Option<Pick> {
