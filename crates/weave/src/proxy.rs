@@ -558,8 +558,11 @@ fn collect_forwarding(headers: &http::HeaderMap) -> Forwarding {
 /// reach the visitor, or the edge would tear down a keep-alive visitor
 /// connection and pipelined requests behind it would be lost. The pool
 /// already honours the origin's close by not reusing that connection.
-/// `Connection`-listed names are dropped too. The upgrade pair is kept for
-/// a 101 (the relay needs it to switch the visitor).
+/// `Connection`-listed names are dropped too, `Upgrade` included: on a 101
+/// the relay emits its own `Connection`/`Upgrade` pair toward the visitor
+/// (it knows the protocol from the request), and forwarding the origin's
+/// copy as well would duplicate the header, which strict WebSocket clients
+/// reject.
 fn collect_headers(headers: &http::HeaderMap) -> Vec<(String, Vec<u8>)> {
     let connection_tokens: Vec<String> = headers
         .get_all(http::header::CONNECTION)
@@ -573,9 +576,6 @@ fn collect_headers(headers: &http::HeaderMap) -> Vec<(String, Vec<u8>)> {
         .iter()
         .filter(|(n, _)| {
             let name = n.as_str();
-            if name == "upgrade" {
-                return true;
-            }
             !(HOP_BY_HOP.contains(&name) || connection_tokens.contains(&name.to_string()))
         })
         .map(|(n, v)| (n.as_str().to_string(), v.as_bytes().to_vec()))

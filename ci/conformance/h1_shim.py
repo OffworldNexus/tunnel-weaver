@@ -42,6 +42,14 @@ def rewrite_head(buf: bytes, tunnel_host: bytes):
 
 
 def pump(src, dst, transform=None):
+    """Copy bytes src → dst until EOF or error, then half-close dst.
+
+    Connection state is part of what the probe measures (`Connection:
+    close` must actually close; a smuggled request must not get an extra
+    response), so EOF must propagate exactly: when the edge closes, the
+    probe's socket must see EOF too, and vice versa. Only the write side
+    of `dst` is shut here; the other pump thread still owns its read side.
+    """
     try:
         while True:
             data = src.recv(65536)
@@ -49,15 +57,15 @@ def pump(src, dst, transform=None):
                 break
             if transform is not None:
                 data = transform(data)
-            dst.sendall(data)
+            if data:
+                dst.sendall(data)
     except OSError:
         pass
     finally:
-        for s in (src, dst):
-            try:
-                s.shutdown(socket.SHUT_RDWR)
-            except OSError:
-                pass
+        try:
+            dst.shutdown(socket.SHUT_WR)
+        except OSError:
+            pass
 
 
 def handle(client, tunnel_host: str, edge_host: str, ctx: ssl.SSLContext):
@@ -121,10 +129,16 @@ def handle(client, tunnel_host: str, edge_host: str, ctx: ssl.SSLContext):
                 break
         return out
 
-    t = threading.Thread(target=pump, args=(edge, client), daemon=True)
-    t.start()
-    pump(client, edge, to_edge)
-    t.join(timeout=5)
+    # Two independent half-duplex pumps; each half-closes its destination
+    # on EOF, so the probe sees exactly the connection lifecycle the edge
+    # produced. Both directions must end before the sockets are dropped, or
+    # a late FIN from the edge would be lost.
+    down = threading.Thread(target=pump, args=(edge, client), daemon=True)
+    up = threading.Thread(target=pump, args=(client, edge, to_edge), daemon=True)
+    down.start()
+    up.start()
+    down.join(timeout=60)
+    up.join(timeout=60)
     for s in (client, edge):
         try:
             s.close()

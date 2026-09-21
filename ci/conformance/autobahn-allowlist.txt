@@ -5,11 +5,13 @@
 # the echo origin's (Python `websockets`), not ours; the tunnel is only
 # judged on delivering frames and the close handshake unchanged.
 #
-# Case selection (fuzzingclient.json): §9 (performance/limits) and the
-# 1000-message deflate cases 12.1.1-3 / 13.1.1-3 are excluded — they do
-# 1000 *sequential* round trips and time out at Autobahn's fixed 60 s
-# budget purely from WAN latency (≈90 ms × 1000), which says nothing about
-# framing. The remaining 12.1.x / 13.1.x (larger payloads, fewer messages)
-# still exercise permessage-deflate end to end.
+# Case selection (fuzzingclient.json): all of §1-7 and §10 — framing,
+# fragmentation, control frames, UTF-8, close codes — which is what the
+# tunnel actually mediates. §9 (performance/limits) is out. §12/§13
+# (permessage-deflate) are sampled (12.1.4-5, 13.1.4-5): every case in
+# those sections is ~1000 sequential round-trips, i.e. ~75 s each over a
+# real WAN regardless of the implementation, so the full 216 would take
+# hours and prove nothing further; the sample still shows compressed
+# frames of several sizes survive both hops intact.
 
 7.1.5   origin (Python websockets) answers fragment-then-Close with 1002 instead of 1000; origin's choice, carried unchanged by the tunnel
