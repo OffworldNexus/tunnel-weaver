@@ -218,6 +218,8 @@ struct Exchange {
     req_body_tx: Option<mpsc::Sender<Result<Frame<Bytes>, BoxError>>>,
     req_done: bool,
     req_paused: bool,
+    /// Our FIN has gone out; the exchange may outlive it on a pipe.
+    fin_sent: bool,
     /// Log line already printed (long-lived streams log at head, then at close).
     logged_at_head: bool,
     long_lived: bool,
@@ -495,6 +497,7 @@ impl ProxyHandler {
                 req_body_tx: Some(req_tx),
                 req_done: false,
                 req_paused: false,
+                fin_sent: false,
                 logged_at_head: false,
                 resp_headers: Vec::new(),
                 long_lived: false,
@@ -644,16 +647,26 @@ impl ProxyHandler {
                 Err(TryRecvError::Empty) => return,
             }
             if ex.out_done && ex.pending_bytes.is_empty() && ex.out_head.is_none() {
-                let _ = conn.finish(id);
-                ex.log_line(
-                    &style,
-                    if ex.long_lived {
-                        Phase::Closed
-                    } else {
-                        Phase::Done
-                    },
-                );
-                self.inflight.remove(&id);
+                if !ex.fin_sent {
+                    let _ = conn.finish(id);
+                    ex.fin_sent = true;
+                    ex.log_line(
+                        &style,
+                        if ex.long_lived {
+                            Phase::Closed
+                        } else {
+                            Phase::Done
+                        },
+                    );
+                }
+                // Our direction is done, but on an upgraded pipe the relay
+                // may still be forwarding visitor bytes (its WebSocket Close
+                // reply, typically) that must reach the origin: keep the
+                // exchange — and its request-body channel — until the relay
+                // FINs too. Non-upgrade exchanges have `req_done` already.
+                if ex.req_done {
+                    self.inflight.remove(&id);
+                }
                 return;
             }
         }
@@ -744,9 +757,17 @@ impl StreamHandler for ProxyHandler {
                 }
             }
             Event::Finished(id) => {
-                if let Some(ex) = self.inflight.get_mut(&id) {
+                let done = if let Some(ex) = self.inflight.get_mut(&id) {
                     ex.req_done = true;
+                    // Dropping the sender ends the request body / pipe input.
                     ex.req_body_tx = None;
+                    ex.fin_sent
+                } else {
+                    false
+                };
+                // Both directions finished (ours went first): tear down.
+                if done {
+                    self.inflight.remove(&id);
                 }
             }
             Event::Reset { id, .. } => {

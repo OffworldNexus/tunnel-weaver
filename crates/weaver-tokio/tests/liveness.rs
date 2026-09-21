@@ -261,3 +261,62 @@ async fn keepalives_survive_a_saturating_bulk_send() {
     );
     assert_eq!(sink.closed, Some(CloseCode::Shutdown), "{server_res:?}");
 }
+
+/// The mirror image of the flood test: the *receiving* side of a saturating
+/// transfer must keep pinging and pong'ing too. Here the server floods the
+/// client (a big download through the tunnel), the client only ever
+/// receives, and neither side may drop the other for idleness.
+#[tokio::test]
+async fn keepalives_survive_a_saturating_bulk_receive() {
+    let (client_cfg, server_cfg) = configs();
+    let (client_pipe, server_pipe) = duplex(1, Duration::from_millis(50));
+
+    // Server floods once the client opens a stream toward it; simplest is a
+    // server-side handler that opens the stream itself after auth.
+    let flood = Flood {
+        stream: None,
+        sent: 0,
+        stop_after: 8 * 1024 * 1024,
+        payload: vec![0x5Au8; 16 * 1024],
+    };
+    let server = Driver::new(
+        Connection::new(server_cfg, Instant::now()),
+        server_pipe,
+        flood,
+    );
+    let client = Driver::new(
+        Connection::new(client_cfg, Instant::now()),
+        client_pipe,
+        Sink_::default(),
+    );
+    let client_handle = client.handle();
+    let server_task = tokio::spawn(server.run());
+    let client_task = tokio::spawn(client.run());
+
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    client_handle.close(weaver_mux::CloseReason::new(CloseCode::Shutdown));
+
+    let (sink, client_res) = tokio::time::timeout(Duration::from_secs(10), client_task)
+        .await
+        .expect("client driver hung")
+        .unwrap();
+    let (flood, server_res) = tokio::time::timeout(Duration::from_secs(10), server_task)
+        .await
+        .expect("server driver hung")
+        .unwrap();
+    eprintln!(
+        "server sent={} client received={} client_closed={:?} client_res={:?} server_res={:?}",
+        flood.sent, sink.received, sink.closed, client_res, server_res
+    );
+    assert!(sink.received > 256 * 1024, "receiver barely ran");
+    assert_ne!(
+        sink.closed,
+        Some(CloseCode::Timeout),
+        "receiver timed out mid-download"
+    );
+    assert!(
+        !matches!(&server_res, Ok(r) if r.code == CloseCode::Timeout),
+        "sender saw Timeout: {server_res:?}"
+    );
+    assert_eq!(sink.closed, Some(CloseCode::Shutdown));
+}

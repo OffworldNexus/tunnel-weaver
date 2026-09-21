@@ -126,6 +126,10 @@ struct Exchange {
     /// The exchange became a raw byte pipe: response frames go to the
     /// visitor socket writer instead of a hyper body.
     piped: bool,
+    /// The visitor's upgraded socket reached EOF (pipe only). Distinct from
+    /// `body_done`, which hyper sets when the *HTTP request body* ends —
+    /// immediately, for a bodiless upgrade request.
+    visitor_eof: bool,
     /// Response frames from the client queued for the visitor.
     pending_down: VecDeque<BodyFrameItem>,
     /// A `body_tx.send` is in flight; only one frame is handed to the
@@ -216,7 +220,7 @@ impl StreamHandler for RelayHandler {
                     .get(&id)
                     .is_some_and(|ex| !ex.forwarding && ex.pending_down.is_empty());
                 if drained {
-                    self.inflight.remove(&id);
+                    self.finish_exchange(id);
                 }
             }
             Event::Reset { id, code } => {
@@ -427,6 +431,7 @@ impl RelayHandler {
                 on_upgrade: req.on_upgrade,
                 visitor_connect: req.visitor_connect,
                 piped: false,
+                visitor_eof: false,
                 pending_down: VecDeque::new(),
                 forwarding: false,
                 down_paused: false,
@@ -701,10 +706,31 @@ impl RelayHandler {
                     });
                 });
             }
-            Pump::Fin => {
-                self.inflight.remove(&id);
-            }
+            Pump::Fin => self.finish_exchange(id),
             Pump::Idle => {}
+        }
+    }
+
+    /// The client's direction is complete and every queued frame has been
+    /// handed to the visitor. For a normal exchange that is the end. For a
+    /// piped (upgraded) exchange it is only *one* direction: the visitor may
+    /// still be sending — typically its WebSocket Close reply — and that
+    /// must still reach the client. So on a pipe whose visitor side is not
+    /// yet at EOF, only the down pump is ended (dropping `body_tx` lets it
+    /// finish writing and return the socket half), and the exchange stays
+    /// until the up pump reports `body_done`, which comes back through
+    /// `pump_down` and lands here again.
+    fn finish_exchange(&mut self, id: StreamId) {
+        let remove = match self.inflight.get_mut(&id) {
+            Some(ex) if ex.piped && !ex.visitor_eof => {
+                ex.body_tx = None;
+                false
+            }
+            Some(_) => true,
+            None => false,
+        };
+        if remove {
+            self.inflight.remove(&id);
         }
     }
 
@@ -762,13 +788,16 @@ impl RelayHandler {
                         }
                     }
                     // Visitor closed its write side: FIN our half once the
-                    // queue drains.
+                    // queue drains. If the client has already FIN'd too, the
+                    // exchange is complete; `pump_down` → `Pump::Fin` →
+                    // `finish_exchange` tears it down.
                     handle.spawn_on(move |conn, h| {
                         if let Some(ex) = h.inflight.get_mut(&id) {
+                            ex.visitor_eof = true;
                             ex.body_done = true;
-                            ex.piped = false;
                             Self::drain_request_body(ex, conn, id);
                         }
+                        h.pump_down(id);
                     });
                 }
             };
@@ -785,6 +814,15 @@ impl RelayHandler {
                     }
                     let _ = wr.flush().await;
                 }
+                // `down_rx` ended: the client FIN'd (the origin closed its
+                // side, its Close frame — if any — already written and
+                // flushed above). Signal end-of-stream to the visitor. On
+                // TLS `shutdown` is a close_notify, i.e. a full close rather
+                // than a half-close, but at this point there is nothing left
+                // to deliver in this direction, and a WebSocket client that
+                // has received its Close reply expects the server to close
+                // TCP (RFC 6455 §7.1.1). Without this the visitor waits out
+                // its close timeout on every connection.
                 let _ = wr.shutdown().await;
             };
 
@@ -820,8 +858,15 @@ impl RelayHandler {
         {
             let _ = resume.send(());
         }
-        // In a piped exchange the stream stays open until the pipe ends.
-        if ex.body_done && ex.pending_body.is_empty() && !ex.piped && ex.on_upgrade.is_none() {
+        // Our half is FIN'd once everything we had to send is out:
+        // `body_done` is set by hyper's body reader for a normal request and
+        // by the up pump on the visitor socket's EOF for a pipe. Before the
+        // 101 of an upgrade the body is not read at all, so never FIN then.
+        if ex.body_done
+            && ex.pending_body.is_empty()
+            && ex.on_upgrade.is_none()
+            && (!ex.piped || ex.visitor_eof)
+        {
             let _ = conn.finish(id);
         }
     }

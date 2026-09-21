@@ -774,12 +774,13 @@ async fn spawn_ws_echo_origin() -> TestOrigin {
                         return;
                     }
                 };
+                // Echo, and perform the closing handshake properly: on the
+                // peer's Close, tungstenite queues the reply Close; draining
+                // to `None` flushes it and waits for TCP EOF, instead of
+                // dropping the socket with the Close unanswered (which the
+                // tunnel would faithfully relay as an abrupt reset).
                 while let Some(Ok(msg)) = ws.next().await {
-                    if msg.is_text() || msg.is_binary() {
-                        if ws.send(msg).await.is_err() {
-                            break;
-                        }
-                    } else if msg.is_close() {
+                    if (msg.is_text() || msg.is_binary()) && ws.send(msg).await.is_err() {
                         break;
                     }
                 }
