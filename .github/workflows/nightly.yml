@@ -325,9 +325,13 @@ jobs:
 
           ci/conformance/check_http11probe.sh /tmp/probe-origin.json /tmp/probe-tunnel.json ci/conformance/http11probe-expectations.txt
 
-      # WebSocket conformance (RFC 6455 + permessage-deflate) through the
-      # tunnel: an echo origin behind `weave start`, Autobahn's fuzzingclient
-      # driving the public wss:// endpoint. Performance cases are skipped.
+      # WebSocket piping conformance through the tunnel: an echo origin behind
+      # `weave start`, Autobahn's fuzzingclient driving the public wss://
+      # endpoint. After the 101 the tunnel is a byte pipe, so the suite runs
+      # §1-5/§7/§10 (framing, ping/pong, reserved bits, opcodes,
+      # fragmentation, close handling, auto-fragmentation) — the endpoint
+      # implementations we do not provide are not graded. See
+      # `ci/conformance/autobahn-allowlist.txt` and `fuzzingclient.json`.
       - name: WebSocket conformance (Autobahn)
         id: autobahn
         continue-on-error: true

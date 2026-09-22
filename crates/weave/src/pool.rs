@@ -131,6 +131,7 @@ impl Pool {
         )
         .await
         .map_err(|_| format!("connection to {} timed out", target.origin()))??;
+        weaver_tokio::set_tcp_nodelay(&tcp);
         weaver_tokio::set_tcp_notsent_lowat(&tcp);
 
         match target.scheme {

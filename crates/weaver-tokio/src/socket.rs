@@ -1,5 +1,17 @@
 //! Socket tuning the mux's scheduler depends on.
 
+/// Disable Nagle's algorithm on a latency-sensitive socket.
+///
+/// The proxy writes a response head and its first body chunk as separate
+/// small writes. With Nagle enabled, the second write is held until the first
+/// is ACKed — a full RTT of added latency over a WAN, which delays the body
+/// behind the head (and small mux control frames behind bulk data). Every
+/// socket the tunnel owns is a latency path, so Nagle is turned off
+/// everywhere.
+pub fn set_tcp_nodelay(stream: &tokio::net::TcpStream) {
+    let _ = stream.set_nodelay(true);
+}
+
 /// Set `TCP_NOTSENT_LOWAT` to ~32 KiB so the kernel reports writability
 /// only when its own send queue is nearly empty. Without it, megabytes of
 /// bulk data sit in the socket buffer ahead of an urgent frame and the

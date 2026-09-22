@@ -71,7 +71,7 @@ pub fn is_ip_literal(host: &str) -> bool {
     unbracketed.parse::<IpAddr>().is_ok()
 }
 
-pub use weaver_tokio::set_tcp_notsent_lowat;
+pub use weaver_tokio::{set_tcp_nodelay, set_tcp_notsent_lowat};
 
 /// Dispatches an HTTPS request based on SNI and Host header validation.
 pub async fn handle_https_request(
@@ -391,7 +391,12 @@ pub async fn run_https_server_with_registry(
                     }
                 };
 
-                // Apply TCP_NOTSENT_LOWAT before TLS handshake wrapping
+                // Disable Nagle and apply TCP_NOTSENT_LOWAT before TLS
+                // handshake wrapping. Without NODELAY the response head and
+                // its first body chunk go out as separate small writes with
+                // the body held until the head is ACKed — a full RTT of added
+                // latency on every WAN visitor connection.
+                set_tcp_nodelay(&tcp_stream);
                 set_tcp_notsent_lowat(&tcp_stream);
 
                 let tls_acceptor = acceptor.clone();

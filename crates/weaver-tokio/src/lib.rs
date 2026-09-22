@@ -21,5 +21,5 @@ mod ws;
 
 pub use driver::{Driver, DriverError, Handle, StreamHandler};
 pub use rng::SystemRng;
-pub use socket::set_tcp_notsent_lowat;
+pub use socket::{set_tcp_nodelay, set_tcp_notsent_lowat};
 pub use ws::{Transport, WsTransport};

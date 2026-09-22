@@ -924,6 +924,276 @@ async fn test_websocket_upgrade_h1_and_h2_extended_connect() {
     relay.shutdown_token.cancel();
 }
 
+/// A WebSocket origin that sends one text frame and then initiates a Close
+/// with code 1000 — the shape Autobahn's §6/§7 server-initiated-close cases
+/// exercise. The visitor must receive that Close, not an abrupt EOF/reset.
+async fn spawn_ws_closing_origin() -> TestOrigin {
+    use futures_util::{SinkExt, StreamExt};
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let token = CancellationToken::new();
+    let t = token.clone();
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = tokio::select! {
+                _ = t.cancelled() => break,
+                accepted = listener.accept() => match accepted {
+                    Ok(pair) => pair,
+                    Err(_) => continue,
+                },
+            };
+            tokio::spawn(async move {
+                use tokio_tungstenite::tungstenite::protocol::CloseFrame;
+                use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
+                let mut ws = match tokio_tungstenite::accept_async(stream).await {
+                    Ok(ws) => ws,
+                    Err(_) => return,
+                };
+                // Wait for one client frame, echo it, then close cleanly.
+                let _ = ws.next().await;
+                let _ = ws
+                    .send(tokio_tungstenite::tungstenite::Message::Text(
+                        "server says bye".into(),
+                    ))
+                    .await;
+                let _ = ws
+                    .close(Some(CloseFrame {
+                        code: CloseCode::Normal,
+                        reason: "server closing".into(),
+                    }))
+                    .await;
+                // Drain until EOF so the Close is flushed and the TCP close
+                // is orderly.
+                while let Some(Ok(_)) = ws.next().await {}
+            });
+        }
+    });
+    TestOrigin { addr, token }
+}
+
+/// A raw WebSocket origin that sends a text frame followed by a Close frame
+/// and then immediately closes the TCP connection — without waiting for the
+/// client's Close reply. This is exactly what Python `websockets` does when
+/// it *fails* the connection (invalid UTF-8 → Close 1007), and it is the
+/// shape that loses the Close frame through the tunnel.
+async fn spawn_ws_abrupt_close_origin() -> TestOrigin {
+    use futures_util::SinkExt;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let token = CancellationToken::new();
+    let t = token.clone();
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = tokio::select! {
+                _ = t.cancelled() => break,
+                accepted = listener.accept() => match accepted {
+                    Ok(pair) => pair,
+                    Err(_) => continue,
+                },
+            };
+            tokio::spawn(async move {
+                use tokio_tungstenite::tungstenite::Message;
+                use tokio_tungstenite::tungstenite::protocol::CloseFrame;
+                use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
+                let mut ws = match tokio_tungstenite::accept_async(stream).await {
+                    Ok(ws) => ws,
+                    Err(_) => return,
+                };
+                let _ = ws.send(Message::Text("bye".into())).await;
+                // Send Close 1007 and drop the TCP connection right away,
+                // without waiting for the client's Close reply — the Python
+                // `websockets` fail-fast path.
+                let _ = ws
+                    .send(Message::Close(Some(CloseFrame {
+                        code: CloseCode::from(1007u16),
+                        reason: "invalid utf8".into(),
+                    })))
+                    .await;
+            });
+        }
+    });
+    TestOrigin { addr, token }
+}
+
+/// A trailing origin Close must survive an immediate origin-side TCP close:
+/// Python `websockets` sends Close-1007 and drops the connection on invalid
+/// UTF-8, and the visitor must still receive the Close frame.
+#[tokio::test]
+async fn test_websocket_abrupt_origin_close_reaches_visitor() {
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
+    use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
+
+    let root = "localhost";
+    let relay = spawn_test_relay(root).await;
+    let echo = spawn_ws_abrupt_close_origin().await;
+
+    let token = CancellationToken::new();
+    let c_tok = token.clone();
+    let server = format!("localhost:{}", relay.addr.port());
+    let ca = relay.ca_pem_path.clone();
+    let opts = start_options_multi(server, &ca, &[("ws", echo.port())]);
+    let task = tokio::spawn(async move { weave::run_start_with_token(opts, c_tok).await });
+
+    let host = derive_hostname("ws", &poc_identity(), root);
+    for _ in 0..50 {
+        if relay.registry.lookup(&host).is_some() {
+            break;
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+
+    let connector = TlsConnector::from(create_client_tls_config(vec![b"http/1.1".to_vec()]));
+    let tcp = TcpStream::connect(relay.addr).await.unwrap();
+    let tls = connector
+        .connect(ServerName::try_from(host.clone()).unwrap(), tcp)
+        .await
+        .unwrap();
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri(format!("wss://{host}/echo"))
+        .header("host", &host)
+        .header("connection", "Upgrade")
+        .header("upgrade", "websocket")
+        .header("sec-websocket-version", "13")
+        .header(
+            "sec-websocket-key",
+            tokio_tungstenite::tungstenite::handshake::client::generate_key(),
+        )
+        .body(())
+        .unwrap();
+    let (mut ws, _resp) = tokio_tungstenite::client_async(req, tls).await.unwrap();
+    ws.send(Message::Text("hi".into())).await.unwrap();
+
+    let mut saw_text = false;
+    let mut close_code = None;
+    let mut eof = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        match tokio::time::timeout_at(deadline, ws.next()).await {
+            Err(_) => break,
+            Ok(None) => {
+                eof = true;
+                break;
+            }
+            Ok(Some(Err(_))) => {
+                eof = true;
+                break;
+            }
+            Ok(Some(Ok(Message::Text(t)))) => {
+                if t.as_str() == "bye" {
+                    saw_text = true;
+                }
+            }
+            Ok(Some(Ok(Message::Close(frame)))) => {
+                close_code = frame.map(|f| f.code);
+                break;
+            }
+            Ok(Some(Ok(_))) => {}
+        }
+    }
+
+    token.cancel();
+    let _ = task.await;
+    echo.token.cancel();
+    relay.shutdown_token.cancel();
+
+    assert!(saw_text, "expected the origin text frame");
+    assert!(
+        !eof || close_code == Some(CloseCode::from(1007u16)),
+        "origin Close 1007 was lost: got eof={eof} close={close_code:?}"
+    );
+    assert_eq!(
+        close_code,
+        Some(CloseCode::from(1007u16)),
+        "origin Close 1007 must reach the visitor even when the origin drops TCP immediately"
+    );
+}
+
+/// An origin-initiated WebSocket Close must reach the visitor as a Close
+/// frame. Regression guard for the nightly Autobahn `OK/UNCLEAN` cases,
+/// where `remoteCloseCode` is null — the origin's Close never arrived.
+#[tokio::test]
+async fn test_websocket_origin_initiated_close_reaches_visitor() {
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
+    use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
+
+    let root = "localhost";
+    let relay = spawn_test_relay(root).await;
+    let echo = spawn_ws_closing_origin().await;
+
+    let token = CancellationToken::new();
+    let c_tok = token.clone();
+    let server = format!("localhost:{}", relay.addr.port());
+    let ca = relay.ca_pem_path.clone();
+    let opts = start_options_multi(server, &ca, &[("ws", echo.port())]);
+    let task = tokio::spawn(async move { weave::run_start_with_token(opts, c_tok).await });
+
+    let host = derive_hostname("ws", &poc_identity(), root);
+    for _ in 0..50 {
+        if relay.registry.lookup(&host).is_some() {
+            break;
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+
+    let connector = TlsConnector::from(create_client_tls_config(vec![b"http/1.1".to_vec()]));
+    let tcp = TcpStream::connect(relay.addr).await.unwrap();
+    let tls = connector
+        .connect(ServerName::try_from(host.clone()).unwrap(), tcp)
+        .await
+        .unwrap();
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri(format!("wss://{host}/echo"))
+        .header("host", &host)
+        .header("connection", "Upgrade")
+        .header("upgrade", "websocket")
+        .header("sec-websocket-version", "13")
+        .header(
+            "sec-websocket-key",
+            tokio_tungstenite::tungstenite::handshake::client::generate_key(),
+        )
+        .body(())
+        .unwrap();
+    let (mut ws, _resp) = tokio_tungstenite::client_async(req, tls).await.unwrap();
+    ws.send(Message::Text("hi".into())).await.unwrap();
+
+    let mut saw_text = false;
+    let mut close_code = None;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let next = tokio::time::timeout_at(deadline, ws.next()).await;
+        match next {
+            Err(_) => break,
+            Ok(None) | Ok(Some(Err(_))) => break,
+            Ok(Some(Ok(Message::Text(t)))) => {
+                if t.as_str() == "server says bye" {
+                    saw_text = true;
+                }
+            }
+            Ok(Some(Ok(Message::Close(frame)))) => {
+                close_code = frame.map(|f| f.code);
+                break;
+            }
+            Ok(Some(Ok(_))) => {}
+        }
+    }
+
+    token.cancel();
+    let _ = task.await;
+    echo.token.cancel();
+    relay.shutdown_token.cancel();
+
+    assert!(saw_text, "expected the origin text frame");
+    assert_eq!(
+        close_code,
+        Some(CloseCode::Normal),
+        "origin-initiated Close must reach the visitor with code 1000"
+    );
+}
+
 /// An unreachable origin 502s only its own service.
 #[tokio::test]
 async fn test_origin_down_502s_only_that_service() {
@@ -1569,4 +1839,106 @@ fn poc_identity() -> Identity {
         person: "poc".into(),
         machine: "laptop".into(),
     }
+}
+
+/// An origin that closes the TCP connection after every reply, like an
+/// HTTP/1.0 server (`python3 -m http.server`): fixed `Content-Length`, no
+/// keep-alive. Used to reproduce the nightly conformance behaviour.
+async fn spawn_closing_origin() -> TestOrigin {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let token = CancellationToken::new();
+    let t = token.clone();
+    tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = tokio::select! {
+                _ = t.cancelled() => break,
+                accepted = listener.accept() => match accepted {
+                    Ok(pair) => pair,
+                    Err(_) => continue,
+                },
+            };
+            tokio::spawn(async move {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                // Read whatever the client sends (one request), then reply
+                // HTTP/1.0 and close — no keep-alive.
+                let mut buf = [0u8; 4096];
+                let _ = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut buf)).await;
+                let body = b"origin GET / 0 bytes";
+                let resp = format!(
+                    "HTTP/1.0 200 OK\r\nServer: SimpleHTTP/0.6 Python/3.12.3\r\nContent-type: text/html; charset=utf-8\r\nContent-Length: {}\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(resp.as_bytes()).await;
+                let _ = stream.write_all(body).await;
+                let _ = stream.shutdown().await;
+            });
+        }
+    });
+    TestOrigin { addr, token }
+}
+
+/// Raw HTTP/1.1 through the edge: `Connection: close` must actually close
+/// the visitor connection once the response is written (RFC 9112 §9.3).
+#[tokio::test]
+async fn test_visitor_connection_close_is_honoured() {
+    assert_connection_close_closes(spawn_test_origin().await).await;
+    assert_connection_close_closes(spawn_closing_origin().await).await;
+}
+
+async fn assert_connection_close_closes(origin: TestOrigin) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let root = "localhost";
+    let relay = spawn_test_relay(root).await;
+
+    let client_token = CancellationToken::new();
+    let c_tok = client_token.clone();
+    let server_addr = format!("localhost:{}", relay.addr.port());
+    let ca_path = relay.ca_pem_path.clone();
+    let opts = start_options(server_addr, &ca_path, origin.port());
+    let client_task = tokio::spawn(async move { weave::run_start_with_token(opts, c_tok).await });
+
+    let hostname = derive_hostname("web", &poc_identity(), root);
+    for _ in 0..50 {
+        if relay.registry.lookup(&hostname).is_some() {
+            break;
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+
+    let connector = TlsConnector::from(create_client_tls_config(vec![b"http/1.1".to_vec()]));
+    let tcp = TcpStream::connect(relay.addr).await.unwrap();
+    let mut tls = connector
+        .connect(ServerName::try_from(hostname.clone()).unwrap(), tcp)
+        .await
+        .unwrap();
+
+    let request = format!("GET / HTTP/1.1\r\nHost: {hostname}\r\nConnection: close\r\n\r\n");
+    tls.write_all(request.as_bytes()).await.unwrap();
+
+    let mut buf = Vec::new();
+    let read = tokio::time::timeout(Duration::from_secs(5), tls.read_to_end(&mut buf))
+        .await
+        .expect("server did not close the connection after `Connection: close`");
+    read.expect("read after Connection: close");
+    assert!(
+        buf.starts_with(b"HTTP/1.1 200"),
+        "unexpected response: {}",
+        String::from_utf8_lossy(&buf[..buf.len().min(120)])
+    );
+    let head_end = buf
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .expect("response head");
+    assert_eq!(
+        &buf[head_end + 4..],
+        b"origin GET / 0 bytes",
+        "body should be complete before close"
+    );
+
+    client_token.cancel();
+    let _ = client_task.await;
+    origin.token.cancel();
+    relay.shutdown_token.cancel();
 }
