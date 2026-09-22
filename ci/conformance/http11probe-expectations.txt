@@ -40,31 +40,3 @@ COMP-HTTP12-VERSION     Fail   hyper rejects HTTP/1.2 request-line with 400 (onl
 SMUG-CL0-BODY-POISON        Fail   CL:0 then stray byte: hyper parses the byte as a new (invalid) request-line; follow-up answered independently, no poisoning
 SMUG-EXPECT-100-CL-DESYNC   Warn   edge sends 100 Continue, forwards body, follow-up answered independently, no poisoning
 SMUG-OPTIONS-CL-BODY-DESYNC Fail   OPTIONS body drained by hyper; follow-up answered independently, no poisoning
-
-# --- Ambiguous CL+TE / TE+CL framing. hyper resolves RFC 9112 §6.1 before the
-#     edge ever sees the request: when Transfer-Encoding is present it drops
-#     Content-Length (TE wins), so the origin receives only
-#     `Transfer-Encoding: chunked` — verified in `tunnel_e2e.rs`. The
-#     forwarded request is therefore unambiguous and no smuggling is possible;
-#     there is no translation defect to fix. The probe's Fail is its
-#     "MUST close after an ambiguous request" rubric meeting an HTTP/1.1
-#     keep-alive proxy: the baseline origin is Python http.server (HTTP/1.0),
-#     which closes after every reply, while the edge keeps the visitor
-#     connection alive and strips the origin's hop-by-hop `Connection: close`
-#     (RFC 9110 §7.6.1). Keeping the visitor connection alive across requests
-#     is a legitimate proxy choice. The GET-with-CL-body cases are the same
-#     desync-rubric limitation documented above for SMUG-CL0-BODY-POISON.
-SMUG-CLTE-PIPELINE              Fail   hyper drops CL (TE wins); forwarded request is unambiguous, probe close rubric vs keep-alive proxy
-SMUG-TECL-PIPELINE              Fail   hyper drops CL (TE wins); forwarded request is unambiguous, probe close rubric vs keep-alive proxy
-SMUG-CLTE-CONN-CLOSE            Fail   hyper drops CL (TE wins); no smuggling, probe close rubric vs keep-alive proxy
-SMUG-TECL-CONN-CLOSE            Fail   hyper drops CL (TE wins); no smuggling, probe close rubric vs keep-alive proxy
-SMUG-CLTE-DESYNC                Fail   hyper drops CL (TE wins); no desync, probe close rubric vs keep-alive proxy
-SMUG-TECL-DESYNC                Fail   hyper drops CL (TE wins); no desync, probe close rubric vs keep-alive proxy
-SMUG-CLTE-SMUGGLED-GET          Fail   hyper drops CL (TE wins); no smuggled response, probe close rubric vs keep-alive proxy
-SMUG-CLTE-SMUGGLED-GET-TE-CASE-MISMATCH   Fail   hyper drops CL (TE wins); no smuggled response, probe close rubric vs keep-alive proxy
-SMUG-CLTE-SMUGGLED-GET-TE-LEADING-COMMA   Fail   hyper drops CL (TE wins); no smuggled response, probe close rubric vs keep-alive proxy
-SMUG-CLTE-SMUGGLED-GET-TE-TRAILING-SPACE  Fail   hyper drops CL (TE wins); no smuggled response, probe close rubric vs keep-alive proxy
-SMUG-CLTE-SMUGGLED-HEAD         Fail   hyper drops CL (TE wins); no smuggled response, probe close rubric vs keep-alive proxy
-SMUG-TECL-SMUGGLED-GET          Fail   hyper drops CL (TE wins); no smuggled response, probe close rubric vs keep-alive proxy
-SMUG-GET-CL-BODY-DESYNC         Warn   CL body drained by hyper; follow-up answered independently, no desync (same rubric limit as SMUG-CL0-BODY-POISON)
-SMUG-GET-CL-PREFIX-DESYNC       Warn   CL body drained by hyper; follow-up answered independently, no desync (same rubric limit as SMUG-CL0-BODY-POISON)
