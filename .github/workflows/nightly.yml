@@ -408,8 +408,12 @@ jobs:
           TUNNEL_HOST="web.laptop.poc.$TARGET_DOMAIN"
           WEAVE_PID=$(cat /tmp/weave.pid)
           echo "Stopping weave client (PID $WEAVE_PID)..."
-          kill -INT $WEAVE_PID
-          wait $WEAVE_PID 2>/dev/null || true
+          # The client may already be gone: the WebSocket step starts a second
+          # `weave start` with the same hard-coded PoC identity, which the relay
+          # treats as superseding this one. Either way the tunnel is gone, which
+          # is what the 404 check below verifies, so a missing PID is fine.
+          kill -INT "$WEAVE_PID" 2>/dev/null || true
+          wait "$WEAVE_PID" 2>/dev/null || true
 
           sleep 2
           echo "Verifying 404 after tunnel termination..."
