@@ -219,6 +219,103 @@ async fn test_https_421_misdirected_requests() {
     shutdown_token.cancel();
 }
 
+// OFF-86: RFC 9112 §3.2 — a request with no Host, more than one Host line,
+// or a malformed Host value MUST get 400, not be routed on a guess (and not
+// 421, which is for a well-formed host the edge does not serve).
+#[tokio::test]
+async fn test_https_400_missing_duplicate_or_invalid_host() {
+    let root_domain = "weaver.test";
+    let (addr, shutdown_token) = spawn_test_https_server(root_domain).await;
+    let client_config = create_test_client_config(vec![b"http/1.1".to_vec()]);
+    let connector = TlsConnector::from(client_config);
+
+    let cases: &[(&str, &[u8])] = &[
+        ("missing Host", b"GET / HTTP/1.1\r\n\r\n"),
+        ("empty Host", b"GET / HTTP/1.1\r\nHost: \r\n\r\n"),
+        (
+            "duplicate identical Host",
+            b"GET / HTTP/1.1\r\nHost: weaver.test\r\nHost: weaver.test\r\n\r\n",
+        ),
+        (
+            "duplicate differing Host",
+            b"GET / HTTP/1.1\r\nHost: weaver.test\r\nHost: other.weaver.test\r\n\r\n",
+        ),
+        (
+            "comma-joined Host",
+            b"GET / HTTP/1.1\r\nHost: weaver.test, other.example.com\r\n\r\n",
+        ),
+        (
+            "Host with userinfo",
+            b"GET / HTTP/1.1\r\nHost: admin@weaver.test\r\n\r\n",
+        ),
+        (
+            "Host with path",
+            b"GET / HTTP/1.1\r\nHost: weaver.test/evil\r\n\r\n",
+        ),
+    ];
+
+    for (label, raw) in cases {
+        let tcp = TcpStream::connect(addr).await.unwrap();
+        let server_name = ServerName::try_from(root_domain).unwrap().to_owned();
+        let mut tls = connector.connect(server_name, tcp).await.unwrap();
+        tls.write_all(raw).await.unwrap();
+        let mut resp = String::new();
+        // No `Connection: close` on the request: the *server* must close.
+        tls.read_to_string(&mut resp).await.unwrap();
+        assert!(
+            resp.starts_with("HTTP/1.1 400 Bad Request"),
+            "{label}: expected 400, got {resp:?}"
+        );
+        assert!(
+            resp.to_ascii_lowercase().contains("connection: close"),
+            "{label}: 400 must close the connection"
+        );
+    }
+
+    shutdown_token.cancel();
+}
+
+// OFF-86: RFC 9113 §8.3.1 — on h2 a `host` header that disagrees with
+// `:authority` is malformed (400); one that agrees is fine.
+#[tokio::test]
+async fn test_https_h2_host_authority_mismatch_is_400() {
+    let root_domain = "weaver.test";
+    let (addr, shutdown_token) = spawn_test_https_server(root_domain).await;
+    let client_config = create_test_client_config(vec![b"h2".to_vec()]);
+    let connector = TlsConnector::from(client_config);
+
+    let tcp = TcpStream::connect(addr).await.unwrap();
+    let server_name = ServerName::try_from(root_domain).unwrap().to_owned();
+    let tls = connector.connect(server_name, tcp).await.unwrap();
+    let (mut sender, conn) = hyper::client::conn::http2::Builder::new(TokioExecutor::new())
+        .handshake(TokioIo::new(tls))
+        .await
+        .unwrap();
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri(format!("https://{root_domain}/healthz"))
+        .header(http::header::HOST, "other.weaver.test")
+        .body(http_body_util::Empty::<Bytes>::new())
+        .unwrap();
+    let res = sender.send_request(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri(format!("https://{root_domain}/healthz"))
+        .header(http::header::HOST, "WEAVER.test:443")
+        .body(http_body_util::Empty::<Bytes>::new())
+        .unwrap();
+    let res = sender.send_request(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    shutdown_token.cancel();
+}
+
 #[tokio::test]
 async fn test_https_http2_alpn_and_request() {
     let root_domain = "weaver.test";

@@ -1942,3 +1942,109 @@ async fn assert_connection_close_closes(origin: TestOrigin) {
     origin.token.cancel();
     relay.shutdown_token.cancel();
 }
+
+/// Regression for the `is_active` flake seen in CI: `register_service`
+/// activates the hostname *before* awaiting the ACME order, and used to set
+/// it active again unconditionally *after*. A client that left during the
+/// order had already been unregistered (route gone, hostname deactivated),
+/// so that trailing write resurrected an orphaned active hostname that the
+/// renewal loop would keep re-issuing. The flag must follow the route.
+#[tokio::test]
+async fn test_client_leaving_during_cert_issuance_does_not_leave_hostname_active() {
+    // An "ACME directory" that accepts the TCP connection and never answers:
+    // `ensure` blocks inside the order for as long as we hold the socket.
+    let stall = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let stall_addr = stall.local_addr().unwrap();
+    let stall_task = tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((sock, _)) = stall.accept().await {
+            held.push(sock);
+        }
+    });
+
+    let root = "localhost";
+    let temp_db = NamedTempFile::new().unwrap();
+    let store = Arc::new(Store::open(temp_db.path()).await.unwrap());
+    let config = Arc::new(Config {
+        root_domain: root.to_string(),
+        admin_email: "admin@weaver.test".to_string(),
+        acme_provider: "custom".to_string(),
+        listen_http: SocketAddr::from(([127, 0, 0, 1], 0)),
+        listen_https: SocketAddr::from(([127, 0, 0, 1], 0)),
+        control_socket: std::path::PathBuf::from("/tmp/dummy.sock"),
+        acme_directory: Some(format!("https://{stall_addr}/dir")),
+        acme_eab_kid: None,
+        acme_eab_hmac: None,
+        acme_root_ca_pem: None,
+        acme_fallback_providers: Vec::new(),
+    });
+    let challenge_registry = Arc::new(ChallengeRegistry::new());
+    let resolver = Arc::new(CertResolver::new(
+        root.to_string(),
+        Arc::clone(&challenge_registry),
+    ));
+    let cert_manager = CertManager::new(
+        Arc::clone(&config),
+        store,
+        resolver,
+        challenge_registry,
+        Arc::new(SystemClock),
+        false,
+    );
+    let registry = Arc::new(TunnelRegistry::new(
+        root.to_string(),
+        Arc::clone(&cert_manager),
+        Arc::new(PocResolver),
+    ));
+
+    let key = PocResolver::KEY_ID;
+    let (superseded_tx, _superseded_rx) = tokio::sync::oneshot::channel();
+    let conn_id = registry.register_connection(key, superseded_tx);
+    let hostname = derive_hostname("web", &poc_identity(), root);
+
+    // Registration: the route is inserted immediately, then the call parks
+    // in the ACME order.
+    let (proxy_tx, _proxy_rx) = tokio::sync::mpsc::channel(1);
+    let reg = {
+        let registry = Arc::clone(&registry);
+        tokio::spawn(async move {
+            registry
+                .register_service(key, conn_id, "web", proxy_tx)
+                .await
+        })
+    };
+    let mut routed = false;
+    for _ in 0..50 {
+        if registry.lookup(&hostname).is_some() {
+            routed = true;
+            break;
+        }
+        sleep(Duration::from_millis(20)).await;
+    }
+    assert!(routed, "route must appear before the order completes");
+    assert!(cert_manager.is_active(&hostname));
+    // Give the order a real chance to finish early if the stall were not
+    // holding: it must still be in flight.
+    sleep(Duration::from_millis(300)).await;
+    assert!(!reg.is_finished(), "the order must still be in flight");
+
+    // The client goes away mid-order.
+    registry.unregister_connection(key, conn_id);
+    assert!(registry.lookup(&hostname).is_none());
+    assert!(!cert_manager.is_active(&hostname));
+
+    // Let the order finish (by failing: the stalled socket is dropped).
+    stall_task.abort();
+    let result = tokio::time::timeout(Duration::from_secs(30), reg)
+        .await
+        .expect("register_service must return once the order fails")
+        .unwrap();
+    assert!(result.is_ok(), "registration itself reports the hostname");
+
+    // The whole point: nothing resurrected the departed tunnel's hostname.
+    assert!(registry.lookup(&hostname).is_none());
+    assert!(
+        !cert_manager.is_active(&hostname),
+        "a hostname whose tunnel left during issuance must not be active"
+    );
+}

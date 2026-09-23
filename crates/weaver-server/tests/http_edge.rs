@@ -93,3 +93,51 @@ async fn test_http_308_redirect_standard_https_port_443() {
     shutdown_token.cancel();
     server_task.await.unwrap();
 }
+
+// OFF-86: RFC 9112 §3.2 on the cleartext edge too — no redirect is built
+// from a missing, duplicated or malformed Host. HTTP/1.0 without Host is
+// the one legitimate hostless request and redirects to the root domain.
+#[tokio::test]
+async fn test_http_400_on_bad_host_but_http10_without_host_redirects() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let shutdown_token = CancellationToken::new();
+
+    let token_clone = shutdown_token.clone();
+    let server_task = tokio::spawn(async move {
+        run_http_server(listener, "weaver.test".to_string(), 443, None, token_clone).await;
+    });
+
+    let bad: &[(&str, &[u8])] = &[
+        ("missing Host", b"GET / HTTP/1.1\r\n\r\n"),
+        (
+            "duplicate Host",
+            b"GET / HTTP/1.1\r\nHost: weaver.test\r\nHost: weaver.test\r\n\r\n",
+        ),
+        (
+            "comma-joined Host",
+            b"GET / HTTP/1.1\r\nHost: weaver.test, evil.example\r\n\r\n",
+        ),
+    ];
+    for (label, raw) in bad {
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        stream.write_all(raw).await.unwrap();
+        let mut resp = String::new();
+        stream.read_to_string(&mut resp).await.unwrap();
+        assert!(
+            resp.starts_with("HTTP/1.1 400 Bad Request"),
+            "{label}: expected 400, got {resp:?}"
+        );
+        assert!(!resp.contains("location:"), "{label}: must not redirect");
+    }
+
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    stream.write_all(b"GET /x HTTP/1.0\r\n\r\n").await.unwrap();
+    let mut resp = String::new();
+    stream.read_to_string(&mut resp).await.unwrap();
+    assert!(resp.starts_with("HTTP/1.0 308"), "got {resp:?}");
+    assert!(resp.contains("location: https://weaver.test/x"));
+
+    shutdown_token.cancel();
+    server_task.await.unwrap();
+}

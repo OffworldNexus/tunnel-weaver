@@ -27,17 +27,34 @@ import ssl
 import sys
 import threading
 
-HOST_RE = re.compile(rb"(?im)^host:[^\r\n]*")
+# Matches the probe's own `host[:port]` token inside a `Host:` line, and only
+# that token: whatever the probe wrapped around it (a `user@`, a `/path`, a
+# `, second-host`, an empty value) stays, so the malformation reaches the
+# edge instead of being sanitised away by the shim.
+PROBE_HOST_RE = re.compile(rb"(?im)^(host:[ \t]*(?:[^\r\n@]*@)?)((?:\d{1,3}\.){3}\d{1,3}|localhost)(?::\d{1,5})?")
+# Same token inside an absolute-form request-target (`GET http://host:port/`).
+# RFC 9112 §3.2.2 makes the edge use *that* authority over `Host`, so it
+# must point at the tunnel too or the probe would be testing the shim.
+PROBE_TARGET_RE = re.compile(rb"(?i)^([A-Z]+ https?://(?:[^\s/@]*@)?)((?:\d{1,3}\.){3}\d{1,3}|localhost)(?::\d{1,5})?")
 
 
 def rewrite_head(buf: bytes, tunnel_host: bytes):
-    """Return (rewritten_head_plus_rest, done) once a blank line is seen."""
+    """Return (rewritten_head_plus_rest, done) once a blank line is seen.
+
+    Leading CRLFs before the request-line are skipped (RFC 9112 §2.2), not
+    mistaken for the end of the head. *Every* ``Host:`` line is rewritten,
+    so a probe that sends two of them still sends two through the tunnel —
+    the shape is what the edge is being tested on, only the value changes.
+    """
+    lead = len(buf) - len(buf.lstrip(b"\r\n"))
+    body = buf[lead:]
     for sep in (b"\r\n\r\n", b"\n\n"):
-        idx = buf.find(sep)
+        idx = body.find(sep)
         if idx != -1:
-            head, rest = buf[: idx + len(sep)], buf[idx + len(sep) :]
-            head = HOST_RE.sub(b"Host: " + tunnel_host, head, count=1)
-            return head + rest, True
+            head, rest = body[: idx + len(sep)], body[idx + len(sep) :]
+            head = PROBE_HOST_RE.sub(rb"\g<1>" + tunnel_host, head)
+            head = PROBE_TARGET_RE.sub(rb"\g<1>" + tunnel_host, head)
+            return buf[:lead] + head + rest, True
     return buf, False
 
 
@@ -100,16 +117,20 @@ def handle(client, tunnel_host: str, edge_host: str, ctx: ssl.SSLContext):
             # Only hold bytes back while they look like the start of a
             # request head; anything else (a body, garbage the probe sends on
             # purpose) goes straight through.
-            first_line_end = state["buf"].find(b"\n")
-            probe = state["buf"] if first_line_end == -1 else state["buf"][:first_line_end]
-            looks_like_head = method_re.match(probe.lstrip(b"\r\n")) is not None
+            # RFC 9112 §2.2 lets a server ignore CRLFs before a request-line;
+            # skip them here too so the head behind them still gets its Host
+            # patched (the bytes themselves are forwarded untouched).
+            lead = len(state["buf"]) - len(state["buf"].lstrip(b"\r\n"))
+            first_line_end = state["buf"].find(b"\n", lead)
+            probe = state["buf"][lead:] if first_line_end == -1 else state["buf"][lead:first_line_end]
+            looks_like_head = method_re.match(probe) is not None
             if not looks_like_head and first_line_end != -1:
                 out += state["buf"]
                 state["buf"] = b""
                 break
             patched, done = rewrite_head(state["buf"], thost)
             if not done:
-                if len(state["buf"]) > 64 * 1024:
+                if len(state["buf"]) > 1024 * 1024:
                     out, state["buf"] = out + state["buf"], b""
                 break
             cut = None

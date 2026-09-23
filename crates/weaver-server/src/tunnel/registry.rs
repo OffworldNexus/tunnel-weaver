@@ -161,10 +161,31 @@ impl TunnelRegistry {
             }
         }
 
-        // Trigger certificate issuance and mark active in renewal manager
+        // Trigger certificate issuance. `ensure` marks the hostname active
+        // before it awaits the ACME order; the order can take long enough
+        // for the client to have gone away meanwhile, in which case
+        // `unregister_*` already removed the route and deactivated the
+        // hostname. The active flag must follow the *route*, so it is
+        // reconciled against the table after the await rather than set
+        // unconditionally — otherwise a departed tunnel leaves an orphaned
+        // hostname that the renewal loop keeps re-issuing forever.
         let _ = self.cert_manager.ensure(&host_lower).await;
-        self.cert_manager.set_active(&host_lower, true);
-        info!(hostname = %host_lower, "Tunnel service registered");
+        let still_routed = {
+            // Held across `set_active` so an unregister cannot slip in
+            // between the check and the flag (it takes the same lock
+            // first, in the same order).
+            let routes = self.routes.read().unwrap();
+            let routed = routes
+                .get(&host_lower)
+                .is_some_and(|route| route.key_id == key_id);
+            self.cert_manager.set_active(&host_lower, routed);
+            routed
+        };
+        if still_routed {
+            info!(hostname = %host_lower, "Tunnel service registered");
+        } else {
+            info!(hostname = %host_lower, "Tunnel service left during certificate issuance");
+        }
 
         Ok(host_lower)
     }

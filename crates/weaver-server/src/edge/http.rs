@@ -9,7 +9,7 @@ use std::convert::Infallible;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use http::{Request, Response, StatusCode};
+use http::{Request, Response, StatusCode, Version};
 use http_body_util::Full;
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioExecutor, TokioIo};
@@ -17,9 +17,10 @@ use hyper_util::server::conn::auto::Builder;
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
-use tracing::{info, trace};
+use tracing::{debug, info, trace};
 
 use crate::cert::challenge::ChallengeRegistry;
+use crate::edge::host::{HostError, request_host};
 
 /// Shared state for HTTP edge service.
 #[derive(Clone, Default)]
@@ -73,12 +74,26 @@ pub async fn handle_http_redirect(
         return Ok(response);
     }
 
-    let host_header = req
-        .headers()
-        .get(http::header::HOST)
-        .and_then(|h| h.to_str().ok())
-        .or_else(|| req.uri().authority().map(|a| a.as_str()))
-        .unwrap_or("");
+    // RFC 9112 §3.2: no routing — not even a redirect — on a missing,
+    // duplicated or malformed `Host`. HTTP/1.0 without `Host` is the one
+    // legitimate hostless shape; it is redirected to the root domain.
+    let host = match request_host(&req) {
+        Ok(host) => host,
+        Err(HostError::Missing) if req.version() == Version::HTTP_10 => String::new(),
+        Err(reason) => {
+            debug!(
+                ?reason,
+                "Rejecting cleartext request without a usable Host with 400"
+            );
+            let response = Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .header(http::header::CONNECTION, "close")
+                .header(http::header::CONTENT_TYPE, "text/plain; charset=utf-8")
+                .body(Full::new(Bytes::from("400 Bad Request: invalid Host\n")))
+                .unwrap();
+            return Ok(response);
+        }
+    };
 
     let path_and_query = req
         .uri()
@@ -86,7 +101,7 @@ pub async fn handle_http_redirect(
         .map(|pq| pq.as_str())
         .unwrap_or("/");
 
-    let target_host = format_target_host(host_header, &config.root_domain, config.https_port);
+    let target_host = format_target_host(&host, &config.root_domain, config.https_port);
     let location = format!("https://{target_host}{path_and_query}");
 
     trace!(%location, "Redirecting cleartext HTTP request to HTTPS");
