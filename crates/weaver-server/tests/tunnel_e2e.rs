@@ -1972,7 +1972,7 @@ async fn test_client_leaving_during_cert_issuance_does_not_leave_hostname_active
         listen_http: SocketAddr::from(([127, 0, 0, 1], 0)),
         listen_https: SocketAddr::from(([127, 0, 0, 1], 0)),
         control_socket: std::path::PathBuf::from("/tmp/dummy.sock"),
-        acme_directory: Some(format!("http://{stall_addr}/dir")),
+        acme_directory: Some(format!("https://{stall_addr}/dir")),
         acme_eab_kid: None,
         acme_eab_hmac: None,
         acme_root_ca_pem: None,
@@ -2023,6 +2023,9 @@ async fn test_client_leaving_during_cert_issuance_does_not_leave_hostname_active
     }
     assert!(routed, "route must appear before the order completes");
     assert!(cert_manager.is_active(&hostname));
+    // Give the order a real chance to finish early if the stall were not
+    // holding: it must still be in flight.
+    sleep(Duration::from_millis(300)).await;
     assert!(!reg.is_finished(), "the order must still be in flight");
 
     // The client goes away mid-order.
