@@ -20,6 +20,7 @@ use tokio_util::task::TaskTracker;
 use tracing::{debug, info, trace};
 
 use crate::cert::resolver::CertResolver;
+use crate::edge::host::request_host;
 use crate::edge::waf;
 use crate::tunnel::proxy::{BoxBody, empty_body, forward_visitor_request, full_body};
 use crate::tunnel::registry::TunnelRegistry;
@@ -46,21 +47,6 @@ impl std::fmt::Debug for HttpsEdgeConfig {
     }
 }
 
-/// Helper to parse and strip any port component from an authority or Host header value.
-pub fn extract_host_without_port(raw: &str) -> String {
-    let trimmed = raw.trim();
-    if trimmed.starts_with('[')
-        && let Some(close_bracket) = trimmed.find(']')
-    {
-        return trimmed[..=close_bracket].to_string();
-    }
-    if let Some((host, _port)) = trimmed.split_once(':') {
-        host.to_string()
-    } else {
-        trimmed.to_string()
-    }
-}
-
 /// Determines whether a host string is an IPv4 or IPv6 address literal.
 pub fn is_ip_literal(host: &str) -> bool {
     let unbracketed = if host.starts_with('[') && host.ends_with(']') {
@@ -80,13 +66,6 @@ pub async fn handle_https_request(
     client_sni: Option<String>,
     remote_addr: SocketAddr,
 ) -> Result<Response<BoxBody>, Infallible> {
-    let host_header = req
-        .headers()
-        .get(http::header::HOST)
-        .and_then(|h| h.to_str().ok())
-        .or_else(|| req.uri().authority().map(|a| a.as_str()))
-        .unwrap_or("");
-
     // The relay is a reverse proxy, never a forward proxy: a plain `CONNECT`
     // (tunnelling to an arbitrary authority) is rejected with 405. An RFC
     // 8441 extended CONNECT carries a `:protocol` pseudo-header and is the
@@ -107,11 +86,27 @@ pub async fn handle_https_request(
         return Ok(resp);
     }
 
-    let host = extract_host_without_port(host_header);
+    // RFC 9112 §3.2 / RFC 9113 §8.3.1: a request with no host, more than
+    // one `Host` line, a malformed value, or (h2) a `host` that disagrees
+    // with `:authority` is a 400, never routed on a guess. Duplicate `Host`
+    // in particular is a request-smuggling shape and the edge must refuse
+    // it before anything is forwarded. `Connection: close` because the
+    // framing of what follows on that connection can no longer be trusted.
+    let host = match request_host(&req) {
+        Ok(host) => host,
+        Err(reason) => {
+            debug!(?reason, "Rejecting request without a usable Host with 400");
+            return Ok(Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .header(http::header::CONNECTION, "close")
+                .body(full_body("400 Bad Request: invalid Host\n"))
+                .unwrap());
+        }
+    };
 
-    // Reject empty host or IP literal host with 421 Misdirected Request
-    if host.is_empty() || is_ip_literal(&host) {
-        debug!(%host, "Rejecting empty or IP literal host on HTTPS with 421");
+    // Reject IP literal host with 421 Misdirected Request
+    if is_ip_literal(&host) {
+        debug!(%host, "Rejecting IP literal host on HTTPS with 421");
         return Ok(Response::builder()
             .status(StatusCode::MISDIRECTED_REQUEST)
             .body(full_body("421 Misdirected Request\n"))

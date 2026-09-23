@@ -18,11 +18,6 @@ COMP-TRACE-WITH-BODY    Fail   WAF rejects TRACE with 403 regardless of body
 # --- Edge WAF: %00 in the path is refused with 403 (Verdict::Malformed).
 MAL-URL-PERCENT-NULL    Warn   WAF answers 403 to a percent-encoded NUL; probe rubric expects 400 or 2xx/404
 
-# --- Strict virtual hosting: the edge requires Host == SNI (421 otherwise),
-#     and a request with no Host at all cannot be routed to a tunnel.
-COMP-HTTP10-NO-HOST     Fail   HTTP/1.0 without Host cannot be routed; edge answers 421 by design (Host must match SNI)
-COMP-LEADING-CRLF       Fail   leading CRLF makes the shim/edge treat the head as hostless; 421 by design
-
 # --- hyper's h1 parser: HTTP/1.2 is rejected with 400 (only 1.0/1.1 are
 #     parsed). RFC 9110 §2.5 says higher minor versions SHOULD be accepted;
 #     this is hyper's stance, not a proxy translation. Tracked, not ours.
