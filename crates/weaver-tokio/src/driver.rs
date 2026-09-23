@@ -27,6 +27,12 @@ pub trait StreamHandler: Send + 'static {
 
 type Command<H> = Box<dyn FnOnce(&mut Connection, &mut H) + Send>;
 
+/// What the saturated-send fast path found ready without blocking.
+enum Input<T, H> {
+    Transport(Option<Result<Option<Bytes>, T>>),
+    Command(Option<Command<H>>),
+}
+
 /// Cloneable handle other tasks use to act on the connection and the
 /// handler from inside the driver's loop.
 pub struct Handle<H> {
@@ -138,39 +144,94 @@ impl<T: Transport, H: StreamHandler> Driver<T, H> {
                 .next_timeout()
                 .map_or(IDLE_WAKE, |t| t.saturating_duration_since(now));
 
-            tokio::select! {
-                _ = tokio::time::sleep(sleep_for) => {
-                    self.conn.handle_timeout(Instant::now());
-                }
-                msg = self.transport.next() => match msg {
-                    Some(Ok(Some(bytes))) => {
-                        if let Err(e) = self.conn.recv(Instant::now(), &bytes) {
-                            debug!(error = %e, "mux protocol error");
-                            outcome = Some(Err(DriverError::Protocol(e)));
+            // With frames still queued after a bounded flush, do not block
+            // here: service whatever input or command is *already* ready,
+            // then go straight back to sending. `select!` polls its arms in
+            // random order, so neither input nor commands can starve the
+            // other while the scheduler is saturated — a command channel
+            // that never got a turn is how a Ctrl-C failed to stop a flood.
+            if self.conn.wants_transmit() {
+                self.conn.handle_timeout(Instant::now());
+                let polled = tokio::select! {
+                    biased;
+                    msg = self.transport.next() => Some(Input::Transport(msg)),
+                    cmd = self.cmd_rx.recv() => Some(Input::Command(cmd)),
+                    () = std::future::ready(()) => None,
+                };
+                match polled {
+                    Some(Input::Transport(msg)) => match self.on_transport(msg) {
+                        Some(Err(DriverError::Protocol(e))) => {
+                            outcome = Some(Err(DriverError::Protocol(e)))
                         }
+                        Some(r) => return r,
+                        None => {}
+                    },
+                    Some(Input::Command(Some(cmd))) => cmd(&mut self.conn, &mut self.handler),
+                    Some(Input::Command(None)) | None => {}
+                }
+                self.dispatch_events();
+                if outcome.is_none() && self.conn.is_closed() {
+                    outcome = Some(Ok(self.close_reason()));
+                }
+                // Cooperative yield so other tasks (the peer in tests, the
+                // origin pump in production) get scheduled between bursts.
+                tokio::task::yield_now().await;
+                continue;
+            }
+
+            tokio::select! {
+                // Input first when both are ready: an inbound PONG or
+                // WINDOW_UPDATE is what lets the send side make progress.
+                biased;
+                msg = self.transport.next() => {
+                    match self.on_transport(msg) {
+                        Some(Err(DriverError::Protocol(e))) => outcome = Some(Err(DriverError::Protocol(e))),
+                        Some(r) => return r,
+                        None => {}
                     }
-                    Some(Ok(None)) => {}
-                    Some(Err(e)) => {
-                        debug!(error = %e, "transport error");
-                        self.finish(CloseReason::new(CloseCode::Shutdown));
-                        return Err(DriverError::Transport(Box::new(e)));
-                    }
-                    None => {
-                        trace!("transport closed");
-                        self.finish(CloseReason::new(CloseCode::Shutdown));
-                        return Err(DriverError::TransportClosed);
-                    }
-                },
+                }
                 cmd = self.cmd_rx.recv() => {
                     if let Some(cmd) = cmd {
                         cmd(&mut self.conn, &mut self.handler);
                     }
+                }
+                _ = tokio::time::sleep(sleep_for) => {
+                    self.conn.handle_timeout(Instant::now());
                 }
             }
 
             self.dispatch_events();
             if outcome.is_none() && self.conn.is_closed() {
                 outcome = Some(Ok(self.close_reason()));
+            }
+        }
+    }
+
+    /// Feed one transport item to the mux. `Some(Err(Protocol))` means the
+    /// mux queued its GOAWAY and the caller should flush before returning;
+    /// other `Some` results are terminal transport failures.
+    fn on_transport(
+        &mut self,
+        msg: Option<Result<Option<Bytes>, T::Err>>,
+    ) -> Option<Result<CloseReason, DriverError>> {
+        match msg {
+            Some(Ok(Some(bytes))) => {
+                if let Err(e) = self.conn.recv(Instant::now(), &bytes) {
+                    debug!(error = %e, "mux protocol error");
+                    return Some(Err(DriverError::Protocol(e)));
+                }
+                None
+            }
+            Some(Ok(None)) => None,
+            Some(Err(e)) => {
+                debug!(error = %e, "transport error");
+                self.finish(CloseReason::new(CloseCode::Shutdown));
+                Some(Err(DriverError::Transport(Box::new(e))))
+            }
+            None => {
+                trace!("transport closed");
+                self.finish(CloseReason::new(CloseCode::Shutdown));
+                Some(Err(DriverError::TransportClosed))
             }
         }
     }
@@ -184,9 +245,39 @@ impl<T: Transport, H: StreamHandler> Driver<T, H> {
         }
     }
 
+    /// Drain what the mux wants to send, one frame per transport message.
+    ///
+    /// Two liveness rules are enforced here, both learned the hard way under
+    /// a sustained bulk transfer over a real WAN:
+    ///
+    /// * Each frame is awaited (a full flush), so while the scheduler is
+    ///   never empty this loop would monopolise the event loop and the
+    ///   `select!` in `run_inner` — the only place the mux's PING timer and
+    ///   the peer's incoming PINGs are serviced — would starve. The peer's
+    ///   `idle_timeout` (60 s) then fires and it drops us with `Timeout`.
+    ///   So the mux clock is re-observed on every iteration and expired
+    ///   timers are handled *inside* the loop; the resulting PING is queued
+    ///   as control traffic and goes out with the next frame.
+    /// * The loop yields after a bounded number of frames regardless, so
+    ///   inbound frames (PONGs, WINDOW_UPDATEs, RSTs) are read even when the
+    ///   scheduler always has more to send. Without this the send side can
+    ///   deadlock on flow control it never learns was released.
     async fn flush(&mut self) -> Result<(), DriverError> {
-        let now = Instant::now();
-        while self.conn.poll_transmit(now, &mut self.buf) {
+        const MAX_FRAMES_PER_FLUSH: usize = 64;
+        // Never spend longer than this in one flush regardless of how many
+        // frames the transport accepted: with a fast link 64 frames is
+        // nothing, with a slow one it is long enough to miss a PING.
+        const MAX_FLUSH_TIME: Duration = Duration::from_millis(20);
+        let started = Instant::now();
+        for _ in 0..MAX_FRAMES_PER_FLUSH {
+            let now = Instant::now();
+            self.conn.handle_timeout(now);
+            if now.saturating_duration_since(started) > MAX_FLUSH_TIME {
+                break;
+            }
+            if !self.conn.poll_transmit(now, &mut self.buf) {
+                break;
+            }
             let frame = Bytes::from(std::mem::take(&mut self.buf));
             self.transport
                 .send(frame)

@@ -1,0 +1,42 @@
+# Http11Probe verdicts the *tunnel* must produce where "same as the origin"
+# is not the right bar. One per line:
+#   <TEST-ID>   <Pass|Warn|Fail|Error|Skip>   <one-line justification>
+#
+# Tests not listed here must score at least as well through the tunnel as
+# against the origin directly (check_http11probe.sh). Add an entry only
+# when the edge is *supposed* to behave differently from a plain origin.
+# Every entry below pins a deliberate edge behaviour; "Fail" here means
+# "the probe's rubric calls it a failure, and we disagree on purpose".
+
+# --- Edge WAF: TRACE is refused with 403 before the tunnel (edge::waf).
+#     The probe wants 405/501; 403 is the WAF's uniform answer and the
+#     origin is never consulted, which is the stricter outcome.
+COMP-METHOD-TRACE       Fail   WAF rejects TRACE with 403 at the edge; origin never sees it
+COMP-TRACE-SENSITIVE    Fail   WAF rejects TRACE with 403; nothing is echoed so nothing sensitive leaks
+COMP-TRACE-WITH-BODY    Fail   WAF rejects TRACE with 403 regardless of body
+
+# --- Edge WAF: %00 in the path is refused with 403 (Verdict::Malformed).
+MAL-URL-PERCENT-NULL    Warn   WAF answers 403 to a percent-encoded NUL; probe rubric expects 400 or 2xx/404
+
+# --- Strict virtual hosting: the edge requires Host == SNI (421 otherwise),
+#     and a request with no Host at all cannot be routed to a tunnel.
+COMP-HTTP10-NO-HOST     Fail   HTTP/1.0 without Host cannot be routed; edge answers 421 by design (Host must match SNI)
+COMP-LEADING-CRLF       Fail   leading CRLF makes the shim/edge treat the head as hostless; 421 by design
+
+# --- hyper's h1 parser: HTTP/1.2 is rejected with 400 (only 1.0/1.1 are
+#     parsed). RFC 9110 §2.5 says higher minor versions SHOULD be accepted;
+#     this is hyper's stance, not a proxy translation. Tracked, not ours.
+COMP-HTTP12-VERSION     Fail   hyper rejects HTTP/1.2 request-line with 400 (only 1.0/1.1 parsed); not a tunnel translation
+
+# --- Desync rubric vs. an HTTP/1.0 baseline origin. Python http.server is
+#     HTTP/1.0 and closes after every reply, so it "passes" every desync
+#     test trivially: there is no live connection for a follow-up to poison.
+#     The tunnel keeps the visitor's HTTP/1.1 connection open (correct),
+#     hyper reads and discards the declared body (correct), and the
+#     follow-up is answered as its own request. The probe's rubric cannot
+#     tell "answered independently" from "poisoned" and marks it; the
+#     `Step 1 / Step 2` notes in the report show independent statuses
+#     (501 for the method the origin rejects, 200 for the GET). No poisoning.
+SMUG-CL0-BODY-POISON        Fail   CL:0 then stray byte: hyper parses the byte as a new (invalid) request-line; follow-up answered independently, no poisoning
+SMUG-EXPECT-100-CL-DESYNC   Warn   edge sends 100 Continue, forwards body, follow-up answered independently, no poisoning
+SMUG-OPTIONS-CL-BODY-DESYNC Fail   OPTIONS body drained by hyper; follow-up answered independently, no poisoning

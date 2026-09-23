@@ -19,10 +19,11 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 use tracing::{debug, info, trace};
 
-use crate::assets::{NO_TUNNEL_HTML, WELCOME_HTML, apply_security_headers};
 use crate::cert::resolver::CertResolver;
+use crate::edge::waf;
 use crate::tunnel::proxy::{BoxBody, empty_body, forward_visitor_request, full_body};
 use crate::tunnel::registry::TunnelRegistry;
+use weaver_assets::{NO_TUNNEL_HTML, WELCOME_HTML, apply_security_headers};
 
 /// Shared state for HTTPS request dispatch.
 #[derive(Clone)]
@@ -70,7 +71,7 @@ pub fn is_ip_literal(host: &str) -> bool {
     unbracketed.parse::<IpAddr>().is_ok()
 }
 
-pub use weaver_tokio::set_tcp_notsent_lowat;
+pub use weaver_tokio::{set_tcp_nodelay, set_tcp_notsent_lowat};
 
 /// Dispatches an HTTPS request based on SNI and Host header validation.
 pub async fn handle_https_request(
@@ -85,6 +86,26 @@ pub async fn handle_https_request(
         .and_then(|h| h.to_str().ok())
         .or_else(|| req.uri().authority().map(|a| a.as_str()))
         .unwrap_or("");
+
+    // The relay is a reverse proxy, never a forward proxy: a plain `CONNECT`
+    // (tunnelling to an arbitrary authority) is rejected with 405. An RFC
+    // 8441 extended CONNECT carries a `:protocol` pseudo-header and is the
+    // WebSocket-over-h2 case, handled by the upgrade path.
+    if req.method() == Method::CONNECT && req.extensions().get::<hyper::ext::Protocol>().is_none() {
+        debug!("Rejecting forward-proxy CONNECT with 405");
+        let mut resp = Response::builder()
+            .status(StatusCode::METHOD_NOT_ALLOWED)
+            .header(
+                http::header::ALLOW,
+                "GET, POST, PUT, PATCH, DELETE, HEAD, OPTIONS",
+            )
+            .body(full_body(
+                "405 Method Not Allowed: CONNECT is not supported\n",
+            ))
+            .unwrap();
+        apply_security_headers(&mut resp, false);
+        return Ok(resp);
+    }
 
     let host = extract_host_without_port(host_header);
 
@@ -234,6 +255,31 @@ pub async fn handle_https_request(
     } else if host_lower.ends_with(&format!(".{root_lower}"))
         && host_lower.len() > root_lower.len() + 1
     {
+        // Always-on edge firewall: scanner probes are refused here so they
+        // never open a tunnel stream or reach the origin (see `edge::waf`).
+        let raw_path = req
+            .uri()
+            .path_and_query()
+            .map(|pq| pq.as_str())
+            .unwrap_or(req.uri().path());
+        if let Some(verdict) = waf::inspect(req.method(), raw_path) {
+            debug!(
+                hostname = %host_lower,
+                visitor = %remote_addr.ip(),
+                method = %req.method(),
+                path = raw_path,
+                rule = verdict.as_str(),
+                "WAF blocked request"
+            );
+            let mut resp = Response::builder()
+                .status(StatusCode::FORBIDDEN)
+                .header("x-weaver-blocked", verdict.as_str())
+                .body(full_body(weaver_assets::render_forbidden(verdict.as_str())))
+                .unwrap();
+            apply_security_headers(&mut resp, include_hsts);
+            return Ok(resp);
+        }
+
         // Check if there is an active tunnel for this subdomain
         if let Some(ref reg) = config.tunnel_registry
             && let Some(route) = reg.lookup(&host_lower)
@@ -251,9 +297,10 @@ pub async fn handle_https_request(
                 }
                 Err(_) => {
                     debug!(hostname = %host_lower, "Tunnel error 502");
+                    let html = weaver_assets::render_bad_gateway(&host_lower);
                     let mut resp = Response::builder()
                         .status(StatusCode::BAD_GATEWAY)
-                        .body(full_body("502 Bad Gateway\n"))
+                        .body(full_body(html))
                         .unwrap();
                     apply_security_headers(&mut resp, include_hsts);
                     return Ok(resp);
@@ -312,7 +359,10 @@ pub async fn run_https_server_with_registry(
         tunnel_registry,
     });
     let acceptor = TlsAcceptor::from(tls_config);
-    let auto_builder = Builder::new(TokioExecutor::new());
+    let mut auto_builder = Builder::new(TokioExecutor::new());
+    // Advertise SETTINGS_ENABLE_CONNECT_PROTOCOL so h2 visitors can carry
+    // WebSocket as an RFC 8441 extended CONNECT (see ADR 0006).
+    auto_builder.http2().enable_connect_protocol();
     let tracker = TaskTracker::new();
 
     let addr_str = listener
@@ -341,7 +391,12 @@ pub async fn run_https_server_with_registry(
                     }
                 };
 
-                // Apply TCP_NOTSENT_LOWAT before TLS handshake wrapping
+                // Disable Nagle and apply TCP_NOTSENT_LOWAT before TLS
+                // handshake wrapping. Without NODELAY the response head and
+                // its first body chunk go out as separate small writes with
+                // the body held until the head is ACKed — a full RTT of added
+                // latency on every WAN visitor connection.
+                set_tcp_nodelay(&tcp_stream);
                 set_tcp_notsent_lowat(&tcp_stream);
 
                 let tls_acceptor = acceptor.clone();

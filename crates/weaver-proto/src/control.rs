@@ -123,7 +123,12 @@ mod tests {
     }
 }
 
-/// Control stream response sent by the relay on the same stream.
+/// Control stream messages sent by the relay on the same stream.
+///
+/// `Registered` or `Refused` is always the first reply. While the lease is
+/// open the relay may then push any number of [`ControlReply::CertState`]
+/// notices as the hostname's certificate moves through its lifecycle, so the
+/// client can show a live indicator without polling.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ControlReply {
     /// Service registration succeeded.
@@ -138,4 +143,43 @@ pub enum ControlReply {
         /// Human-readable explanation.
         message: String,
     },
+    /// The certificate for the registered hostname changed state.
+    CertState {
+        /// Current state.
+        state: CertStatus,
+    },
+}
+
+/// Certificate lifecycle as seen by the client. Mirrors the relay's cert
+/// manager states without exposing timestamps or error internals.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CertStatus {
+    /// Not yet ordered.
+    Pending,
+    /// ACME order in flight; visitors are held at the TLS layer.
+    Ordering,
+    /// Valid certificate being served.
+    Issued,
+    /// Valid certificate being served while a renewal runs.
+    Renewing,
+    /// Order failed; the relay will retry, visitors are refused.
+    Failed,
+}
+
+impl CertStatus {
+    /// Short lowercase label.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Ordering => "ordering",
+            Self::Issued => "issued",
+            Self::Renewing => "renewing",
+            Self::Failed => "failed",
+        }
+    }
+
+    /// Whether visitors can currently reach the service over TLS.
+    pub fn is_serving(self) -> bool {
+        matches!(self, Self::Issued | Self::Renewing)
+    }
 }

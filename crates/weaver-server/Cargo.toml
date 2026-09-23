@@ -23,7 +23,7 @@ base64 = { workspace = true }
 bytes = { workspace = true }
 clap = { workspace = true }
 comfy-table = { workspace = true }
-crossterm = "0.29"
+crossterm = { workspace = true }
 futures-util = { workspace = true }
 http = { workspace = true }
 http-body-util = { workspace = true }
@@ -48,6 +48,7 @@ tokio-tungstenite = { workspace = true }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+weaver-assets = { workspace = true }
 weaver-mux = { workspace = true }
 weaver-proto = { workspace = true }
 weaver-tokio = { workspace = true }

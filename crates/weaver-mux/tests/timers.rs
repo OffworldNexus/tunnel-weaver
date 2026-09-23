@@ -177,3 +177,36 @@ fn set_reverify(cfg: &mut weaver_mux::Config, every: Duration) {
         weaver_mux::Role::Client { .. } => unreachable!(),
     }
 }
+
+/// Regression: a side that only *sends* (a long bulk upload) must still
+/// PING the peer when the peer has been quiet, otherwise it never learns
+/// whether the peer is alive and later closes itself with `Timeout` in the
+/// middle of a healthy transfer. The keepalive clock is the peer's last
+/// frame, not our own last send.
+#[test]
+fn one_way_bulk_sender_still_pings() {
+    let mut p = Pair::authenticated();
+    let id = p.client.open(weaver_mux::Class::Bulk).unwrap();
+    let chunk = vec![7u8; 1024];
+    // Keep the client sending continuously, well past PING, without the
+    // server ever answering (it consumes but stays silent — no WINDOW_UPDATE
+    // needed for these small amounts).
+    let mut buf = Vec::new();
+    for _ in 0..(PING.as_millis() / 100 + 5) {
+        p.clock.advance(Duration::from_millis(100));
+        let now = p.clock.now();
+        let _ = p.client.send(id, &chunk, weaver_mux::Compress::Never);
+        p.client.handle_timeout(now);
+        // Drain what the client wants to send; deliver DATA to the server,
+        // and stop at the first PING.
+        while p.client.poll_transmit(now, &mut buf) {
+            let ty = Frame::parse(&buf).unwrap().frame_type;
+            if ty == FrameType::Ping {
+                return; // pinged while never idle by its own clock: good.
+            }
+            p.server.recv(now, &buf).unwrap();
+            while p.server.poll_event().is_some() {}
+        }
+    }
+    panic!("client never sent a PING during a one-way bulk transfer");
+}

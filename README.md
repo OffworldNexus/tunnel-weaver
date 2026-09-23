@@ -9,6 +9,7 @@ The project is structured as a Cargo workspace:
 - **`crates/weaver-mux`**: Sans-IO stream multiplexer framing layer (`Frame::parse`).
 - **`crates/weaver-proto`**: Shared protocol constants (`PROTOCOL_VERSION`) and core definitions.
 - **`crates/weaver-server`**: Relay server binary (Linux-only).
+- **`crates/weaver-assets`**: Shared embedded branded HTML error pages and security headers.
 - **`crates/weave`**: Tunnel Weaver client CLI binary (Linux, macOS, Windows).
 - **`fuzz/`**: LibFuzzer targets executed continuously in CI.
 

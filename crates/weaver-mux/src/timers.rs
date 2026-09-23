@@ -87,13 +87,17 @@ impl Timers {
         self.last_send = now;
     }
 
-    fn last_activity(&self) -> Instant {
-        self.last_recv.max(self.last_send)
-    }
-
+    /// A PING is due after `ping_interval` of silence *from the peer*.
+    ///
+    /// It must be keyed on `last_recv`, not on our own sends: during a
+    /// one-way bulk transfer the sender is never idle by its own clock, so
+    /// keying on `max(recv, send)` meant it never pinged, got nothing back,
+    /// and closed itself with `Timeout` after `idle_timeout` — a live
+    /// connection dropped in the middle of a healthy transfer. Probing the
+    /// peer whenever *it* has been quiet is what keepalive is for.
     fn ping_due(&self) -> Option<Instant> {
         if self.authenticated && self.ping_outstanding.is_none() {
-            Some(self.last_activity() + self.ping_interval)
+            Some(self.last_recv + self.ping_interval)
         } else {
             None
         }

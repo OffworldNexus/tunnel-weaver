@@ -4,9 +4,15 @@
 //! runs in seconds, while the GitHub Actions `e2e-linux` job exercises the full
 //! ACME order lifecycle, EAB authentication, and TLS-ALPN-01 verification against Pebble.
 
+use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Duration;
 
+use bytes::Bytes;
+use http::{Request, Response, StatusCode};
+use http_body_util::Full;
+use hyper::service::service_fn;
+use hyper_util::rt::TokioIo;
 use rustls::pki_types::{CertificateDer, ServerName};
 use tempfile::tempdir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -14,6 +20,7 @@ use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::Mutex;
 use tokio_rustls::TlsConnector;
 use tokio_util::sync::CancellationToken;
+use weave::{ServiceSpec, StartOptions, Target};
 
 use weaver_server::cert::CertManager;
 use weaver_server::cert::challenge::ChallengeRegistry;
@@ -574,19 +581,56 @@ async fn test_pebble_e2e_tunnel_registration_and_proxying() {
     let mut ca_file = tempfile::NamedTempFile::new().unwrap();
     std::io::Write::write_all(&mut ca_file, ca_bundle.as_bytes()).unwrap();
 
+    // Start a real in-process origin for `weave start` to proxy to.
+    let origin_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin_port = origin_listener.local_addr().unwrap().port();
+    let origin_token = CancellationToken::new();
+    let o_tok = origin_token.clone();
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = tokio::select! {
+                _ = o_tok.cancelled() => break,
+                r = origin_listener.accept() => match r {
+                    Ok(pair) => pair,
+                    Err(_) => continue,
+                },
+            };
+            tokio::spawn(async move {
+                let service = service_fn(|_req: Request<hyper::body::Incoming>| async {
+                    Ok::<_, Infallible>(
+                        Response::builder()
+                            .status(StatusCode::OK)
+                            .header("x-origin", "yes")
+                            .body(Full::new(Bytes::from_static(b"hello from origin")))
+                            .unwrap(),
+                    )
+                });
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(TokioIo::new(stream), service)
+                    .await;
+            });
+        }
+    });
+
     // Start weave client
     let client_token = CancellationToken::new();
     let c_tok = client_token.clone();
     let ca_path = ca_file.path().to_path_buf();
-    let client_task = tokio::spawn(async move {
-        weave::run_poc_with_token(
-            "web".to_string(),
-            format!("pebble.test:{https_port}"),
-            Some(&ca_path),
-            c_tok,
-        )
-        .await
-    });
+    let opts = StartOptions {
+        specs: vec![ServiceSpec {
+            service: "web".to_string(),
+            target: Target::parse(&format!("http://127.0.0.1:{origin_port}")).unwrap(),
+        }],
+        server: format!("pebble.test:{https_port}"),
+        insecure_root_ca: Some(ca_path),
+        insecure_targets: Vec::new(),
+        preserve_host: Vec::new(),
+        no_rewrite: Vec::new(),
+        append_forwarded: Vec::new(),
+        quiet: true,
+        verbose: false,
+    };
+    let client_task = tokio::spawn(async move { weave::run_start_with_token(opts, c_tok).await });
 
     // Wait for certificate to be issued and service registered
     let target_hostname = "web.laptop.poc.pebble.test";
@@ -622,8 +666,8 @@ async fn test_pebble_e2e_tunnel_registration_and_proxying() {
     .unwrap();
     let mut resp = String::new();
     tls.read_to_string(&mut resp).await.unwrap();
-    assert!(resp.starts_with("HTTP/1.1 302 Found"));
-    assert!(resp.contains("https://www.youtube.com/watch?v=dQw4w9WgXcQ"));
+    assert!(resp.starts_with("HTTP/1.1 200 OK"), "resp: {resp}");
+    assert!(resp.contains("hello from origin"), "resp: {resp}");
 
     // Terminate client
     client_token.cancel();

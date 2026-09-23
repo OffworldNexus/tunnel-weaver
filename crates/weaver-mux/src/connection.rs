@@ -243,6 +243,13 @@ impl Connection {
     // Transmit
     // ------------------------------------------------------------------
 
+    /// True when the next [`Connection::poll_transmit`] would produce a
+    /// frame. Lets an event loop decide to keep sending versus go back to
+    /// waiting for input without paying for an encode.
+    pub fn wants_transmit(&self) -> bool {
+        self.pending_goaway.is_some() || !self.handshake_out.is_empty() || self.sched.has_backlog()
+    }
+
     /// Fill `buf` with exactly one frame. Returns `false` (and leaves `buf`
     /// empty) when there is nothing to send. Call only after the previous
     /// frame has been flushed to the transport.

@@ -10,6 +10,9 @@
 - Dependency policy: `cargo deny check` (~2s, timeout 60000ms)
 - Always: quiet on success; dump failures only.
 - Fuzz crate compiles: `(cd fuzz && cargo check)` (~1s, timeout 60000ms)
+- Conformance (nightly / PR to develop only, needs the DO droplet): h2spec
+  and Autobahn run in `.github/workflows/nightly.yml`; allow-lists live in
+  `ci/conformance/*-allowlist.txt`, one case per line with a justification.
 - Last measured: 2026-09-20, full suite 6s (36s incl. compile).
 
 ## Crate notes

@@ -6,7 +6,7 @@ use std::sync::Arc;
 use rustls::pki_types::pem::PemObject;
 use tokio_rustls::TlsConnector;
 
-pub use weaver_tokio::set_tcp_notsent_lowat;
+pub use weaver_tokio::{set_tcp_nodelay, set_tcp_notsent_lowat};
 
 /// Parses a server string in the format `<host>` or `<host>:<port>`, defaulting to port 443.
 pub fn parse_server_address(raw: &str) -> Result<(String, u16), String> {
@@ -48,6 +48,7 @@ pub async fn connect_tls(
     Box<dyn std::error::Error + Send + Sync>,
 > {
     let tcp = tokio::net::TcpStream::connect((host, port)).await?;
+    set_tcp_nodelay(&tcp);
     set_tcp_notsent_lowat(&tcp);
 
     let client_config = if let Some(ca_path) = insecure_root_ca {

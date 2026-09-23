@@ -111,6 +111,11 @@ impl TunnelRegistry {
     /// Verifies the caller identity, checks for duplicates (the service name
     /// was validated by `ControlHead::validate` on receipt),
     /// activates the certificate in `CertManager`, and updates routing tables.
+    /// The certificate manager this registry activates hostnames on.
+    pub fn cert_manager(&self) -> Arc<CertManager> {
+        Arc::clone(&self.cert_manager)
+    }
+
     pub async fn register_service(
         &self,
         key_id: KeyId,
