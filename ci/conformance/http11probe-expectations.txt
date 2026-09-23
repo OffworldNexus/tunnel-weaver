@@ -18,6 +18,14 @@ COMP-TRACE-WITH-BODY    Fail   WAF rejects TRACE with 403 regardless of body
 # --- Edge WAF: %00 in the path is refused with 403 (Verdict::Malformed).
 MAL-URL-PERCENT-NULL    Warn   WAF answers 403 to a percent-encoded NUL; probe rubric expects 400 or 2xx/404
 
+# --- Absolute-form request-target naming a host the edge does not serve.
+#     RFC 9112 §3.2.2: the target's authority MUST win over `Host`; the edge
+#     then has no authority for `other.example.com` and answers 421, which is
+#     precisely what RFC 9110 §15.5.20 defines 421 for. The probe's rubric
+#     only knows 400/2xx (a 2xx would mean ignoring the target — the MUST
+#     violation the pre-OFF-86 edge committed).
+SMUG-ABSOLUTE-URI-HOST-MISMATCH   Fail   edge honours the absolute-form authority (§3.2.2) and answers 421 for a host it is not authoritative for
+
 # --- hyper's h1 parser: HTTP/1.2 is rejected with 400 (only 1.0/1.1 are
 #     parsed). RFC 9110 §2.5 says higher minor versions SHOULD be accepted;
 #     this is hyper's stance, not a proxy translation. Tracked, not ours.

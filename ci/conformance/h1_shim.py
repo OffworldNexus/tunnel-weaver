@@ -32,6 +32,10 @@ import threading
 # `, second-host`, an empty value) stays, so the malformation reaches the
 # edge instead of being sanitised away by the shim.
 PROBE_HOST_RE = re.compile(rb"(?im)^(host:[ \t]*(?:[^\r\n@]*@)?)((?:\d{1,3}\.){3}\d{1,3}|localhost)(?::\d{1,5})?")
+# Same token inside an absolute-form request-target (`GET http://host:port/`).
+# RFC 9112 §3.2.2 makes the edge use *that* authority over `Host`, so it
+# must point at the tunnel too or the probe would be testing the shim.
+PROBE_TARGET_RE = re.compile(rb"(?i)^([A-Z]+ https?://(?:[^\s/@]*@)?)((?:\d{1,3}\.){3}\d{1,3}|localhost)(?::\d{1,5})?")
 
 
 def rewrite_head(buf: bytes, tunnel_host: bytes):
@@ -49,6 +53,7 @@ def rewrite_head(buf: bytes, tunnel_host: bytes):
         if idx != -1:
             head, rest = body[: idx + len(sep)], body[idx + len(sep) :]
             head = PROBE_HOST_RE.sub(rb"\g<1>" + tunnel_host, head)
+            head = PROBE_TARGET_RE.sub(rb"\g<1>" + tunnel_host, head)
             return buf[:lead] + head + rest, True
     return buf, False
 
