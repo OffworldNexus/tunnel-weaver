@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>{% block title %}{% endblock %} · Tunnel Weaver</title>
+  <style>{% include "partials/styles.css" %}</style>
+</head>
+<body>
+  <main class="deck {% block tone %}{% endblock %}">
+    <header class="brand">
+      {% include "partials/weaver-mark.svg" %}
+      <span>Tunnel Weaver</span>
+      <span class="brand__detail">Status page</span>
+    </header>
+    <section class="well" aria-labelledby="page-title">
+      <div class="status"><span class="status__icon" aria-hidden="true">{% block icon %}{% endblock %}</span>{% block status %}{% endblock %}</div>
+      <h1 id="page-title">{% block heading %}{% endblock %}</h1>
+      <p class="summary">{% block summary %}{% endblock %}</p>
+      {% block detail %}{% endblock %}
+      <div class="guidance"><h2>{% block guidance_title %}What to check{% endblock %}</h2><p>{% block guidance %}{% endblock %}</p></div>
+    </section>
+    <footer><span>Small bird. Strong connections.</span><span class="footer__detail">Tunnel Weaver</span></footer>
+  </main>
+</body>
+</html>

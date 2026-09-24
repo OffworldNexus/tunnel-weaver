@@ -2,9 +2,9 @@
 
 ## Testing
 
-- Full suite (fast): `cargo test --workspace` (~6s tests + ~30s compile after a dep change, timeout 120000ms)
+- Full suite (fast): `cargo test --workspace` (~10s warm, ~31s after a dep change, timeout 120000ms)
 - CI-strength property tests: `PROPTEST_CASES=2000 PROPTEST_RNG_SEED=67 cargo test -p weaver-mux` (~70s, timeout 300000ms)
-- Ignored e2e suite: `cargo test --workspace -- --ignored` (~6s, timeout 60000ms)
+- Ignored e2e suite: `cargo test --workspace -- --ignored` (~1s warm, timeout 60000ms)
 - Format check: `cargo fmt --check` (~1s, timeout 30000ms)
 - Clippy: `cargo clippy --workspace --all-targets -- -D warnings` (~5s, timeout 120000ms)
 - Dependency policy: `cargo deny check` (~2s, timeout 60000ms)
@@ -13,7 +13,7 @@
 - Conformance (nightly / PR to develop only, needs the DO droplet): h2spec
   and Autobahn run in `.github/workflows/nightly.yml`; allow-lists live in
   `ci/conformance/*-allowlist.txt`, one case per line with a justification.
-- Last measured: 2026-09-20, full suite 6s (36s incl. compile).
+- Last measured: 2026-09-24, full suite 10.3s (30.6s after Askama dependency addition), ignored suite 0.7s.
 
 ## Crate notes
 

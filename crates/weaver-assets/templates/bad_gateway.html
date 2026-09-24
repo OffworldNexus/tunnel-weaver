@@ -1,0 +1,9 @@
+{% extends "base.html" %}
+{% block title %}Bad Gateway{% endblock %}
+{% block tone %}page--danger{% endblock %}
+{% block icon %}!{% endblock %}
+{% block status %}502 Bad Gateway{% endblock %}
+{% block heading %}The service couldn't be reached.{% endblock %}
+{% block summary %}The service behind this tunnel refused the connection or did not respond in time.{% endblock %}
+{% block detail %}<dl class="detail"><dt>Target</dt><dd><code>{{ target }}</code></dd></dl>{% endblock %}
+{% block guidance %}If you own this tunnel, check that your local service is running and listening on the configured address and port.{% endblock %}
