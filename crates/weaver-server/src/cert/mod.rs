@@ -117,8 +117,8 @@ impl CertManager {
     pub async fn init(self: &Arc<Self>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let root_domain = self.config.root_domain.to_ascii_lowercase();
 
-        // 1. Read all cached certificates from the database
-        let certs = self.store.list_certificates_full().await?;
+        // 1. Read best cached certificate per domain directly from the database
+        let certs = self.store.list_best_certificates_full().await?;
 
         let now = self.clock.now_unix();
         let mut root_valid = false;
@@ -131,7 +131,8 @@ impl CertManager {
             if not_after > now {
                 match parse_certified_key(&cert.cert_pem, &cert.key_pem) {
                     Ok(certified_key) => {
-                        self.resolver.insert_cert(&lower, certified_key);
+                        self.resolver
+                            .insert_cert_with_expiry(&lower, certified_key, not_after);
                         self.set_state(&lower, CertState::Issued { not_after });
 
                         if last_active_at.is_some() || lower == root_domain {
@@ -421,7 +422,7 @@ impl CertManager {
         let mut all_names = HashSet::new();
         all_names.insert(root_domain);
 
-        if let Ok(certs) = self.store.list_certificates().await {
+        if let Ok(certs) = self.store.list_certificates(true).await {
             for c in certs {
                 all_names.insert(c.name.to_ascii_lowercase());
             }
@@ -532,7 +533,7 @@ impl CertManager {
         let mut candidates = HashSet::new();
         candidates.insert(root_domain.clone());
 
-        if let Ok(certs) = self.store.list_certificates().await {
+        if let Ok(certs) = self.store.list_certificates(true).await {
             for c in certs {
                 candidates.insert(c.name.to_ascii_lowercase());
             }
@@ -622,8 +623,8 @@ impl CertManager {
         let root_domain = self.config.root_domain.to_ascii_lowercase();
         let now = self.clock.now_unix();
 
-        // Query certificates from database
-        let certs_res = self.store.list_certificates().await;
+        // Query certificates from database (best certificate per domain)
+        let certs_res = self.store.list_certificates(true).await;
 
         let certs = match certs_res {
             Ok(c) => c,

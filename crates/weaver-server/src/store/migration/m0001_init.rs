@@ -1,4 +1,4 @@
-//! Initial schema: singleton config, ACME accounts, certificates, cert events.
+//! Initial schema: singleton config, ACME accounts, domains, certificates, cert events.
 
 use sea_orm_migration::prelude::*;
 use sea_orm_migration::schema::*;
@@ -28,9 +28,18 @@ enum AcmeAccount {
 }
 
 #[derive(DeriveIden)]
+enum Domains {
+    Table,
+    Id,
+    Name,
+    LastActiveAt,
+}
+
+#[derive(DeriveIden)]
 enum Certificates {
     Table,
-    Name,
+    Id,
+    DomainId,
     CertPem,
     KeyPem,
     NotBefore,
@@ -38,7 +47,6 @@ enum Certificates {
     Issuer,
     Directory,
     ObtainedAt,
-    LastActiveAt,
 }
 
 #[derive(DeriveIden)]
@@ -87,8 +95,20 @@ impl MigrationTrait for Migration {
         manager
             .create_table(
                 Table::create()
+                    .table(Domains::Table)
+                    .col(pk_auto(Domains::Id))
+                    .col(text(Domains::Name).unique_key())
+                    .col(big_integer_null(Domains::LastActiveAt))
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_table(
+                Table::create()
                     .table(Certificates::Table)
-                    .col(text(Certificates::Name).primary_key())
+                    .col(pk_auto(Certificates::Id))
+                    .col(integer(Certificates::DomainId))
                     .col(text(Certificates::CertPem))
                     .col(text(Certificates::KeyPem))
                     .col(big_integer(Certificates::NotBefore))
@@ -96,7 +116,24 @@ impl MigrationTrait for Migration {
                     .col(text_null(Certificates::Issuer))
                     .col(text(Certificates::Directory))
                     .col(big_integer(Certificates::ObtainedAt))
-                    .col(big_integer_null(Certificates::LastActiveAt))
+                    .foreign_key(
+                        ForeignKey::create()
+                            .name("fk_certificates_domain_id")
+                            .from(Certificates::Table, Certificates::DomainId)
+                            .to(Domains::Table, Domains::Id)
+                            .on_delete(ForeignKeyAction::Cascade)
+                            .on_update(ForeignKeyAction::Cascade),
+                    )
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_certificates_domain_id")
+                    .table(Certificates::Table)
+                    .col(Certificates::DomainId)
                     .to_owned(),
             )
             .await?;
@@ -133,6 +170,9 @@ impl MigrationTrait for Migration {
             .await?;
         manager
             .drop_table(Table::drop().table(Certificates::Table).to_owned())
+            .await?;
+        manager
+            .drop_table(Table::drop().table(Domains::Table).to_owned())
             .await?;
         manager
             .drop_table(Table::drop().table(AcmeAccount::Table).to_owned())

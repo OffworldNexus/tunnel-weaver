@@ -98,10 +98,10 @@ async fn test_store_open_runs_migrations_and_is_idempotent() {
         let store = Store::open(&db_path).await.expect("open failed");
         let count: i64 = scalar(
             &store,
-            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN ('config', 'acme_account', 'certificates', 'cert_events', 'seaql_migrations')",
+            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN ('config', 'acme_account', 'domains', 'certificates', 'cert_events', 'seaql_migrations')",
         )
         .await;
-        assert_eq!(count, 5);
+        assert_eq!(count, 6);
         assert_eq!(store.schema_version().await.expect("schema_version"), 1);
     }
 
@@ -301,8 +301,7 @@ async fn test_backup_creates_openable_database() {
 #[tokio::test]
 async fn test_certificate_and_event_round_trip() {
     let store = Store::connect("sqlite::memory:").await.expect("connect");
-    let cert = weaver_server::store::entity::certificate::Model {
-        name: "host.example.com".into(),
+    let cert = weaver_server::store::NewCertificate {
         cert_pem: "CERT".into(),
         key_pem: "KEY".into(),
         not_before: 100,
@@ -310,12 +309,12 @@ async fn test_certificate_and_event_round_trip() {
         issuer: None,
         directory: "https://acme.test/dir".into(),
         obtained_at: 100,
-        last_active_at: Some(100),
+        active_at: Some(100),
     };
     store
-        .upsert_certificate(cert.clone())
+        .save_certificate("host.example.com", cert.clone())
         .await
-        .expect("upsert");
+        .expect("save");
 
     // Lookup is case-insensitive on the caller side
     let rec = store
@@ -323,18 +322,24 @@ async fn test_certificate_and_event_round_trip() {
         .await
         .expect("get")
         .expect("present");
+    assert_eq!(rec.name, "host.example.com");
     assert_eq!(rec.not_after, 200);
     assert_eq!(rec.last_active_at, Some(100));
 
-    // Upsert replaces in place
+    // Saving another certificate inserts a new certificate row linked to the same domain
     store
-        .upsert_certificate(weaver_server::store::entity::certificate::Model {
-            not_after: 300,
-            ..cert
-        })
+        .save_certificate(
+            "host.example.com",
+            weaver_server::store::NewCertificate {
+                not_after: 300,
+                ..cert
+            },
+        )
         .await
-        .expect("upsert 2");
-    assert_eq!(store.list_certificates().await.expect("list").len(), 1);
+        .expect("save 2");
+
+    // only_best = true returns 1 (the best one, not_after = 300)
+    assert_eq!(store.list_certificates(true).await.expect("list").len(), 1);
     assert_eq!(
         store
             .get_certificate("host.example.com")
@@ -344,6 +349,30 @@ async fn test_certificate_and_event_round_trip() {
             .not_after,
         300
     );
+
+    // only_best = false returns both certificates
+    assert_eq!(store.list_certificates(false).await.expect("list").len(), 2);
+
+    // Lookup by certificate PK ID
+    let best_cert = store
+        .get_certificate("host.example.com")
+        .await
+        .unwrap()
+        .unwrap();
+    let rec_by_id = store
+        .get_certificate_by_id(best_cert.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(rec_by_id.name, "host.example.com");
+    assert_eq!(rec_by_id.not_after, 300);
+
+    let rec_by_id_str = store
+        .get_certificate_by_id_or_name(&best_cert.id.to_string())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(rec_by_id_str.id, best_cert.id);
 
     // Active flag
     store
@@ -400,4 +429,130 @@ async fn test_acme_account_round_trip() {
     assert_eq!(acct.kid.as_deref(), Some("kid2"));
     assert_eq!(acct.credentials_json, "{\"k\":1}");
     assert_eq!(acct.created_at, 2);
+}
+
+#[tokio::test]
+async fn test_multiple_certificates_and_best_resolution() {
+    let store = Store::connect("sqlite::memory:").await.expect("connect");
+
+    let cert_1 = weaver_server::store::NewCertificate {
+        cert_pem: "PEM1".into(),
+        key_pem: "KEY1".into(),
+        not_before: 1_000,
+        not_after: 2_000,
+        issuer: Some("Issuer 1".into()),
+        directory: "dir1".into(),
+        obtained_at: 1_000,
+        active_at: Some(1_000),
+    };
+    let cert_2 = weaver_server::store::NewCertificate {
+        cert_pem: "PEM2".into(),
+        key_pem: "KEY2".into(),
+        not_before: 1_500,
+        not_after: 3_000, // Furthest expiration
+        issuer: Some("Issuer 2".into()),
+        directory: "dir2".into(),
+        obtained_at: 1_500,
+        active_at: Some(1_500),
+    };
+    let cert_3 = weaver_server::store::NewCertificate {
+        cert_pem: "PEM3".into(),
+        key_pem: "KEY3".into(),
+        not_before: 500,
+        not_after: 1_200,
+        issuer: Some("Issuer 3".into()),
+        directory: "dir3".into(),
+        obtained_at: 500,
+        active_at: Some(500),
+    };
+
+    store
+        .save_certificate("multi.example.com", cert_1)
+        .await
+        .unwrap();
+    store
+        .save_certificate("multi.example.com", cert_2)
+        .await
+        .unwrap();
+    store
+        .save_certificate("multi.example.com", cert_3)
+        .await
+        .unwrap();
+
+    // Verify count in SQL
+    let count = store
+        .count_certificates_for_domain("multi.example.com")
+        .await
+        .unwrap();
+    assert_eq!(count, 3);
+
+    // Verify best certificate resolution chooses cert_2 (furthest not_after = 3000)
+    let best = store
+        .get_certificate("multi.example.com")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(best.not_after, 3_000);
+    assert_eq!(best.issuer.as_deref(), Some("Issuer 2"));
+
+    // Verify list_certificates(true) returns only the single best certificate
+    let list_best = store.list_certificates(true).await.unwrap();
+    assert_eq!(list_best.len(), 1);
+    assert_eq!(list_best[0].not_after, 3_000);
+
+    // Verify list_certificates(false) returns all 3 certificates
+    let list_all = store.list_certificates(false).await.unwrap();
+    assert_eq!(list_all.len(), 3);
+
+    // Verify list_best_certificates_full returns only 1 full record with PEMs
+    let full_best = store.list_best_certificates_full().await.unwrap();
+    assert_eq!(full_best.len(), 1);
+    assert_eq!(full_best[0].cert_pem, "PEM2");
+}
+
+#[tokio::test]
+async fn test_cascade_delete_domain() {
+    use sea_orm::EntityTrait;
+    let store = Store::connect("sqlite::memory:").await.expect("connect");
+
+    let cert = weaver_server::store::NewCertificate {
+        cert_pem: "PEM".into(),
+        key_pem: "KEY".into(),
+        not_before: 1_000,
+        not_after: 2_000,
+        issuer: None,
+        directory: "dir".into(),
+        obtained_at: 1_000,
+        active_at: None,
+    };
+    store
+        .save_certificate("cascade.example.com", cert)
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .count_certificates_for_domain("cascade.example.com")
+            .await
+            .unwrap(),
+        1
+    );
+
+    let domain = store
+        .get_domain("cascade.example.com")
+        .await
+        .unwrap()
+        .unwrap();
+    // Delete parent domain directly via entity
+    weaver_server::store::entity::domain::Entity::delete_by_id(domain.id)
+        .exec(store.db())
+        .await
+        .unwrap();
+
+    // Associated certificates should be cascaded and deleted
+    let certs_count: i64 = scalar(
+        &store,
+        "SELECT count(*) FROM certificates WHERE domain_id = 999 OR domain_id NOT IN (SELECT id FROM domains)",
+    )
+    .await;
+    assert_eq!(certs_count, 0);
 }

@@ -8,3 +8,4 @@ pub mod acme_account;
 pub mod cert_event;
 pub mod certificate;
 pub mod config;
+pub mod domain;

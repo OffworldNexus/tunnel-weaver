@@ -60,15 +60,19 @@ pub enum Commands {
 /// Subcommands for certificate operations.
 #[derive(Subcommand, Debug, Clone)]
 pub enum CertCommands {
-    /// Shows certificate summary table or detailed status for a single hostname.
+    /// Shows certificate summary table or detailed status for a single hostname or certificate ID.
     Status {
-        /// Hostname to inspect (or "root" for base domain). If omitted, displays all certificates.
-        #[arg(value_name = "NAME")]
+        /// Hostname or certificate ID to inspect (or "root" for base domain). If omitted, displays all certificates.
+        #[arg(value_name = "NAME_OR_CERT_ID")]
         name: Option<String>,
 
         /// Maximum number of historical cert events to return in detail view (default: 10).
         #[arg(long)]
         limit: Option<usize>,
+
+        /// Disables filtering to only the best certificate per domain in list view.
+        #[arg(long)]
+        no_only_best: bool,
 
         /// Outputs the result as raw JSON.
         #[arg(long)]
@@ -127,14 +131,15 @@ pub fn parse_listen_addr(s: &str) -> Result<SocketAddr, String> {
     trimmed.parse::<SocketAddr>().map_err(|e| e.to_string())
 }
 
-/// Validates that a hostname argument is a valid FQDN or the alias "root".
+/// Validates that a hostname argument is a valid FQDN, integer certificate ID, or the alias "root".
 fn validate_cert_name(name: &Option<String>) {
     if let Some(n) = name
         && n != "root"
         && !n.contains('.')
+        && n.parse::<i32>().is_err()
     {
         eprintln!(
-            "Error: Invalid hostname '{n}'. Must be a fully qualified domain name (containing '.') or 'root'."
+            "Error: Invalid hostname '{n}'. Must be a fully qualified domain name (containing '.'), certificate ID, or 'root'."
         );
         std::process::exit(2);
     }
@@ -498,12 +503,18 @@ async fn main() {
                 .socket
                 .unwrap_or_else(|| PathBuf::from("/run/weaver/control.sock"));
             match command {
-                CertCommands::Status { name, limit, json } => {
+                CertCommands::Status {
+                    name,
+                    limit,
+                    no_only_best,
+                    json,
+                } => {
                     validate_cert_name(&name);
                     let code = weaver_server::control::client::client_cert_status(
                         &socket_path,
                         name,
                         limit,
+                        no_only_best,
                         json,
                     )
                     .await;

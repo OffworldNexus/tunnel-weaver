@@ -189,6 +189,7 @@ pub async fn client_status(socket_path: &Path, json: bool) -> i32 {
         all: None,
         force: None,
         path: None,
+        no_only_best: None,
     };
 
     let line = match send_request_and_read_line(socket_path, &req).await {
@@ -296,6 +297,7 @@ pub async fn client_cert_status(
     socket_path: &Path,
     name: Option<String>,
     limit: Option<usize>,
+    no_only_best: bool,
     json: bool,
 ) -> i32 {
     let has_name = name.is_some();
@@ -308,6 +310,7 @@ pub async fn client_cert_status(
         all: None,
         force: None,
         path: None,
+        no_only_best: if no_only_best { Some(true) } else { None },
     };
 
     let line = match send_request_and_read_line(socket_path, &req).await {
@@ -357,7 +360,15 @@ pub async fn client_cert_status(
         }
 
         let mut table = create_styled_table();
-        table.set_header(vec![
+        let mut header = Vec::new();
+        if no_only_best {
+            header.push(
+                Cell::new("CERT-ID")
+                    .add_attribute(Attribute::Bold)
+                    .fg(Color::Cyan),
+            );
+        }
+        header.extend(vec![
             Cell::new("NAME")
                 .add_attribute(Attribute::Bold)
                 .fg(Color::Cyan),
@@ -374,6 +385,7 @@ pub async fn client_cert_status(
                 .add_attribute(Attribute::Bold)
                 .fg(Color::Cyan),
         ]);
+        table.set_header(header);
 
         for (idx, cert) in resp.certificates.iter().enumerate() {
             let is_root = idx == 0;
@@ -417,13 +429,19 @@ pub async fn client_cert_status(
             };
             let age_cell = Cell::new(age_str).fg(Color::DarkGrey);
 
-            table.add_row(vec![
+            let mut row = Vec::new();
+            if no_only_best {
+                let id_str = cert.cert_id.map_or("-".to_string(), |id| id.to_string());
+                row.push(Cell::new(id_str).fg(Color::Cyan));
+            }
+            row.extend(vec![
                 name_cell,
                 state_cell,
                 days_cell,
                 active_cell,
                 age_cell,
             ]);
+            table.add_row(row);
         }
 
         println!("{table}");
@@ -527,6 +545,13 @@ pub async fn client_cert_status(
             ),
         ]);
 
+        if let Some(cert_id) = resp.cert_id {
+            table.add_row(vec![
+                Cell::new("Certificate ID").fg(Color::DarkCyan),
+                Cell::new(cert_id.to_string()),
+            ]);
+        }
+
         println!("{table}");
 
         if !resp.cert_events.is_empty() {
@@ -583,6 +608,7 @@ pub async fn client_cert_wait(
         all: None,
         force: None,
         path: None,
+        no_only_best: None,
     };
 
     let mut stream = match connect_control_socket(socket_path).await {
@@ -733,6 +759,7 @@ pub async fn client_cert_renew(
         all: if all { Some(true) } else { None },
         force: if force { Some(true) } else { None },
         path: None,
+        no_only_best: None,
     };
 
     let line = match send_request_and_read_line(socket_path, &req).await {
@@ -825,6 +852,7 @@ pub async fn client_backup(socket_path: &Path, path: String, json: bool) -> i32 
         all: None,
         force: None,
         path: Some(path),
+        no_only_best: None,
     };
 
     let line = match send_request_and_read_line(socket_path, &req).await {
@@ -885,6 +913,7 @@ pub async fn client_shutdown(socket_path: &Path, json: bool) -> i32 {
         all: None,
         force: None,
         path: None,
+        no_only_best: None,
     };
 
     let line = match send_request_and_read_line(socket_path, &req).await {

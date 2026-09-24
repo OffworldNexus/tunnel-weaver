@@ -167,9 +167,8 @@ async fn test_control_socket_daemon_suite() {
         .unwrap()
         .as_secs() as i64;
 
-    let seed_cert = |name: &str, cert_pem: &str, key_pem: &str, days: i64, active: bool| {
-        weaver_server::store::entity::certificate::Model {
-            name: name.to_string(),
+    let seed_cert = |cert_pem: &str, key_pem: &str, days: i64, active: bool| {
+        weaver_server::store::NewCertificate {
             cert_pem: cert_pem.to_string(),
             key_pem: key_pem.to_string(),
             not_before: now - 3600,
@@ -177,37 +176,37 @@ async fn test_control_socket_daemon_suite() {
             issuer: Some("Test Issuer".to_string()),
             directory: "letsencrypt-staging".to_string(),
             obtained_at: now - 3600,
-            last_active_at: active.then_some(now - 3600),
+            active_at: active.then_some(now - 3600),
         }
     };
+    // Seed an older certificate for root domain (30 days left)
     store
-        .upsert_certificate(seed_cert(
+        .save_certificate(
             "weaver.test",
-            &root_cert_pem,
-            &root_key_pem,
-            90,
-            true,
-        ))
+            seed_cert(&root_cert_pem, &root_key_pem, 30, true),
+        )
+        .await
+        .unwrap();
+    // Seed the best/newer certificate for root domain (90 days left)
+    store
+        .save_certificate(
+            "weaver.test",
+            seed_cert(&root_cert_pem, &root_key_pem, 90, true),
+        )
         .await
         .unwrap();
     store
-        .upsert_certificate(seed_cert(
+        .save_certificate(
             "tunnel-active.weaver.test",
-            &tunnel_cert_pem,
-            &tunnel_key_pem,
-            60,
-            true,
-        ))
+            seed_cert(&tunnel_cert_pem, &tunnel_key_pem, 60, true),
+        )
         .await
         .unwrap();
     store
-        .upsert_certificate(seed_cert(
+        .save_certificate(
             "tunnel-inactive.weaver.test",
-            &inactive_cert_pem,
-            &inactive_key_pem,
-            30,
-            false,
-        ))
+            seed_cert(&inactive_cert_pem, &inactive_key_pem, 30, false),
+        )
         .await
         .unwrap();
     // Cert events
@@ -365,14 +364,41 @@ async fn test_control_socket_daemon_suite() {
         let val: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
         assert_eq!(val["ok"], true);
         let certs = val["certificates"].as_array().unwrap();
+        // Default only shows the best certificate per domain (3 domains)
         assert_eq!(certs.len(), 3);
         // Root domain is strictly first!
         assert_eq!(certs[0]["name"], "weaver.test");
         assert_eq!(certs[0]["active"], true);
+        assert!(certs[0]["cert_id"].as_i64().is_some());
         // Remaining names sorted alphabetically
         assert_eq!(certs[1]["name"], "tunnel-active.weaver.test");
         assert_eq!(certs[2]["name"], "tunnel-inactive.weaver.test");
         assert_eq!(certs[2]["active"], false);
+    }
+
+    // --- Test CLI: cert status --no-only-best (shows all certs and CERT-ID) ---
+    {
+        let output = Command::new(bin_path)
+            .arg("--socket")
+            .arg(&control_sock_path)
+            .arg("cert")
+            .arg("status")
+            .arg("--no-only-best")
+            .arg("--json")
+            .output()
+            .unwrap();
+
+        assert_eq!(output.status.code(), Some(0));
+        let val: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(val["ok"], true);
+        let certs = val["certificates"].as_array().unwrap();
+        // Shows all 4 certificates (2 for weaver.test, 1 active tunnel, 1 inactive tunnel)
+        assert_eq!(certs.len(), 4);
+        assert_eq!(certs[0]["name"], "weaver.test");
+        assert_eq!(certs[1]["name"], "weaver.test");
+        assert!(certs[0]["cert_id"].as_i64().is_some());
+        assert!(certs[1]["cert_id"].as_i64().is_some());
+        assert_ne!(certs[0]["cert_id"], certs[1]["cert_id"]);
     }
 
     // --- Test CLI: cert status human-readable table with highlighted root ---
@@ -388,9 +414,31 @@ async fn test_control_socket_daemon_suite() {
         assert_eq!(output.status.code(), Some(0));
         let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(stdout.contains("NAME"));
+        assert!(!stdout.contains("CERT-ID")); // CERT-ID column omitted by default
         assert!(stdout.contains("weaver.test"));
         assert!(stdout.contains("★")); // Highlighted root!
         assert!(stdout.contains("tunnel-active.weaver.test"));
+    }
+
+    // --- Test CLI: cert status --no-only-best table has CERT-ID and single ★ on best root cert ---
+    {
+        let output = Command::new(bin_path)
+            .arg("--socket")
+            .arg(&control_sock_path)
+            .arg("cert")
+            .arg("status")
+            .arg("--no-only-best")
+            .output()
+            .unwrap();
+
+        assert_eq!(output.status.code(), Some(0));
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("CERT-ID"));
+        assert!(stdout.contains("NAME"));
+        // Best root certificate has star marker
+        assert!(stdout.contains("★ weaver.test"));
+        // Secondary root certificate has space indent without star
+        assert!(stdout.contains("  weaver.test"));
     }
 
     // --- Test CLI: cert status detail view ---
@@ -410,7 +458,27 @@ async fn test_control_socket_daemon_suite() {
         assert_eq!(val["ok"], true);
         assert_eq!(val["name"], "weaver.test");
         assert_eq!(val["state"]["status"], "issued");
+        assert!(val["cert_id"].as_i64().is_some());
         assert_eq!(val["cert_events"].as_array().unwrap().len(), 1);
+
+        let root_cert_id = val["cert_id"].as_i64().unwrap();
+
+        // Also test detail view by certificate integer PK!
+        let output_by_id = Command::new(bin_path)
+            .arg("--socket")
+            .arg(&control_sock_path)
+            .arg("cert")
+            .arg("status")
+            .arg(root_cert_id.to_string())
+            .arg("--json")
+            .output()
+            .unwrap();
+
+        assert_eq!(output_by_id.status.code(), Some(0));
+        let val_by_id: serde_json::Value = serde_json::from_slice(&output_by_id.stdout).unwrap();
+        assert_eq!(val_by_id["ok"], true);
+        assert_eq!(val_by_id["name"], "weaver.test");
+        assert_eq!(val_by_id["cert_id"], root_cert_id);
     }
 
     // --- Test CLI: cert wait on unknown name exits 1 ---
