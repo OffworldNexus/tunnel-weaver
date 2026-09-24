@@ -1,0 +1,9 @@
+{% extends "base.html" %}
+{% block title %}Request Blocked{% endblock %}
+{% block tone %}page--danger{% endblock %}
+{% block icon %}×{% endblock %}
+{% block status %}403 Forbidden{% endblock %}
+{% block heading %}Request blocked.{% endblock %}
+{% block summary %}This request matched an edge firewall rule. It was refused before reaching the local service.{% endblock %}
+{% block detail %}<dl class="detail"><dt>Matched rule</dt><dd><code>{{ reason }}</code></dd></dl>{% endblock %}
+{% block guidance %}Check the requested path. The edge blocks common scanner probes for paths that applications behind this tunnel do not serve.{% endblock %}

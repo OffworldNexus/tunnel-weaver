@@ -24,7 +24,7 @@ use crate::edge::host::request_host;
 use crate::edge::waf;
 use crate::tunnel::proxy::{BoxBody, empty_body, forward_visitor_request, full_body};
 use crate::tunnel::registry::TunnelRegistry;
-use weaver_assets::{NO_TUNNEL_HTML, WELCOME_HTML, apply_security_headers};
+use weaver_assets::{apply_security_headers, render_no_tunnel, render_welcome};
 
 /// Shared state for HTTPS request dispatch.
 #[derive(Clone)]
@@ -224,7 +224,7 @@ pub async fn handle_https_request(
             (&Method::GET, "/") => {
                 let mut resp = Response::builder()
                     .status(StatusCode::OK)
-                    .body(full_body(WELCOME_HTML))
+                    .body(full_body(render_welcome()))
                     .unwrap();
                 apply_security_headers(&mut resp, include_hsts);
                 Ok(resp)
@@ -306,7 +306,7 @@ pub async fn handle_https_request(
         debug!(hostname = %host_lower, "Tunnel not found");
         let mut resp = Response::builder()
             .status(StatusCode::NOT_FOUND)
-            .body(full_body(NO_TUNNEL_HTML))
+            .body(full_body(render_no_tunnel()))
             .unwrap();
         apply_security_headers(&mut resp, include_hsts);
         Ok(resp)

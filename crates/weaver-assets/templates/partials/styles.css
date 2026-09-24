@@ -1,0 +1,96 @@
+/* Semantic tokens are shared by every page. Native fonts and inline assets
+   keep the response useful even when the tunnel cannot reach any origin. */
+@layer tokens, reset, base, components;
+
+@layer tokens {
+  :root {
+    color-scheme: light dark;
+    --tw-bg: #cdc6bf;
+    --tw-deck: #e5e0d8;
+    --tw-well: #fefaf3;
+    --tw-text: #0b0604;
+    --tw-muted: #524943;
+    --tw-border: #cdc6bf;
+    --tw-accent: #772a0a;
+    --tw-success: #4d5818;
+    --tw-danger: #a44039;
+    --tw-shadow: #201a1626;
+    /* Exact stacks from https://modernfontstacks.com/: Neo-Grotesque for
+       interface text, Geometric Humanist for headings, Monospace Code for
+       technical values. All resolve locally; no font downloads. */
+    --tw-sans: Inter, Roboto, "Helvetica Neue", "Arial Nova", "Nimbus Sans", Arial, sans-serif;
+    --tw-heading: Avenir, Montserrat, Corbel, "URW Gothic", source-sans-pro, sans-serif;
+    --tw-mono: ui-monospace, "Cascadia Code", "Source Code Pro", Menlo, Consolas, "DejaVu Sans Mono", monospace;
+    --tw-radius: 3px;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --tw-bg: #0b0604;
+      --tw-deck: #201a16;
+      --tw-well: #0b0604;
+      --tw-text: #fefaf3;
+      --tw-muted: #cdc6bf;
+      --tw-border: #524943;
+      --tw-accent: #ffcf2e;
+      --tw-success: #cfd9a0;
+      --tw-danger: #ffb8af;
+      --tw-shadow: #00000066;
+    }
+  }
+}
+
+@layer reset {
+  *, *::before, *::after { box-sizing: border-box; }
+  body, h1, h2, p, dl, dd { margin: 0; }
+}
+
+@layer base {
+  body {
+    min-height: 100svh;
+    display: grid;
+    place-items: center;
+    padding: clamp(16px, 5vw, 64px);
+    background: var(--tw-bg);
+    color: var(--tw-text);
+    font: 400 16px/1.6 var(--tw-sans);
+  }
+  h1 { font-family: var(--tw-heading); font-size: clamp(32px, 5vw, 48px); line-height: 1.12; letter-spacing: -.035em; text-wrap: balance; }
+  h2 { font-size: 16px; line-height: 1.5; }
+  code { font: 400 16px/1.65 var(--tw-mono); font-variant-ligatures: none; }
+  ::selection { background: var(--tw-accent); color: var(--tw-well); }
+}
+
+@layer components {
+  /* The solid deck and recessed well echo the physical Minitel keyboard.
+     The clipped status corner is decorative, not an implied button. */
+  .deck {
+    --tw-status: var(--tw-accent);
+    width: min(100%, 800px);
+    min-width: 0;
+    padding: clamp(16px, 3vw, 32px);
+    border: 1px solid var(--tw-border);
+    border-radius: 8px;
+    background: var(--tw-deck);
+    box-shadow: 0 16px 48px var(--tw-shadow);
+  }
+  .page--success { --tw-status: var(--tw-success); }
+  .page--danger { --tw-status: var(--tw-danger); }
+  .brand { display: flex; align-items: center; gap: 12px; margin-bottom: 24px; font-family: var(--tw-heading); font-weight: 800; letter-spacing: .035em; }
+  .brand svg { width: 52px; height: 54px; flex: none; }
+  .brand__detail { margin-left: auto; font-size: 14px; font-weight: 400; color: var(--tw-muted); letter-spacing: 0; }
+  .well { padding: clamp(24px, 5vw, 48px); border: 1px solid var(--tw-border); border-radius: var(--tw-radius); background: var(--tw-well); }
+  .status { display: inline-flex; align-items: center; gap: 10px; color: var(--tw-status); font-weight: 700; margin-bottom: 24px; }
+  .status__icon { display: grid; place-items: center; width: 28px; height: 28px; color: var(--tw-well); background: var(--tw-status); clip-path: polygon(0 0, 75% 0, 100% 25%, 100% 100%, 0 100%); }
+  .summary { margin-top: 20px; color: var(--tw-muted); font-size: 18px; }
+  .detail { margin-top: 28px; border-block: 1px solid var(--tw-border); padding-block: 18px; }
+  .detail dt { font-size: 14px; font-weight: 700; color: var(--tw-muted); margin-bottom: 6px; }
+  .detail dd { overflow-wrap: anywhere; }
+  .guidance { margin-top: 28px; }
+  .guidance p { margin-top: 6px; color: var(--tw-muted); }
+  footer { display: flex; flex-wrap: wrap; gap: 8px 24px; justify-content: space-between; padding-top: 24px; color: var(--tw-muted); font-size: 14px; }
+  .footer__detail { font-family: var(--tw-mono); }
+  @media (max-width: 480px) {
+    .brand__detail, .footer__detail { display: none; }
+    .well { padding: 24px 20px; }
+  }
+}

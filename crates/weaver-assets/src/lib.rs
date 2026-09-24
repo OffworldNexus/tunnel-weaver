@@ -9,35 +9,57 @@
 //! security headers. All documents are embedded at compile time, so there is
 //! no runtime filesystem dependency.
 
-/// Embedded HTML content for the root domain welcome page.
-pub const WELCOME_HTML: &str = include_str!("welcome.html");
+use askama::Template;
 
-/// Embedded HTML content for the branded subdomain 404 page ("no such tunnel").
-pub const NO_TUNNEL_HTML: &str = include_str!("no_tunnel.html");
+// Private compile-time templates keep layout/includes internal and autoescape
+// every dynamic value. Rendering never reads files or fetches external assets.
+#[derive(Template)]
+#[template(path = "welcome.html")]
+struct Welcome;
 
-/// Embedded HTML template for the branded 502 page. It names the unreachable
-/// target: call [`render_bad_gateway`] rather than serving this directly, so
-/// the target is HTML-escaped.
-pub const BAD_GATEWAY_HTML_TEMPLATE: &str = include_str!("bad_gateway.html");
+#[derive(Template)]
+#[template(path = "no_tunnel.html")]
+struct NoTunnel;
 
-/// Embedded HTML template for the branded 403 page the edge firewall serves
-/// for scanner probes. Call [`render_forbidden`].
-pub const FORBIDDEN_HTML_TEMPLATE: &str = include_str!("forbidden.html");
+#[derive(Template)]
+#[template(path = "bad_gateway.html")]
+struct BadGateway<'a> {
+    target: &'a str,
+}
 
-/// Placeholder substituted by [`render_bad_gateway`].
-const TARGET_PLACEHOLDER: &str = "{{TARGET}}";
-/// Placeholder substituted by [`render_forbidden`].
-const REASON_PLACEHOLDER: &str = "{{REASON}}";
+#[derive(Template)]
+#[template(path = "forbidden.html")]
+struct Forbidden<'a> {
+    reason: &'a str,
+}
+
+/// Render the informational relay welcome page (not a live health check).
+pub fn render_welcome() -> String {
+    render(Welcome)
+}
+
+/// Render the shared page for an absent or offline tunnel.
+pub fn render_no_tunnel() -> String {
+    render(NoTunnel)
+}
 
 /// Render the branded 502 page for `target`, HTML-escaping the target so a
 /// hostile target string cannot inject markup.
 pub fn render_bad_gateway(target: &str) -> String {
-    BAD_GATEWAY_HTML_TEMPLATE.replace(TARGET_PLACEHOLDER, &escape_html(target))
+    render(BadGateway { target })
 }
 
 /// Render the branded 403 page naming the firewall rule that fired.
 pub fn render_forbidden(reason: &str) -> String {
-    FORBIDDEN_HTML_TEMPLATE.replace(REASON_PLACEHOLDER, &escape_html(reason))
+    render(Forbidden { reason })
+}
+
+/// String-only templates have no fallible filters or custom Display values;
+/// writing their literals and borrowed strings into a String cannot fail.
+fn render(template: impl Template) -> String {
+    template
+        .render()
+        .expect("embedded string-only HTML template")
 }
 
 /// Inject standard security headers and content-type into HTML responses.
@@ -78,24 +100,6 @@ pub fn apply_security_headers<B>(response: &mut http::Response<B>, include_hsts:
     }
 }
 
-/// Minimal HTML text escaping for values interpolated into an attribute-free
-/// context. Escapes the five characters that can break out of text or an
-/// attribute, which is enough for the target shown inside `<code>`.
-fn escape_html(value: &str) -> String {
-    let mut out = String::with_capacity(value.len());
-    for ch in value.chars() {
-        match ch {
-            '&' => out.push_str("&amp;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            '"' => out.push_str("&quot;"),
-            '\'' => out.push_str("&#39;"),
-            _ => out.push(ch),
-        }
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -103,16 +107,27 @@ mod tests {
     #[test]
     fn assets_embedded_and_non_empty() {
         // `contains` on a non-empty needle implies the asset is non-empty.
-        assert!(WELCOME_HTML.contains("Tunnel Weaver"));
-        assert!(NO_TUNNEL_HTML.contains("No Such Tunnel"));
-        assert!(BAD_GATEWAY_HTML_TEMPLATE.contains("502 Bad Gateway"));
+        for (html, status) in [
+            (render_welcome(), "Operational"),
+            (render_no_tunnel(), "404 Not Found"),
+            (render_bad_gateway("localhost"), "502 Bad Gateway"),
+            (render_forbidden("dotfile"), "403 Forbidden"),
+        ] {
+            assert!(html.contains(status));
+            assert!(html.contains("<style>"));
+            assert!(html.contains("<svg"));
+            assert!(!html.contains("{%"));
+            for external in ["<script", "<link", "<img", "src=", "@import", "url("] {
+                assert!(!html.contains(external), "external asset: {external}");
+            }
+        }
     }
 
     #[test]
     fn bad_gateway_names_target_and_leaves_no_placeholder() {
         let html = render_bad_gateway("http://localhost:8080");
         assert!(html.contains("http://localhost:8080"));
-        assert!(!html.contains(TARGET_PLACEHOLDER));
+        assert!(!html.contains("{{ target }}"));
     }
 
     #[test]
@@ -120,15 +135,27 @@ mod tests {
         let html = render_forbidden("dotfile");
         assert!(html.contains("403 Forbidden"));
         assert!(html.contains("<code>dotfile</code>"));
-        assert!(!html.contains(REASON_PLACEHOLDER));
+        assert!(!html.contains("{{ reason }}"));
     }
 
     #[test]
-    fn bad_gateway_escapes_target() {
-        let html = render_bad_gateway("<script>alert('x')</script>");
-        assert!(!html.contains("<script>"));
-        assert!(html.contains("&lt;script&gt;"));
-        assert!(html.contains("&#39;"));
+    fn dynamic_text_cannot_inject_markup_or_templates() {
+        // Exercise both entry points: a rule/target is data, never HTML or a
+        // second template, including literal entity and template syntax.
+        for render in [render_bad_gateway, render_forbidden] {
+            let html = render(
+                "</code><script>alert('x')</script><img src=x onerror=alert(1)> & \" {{TARGET}} café",
+            );
+            assert!(!html.contains("<script>"));
+            assert!(!html.contains("<img"));
+            assert!(!html.contains("</code><script"));
+            assert!(html.contains("&lt;") || html.contains("&#60;"));
+            assert!(html.contains("&amp;") || html.contains("&#38;"));
+            assert!(html.contains("{{TARGET}} café"));
+            assert!(render("").contains("<code></code>"));
+            let long = "é".repeat(4096);
+            assert!(render(&long).contains(&long));
+        }
     }
 
     #[test]

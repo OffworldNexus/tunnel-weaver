@@ -108,6 +108,9 @@ async fn test_https_root_domain_endpoints() {
     assert!(resp.contains("x-frame-options: DENY"));
     assert!(resp.contains("referrer-policy: no-referrer"));
     assert!(resp.contains("Tunnel Weaver"));
+    assert!(resp.contains("Ready for connections."));
+    assert!(resp.contains("<style>"));
+    assert!(resp.contains("<svg"));
 
     // 2. GET /healthz on root_domain -> 200 with "ok"
     let tcp = TcpStream::connect(addr).await.unwrap();
@@ -163,6 +166,9 @@ async fn test_https_subdomain_branded_404() {
     assert!(resp.starts_with("HTTP/1.1 404 Not Found"));
     assert!(resp.contains("content-type: text/html; charset=utf-8"));
     assert!(resp.contains("No Such Tunnel"));
+    assert!(resp.contains("No tunnel here."));
+    assert!(resp.contains("<style>"));
+    assert!(resp.contains("<svg"));
     assert!(resp.contains("content-security-policy: default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'"));
 
     shutdown_token.cancel();
