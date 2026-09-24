@@ -29,6 +29,9 @@ pub struct ControlRequest {
     /// Target path for backup operations.
     #[serde(default)]
     pub path: Option<String>,
+    /// Flag to disable filtering to only the best certificate per domain.
+    #[serde(default)]
+    pub no_only_best: Option<bool>,
 }
 
 /// Generic error response returned when a command fails or validation rejects the request.
@@ -102,6 +105,8 @@ pub struct CertSummary {
     pub not_after: Option<i64>,
     pub active: bool,
     pub last_event: Option<CertEventSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cert_id: Option<i32>,
 }
 
 /// Response payload for `cert.status` without a hostname.
@@ -111,7 +116,7 @@ pub struct CertListResponse {
     pub certificates: Vec<CertSummary>,
 }
 
-/// Response payload for `cert.status` with a specific hostname.
+/// Response payload for `cert.status` with a specific hostname or certificate ID.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CertDetailResponse {
     pub ok: bool,
@@ -124,6 +129,8 @@ pub struct CertDetailResponse {
     pub active: bool,
     pub last_active_at: Option<i64>,
     pub cert_events: Vec<CertEventSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cert_id: Option<i32>,
 }
 
 /// Individual streamed event for `cert.wait`.

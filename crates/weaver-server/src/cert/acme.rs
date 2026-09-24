@@ -319,17 +319,19 @@ impl AcmeEngine {
 
         // 8. Persist into the certificates table
         self.store
-            .upsert_certificate(crate::store::entity::certificate::Model {
-                name: hostname.to_string(),
-                cert_pem: cert_pem.clone(),
-                key_pem: key_pem.clone(),
-                not_before,
-                not_after,
-                issuer: None,
-                directory: directory_url.to_string(),
-                obtained_at: now,
-                last_active_at: Some(now),
-            })
+            .save_certificate(
+                hostname,
+                crate::store::NewCertificate {
+                    cert_pem: cert_pem.clone(),
+                    key_pem: key_pem.clone(),
+                    not_before,
+                    not_after,
+                    issuer: None,
+                    directory: directory_url.to_string(),
+                    obtained_at: now,
+                    active_at: Some(now),
+                },
+            )
             .await
             .map_err(|e| AcmeError::Other(format!("Failed to save certificate: {e}")))?;
 

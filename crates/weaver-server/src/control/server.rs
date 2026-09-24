@@ -280,57 +280,162 @@ async fn handle_connection(
             let root_domain = config.root_domain.to_ascii_lowercase();
             match req.name {
                 None => {
-                    // Summary list of all certificates
-                    let mut names = std::collections::BTreeSet::new();
-                    names.insert(root_domain.clone());
+                    let no_only_best = req.no_only_best.unwrap_or(false);
 
-                    if let Ok(records) = store.list_certificates().await {
-                        for r in records {
-                            names.insert(r.name.to_ascii_lowercase());
+                    let summaries = if !no_only_best {
+                        // Summary list: only the best certificate per domain
+                        let mut domain_names = std::collections::BTreeSet::new();
+                        domain_names.insert(root_domain.clone());
+
+                        let best_records = store.list_certificates(true).await.unwrap_or_default();
+                        let mut records_map = std::collections::HashMap::new();
+                        for r in best_records {
+                            let lower = r.name.to_ascii_lowercase();
+                            domain_names.insert(lower.clone());
+                            records_map.insert(lower, r);
                         }
-                    }
-                    for n in cert_manager.list_states().keys() {
-                        names.insert(n.to_ascii_lowercase());
-                    }
-
-                    // Order root first, then remaining alphabetically
-                    let mut ordered_names = Vec::with_capacity(names.len());
-                    ordered_names.push(root_domain.clone());
-                    for n in names {
-                        if n != root_domain {
-                            ordered_names.push(n);
+                        for n in cert_manager.list_states().keys() {
+                            domain_names.insert(n.to_ascii_lowercase());
                         }
-                    }
 
-                    let mut summaries = Vec::with_capacity(ordered_names.len());
-                    for name in ordered_names {
-                        let state = cert_manager.status(&name).label().to_string();
-                        let cert_rec = store.get_certificate(&name).await.ok().flatten();
-                        let not_after = cert_rec
-                            .as_ref()
-                            .map(|c| c.not_after)
-                            .or_else(|| cert_manager.status(&name).not_after());
-                        let active = cert_manager.is_active(&name);
-                        let last_event = store
-                            .get_latest_cert_event(&name)
-                            .await
-                            .ok()
-                            .flatten()
-                            .map(|e| CertEventSummary {
-                                id: e.id,
-                                at: e.at,
-                                kind: e.kind,
-                                detail: e.detail,
+                        // Order root first, then remaining alphabetically
+                        let mut ordered_names = Vec::with_capacity(domain_names.len());
+                        ordered_names.push(root_domain.clone());
+                        for n in domain_names {
+                            if n != root_domain {
+                                ordered_names.push(n);
+                            }
+                        }
+
+                        let mut list = Vec::with_capacity(ordered_names.len());
+                        for name in ordered_names {
+                            let state = cert_manager.status(&name).label().to_string();
+                            let cert_rec = records_map.get(&name);
+                            let not_after = cert_rec
+                                .map(|c| c.not_after)
+                                .or_else(|| cert_manager.status(&name).not_after());
+                            let active = cert_manager.is_active(&name);
+                            let cert_id = cert_rec.map(|c| c.id);
+                            let last_event = store
+                                .get_latest_cert_event(&name)
+                                .await
+                                .ok()
+                                .flatten()
+                                .map(|e| CertEventSummary {
+                                    id: e.id,
+                                    at: e.at,
+                                    kind: e.kind,
+                                    detail: e.detail,
+                                });
+
+                            list.push(CertSummary {
+                                name,
+                                state,
+                                not_after,
+                                active,
+                                last_event,
+                                cert_id,
                             });
+                        }
+                        list
+                    } else {
+                        // Full list: all certificates for each domain
+                        let all_records = store.list_certificates(false).await.unwrap_or_default();
+                        let mut list = Vec::new();
+                        let mut seen_domains = std::collections::HashSet::new();
 
-                        summaries.push(CertSummary {
-                            name,
-                            state,
-                            not_after,
-                            active,
-                            last_event,
-                        });
-                    }
+                        // First partition: root domain certificates (best root first)
+                        for r in &all_records {
+                            if r.name.eq_ignore_ascii_case(&root_domain) {
+                                seen_domains.insert(root_domain.clone());
+                                let state = cert_manager.status(&root_domain).label().to_string();
+                                let active = cert_manager.is_active(&root_domain);
+                                let last_event = store
+                                    .get_latest_cert_event(&root_domain)
+                                    .await
+                                    .ok()
+                                    .flatten()
+                                    .map(|e| CertEventSummary {
+                                        id: e.id,
+                                        at: e.at,
+                                        kind: e.kind,
+                                        detail: e.detail,
+                                    });
+                                list.push(CertSummary {
+                                    name: root_domain.clone(),
+                                    state,
+                                    not_after: Some(r.not_after),
+                                    active,
+                                    last_event,
+                                    cert_id: Some(r.id),
+                                });
+                            }
+                        }
+
+                        // If root had no certificates yet, add placeholder row
+                        if !seen_domains.contains(&root_domain) {
+                            let state = cert_manager.status(&root_domain).label().to_string();
+                            let not_after = cert_manager.status(&root_domain).not_after();
+                            let active = cert_manager.is_active(&root_domain);
+                            list.push(CertSummary {
+                                name: root_domain.clone(),
+                                state,
+                                not_after,
+                                active,
+                                last_event: None,
+                                cert_id: None,
+                            });
+                            seen_domains.insert(root_domain.clone());
+                        }
+
+                        // Second partition: non-root certificates
+                        for r in &all_records {
+                            let lower = r.name.to_ascii_lowercase();
+                            if lower != root_domain {
+                                seen_domains.insert(lower.clone());
+                                let state = cert_manager.status(&lower).label().to_string();
+                                let active = cert_manager.is_active(&lower);
+                                let last_event = store
+                                    .get_latest_cert_event(&lower)
+                                    .await
+                                    .ok()
+                                    .flatten()
+                                    .map(|e| CertEventSummary {
+                                        id: e.id,
+                                        at: e.at,
+                                        kind: e.kind,
+                                        detail: e.detail,
+                                    });
+                                list.push(CertSummary {
+                                    name: lower,
+                                    state,
+                                    not_after: Some(r.not_after),
+                                    active,
+                                    last_event,
+                                    cert_id: Some(r.id),
+                                });
+                            }
+                        }
+
+                        // Any in-memory domain states without cert records
+                        for n in cert_manager.list_states().keys() {
+                            let lower = n.to_ascii_lowercase();
+                            if seen_domains.insert(lower.clone()) {
+                                let state = cert_manager.status(&lower).label().to_string();
+                                let not_after = cert_manager.status(&lower).not_after();
+                                let active = cert_manager.is_active(&lower);
+                                list.push(CertSummary {
+                                    name: lower,
+                                    state,
+                                    not_after,
+                                    active,
+                                    last_event: None,
+                                    cert_id: None,
+                                });
+                            }
+                        }
+                        list
+                    };
 
                     let resp = CertListResponse {
                         ok: true,
@@ -342,19 +447,29 @@ async fn handle_connection(
                     writer.flush().await?;
                 }
                 Some(name) => {
-                    let target = if name == "root" {
+                    let cert_rec = if let Ok(cert_id) = name.parse::<i32>() {
+                        store.get_certificate_by_id(cert_id).await.ok().flatten()
+                    } else {
+                        let target = if name == "root" {
+                            root_domain.clone()
+                        } else {
+                            name.to_ascii_lowercase()
+                        };
+                        store.get_certificate(&target).await.ok().flatten()
+                    };
+
+                    let target = if let Some(ref r) = cert_rec {
+                        r.name.clone()
+                    } else if name == "root" {
                         root_domain.clone()
                     } else {
                         name.to_ascii_lowercase()
                     };
 
-                    let cert_rec = store.get_certificate(&target).await.ok().flatten();
                     let in_states = cert_manager.list_states().contains_key(&target);
 
                     if target != root_domain && cert_rec.is_none() && !in_states {
-                        let resp = ErrorResponse::new(format!(
-                            "Certificate for hostname '{target}' not found"
-                        ));
+                        let resp = ErrorResponse::new(format!("Certificate '{name}' not found"));
                         let mut data = serde_json::to_vec(&resp)?;
                         data.push(b'\n');
                         writer.write_all(&data).await?;
@@ -389,6 +504,7 @@ async fn handle_connection(
                         .unwrap_or_else(|| config.acme_provider.clone());
                     let active = cert_manager.is_active(&target);
                     let last_active_at = cert_rec.as_ref().and_then(|r| r.last_active_at);
+                    let cert_id = cert_rec.as_ref().map(|r| r.id);
 
                     let resp = CertDetailResponse {
                         ok: true,
@@ -401,6 +517,7 @@ async fn handle_connection(
                         active,
                         last_active_at,
                         cert_events,
+                        cert_id,
                     };
                     let mut data = serde_json::to_vec(&resp)?;
                     data.push(b'\n');

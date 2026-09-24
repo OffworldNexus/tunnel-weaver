@@ -139,7 +139,8 @@ impl CertResolver {
     }
 
     /// Stores an issued certificate for `name` with an explicit `not_after` expiration timestamp
-    /// and unblocks any waiting handshakes.
+    /// and unblocks any waiting handshakes. Updates the in-memory best certificate cache if
+    /// the certificate is newer than or equal to any currently cached certificate for `name`.
     pub fn insert_cert_with_expiry(
         &self,
         name: &str,
@@ -147,13 +148,27 @@ impl CertResolver {
         not_after: i64,
     ) {
         let lower = name.to_ascii_lowercase();
-        self.certs.write().unwrap().insert(
-            lower.clone(),
-            StoredCert {
-                key: certified_key,
-                not_after,
-            },
-        );
+        let mut certs = self.certs.write().unwrap();
+        match certs.get_mut(&lower) {
+            Some(existing) => {
+                if not_after >= existing.not_after {
+                    *existing = StoredCert {
+                        key: certified_key,
+                        not_after,
+                    };
+                }
+            }
+            None => {
+                certs.insert(
+                    lower.clone(),
+                    StoredCert {
+                        key: certified_key,
+                        not_after,
+                    },
+                );
+            }
+        }
+        drop(certs);
 
         if let Some(waiter) = self.ordering_waiters.lock().unwrap().remove(&lower) {
             waiter.notify();

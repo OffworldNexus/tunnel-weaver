@@ -11,7 +11,7 @@ use tokio_rustls::TlsConnector;
 use tokio_util::sync::CancellationToken;
 
 use weaver_server::cert::challenge::{ChallengeRegistry, create_tls_alpn_01_certified_key};
-use weaver_server::cert::clock::MockClock;
+use weaver_server::cert::clock::{Clock, MockClock};
 use weaver_server::cert::providers::{format_providers_table, requires_eab, resolve_directory_url};
 use weaver_server::cert::resolver::CertResolver;
 use weaver_server::cert::state::CertState;
@@ -457,17 +457,19 @@ async fn test_sqlite_caching_and_server_restart_no_reorder() {
 
     // Seed database with a valid cached certificate
     store
-        .upsert_certificate(weaver_server::store::entity::certificate::Model {
-            name: "test.example.com".into(),
-            cert_pem: cert_pem.clone(),
-            key_pem: key_pem.clone(),
-            not_before: 1_690_000_000,
-            not_after: 1_790_000_000, // valid until far in future
-            issuer: None,
-            directory: "https://acme-staging-v02.api.letsencrypt.org/directory".into(),
-            obtained_at: 1_700_000_000,
-            last_active_at: Some(1_700_000_000),
-        })
+        .save_certificate(
+            "test.example.com",
+            weaver_server::store::NewCertificate {
+                cert_pem: cert_pem.clone(),
+                key_pem: key_pem.clone(),
+                not_before: 1_690_000_000,
+                not_after: 1_790_000_000, // valid until far in future
+                issuer: None,
+                directory: "https://acme-staging-v02.api.letsencrypt.org/directory".into(),
+                obtained_at: 1_700_000_000,
+                active_at: Some(1_700_000_000),
+            },
+        )
         .await
         .unwrap();
 
@@ -486,9 +488,10 @@ async fn test_sqlite_caching_and_server_restart_no_reorder() {
     });
 
     let registry = Arc::new(ChallengeRegistry::new());
-    let resolver = Arc::new(CertResolver::new(
+    let resolver = Arc::new(CertResolver::with_clock(
         "test.example.com".into(),
         Arc::clone(&registry),
+        Arc::clone(&clock) as Arc<dyn Clock>,
     ));
 
     let manager = CertManager::new(config, store, resolver, registry, clock, true);
@@ -567,17 +570,19 @@ async fn test_forced_expiration_triggers_renewal_flow_and_event() {
     let key_pem = rcgen_cert.signing_key.serialize_pem();
 
     store
-        .upsert_certificate(weaver_server::store::entity::certificate::Model {
-            name: "example.com".into(),
-            cert_pem: cert_pem.clone(),
-            key_pem: key_pem.clone(),
-            not_before: 1_600_000_000,
-            not_after: 1_710_000_000,
-            issuer: None,
-            directory: "https://acme-staging-v02.api.letsencrypt.org/directory".into(),
-            obtained_at: 1_600_000_000,
-            last_active_at: Some(1_700_000_000),
-        })
+        .save_certificate(
+            "example.com",
+            weaver_server::store::NewCertificate {
+                cert_pem: cert_pem.clone(),
+                key_pem: key_pem.clone(),
+                not_before: 1_600_000_000,
+                not_after: 1_710_000_000,
+                issuer: None,
+                directory: "https://acme-staging-v02.api.letsencrypt.org/directory".into(),
+                obtained_at: 1_600_000_000,
+                active_at: Some(1_700_000_000),
+            },
+        )
         .await
         .unwrap();
 

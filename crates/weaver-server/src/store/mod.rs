@@ -14,10 +14,10 @@ pub mod migration;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use sea_orm::sea_query::{Expr, OnConflict};
+use sea_orm::sea_query::{Alias, Expr, OnConflict, Query};
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectOptions, ConnectionTrait, Database, DatabaseConnection,
-    DbBackend, EntityTrait, QueryFilter, QueryOrder, QuerySelect, Set, Statement,
+    DbBackend, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Set, Statement,
 };
 use sea_orm_migration::MigratorTrait;
 
@@ -25,7 +25,7 @@ pub use error::StoreError;
 pub use migration::Migrator;
 
 use crate::config::{Config, ConfigError};
-use entity::{acme_account, cert_event, certificate, config};
+use entity::{acme_account, cert_event, certificate, config, domain};
 
 /// Upper bound on pooled connections. SQLite serializes writers anyway; a
 /// small pool lets concurrent readers proceed without contention.
@@ -251,67 +251,260 @@ impl Store {
         Ok(applied.len() as u32)
     }
 
-    // ----- certificates -----
+    // ----- certificates and domains -----
 
-    /// Fetches the metadata record for a certificate by hostname.
-    pub async fn get_certificate(&self, name: &str) -> Result<Option<CertRecord>, StoreError> {
-        let row = certificate::Entity::find_by_id(name.to_ascii_lowercase())
+    /// Fetches an existing domain by lowercase name, or creates a new one with optional `last_active_at`.
+    pub async fn get_or_create_domain(
+        &self,
+        name: &str,
+        active_at: Option<i64>,
+    ) -> Result<domain::Model, StoreError> {
+        let lower = name.to_ascii_lowercase();
+        if let Some(existing) = domain::Entity::find()
+            .filter(domain::Column::Name.eq(&lower))
             .one(&self.db)
-            .await?;
-        Ok(row.map(CertRecord::from))
+            .await?
+        {
+            if active_at.is_some() && existing.last_active_at != active_at {
+                let mut active: domain::ActiveModel = existing.into();
+                active.last_active_at = Set(active_at);
+                let updated = active.update(&self.db).await?;
+                return Ok(updated);
+            }
+            return Ok(existing);
+        }
+
+        let new_domain = domain::ActiveModel {
+            name: Set(lower.clone()),
+            last_active_at: Set(active_at),
+            ..Default::default()
+        };
+        match new_domain.insert(&self.db).await {
+            Ok(model) => Ok(model),
+            Err(e) => {
+                if let Some(existing) = domain::Entity::find()
+                    .filter(domain::Column::Name.eq(&lower))
+                    .one(&self.db)
+                    .await?
+                {
+                    Ok(existing)
+                } else {
+                    Err(e.into())
+                }
+            }
+        }
     }
 
-    /// Lists all certificate records (without key material) ordered by name.
-    pub async fn list_certificates(&self) -> Result<Vec<CertRecord>, StoreError> {
-        let rows = self.list_certificates_full().await?;
-        Ok(rows.into_iter().map(CertRecord::from).collect())
-    }
-
-    /// Lists all certificates including PEM material, ordered by name.
-    ///
-    /// Used at startup to repopulate the in-memory TLS resolver.
-    pub async fn list_certificates_full(&self) -> Result<Vec<certificate::Model>, StoreError> {
-        Ok(certificate::Entity::find()
-            .order_by_asc(certificate::Column::Name)
-            .all(&self.db)
+    /// Fetches a domain by lowercase name.
+    pub async fn get_domain(&self, name: &str) -> Result<Option<domain::Model>, StoreError> {
+        let lower = name.to_ascii_lowercase();
+        Ok(domain::Entity::find()
+            .filter(domain::Column::Name.eq(&lower))
+            .one(&self.db)
             .await?)
     }
 
-    /// Inserts or replaces a certificate row keyed by hostname.
-    pub async fn upsert_certificate(&self, cert: certificate::Model) -> Result<(), StoreError> {
-        let active: certificate::ActiveModel = cert.into();
-        certificate::Entity::insert(active)
-            .on_conflict(
-                OnConflict::column(certificate::Column::Name)
-                    .update_columns([
-                        certificate::Column::CertPem,
-                        certificate::Column::KeyPem,
-                        certificate::Column::NotBefore,
-                        certificate::Column::NotAfter,
-                        certificate::Column::Issuer,
-                        certificate::Column::Directory,
-                        certificate::Column::ObtainedAt,
-                        certificate::Column::LastActiveAt,
-                    ])
+    /// Fetches a domain by either integer ID or hostname.
+    pub async fn get_domain_by_id_or_name(
+        &self,
+        identifier: &str,
+    ) -> Result<Option<domain::Model>, StoreError> {
+        if let Ok(id) = identifier.parse::<i32>()
+            && let Some(d) = domain::Entity::find_by_id(id).one(&self.db).await?
+        {
+            return Ok(Some(d));
+        }
+        self.get_domain(identifier).await
+    }
+
+    /// Saves a newly issued certificate, ensuring the parent domain exists.
+    pub async fn save_certificate(
+        &self,
+        domain_name: &str,
+        cert: NewCertificate,
+    ) -> Result<certificate::Model, StoreError> {
+        let domain = self
+            .get_or_create_domain(domain_name, cert.active_at)
+            .await?;
+        let active = certificate::ActiveModel {
+            domain_id: Set(domain.id),
+            cert_pem: Set(cert.cert_pem),
+            key_pem: Set(cert.key_pem),
+            not_before: Set(cert.not_before),
+            not_after: Set(cert.not_after),
+            issuer: Set(cert.issuer),
+            directory: Set(cert.directory),
+            obtained_at: Set(cert.obtained_at),
+            ..Default::default()
+        };
+        let model = active.insert(&self.db).await?;
+        Ok(model)
+    }
+
+    /// Base query joining certificates with their parent domain.
+    fn certs_with_domains() -> sea_orm::SelectTwo<certificate::Entity, domain::Entity> {
+        certificate::Entity::find().find_also_related(domain::Entity)
+    }
+
+    /// Query for the best certificate per domain, filtered directly in SQL.
+    fn best_certs_with_domains() -> sea_orm::SelectTwo<certificate::Entity, domain::Entity> {
+        let best_ids = Query::select()
+            .column(Alias::new("id"))
+            .from_subquery(
+                Query::select()
+                    .column(certificate::Column::Id)
+                    .expr_as(
+                        Expr::cust(
+                            "ROW_NUMBER() OVER (PARTITION BY domain_id ORDER BY not_after DESC, id DESC)",
+                        ),
+                        Alias::new("rn"),
+                    )
+                    .from(certificate::Entity)
                     .to_owned(),
+                Alias::new("ranked"),
             )
-            .exec_without_returning(&self.db)
+            .and_where(Expr::cust("ranked.rn = 1"))
+            .to_owned();
+
+        Self::certs_with_domains().filter(certificate::Column::Id.in_subquery(best_ids))
+    }
+
+    /// Fetches a specific certificate record by its certificate PK ID via a single join query.
+    pub async fn get_certificate_by_id(
+        &self,
+        cert_id: i32,
+    ) -> Result<Option<CertRecord>, StoreError> {
+        let row = Self::certs_with_domains()
+            .filter(certificate::Column::Id.eq(cert_id))
+            .one(&self.db)
+            .await?;
+
+        Ok(row.map(|(cert, domain)| to_cert_record(cert, domain)))
+    }
+
+    /// Fetches the best certificate metadata for a domain by hostname via a single join query.
+    pub async fn get_certificate(
+        &self,
+        domain_name: &str,
+    ) -> Result<Option<CertRecord>, StoreError> {
+        let lower = domain_name.to_ascii_lowercase();
+        let row = Self::best_certs_with_domains()
+            .filter(domain::Column::Name.eq(lower))
+            .one(&self.db)
+            .await?;
+
+        Ok(row.map(|(cert, domain)| to_cert_record(cert, domain)))
+    }
+
+    /// Fetches a certificate by integer certificate ID or by domain name (best cert).
+    pub async fn get_certificate_by_id_or_name(
+        &self,
+        identifier: &str,
+    ) -> Result<Option<CertRecord>, StoreError> {
+        if let Ok(id) = identifier.parse::<i32>() {
+            self.get_certificate_by_id(id).await
+        } else {
+            self.get_certificate(identifier).await
+        }
+    }
+
+    /// Counts the total number of certificates stored for a domain by ID or hostname directly in SQL.
+    pub async fn count_certificates_for_domain(
+        &self,
+        identifier: &str,
+    ) -> Result<usize, StoreError> {
+        let Some(domain) = self.get_domain_by_id_or_name(identifier).await? else {
+            return Ok(0);
+        };
+        let count = certificate::Entity::find()
+            .filter(certificate::Column::DomainId.eq(domain.id))
+            .count(&self.db)
+            .await?;
+        Ok(count as usize)
+    }
+
+    /// Fetches all certificates for a domain by ID or hostname directly via SQL.
+    pub async fn get_certificates_for_domain(
+        &self,
+        identifier: &str,
+    ) -> Result<Vec<CertRecord>, StoreError> {
+        let Some(domain) = self.get_domain_by_id_or_name(identifier).await? else {
+            return Ok(Vec::new());
+        };
+        let rows = Self::certs_with_domains()
+            .filter(certificate::Column::DomainId.eq(domain.id))
+            .order_by_desc(certificate::Column::NotAfter)
+            .order_by_desc(certificate::Column::Id)
+            .all(&self.db)
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(cert, domain)| to_cert_record(cert, domain))
+            .collect())
+    }
+
+    /// Lists certificate records: either only the best certificate per domain or all certificates.
+    pub async fn list_certificates(&self, only_best: bool) -> Result<Vec<CertRecord>, StoreError> {
+        let rows = if only_best {
+            Self::best_certs_with_domains().all(&self.db).await?
+        } else {
+            Self::certs_with_domains().all(&self.db).await?
+        };
+
+        let mut results: Vec<CertRecord> = rows
+            .into_iter()
+            .map(|(cert, domain)| to_cert_record(cert, domain))
+            .collect();
+        results.sort_by(|a, b| {
+            a.name
+                .cmp(&b.name)
+                .then_with(|| b.not_after.cmp(&a.not_after))
+        });
+        Ok(results)
+    }
+
+    /// Lists the best certificate per domain including PEM material, directly queried via SQL.
+    pub async fn list_best_certificates_full(&self) -> Result<Vec<FullCertRecord>, StoreError> {
+        let rows = Self::best_certs_with_domains().all(&self.db).await?;
+        let mut results: Vec<FullCertRecord> = rows
+            .into_iter()
+            .map(|(cert, domain)| to_full_cert_record(cert, domain))
+            .collect();
+        results.sort_by(|a, b| {
+            a.name
+                .cmp(&b.name)
+                .then_with(|| b.not_after.cmp(&a.not_after))
+        });
+        Ok(results)
+    }
+
+    /// Lists all certificates including PEM material across all domains.
+    pub async fn list_certificates_full(&self) -> Result<Vec<FullCertRecord>, StoreError> {
+        self.list_best_certificates_full().await
+    }
+
+    /// Sets or clears `last_active_at` for a domain.
+    pub async fn set_domain_active(
+        &self,
+        name: &str,
+        active_at: Option<i64>,
+    ) -> Result<(), StoreError> {
+        let lower = name.to_ascii_lowercase();
+        domain::Entity::update_many()
+            .col_expr(domain::Column::LastActiveAt, Expr::value(active_at))
+            .filter(domain::Column::Name.eq(lower))
+            .exec(&self.db)
             .await?;
         Ok(())
     }
 
-    /// Sets or clears `last_active_at` for a hostname's certificate.
+    /// Legacy alias for `set_domain_active`.
     pub async fn set_cert_active(
         &self,
         name: &str,
         active_at: Option<i64>,
     ) -> Result<(), StoreError> {
-        certificate::Entity::update_many()
-            .col_expr(certificate::Column::LastActiveAt, Expr::value(active_at))
-            .filter(certificate::Column::Name.eq(name.to_ascii_lowercase()))
-            .exec(&self.db)
-            .await?;
-        Ok(())
+        self.set_domain_active(name, active_at).await
     }
 
     // ----- certificate events -----
@@ -406,9 +599,63 @@ impl Store {
     }
 }
 
-/// Certificate database record metadata (no key material).
+/// Input data for saving a newly issued certificate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewCertificate {
+    pub cert_pem: String,
+    pub key_pem: String,
+    pub not_before: i64,
+    pub not_after: i64,
+    pub issuer: Option<String>,
+    pub directory: String,
+    pub obtained_at: i64,
+    pub active_at: Option<i64>,
+}
+
+/// Maps a certificate model and its joined domain model into a `CertRecord`.
+fn to_cert_record(cert: certificate::Model, domain: Option<domain::Model>) -> CertRecord {
+    let (name, last_active_at) = match domain {
+        Some(d) => (d.name, d.last_active_at),
+        None => (String::new(), None),
+    };
+    CertRecord {
+        id: cert.id,
+        domain_id: cert.domain_id,
+        name,
+        not_before: cert.not_before,
+        not_after: cert.not_after,
+        issuer: cert.issuer,
+        directory: cert.directory,
+        obtained_at: cert.obtained_at,
+        last_active_at,
+    }
+}
+
+fn to_full_cert_record(cert: certificate::Model, domain: Option<domain::Model>) -> FullCertRecord {
+    let (name, last_active_at) = match domain {
+        Some(d) => (d.name, d.last_active_at),
+        None => (String::new(), None),
+    };
+    FullCertRecord {
+        id: cert.id,
+        domain_id: cert.domain_id,
+        name,
+        cert_pem: cert.cert_pem,
+        key_pem: cert.key_pem,
+        not_before: cert.not_before,
+        not_after: cert.not_after,
+        issuer: cert.issuer,
+        directory: cert.directory,
+        obtained_at: cert.obtained_at,
+        last_active_at,
+    }
+}
+
+/// Certificate database record metadata joined with domain metadata (no key material).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CertRecord {
+    pub id: i32,
+    pub domain_id: i32,
     pub name: String,
     pub not_before: i64,
     pub not_after: i64,
@@ -418,18 +665,20 @@ pub struct CertRecord {
     pub last_active_at: Option<i64>,
 }
 
-impl From<certificate::Model> for CertRecord {
-    fn from(m: certificate::Model) -> Self {
-        Self {
-            name: m.name,
-            not_before: m.not_before,
-            not_after: m.not_after,
-            issuer: m.issuer,
-            directory: m.directory,
-            obtained_at: m.obtained_at,
-            last_active_at: m.last_active_at,
-        }
-    }
+/// Full certificate record with PEM material, used for startup cache hydration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FullCertRecord {
+    pub id: i32,
+    pub domain_id: i32,
+    pub name: String,
+    pub cert_pem: String,
+    pub key_pem: String,
+    pub not_before: i64,
+    pub not_after: i64,
+    pub issuer: Option<String>,
+    pub directory: String,
+    pub obtained_at: i64,
+    pub last_active_at: Option<i64>,
 }
 
 /// Certificate event database record.
