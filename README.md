@@ -1,6 +1,21 @@
-# Tunnel Weaver
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset=".github/brand/header-dark.svg">
+  <source media="(prefers-color-scheme: light)" srcset=".github/brand/header-light.svg">
+  <img src=".github/brand/header-light.svg" alt="Tunnel Weaver — Small bird. Strong connections." width="960">
+</picture>
+
+<p align="center">
+  <a href="#building--testing">Build &amp; test</a> ·
+  <a href="docs/architecture.md">Architecture</a> ·
+  <a href="CONTRIBUTING.md">Contribute</a> ·
+  <a href="LICENSE">Apache 2.0</a>
+</p>
 
 Tunnel Weaver is an open-core tunneling and reverse proxying system designed for exposing local services to public domains with automated TLS, end-to-end authentication, and multiplexed streams.
+
+| Public endpoints | Authenticated connections | Multiplexed streams |
+| --- | --- | --- |
+| Expose local services through public domains with automated TLS. | End-to-end authentication between the client and relay. | A Rust workspace with a sans-IO multiplexer at its core. |
 
 ## Workspace Overview
 
