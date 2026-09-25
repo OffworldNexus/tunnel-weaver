@@ -6,13 +6,13 @@ use weaver_mux::{
     RST_CODE_CONNECTION_CLOSED, StreamError,
 };
 
-#[test]
-fn close_key_revoked() {
-    let mut p = Pair::authenticated();
+#[tokio::test]
+async fn close_key_revoked() {
+    let mut p = Pair::authenticated().await;
     let a = p.server.open(Class::Interactive).unwrap();
     let b = p.client.open(Class::Interactive).unwrap();
     send(&mut p.server, a, b"pending bulk");
-    p.pump();
+    p.pump().await;
     p.drain_events(Side::Client);
     p.drain_events(Side::Server);
     // Queue more data so the scheduler has a backlog GOAWAY must beat.
@@ -55,8 +55,8 @@ fn close_key_revoked() {
     );
 
     // Deliver GOAWAY (and trailing RSTs) to the client.
-    p.client.recv(now, &buf).unwrap_err_or_ok();
-    p.pump();
+    p.client.recv(now, &buf).await.unwrap_err_or_ok();
+    p.pump().await;
     let client_events = p.drain_events(Side::Client);
     assert!(
         client_events
@@ -88,9 +88,9 @@ impl<T, E> UnwrapErrOrOk for Result<T, E> {
     fn unwrap_err_or_ok(self) {}
 }
 
-#[test]
-fn close_is_idempotent_and_recv_after_close_is_rejected() {
-    let mut p = Pair::authenticated();
+#[tokio::test]
+async fn close_is_idempotent_and_recv_after_close_is_rejected() {
+    let mut p = Pair::authenticated().await;
     p.client.close(CloseReason::new(CloseCode::Shutdown));
     p.client.close(CloseReason::new(CloseCode::Superseded));
     let events = p.drain_events(Side::Client);
@@ -102,12 +102,12 @@ fn close_is_idempotent_and_recv_after_close_is_rejected() {
         frame_type: FrameType::Ping,
         payload: vec![1],
     };
-    assert_eq!(p.client.recv(now, &encode(&ping)), Ok(()));
+    assert_eq!(p.client.recv(now, &encode(&ping)).await, Ok(()));
     assert!(p.drain_events(Side::Client).is_empty());
 }
 
-#[test]
-fn every_close_code_round_trips() {
+#[tokio::test]
+async fn every_close_code_round_trips() {
     for code in [
         CloseCode::KeyRevoked,
         CloseCode::Rejected,
@@ -116,9 +116,9 @@ fn every_close_code_round_trips() {
         CloseCode::ProtocolError,
         CloseCode::Timeout,
     ] {
-        let mut p = Pair::authenticated();
+        let mut p = Pair::authenticated().await;
         p.client.close(CloseReason::new(code));
-        p.pump();
+        p.pump().await;
         assert!(matches!(
             p.drain_events(Side::Server).last(),
             Some(Event::Closed { reason }) if reason.code == code
@@ -126,18 +126,18 @@ fn every_close_code_round_trips() {
     }
 }
 
-#[test]
-fn protocol_error_closes_with_goaway_protocol_error() {
-    let mut p = Pair::authenticated();
+#[tokio::test]
+async fn protocol_error_closes_with_goaway_protocol_error() {
+    let mut p = Pair::authenticated().await;
     let now = p.clock.now();
     let garbage = Frame {
         stream_id: 0,
         frame_type: FrameType::Pong,
         payload: vec![0xff; 20],
     };
-    let err = p.client.recv(now, &encode(&garbage)).unwrap_err();
+    let err = p.client.recv(now, &encode(&garbage)).await.unwrap_err();
     assert_eq!(err, ProtocolError::Decode(FrameType::Pong));
-    p.pump();
+    p.pump().await;
     assert!(matches!(
         p.drain_events(Side::Server).last(),
         Some(Event::Closed { reason }) if reason.code == CloseCode::ProtocolError

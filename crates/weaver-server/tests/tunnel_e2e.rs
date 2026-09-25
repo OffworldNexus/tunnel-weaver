@@ -26,7 +26,12 @@ use weaver_server::config::Config;
 use weaver_server::edge::https::run_https_server_with_registry;
 use weaver_server::store::Store;
 use weaver_server::tunnel::TunnelRegistry;
-use weaver_server::tunnel::{Identity, PocResolver, derive_hostname};
+use weaver_server::tunnel::{Identity, StoreIdentityResolver, derive_hostname};
+
+fn client_dev_key() -> weaver_mux::KeyId {
+    use weaver_mux::auth::Signer as _;
+    weave::Ed25519Signer::dev().key_id()
+}
 
 /// A trivial in-process HTTP/1.1 origin used by the proxy e2e tests. It
 /// answers every request with `200`, an `x-origin: yes` marker, a
@@ -289,10 +294,12 @@ async fn spawn_test_relay(root_domain: &str) -> TestRelay {
     std::io::Write::write_all(&mut temp_ca, cert_pem.as_bytes()).unwrap();
     let ca_pem_path = temp_ca.path().to_path_buf();
 
+    let resolver = Arc::new(StoreIdentityResolver::new(store.as_ref().clone()));
     let registry = Arc::new(TunnelRegistry::new(
         root_domain.to_string(),
         Arc::clone(&cert_manager),
-        Arc::new(PocResolver),
+        resolver,
+        store.as_ref().clone(),
     ));
 
     let shutdown_token = CancellationToken::new();
@@ -651,21 +658,19 @@ async fn test_duplicate_registration_refusal() {
 
     let (proxy_tx, _) = tokio::sync::mpsc::channel(1);
     let (s_tx, _) = tokio::sync::oneshot::channel();
-    let conn_id = relay
-        .registry
-        .register_connection(PocResolver::KEY_ID, s_tx);
+    let conn_id = relay.registry.register_connection(client_dev_key(), s_tx);
 
     // First registration succeeds
     let res1 = relay
         .registry
-        .register_service(PocResolver::KEY_ID, conn_id, "web", proxy_tx.clone())
+        .register_service(client_dev_key(), conn_id, "web", proxy_tx.clone())
         .await;
     assert!(res1.is_ok());
 
     // Duplicate registration for same service returns AlreadyRegistered
     let res2 = relay
         .registry
-        .register_service(PocResolver::KEY_ID, conn_id, "web", proxy_tx.clone())
+        .register_service(client_dev_key(), conn_id, "web", proxy_tx.clone())
         .await;
     assert_eq!(res2, Err(RefusalCode::AlreadyRegistered));
 
@@ -1985,19 +1990,21 @@ async fn test_client_leaving_during_cert_issuance_does_not_leave_hostname_active
     ));
     let cert_manager = CertManager::new(
         Arc::clone(&config),
-        store,
+        Arc::clone(&store),
         resolver,
         challenge_registry,
         Arc::new(SystemClock),
         false,
     );
+    let identity_resolver = Arc::new(StoreIdentityResolver::new(store.as_ref().clone()));
     let registry = Arc::new(TunnelRegistry::new(
         root.to_string(),
         Arc::clone(&cert_manager),
-        Arc::new(PocResolver),
+        identity_resolver,
+        store.as_ref().clone(),
     ));
 
-    let key = PocResolver::KEY_ID;
+    let key = client_dev_key();
     let (superseded_tx, _superseded_rx) = tokio::sync::oneshot::channel();
     let conn_id = registry.register_connection(key, superseded_tx);
     let hostname = derive_hostname("web", &poc_identity(), root);
@@ -2047,4 +2054,78 @@ async fn test_client_leaving_during_cert_issuance_does_not_leave_hostname_active
         !cert_manager.is_active(&hostname),
         "a hostname whose tunnel left during issuance must not be active"
     );
+}
+
+#[tokio::test]
+async fn test_store_backed_auth_and_service_domain_persistence() {
+    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+    use weaver_mux::KeyId;
+    use weaver_server::store::entity::{domain, service};
+
+    let root = "localhost";
+    let relay = spawn_test_relay(root).await;
+    let store = relay.registry.store();
+
+    // 1. The resolver checks against the database, not in-memory constants:
+    // an unknown key is rejected. (The real key is proven by the handshake
+    // below, so it needs no separate assertion.)
+    let identities = relay.registry.identities();
+    let unknown_key = KeyId::Ed25519([0xee; 32]);
+    assert_eq!(identities.identity(&unknown_key).await, None);
+    assert_eq!(identities.public_key(&unknown_key).await, None);
+
+    // 2. Start an origin and connect a real weave tunnel client with the dev key
+    let origin = spawn_test_origin().await;
+    let client_token = CancellationToken::new();
+    let c_tok = client_token.clone();
+    let server_addr = format!("localhost:{}", relay.addr.port());
+    let ca_path = relay.ca_pem_path.clone();
+    let opts = start_options_multi(server_addr, &ca_path, &[("myservice", origin.port())]);
+
+    let client_task = tokio::spawn(async move { weave::run_start_with_token(opts, c_tok).await });
+
+    // Wait until route appears in the registry
+    let expected_hostname = derive_hostname("myservice", &poc_identity(), root);
+    let mut registered = false;
+    for _ in 0..50 {
+        if relay.registry.lookup(&expected_hostname).is_some() {
+            registered = true;
+            break;
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+    assert!(registered, "Service must register successfully");
+
+    // 3. Verify service was persisted under the connecting machine in SQLite
+    let resolved = store
+        .resolve_key(&client_dev_key())
+        .await
+        .unwrap()
+        .expect("seeded dev key must resolve");
+    let (_pers, mach, _k) = resolved;
+
+    let svc_record = service::Entity::find()
+        .filter(service::Column::MachineId.eq(mach.id))
+        .filter(service::Column::Name.eq("myservice"))
+        .one(store.db())
+        .await
+        .unwrap()
+        .expect("service record must be persisted in database");
+
+    assert_eq!(svc_record.name, "myservice");
+    assert_eq!(svc_record.machine_id, mach.id);
+
+    // 4. Verify domain record exists and links to the service record
+    let dom_record = domain::Entity::find()
+        .filter(domain::Column::Name.eq(&expected_hostname))
+        .one(store.db())
+        .await
+        .unwrap()
+        .expect("domain record must exist in database");
+
+    assert_eq!(dom_record.service_id, Some(svc_record.id));
+
+    client_token.cancel();
+    origin.token.cancel();
+    let _ = client_task.await;
 }

@@ -158,10 +158,12 @@ pub async fn run_server(
     // Start background renewal loop
     cert_manager.start_renewal_loop(shutdown_token.clone());
 
+    let identity_resolver = Arc::new(crate::tunnel::StoreIdentityResolver::new(store.clone()));
     let tunnel_registry = Arc::new(crate::tunnel::TunnelRegistry::new(
         config.root_domain.clone(),
         Arc::clone(&cert_manager),
-        Arc::new(crate::tunnel::PocResolver),
+        identity_resolver,
+        store.clone(),
     ));
 
     let http_token = shutdown_token.clone();

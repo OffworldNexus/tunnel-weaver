@@ -205,7 +205,7 @@ impl Connection {
 
     /// Fire every deadline that has passed. Idempotent: a deadline fires
     /// once, and a closed connection has no deadlines.
-    pub fn handle_timeout(&mut self, now: Instant) {
+    pub async fn handle_timeout(&mut self, now: Instant) {
         let now = self.timers.observe(now);
         while self.closed.is_none() {
             match self.timers.expired(now) {
@@ -215,7 +215,7 @@ impl Connection {
                 }
                 Some(Expired::Reverify) => {
                     let still_valid = match (&mut self.cfg.role, &self.key_id) {
-                        (Role::Server { verifier, .. }, Some(k)) => verifier.still_valid(k),
+                        (Role::Server { verifier, .. }, Some(k)) => verifier.still_valid(k).await,
                         _ => true,
                     };
                     if let Some(interval) = self.timers.reverify_interval {
@@ -368,7 +368,7 @@ impl Connection {
     /// Feed one frame (exactly one transport message) from the peer. Any
     /// `Err` means the connection closed itself with `GOAWAY { ProtocolError }`.
     /// Frames arriving after the connection closed are ignored.
-    pub fn recv(&mut self, now: Instant, bytes: &[u8]) -> Result<(), ProtocolError> {
+    pub async fn recv(&mut self, now: Instant, bytes: &[u8]) -> Result<(), ProtocolError> {
         let now = self.timers.observe(now);
         if self.closed.is_some() {
             return Ok(());
@@ -378,7 +378,7 @@ impl Connection {
             Err(e) => return Err(self.fail(e)),
         };
         self.timers.on_recv(now);
-        match self.dispatch(now, frame) {
+        match self.dispatch(now, frame).await {
             Ok(()) => Ok(()),
             Err(e) => Err(self.fail(e)),
         }
@@ -394,12 +394,12 @@ impl Connection {
         err
     }
 
-    fn dispatch(&mut self, now: Instant, frame: Frame) -> Result<(), ProtocolError> {
+    async fn dispatch(&mut self, now: Instant, frame: Frame) -> Result<(), ProtocolError> {
         use FrameType as T;
         if frame.stream_id == 0 {
             return match frame.frame_type {
                 T::Challenge => self.on_challenge(frame),
-                T::Hello => self.on_hello(now, frame),
+                T::Hello => self.on_hello(now, frame).await,
                 T::Welcome => self.on_welcome(now, frame),
                 T::Reject => self.on_reject(frame),
                 T::Goaway => self.on_goaway(frame),
@@ -479,7 +479,7 @@ impl Connection {
         Ok(())
     }
 
-    fn on_hello(&mut self, now: Instant, frame: Frame) -> Result<(), ProtocolError> {
+    async fn on_hello(&mut self, now: Instant, frame: Frame) -> Result<(), ProtocolError> {
         if self.hs != HandshakeState::ChallengeSent {
             return Err(ProtocolError::StateViolation("unexpected HELLO"));
         }
@@ -503,7 +503,7 @@ impl Connection {
                 return Ok(());
             }
         };
-        let Some(pk) = verifier.public_key(&hello.key_id) else {
+        let Some(pk) = verifier.public_key(&hello.key_id).await else {
             self.reject(RejectCode::UnknownKey, "unknown key");
             return Ok(());
         };

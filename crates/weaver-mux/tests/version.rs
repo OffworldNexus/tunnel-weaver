@@ -7,7 +7,7 @@ use weaver_mux::{Event, Frame, FrameType, RejectCode, Signer as _, auth};
 
 /// Drive a server through CHALLENGE, then hand-craft a HELLO advertising
 /// `client_max` and return the server's answer.
-fn hello_with_version(client_max: u16) -> (Frame, Pair) {
+async fn hello_with_version(client_max: u16) -> (Frame, Pair) {
     let mut p = Pair::default_pair();
     let now = p.clock.now();
     let mut buf = Vec::new();
@@ -29,14 +29,14 @@ fn hello_with_version(client_max: u16) -> (Frame, Pair) {
         frame_type: FrameType::Hello,
         payload: wire::encode_payload(&hello),
     };
-    p.server.recv(now, &encode(&frame)).unwrap();
+    p.server.recv(now, &encode(&frame)).await.unwrap();
     assert!(p.server.poll_transmit(now, &mut buf));
     (Frame::parse(&buf).unwrap(), p)
 }
 
-#[test]
-fn matching_version_negotiates_v1() {
-    let (reply, mut p) = hello_with_version(1);
+#[tokio::test]
+async fn matching_version_negotiates_v1() {
+    let (reply, mut p) = hello_with_version(1).await;
     assert_eq!(reply.frame_type, FrameType::Welcome);
     let w: wire::Welcome = wire::decode_payload(FrameType::Welcome, &reply.payload).unwrap();
     assert_eq!(w.version, 1);
@@ -47,18 +47,18 @@ fn matching_version_negotiates_v1() {
     ));
 }
 
-#[test]
-fn future_client_falls_back_to_v1() {
-    let (reply, p) = hello_with_version(2);
+#[tokio::test]
+async fn future_client_falls_back_to_v1() {
+    let (reply, p) = hello_with_version(2).await;
     assert_eq!(reply.frame_type, FrameType::Welcome);
     let w: wire::Welcome = wire::decode_payload(FrameType::Welcome, &reply.payload).unwrap();
     assert_eq!(w.version, 1);
     assert_eq!(p.server.version(), Some(1));
 }
 
-#[test]
-fn too_old_client_is_rejected_with_range() {
-    let (reply, p) = hello_with_version(0);
+#[tokio::test]
+async fn too_old_client_is_rejected_with_range() {
+    let (reply, p) = hello_with_version(0).await;
     assert_eq!(reply.frame_type, FrameType::Reject);
     let r: wire::Reject = wire::decode_payload(FrameType::Reject, &reply.payload).unwrap();
     assert_eq!(r.code, RejectCode::UnsupportedVersion { min: 1, max: 1 });
@@ -66,10 +66,10 @@ fn too_old_client_is_rejected_with_range() {
     assert_eq!(p.server.version(), None);
 }
 
-#[test]
-fn negotiated_version_visible_on_both_sides() {
+#[tokio::test]
+async fn negotiated_version_visible_on_both_sides() {
     let mut p = Pair::default_pair();
-    p.pump();
+    p.pump().await;
     assert_eq!(p.client.version(), Some(1));
     assert_eq!(p.server.version(), Some(1));
     assert!(matches!(

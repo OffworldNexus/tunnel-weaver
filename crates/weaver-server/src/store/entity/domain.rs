@@ -13,17 +13,31 @@ pub struct Model {
     #[sea_orm(unique)]
     pub name: String,
     pub last_active_at: Option<i64>,
+    pub service_id: Option<i32>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
 pub enum Relation {
     #[sea_orm(has_many = "super::certificate::Entity")]
     Certificates,
+    #[sea_orm(
+        belongs_to = "super::service::Entity",
+        from = "Column::ServiceId",
+        to = "super::service::Column::Id",
+        on_delete = "SetNull"
+    )]
+    Service,
 }
 
 impl Related<super::certificate::Entity> for Entity {
     fn to() -> RelationDef {
         Relation::Certificates.def()
+    }
+}
+
+impl Related<super::service::Entity> for Entity {
+    fn to() -> RelationDef {
+        Relation::Service.def()
     }
 }
 
