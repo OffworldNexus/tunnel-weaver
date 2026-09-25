@@ -42,12 +42,12 @@ struct Sim {
 }
 
 impl Sim {
-    fn new() -> Self {
-        Self::with_threshold(None)
+    async fn new() -> Self {
+        Self::with_threshold(None).await
     }
 
     /// `bulk_threshold` for the client; `None` pins every class.
-    fn with_threshold(bulk_threshold: Option<u64>) -> Self {
+    async fn with_threshold(bulk_threshold: Option<u64>) -> Self {
         let mut server = server_config(1);
         server_params(&mut server, |p| {
             p.max_frame = MAX_FRAME;
@@ -57,7 +57,7 @@ impl Sim {
         let mut client = client_config(1);
         client.bulk_threshold = bulk_threshold;
         let mut p = Pair::new(client, server);
-        p.pump();
+        p.pump().await;
         p.drain_events(Side::Client);
         p.drain_events(Side::Server);
         Self {
@@ -95,7 +95,7 @@ impl Sim {
     /// One tick of the pipe: up to RATE bytes client → server, then let the
     /// server drain everything it wants to send back (WINDOW_UPDATEs) and
     /// read every stream so the sender never runs out of credit.
-    fn tick(&mut self) {
+    async fn tick(&mut self) {
         self.top_up();
         let now = self.p.clock.now();
         let mut budget = RATE as i64;
@@ -103,7 +103,7 @@ impl Sim {
         while budget > 0 && self.p.client.poll_transmit(now, &mut buf) {
             let f = Frame::parse(&buf).unwrap();
             budget -= f.wire_len() as i64;
-            let _ = self.p.server.recv(now, &buf);
+            let _ = self.p.server.recv(now, &buf).await;
             self.trace.push((f.frame_type, f.stream_id, self.tick));
             if f.frame_type == FrameType::Data {
                 *self.delivered.entry(f.stream_id).or_default() += f.payload.len() as u64;
@@ -118,18 +118,18 @@ impl Sim {
         for id in ids {
             let _ = read_all(&mut self.p.server, id);
         }
-        while self.p.step(Side::Server).is_some() {}
+        while self.p.step(Side::Server).await.is_some() {}
         self.p.drain_events(Side::Server);
         self.p.drain_events(Side::Client);
         self.tick += 1;
         let t = self.p.clock.advance(TICK);
-        self.p.client.handle_timeout(t);
-        self.p.server.handle_timeout(t);
+        self.p.client.handle_timeout(t).await;
+        self.p.server.handle_timeout(t).await;
     }
 
-    fn run(&mut self, ticks: u64) {
+    async fn run(&mut self, ticks: u64) {
         for _ in 0..ticks {
-            self.tick();
+            self.tick().await;
         }
     }
 
@@ -142,13 +142,13 @@ impl Sim {
     }
 }
 
-#[test]
-fn lone_bulk_stream_gets_full_rate() {
-    let mut s = Sim::new();
+#[tokio::test]
+async fn lone_bulk_stream_gets_full_rate() {
+    let mut s = Sim::new().await;
     let bulk = s.open(Class::Bulk);
     assert_eq!(s.p.client.class_of(bulk), Some(Class::Bulk));
     s.saturate(bulk);
-    s.run(50);
+    s.run(50).await;
     // Every tick moved (almost) a full RATE of bulk payload: 4 frames of
     // 16 KiB minus headers/flags.
     let per_tick = s.delivered(bulk) as f64 / 50.0;
@@ -158,16 +158,16 @@ fn lone_bulk_stream_gets_full_rate() {
     );
 }
 
-#[test]
-fn class_shares_converge_to_weights() {
-    let mut s = Sim::new();
+#[tokio::test]
+async fn class_shares_converge_to_weights() {
+    let mut s = Sim::new().await;
     let rt = s.open(Class::Realtime);
     let small = s.open(Class::Interactive);
     let bulk = s.open(Class::Bulk);
     for id in [rt, small, bulk] {
         s.saturate(id);
     }
-    s.run(400);
+    s.run(400).await;
     let total = s.total() as f64;
     let expect = |w: f64| total * w / (300.0 + 300.0 + 40.0);
     for (id, w) in [(rt, 300.0), (small, 300.0), (bulk, 40.0)] {
@@ -177,14 +177,14 @@ fn class_shares_converge_to_weights() {
     }
 }
 
-#[test]
-fn equal_shares_within_a_class() {
-    let mut s = Sim::new();
+#[tokio::test]
+async fn equal_shares_within_a_class() {
+    let mut s = Sim::new().await;
     let ids: Vec<_> = (0..4).map(|_| s.open(Class::Interactive)).collect();
     for &id in &ids {
         s.saturate(id);
     }
-    s.run(200);
+    s.run(200).await;
     let mean = s.total() as f64 / 4.0;
     for &id in &ids {
         let got = s.delivered(id) as f64;
@@ -195,9 +195,9 @@ fn equal_shares_within_a_class() {
     }
 }
 
-#[test]
-fn bulk_keeps_flowing_under_interactive_load() {
-    let mut s = Sim::new();
+#[tokio::test]
+async fn bulk_keeps_flowing_under_interactive_load() {
+    let mut s = Sim::new().await;
     let bulk = s.open(Class::Bulk);
     s.saturate(bulk);
     let smalls: Vec<_> = (0..8)
@@ -208,7 +208,7 @@ fn bulk_keeps_flowing_under_interactive_load() {
             id
         })
         .collect();
-    s.run(300);
+    s.run(300).await;
     let ticks = &s.frame_ticks[&bulk];
     assert!(
         ticks.len() > 10,
@@ -232,18 +232,18 @@ fn bulk_keeps_flowing_under_interactive_load() {
     }
 }
 
-#[test]
-fn new_small_stream_is_served_promptly() {
-    let mut s = Sim::new();
+#[tokio::test]
+async fn new_small_stream_is_served_promptly() {
+    let mut s = Sim::new().await;
     let bulk = s.open(Class::Bulk);
     s.saturate(bulk);
-    s.run(200); // bulk has been hogging the pipe for a while
+    s.run(200).await; // bulk has been hogging the pipe for a while
     let small = s.open(Class::Interactive);
     s.p.client
         .send(small, &noise(MAX_FRAME as usize - 1, 9), Compress::Never)
         .unwrap();
     let start = s.tick;
-    s.run(FRAME_TIME_TICKS + 1);
+    s.run(FRAME_TIME_TICKS + 1).await;
     let first = s.frame_ticks[&small][0];
     assert!(
         first - start <= FRAME_TIME_TICKS,
@@ -253,10 +253,10 @@ fn new_small_stream_is_served_promptly() {
     assert!(s.delivered(small) >= MAX_FRAME as u64 - 1);
 }
 
-#[test]
-fn interactive_demotes_to_bulk_at_threshold() {
+#[tokio::test]
+async fn interactive_demotes_to_bulk_at_threshold() {
     let threshold = 256 * 1024usize;
-    let mut s = Sim::with_threshold(Some(threshold as u64));
+    let mut s = Sim::with_threshold(Some(threshold as u64)).await;
     let id = s.open(Class::Interactive);
     assert_eq!(s.p.client.class_of(id), Some(Class::Interactive));
     s.p.client
@@ -278,7 +278,7 @@ fn interactive_demotes_to_bulk_at_threshold() {
     // Control is not a valid target.
     assert!(s.p.client.set_class(rt, Class::Control).is_err());
     // Without a threshold nothing is demoted.
-    let mut s = Sim::with_threshold(None);
+    let mut s = Sim::with_threshold(None).await;
     let id = s.open(Class::Interactive);
     s.p.client
         .send(id, &noise(threshold + 10, 3), Compress::Never)
@@ -286,34 +286,34 @@ fn interactive_demotes_to_bulk_at_threshold() {
     assert_eq!(s.p.client.class_of(id), Some(Class::Interactive));
 }
 
-#[test]
-fn reclassification_takes_effect_on_next_selection() {
-    let mut s = Sim::new();
+#[tokio::test]
+async fn reclassification_takes_effect_on_next_selection() {
+    let mut s = Sim::new().await;
     let a = s.open(Class::Interactive);
     let b = s.open(Class::Interactive);
     s.saturate(a);
     s.saturate(b);
-    s.run(50);
+    s.run(50).await;
     let (a0, b0) = (s.delivered(a), s.delivered(b));
     // Demote b: from now on a should get ~300/340 of the pipe.
     s.p.client.set_class(b, Class::Bulk).unwrap();
-    s.run(200);
+    s.run(200).await;
     let (da, db) = ((s.delivered(a) - a0) as f64, (s.delivered(b) - b0) as f64);
     let share_a = da / (da + db);
     assert!((share_a - 300.0 / 340.0).abs() < 0.05, "a share {share_a}");
 }
 
-#[test]
-fn control_frames_are_not_starved_by_data() {
-    let mut s = Sim::new();
+#[tokio::test]
+async fn control_frames_are_not_starved_by_data() {
+    let mut s = Sim::new().await;
     let bulk = s.open(Class::Bulk);
     s.saturate(bulk);
-    s.run(20);
+    s.run(20).await;
     // Queue a PING behind a full outbox by advancing past ping_interval.
     let t = s.p.clock.advance(Duration::from_secs(15));
-    s.p.client.handle_timeout(t);
+    s.p.client.handle_timeout(t).await;
     let before = s.trace.len();
-    s.tick();
+    s.tick().await;
     let ping_pos = s.trace[before..]
         .iter()
         .position(|(t, _, _)| *t == FrameType::Ping)
@@ -329,10 +329,10 @@ fn control_frames_are_not_starved_by_data() {
 
     // Same for RST of another stream while bulk is saturated.
     let victim = s.open(Class::Interactive);
-    s.tick();
+    s.tick().await;
     s.p.client.reset(victim, 1).unwrap();
     let before = s.trace.len();
-    s.tick();
+    s.tick().await;
     let rst_pos = s.trace[before..]
         .iter()
         .position(|(t, id, _)| *t == FrameType::Rst && *id == victim)
@@ -340,12 +340,12 @@ fn control_frames_are_not_starved_by_data() {
     assert_eq!(rst_pos, 0);
 }
 
-#[test]
-fn goaway_is_the_very_next_frame() {
-    let mut s = Sim::new();
+#[tokio::test]
+async fn goaway_is_the_very_next_frame() {
+    let mut s = Sim::new().await;
     let bulk = s.open(Class::Bulk);
     s.saturate(bulk);
-    s.run(20);
+    s.run(20).await;
     s.p.client.close(CloseReason::new(CloseCode::Shutdown));
     let now = s.p.clock.now();
     let mut buf = Vec::new();
@@ -378,47 +378,54 @@ proptest! {
         w_small in 50u32..=1000,
         w_bulk in 20u32..=1000,
     ) {
-        let mut server = server_config(1);
-        server_params(&mut server, |p| {
-            p.max_frame = MAX_FRAME;
-            p.initial_window = 4 * 1024 * 1024;
-        });
-        let mut client = client_config(1);
-        client.weights.realtime = w_rt;
-        client.weights.interactive = w_small;
-        client.weights.bulk = w_bulk;
-        client.bulk_threshold = None;
-        let mut p = Pair::new(client, server);
-        p.pump();
-        p.drain_events(Side::Client);
-        p.drain_events(Side::Server);
-        let mut s = Sim {
-            p,
-            delivered: HashMap::new(),
-            frame_ticks: HashMap::new(),
-            trace: Vec::new(),
-            tick: 0,
-            feed: Vec::new(),
-        };
-        let rt = s.open(Class::Realtime);
-        let small = s.open(Class::Interactive);
-        let bulk = s.open(Class::Bulk);
-        for id in [rt, small, bulk] {
-            s.saturate(id);
-        }
-        s.run(300);
-        let total = s.total() as f64;
-        let wsum = f64::from(w_rt + w_small + w_bulk);
-        for (id, w) in [(rt, w_rt), (small, w_small), (bulk, w_bulk)] {
-            let expected = total * f64::from(w) / wsum;
-            let got = s.delivered(id) as f64;
-            // Allow 5% plus a few frames: QFQ bounds the lag of a flow to a
-            // constant number of packets, which for a tiny share is a large
-            // fraction of a short run.
-            prop_assert!(
-                (got - expected).abs() <= 0.05 * expected + 3.0 * f64::from(MAX_FRAME),
-                "stream {id} w={w}: got {got} expected {expected}"
-            );
-        }
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let mut server = server_config(1);
+                server_params(&mut server, |p| {
+                    p.max_frame = MAX_FRAME;
+                    p.initial_window = 4 * 1024 * 1024;
+                });
+                let mut client = client_config(1);
+                client.weights.realtime = w_rt;
+                client.weights.interactive = w_small;
+                client.weights.bulk = w_bulk;
+                client.bulk_threshold = None;
+                let mut p = Pair::new(client, server);
+                p.pump().await;
+                p.drain_events(Side::Client);
+                p.drain_events(Side::Server);
+                let mut s = Sim {
+                    p,
+                    delivered: HashMap::new(),
+                    frame_ticks: HashMap::new(),
+                    trace: Vec::new(),
+                    tick: 0,
+                    feed: Vec::new(),
+                };
+                let rt = s.open(Class::Realtime);
+                let small = s.open(Class::Interactive);
+                let bulk = s.open(Class::Bulk);
+                for id in [rt, small, bulk] {
+                    s.saturate(id);
+                }
+                s.run(300).await;
+                let total = s.total() as f64;
+                let wsum = f64::from(w_rt + w_small + w_bulk);
+                for (id, w) in [(rt, w_rt), (small, w_small), (bulk, w_bulk)] {
+                    let expected = total * f64::from(w) / wsum;
+                    let got = s.delivered(id) as f64;
+                    // Allow 5% plus a few frames: QFQ bounds the lag of a flow to a
+                    // constant number of packets, which for a tiny share is a large
+                    // fraction of a short run.
+                    prop_assert!(
+                        (got - expected).abs() <= 0.05 * expected + 3.0 * f64::from(MAX_FRAME),
+                        "stream {} w={} got {} expected {}", id, w, got, expected
+                    );
+                }
+                Ok(())
+            })
+            .unwrap();
     }
 }

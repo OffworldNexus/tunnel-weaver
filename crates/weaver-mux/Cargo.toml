@@ -13,6 +13,7 @@ repository.workspace = true
 test-util = []
 
 [dependencies]
+async-trait = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
 serde-big-array = { workspace = true }
@@ -25,3 +26,4 @@ zstd = { workspace = true }
 [dev-dependencies]
 weaver-mux = { path = ".", features = ["test-util"] }
 proptest = { workspace = true }
+tokio = { workspace = true }

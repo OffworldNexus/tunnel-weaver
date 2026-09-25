@@ -9,3 +9,7 @@ pub mod cert_event;
 pub mod certificate;
 pub mod config;
 pub mod domain;
+pub mod machine;
+pub mod machine_key;
+pub mod person;
+pub mod service;

@@ -98,10 +98,10 @@ async fn test_store_open_runs_migrations_and_is_idempotent() {
         let store = Store::open(&db_path).await.expect("open failed");
         let count: i64 = scalar(
             &store,
-            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN ('config', 'acme_account', 'domains', 'certificates', 'cert_events', 'seaql_migrations')",
+            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN ('config', 'acme_account', 'domains', 'certificates', 'cert_events', 'seaql_migrations', 'person', 'machine', 'machine_key', 'service')",
         )
         .await;
-        assert_eq!(count, 6);
+        assert_eq!(count, 10);
         assert_eq!(store.schema_version().await.expect("schema_version"), 1);
     }
 
@@ -296,6 +296,74 @@ async fn test_backup_creates_openable_database() {
         .await
         .expect("load backup config failed");
     assert_eq!(loaded_config, config);
+}
+
+#[tokio::test]
+async fn test_auth_persistence_and_identity_resolution() {
+    use weaver_mux::KeyId;
+    use weaver_mux::auth::PublicKey;
+    use weaver_server::tunnel::{IdentityResolver, StoreIdentityResolver};
+
+    let temp = TempDir::new().expect("tempdir");
+    let db_path = temp.path().join("auth.db");
+    let store = Store::open(&db_path).await.expect("open failed");
+
+    // Identities are never created implicitly: enrol a person, a machine, and
+    // a key explicitly, then resolve that custom key.
+    let alice = store.create_person("Alice").await.expect("create person");
+    assert_eq!(alice.name, "alice");
+
+    let desktop = store
+        .create_machine(alice.id, "Workstation")
+        .await
+        .expect("create machine");
+    assert_eq!(desktop.name, "workstation");
+    assert_eq!(desktop.person_id, alice.id);
+
+    let alice_key = KeyId::Ed25519([0x42; 32]);
+    let mkey = store
+        .add_machine_key(desktop.id, &alice_key)
+        .await
+        .expect("add key");
+    assert_eq!(mkey.machine_id, desktop.id);
+
+    let resolver = StoreIdentityResolver::new(store.clone());
+    let id = resolver.identity(&alice_key).await.expect("resolve alice");
+    assert_eq!(id.person, "alice");
+    assert_eq!(id.machine, "workstation");
+    // The resolver serves the *stored* public key material.
+    assert_eq!(
+        resolver.public_key(&alice_key).await,
+        Some(PublicKey::Ed25519([0x42; 32]))
+    );
+
+    // An unenrolled key resolves to nothing.
+    let unknown_key = KeyId::Ed25519([0xAA; 32]);
+    assert!(resolver.identity(&unknown_key).await.is_none());
+    assert!(resolver.public_key(&unknown_key).await.is_none());
+
+    // A declared service attaches to the machine and links its hostname.
+    let svc = store
+        .register_declared_service(&alice_key, "api.workstation.alice.example.com", "API")
+        .await
+        .expect("register service");
+    assert_eq!(svc.name, "api");
+    assert_eq!(svc.machine_id, desktop.id);
+
+    let domain = store
+        .get_domain("api.workstation.alice.example.com")
+        .await
+        .expect("get domain")
+        .expect("domain present");
+    assert_eq!(domain.service_id, Some(svc.id));
+
+    // An unenrolled key cannot declare a service.
+    assert!(
+        store
+            .register_declared_service(&unknown_key, "x.example.com", "x")
+            .await
+            .is_err()
+    );
 }
 
 #[tokio::test]

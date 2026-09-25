@@ -219,12 +219,13 @@ impl MapVerifier {
     }
 }
 
+#[async_trait::async_trait]
 impl Verifier for MapVerifier {
-    fn public_key(&mut self, key_id: &KeyId) -> Option<PublicKey> {
+    async fn public_key(&mut self, key_id: &KeyId) -> Option<PublicKey> {
         self.keys.get(key_id).copied()
     }
 
-    fn still_valid(&mut self, key_id: &KeyId) -> bool {
+    async fn still_valid(&mut self, key_id: &KeyId) -> bool {
         self.still_valid_calls += 1;
         !self.revoked.contains(key_id)
     }

@@ -21,6 +21,10 @@ pub enum StoreError {
     #[error("Invalid path: {0}")]
     InvalidPath(String),
 
+    /// A key was presented that is not enrolled against any machine.
+    #[error("Key is not enrolled against any machine")]
+    KeyNotEnrolled,
+
     /// The operation is only implemented for some SQL backends (e.g. file backup).
     #[error("Operation '{0}' is not supported on the {1:?} backend")]
     UnsupportedBackend(&'static str, sea_orm::DbBackend),

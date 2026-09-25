@@ -8,6 +8,8 @@
 
 use libfuzzer_sys::fuzz_target;
 use std::time::Instant;
+mod async_util;
+use async_util::block_on;
 use weaver_mux::testing::{Ed25519TestSigner, MapVerifier, SeededRng};
 use weaver_mux::{Config, Connection, Signer as _};
 
@@ -28,7 +30,7 @@ fuzz_target!(|data: &[u8]| {
         let take = rest.len().min(512);
         let (frame, tail) = rest.split_at(take);
         rest = tail;
-        let _ = server.recv(now, frame);
+        let _ = block_on(server.recv(now, frame));
         while server.poll_transmit(now, &mut buf) {}
         while server.poll_event().is_some() {}
     }
@@ -43,7 +45,7 @@ fuzz_target!(|data: &[u8]| {
         let take = rest.len().min(512);
         let (frame, tail) = rest.split_at(take);
         rest = tail;
-        let _ = client.recv(now, frame);
+        let _ = block_on(client.recv(now, frame));
         while client.poll_transmit(now, &mut buf) {}
         while client.poll_event().is_some() {}
     }

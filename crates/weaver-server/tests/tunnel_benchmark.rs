@@ -13,7 +13,7 @@ struct ThrottledPipe {
 }
 
 impl ThrottledPipe {
-    fn new(bytes_per_tick: usize) -> Self {
+    async fn new(bytes_per_tick: usize) -> Self {
         let clock = FakeClock::at(Instant::now());
         let now = clock.now();
 
@@ -43,15 +43,15 @@ impl ThrottledPipe {
             s_to_c: Vec::new(),
         };
 
-        pipe.step_until_authenticated();
+        pipe.step_until_authenticated().await;
         pipe
     }
 
-    fn step_until_authenticated(&mut self) {
+    async fn step_until_authenticated(&mut self) {
         let mut c_auth = false;
         let mut s_auth = false;
         for _ in 0..100 {
-            self.tick();
+            self.tick().await;
             while let Some(ev) = self.client.poll_event() {
                 if matches!(ev, Event::Authenticated { .. }) {
                     c_auth = true;
@@ -69,7 +69,7 @@ impl ThrottledPipe {
         assert!(c_auth && s_auth, "Both client and server must authenticate");
     }
 
-    fn tick(&mut self) {
+    async fn tick(&mut self) {
         let now = self.clock.advance(Duration::from_millis(10));
         let mut buf = Vec::with_capacity(64 * 1024);
 
@@ -85,25 +85,25 @@ impl ThrottledPipe {
         while !self.c_to_s.is_empty() && budget_c > 0 {
             let frame = self.c_to_s.remove(0);
             budget_c = budget_c.saturating_sub(frame.len());
-            let _ = self.server.recv(now, &frame);
+            let _ = self.server.recv(now, &frame).await;
         }
 
         let mut budget_s = self.bytes_per_tick;
         while !self.s_to_c.is_empty() && budget_s > 0 {
             let frame = self.s_to_c.remove(0);
             budget_s = budget_s.saturating_sub(frame.len());
-            let _ = self.client.recv(now, &frame);
+            let _ = self.client.recv(now, &frame).await;
         }
 
-        self.client.handle_timeout(now);
-        self.server.handle_timeout(now);
+        self.client.handle_timeout(now).await;
+        self.server.handle_timeout(now).await;
     }
 }
 
-#[test]
-fn test_concurrent_small_requests_during_50mb_bulk_transfer() {
+#[tokio::test]
+async fn test_concurrent_small_requests_during_50mb_bulk_transfer() {
     let bytes_per_tick = 64 * 1024;
-    let mut pipe = ThrottledPipe::new(bytes_per_tick);
+    let mut pipe = ThrottledPipe::new(bytes_per_tick).await;
 
     // 1. Measure unloaded baseline latency for 20 small requests
     let mut baseline_latencies = Vec::new();
@@ -118,7 +118,7 @@ fn test_concurrent_small_requests_during_50mb_bulk_transfer() {
 
         let mut finished = false;
         for _ in 0..100 {
-            pipe.tick();
+            pipe.tick().await;
             while let Some(ev) = pipe.server.poll_event() {
                 if let Event::StreamOpened { id, .. } = ev {
                     let _ = pipe
@@ -174,7 +174,7 @@ fn test_concurrent_small_requests_during_50mb_bulk_transfer() {
         let mut finished = false;
         for _ in 0..100 {
             let _ = pipe.client.send(bulk_stream, &chunk, Compress::Never);
-            pipe.tick();
+            pipe.tick().await;
 
             while let Some(ev) = pipe.server.poll_event() {
                 if let Event::StreamOpened { id, .. } = ev
