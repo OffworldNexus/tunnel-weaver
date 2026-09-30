@@ -62,54 +62,176 @@ pub fn inspect(method: &Method, raw_path: &str) -> Option<Verdict> {
         return Some(Verdict::Trace);
     }
     let path = raw_path.split(['?', '#']).next().unwrap_or("");
-    let decoded = percent_decode_lossy(path);
-    // Decode twice: scanners double-encode (`%252e%252e`) to slip past
-    // single-pass filters.
-    let decoded = percent_decode_lossy(&decoded);
-    let lower = decoded.to_ascii_lowercase();
 
-    if lower.bytes().any(|b| b == 0 || b < 0x20 || b == 0x7f) {
-        return Some(Verdict::Malformed);
-    }
+    // Percent-decode only when needed, and run a second pass only when the
+    // first actually produced a fresh escape (double-encoded scans like
+    // `%252e%252e`). Paths without `%` — the vast majority — borrow the input
+    // and allocate nothing. Decoding twice unconditionally, as before, was one
+    // of the two per-request allocations on this hot path.
+    let decoded_owned;
+    let decoded: &str = if path.as_bytes().contains(&b'%') {
+        let once = percent_decode_lossy(path);
+        decoded_owned = if once.as_bytes().contains(&b'%') {
+            percent_decode_lossy(&once)
+        } else {
+            once
+        };
+        &decoded_owned
+    } else {
+        path
+    };
 
-    let segments: Vec<&str> = lower.split(['/', '\\']).filter(|s| !s.is_empty()).collect();
-
-    if segments.contains(&"..") {
-        return Some(Verdict::Traversal);
-    }
-
-    // Only the hidden files and directories scanners actually fish for are
-    // refused. A blanket "any segment starting with `.`" rule is wrong: modern
-    // frontend dev servers legitimately serve assets from dot-directories
-    // (`.svelte-kit`, `.pnpm`, `.vite`, `.next`, `.nuxt`), so an allowlist of
-    // tooling would rot with every new framework. Matching a curated risk list
-    // instead keeps those reachable while still starving the bots.
-    for (i, seg) in segments.iter().enumerate() {
-        // `/.well-known/…` is a public convention (ACME, security.txt,
-        // webfinger, app links); keep it, but only at the root.
-        if i == 0 && *seg == ".well-known" {
-            continue;
+    // One byte pass settles both the control-character rejection and whether
+    // case folding is needed (scanner probes are lowercase, so it usually
+    // isn't). Folding case is unaffected by these bytes.
+    let mut has_upper = false;
+    for b in decoded.bytes() {
+        if b == 0 || b < 0x20 || b == 0x7f {
+            return Some(Verdict::Malformed);
         }
-        if is_risky_dotfile(seg) {
-            return Some(Verdict::Dotfile);
+        has_upper |= b.is_ascii_uppercase();
+    }
+
+    // Fold ASCII case only if the path actually has uppercase; this is the
+    // second allocation the old code always paid.
+    let lower_owned;
+    let lower: &str = if has_upper {
+        lower_owned = decoded.to_ascii_lowercase();
+        &lower_owned
+    } else {
+        decoded
+    };
+
+    // One pass settles everything: traversal, dotfiles, and the first/last
+    // segments. Traversal outranks every path-shape rule, so it returns the
+    // instant a `..` segment is seen; a risky dotfile is only *remembered*
+    // because a later `..` must still win. This replaces the previous two
+    // split passes (an existential traversal scan plus the classification
+    // scan) with a single traversal.
+    let mut first = "";
+    let mut second = "";
+    let mut last = "";
+    let mut dotfile = false;
+    for (idx, seg) in lower
+        .split(['/', '\\'])
+        .filter(|s| !s.is_empty())
+        .enumerate()
+    {
+        if idx == 0 {
+            first = seg;
+        } else if idx == 1 {
+            second = seg;
+        }
+        last = seg;
+
+        if seg == ".." {
+            return Some(Verdict::Traversal);
+        }
+
+        // Only the hidden files and directories scanners actually fish for are
+        // refused. A blanket "any segment starting with `.`" rule is wrong:
+        // modern frontend dev servers legitimately serve assets from
+        // dot-directories (`.svelte-kit`, `.pnpm`, `.vite`, `.next`, `.nuxt`),
+        // so an allowlist of tooling would rot with every new framework. A
+        // curated risk list keeps those reachable while still starving the
+        // bots. `/.well-known/…` is a public convention at the root only.
+        if !dotfile
+            && seg.starts_with('.')
+            && !(idx == 0 && seg == ".well-known")
+            && is_risky_dotfile(seg)
+        {
+            dotfile = true;
         }
     }
 
-    if let Some(last) = segments.last() {
-        if last.ends_with('~') || LEFTOVER_SUFFIXES.iter().any(|s| last.ends_with(s)) {
+    if dotfile {
+        return Some(Verdict::Dotfile);
+    }
+
+    // Classify the final segment by its extension instead of scanning the
+    // whole suffix table: one `match` dispatches on the bytes, where the two
+    // `iter().any(ends_with)` scans ran ~23 comparisons per request. A name
+    // with no dot can only be a backup (`~`) or an SSH private key.
+    if !last.is_empty() {
+        if last.ends_with('~') {
             return Some(Verdict::Leftover);
         }
-        if SECRET_SUFFIXES.iter().any(|s| last.ends_with(s)) {
+        if last.ends_with("id_rsa") || last.ends_with("id_ed25519") {
             return Some(Verdict::SecretMaterial);
+        }
+        if let Some(dot) = last.rfind('.') {
+            match &last[dot + 1..] {
+                // Editor swap files and backups.
+                "bak" | "backup" | "old" | "orig" | "save" | "swp" | "swo" | "tmp" | "dist" => {
+                    return Some(Verdict::Leftover);
+                }
+                // Dumps and key material.
+                "sql" | "sqlite" | "sqlite3" | "db" | "pem" | "key" | "p12" | "pfx" | "jks"
+                | "keystore" | "ppk" | "htpasswd" | "htaccess" => {
+                    return Some(Verdict::SecretMaterial);
+                }
+                // `.sql.gz` is the only compressed dump we care about.
+                "gz" if last.ends_with(".sql.gz") => return Some(Verdict::SecretMaterial),
+                _ => {}
+            }
         }
     }
 
-    if let Some(first) = segments.first()
-        && DEBUG_ROOTS.contains(first)
+    // Debug roots are exact first segments; a `match` lets the compiler build a
+    // dispatch tree instead of a long linear scan.
+    if !first.is_empty()
+        && matches!(
+            first,
+            // Spring Boot 1.x exposed the environment dump at `/env` (2.x moved
+            // it under `/actuator/env`, covered by DEBUG_PAIRS); scanners try
+            // both.
+            "env"
+                | "phpmyadmin"
+                | "pma"
+                | "myadmin"
+                | "adminer"
+                | "adminer.php"
+                | "phpinfo.php"
+                | "info.php"
+                | "telescope"
+                | "_debugbar"
+                | "_profiler"
+                | "server-status"
+                | "server-info"
+                | "trace.axd"
+                | "elmah.axd"
+                | "___proxy_subdomain_whm"
+                | "___proxy_subdomain_cpanel"
+                | "cgi-bin"
+                | "wp-config.php"
+                | "config.php"
+                | "configuration.php"
+                | "web.config"
+                | "docker-compose.yml"
+                | "docker-compose.yaml"
+                | "dockerfile"
+                | "composer.lock"
+                | "package-lock.json"
+                | "yarn.lock"
+                | "credentials"
+                | "credentials.json"
+                | "secrets.json"
+                | "config.json"
+                | "config.yml"
+                | "config.yaml"
+        )
     {
         return Some(Verdict::DebugEndpoint);
     }
-    if segments.len() >= 2 && DEBUG_PAIRS.contains(&(segments[0], segments[1])) {
+    // Every DEBUG_PAIRS key is one of these roots, so gate the pair scan on the
+    // first segment and skip it for ordinary traffic.
+    if !second.is_empty()
+        && matches!(
+            first,
+            "actuator" | "@vite" | "ecp" | "v2" | "_ignition" | "debug" | "solr"
+        )
+        && DEBUG_PAIRS.contains(&(first, second))
+    {
         return Some(Verdict::DebugEndpoint);
     }
 
@@ -117,121 +239,53 @@ pub fn inspect(method: &Method, raw_path: &str) -> Option<Verdict> {
 }
 
 /// Does this path segment name a hidden file or directory that is a known
-/// scanner target? `segment` is the lowercased, percent-decoded path piece.
+/// scanner target? `segment` is the lowercased, percent-decoded path piece and
+/// is already known to start with `.`.
 ///
 /// Exact names cover the usual credential and metadata droppings; prefix
 /// families cover files whose every suffix variant matters (`.env.local`,
-/// `.git/config`, `.gitignore`, …).
+/// `.git/config`, `.gitignore`, …). A `match` lets the compiler dispatch on
+/// length before comparing bytes.
 fn is_risky_dotfile(segment: &str) -> bool {
-    DOTFILE_RISK_EXACT.contains(&segment)
-        || DOTFILE_RISK_PREFIXES.iter().any(|p| segment.starts_with(p))
+    if DOTFILE_RISK_PREFIXES.iter().any(|p| segment.starts_with(p)) {
+        return true;
+    }
+    matches!(
+        segment,
+        ".ds_store"
+            | ".aws"
+            | ".bash_history"
+            | ".config"
+            | ".docker"
+            | ".dockercfg"
+            | ".gnupg"
+            | ".hg"
+            | ".htaccess"
+            | ".htpasswd"
+            | ".idea"
+            | ".mysql_history"
+            | ".netrc"
+            | ".npmrc"
+            | ".psql_history"
+            | ".pypirc"
+            | ".python_history"
+            | ".ssh"
+            | ".svn"
+            | ".terraform"
+            | ".vscode"
+            | ".wgetrc"
+            | ".yarnrc"
+            | ".zsh_history"
+    )
 }
-
-/// Hidden files/directories that no legitimate public app serves but that
-/// mass scanners probe for secrets. Entries must be lowercase: `inspect`
-/// matches against the lowercased path. Unlike a blanket dot-segment rule,
-/// frontend tooling dot-dirs (`.svelte-kit`, `.pnpm`, `.vite`, `.next`,
-/// `.nuxt`) are deliberately absent and therefore pass through.
-const DOTFILE_RISK_EXACT: &[&str] = &[
-    ".ds_store",
-    ".aws",
-    ".bash_history",
-    ".config",
-    ".docker",
-    ".dockercfg",
-    ".gnupg",
-    ".hg",
-    ".htaccess",
-    ".htpasswd",
-    ".idea",
-    ".mysql_history",
-    ".netrc",
-    ".npmrc",
-    ".psql_history",
-    ".pypirc",
-    ".python_history",
-    ".ssh",
-    ".svn",
-    ".terraform",
-    ".vscode",
-    ".wgetrc",
-    ".yarnrc",
-    ".zsh_history",
-];
 
 /// Dot-prefixed families where every variant is a scanner target: `.env`
 /// (`.env.local`, `.env.production`, `.env.backup`) and `.git`
 /// (`.git/config`, `.gitignore`, `.git-credentials`).
 const DOTFILE_RISK_PREFIXES: &[&str] = &[".env", ".git"];
 
-/// Extensions of editor swap files and backups. A dev server never serves
-/// these on purpose.
-const LEFTOVER_SUFFIXES: &[&str] = &[
-    ".bak", ".backup", ".old", ".orig", ".save", ".swp", ".swo", ".tmp", ".dist",
-];
-
-/// Extensions that only ever hold dumps or key material.
-const SECRET_SUFFIXES: &[&str] = &[
-    ".sql",
-    ".sql.gz",
-    ".sqlite",
-    ".sqlite3",
-    ".db",
-    ".pem",
-    ".key",
-    ".p12",
-    ".pfx",
-    ".jks",
-    ".keystore",
-    ".ppk",
-    ".htpasswd",
-    ".htaccess",
-    "id_rsa",
-    "id_ed25519",
-];
-
-/// First path segments that are never a legitimate public route on a tunnel
-/// but are on every scanner's list.
-const DEBUG_ROOTS: &[&str] = &[
-    // Spring Boot 1.x exposed the environment dump at `/env` (2.x moved it
-    // under `/actuator/env`, covered by DEBUG_PAIRS); scanners try both.
-    "env",
-    "phpmyadmin",
-    "pma",
-    "myadmin",
-    "adminer",
-    "adminer.php",
-    "phpinfo.php",
-    "info.php",
-    "telescope",
-    "_debugbar",
-    "_profiler",
-    "server-status",
-    "server-info",
-    "trace.axd",
-    "elmah.axd",
-    "___proxy_subdomain_whm",
-    "___proxy_subdomain_cpanel",
-    "cgi-bin",
-    "wp-config.php",
-    "config.php",
-    "configuration.php",
-    "web.config",
-    "docker-compose.yml",
-    "docker-compose.yaml",
-    "dockerfile",
-    "composer.lock",
-    "package-lock.json",
-    "yarn.lock",
-    "credentials",
-    "credentials.json",
-    "secrets.json",
-    "config.json",
-    "config.yml",
-    "config.yaml",
-];
-
-/// Two-segment prefixes for framework debug/leak endpoints.
+/// Two-segment prefixes for framework debug/leak endpoints. Every first
+/// element must also appear in the `matches!` gate in `inspect`.
 const DEBUG_PAIRS: &[(&str, &str)] = &[
     ("actuator", "env"),
     ("actuator", "heapdump"),
