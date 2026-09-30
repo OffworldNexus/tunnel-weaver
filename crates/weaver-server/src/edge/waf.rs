@@ -81,15 +81,13 @@ pub fn inspect(method: &Method, raw_path: &str) -> Option<Verdict> {
         path
     };
 
-    // One byte pass settles both the control-character rejection and whether
-    // case folding is needed (scanner probes are lowercase, so it usually
-    // isn't). Folding case is unaffected by these bytes.
-    let mut has_upper = false;
-    for b in decoded.bytes() {
-        if b == 0 || b < 0x20 || b == 0x7f {
-            return Some(Verdict::Malformed);
-        }
-        has_upper |= b.is_ascii_uppercase();
+    // One pass settles both the control-character rejection and whether case
+    // folding is needed (scanner probes are lowercase, so it usually isn't).
+    // The classification runs 8 bytes at a time with SWAR, falling back to a
+    // scalar tail.
+    let (malformed, has_upper) = classify(decoded.as_bytes());
+    if malformed {
+        return Some(Verdict::Malformed);
     }
 
     // Fold ASCII case only if the path actually has uppercase; this is the
@@ -236,6 +234,65 @@ pub fn inspect(method: &Method, raw_path: &str) -> Option<Verdict> {
     }
 
     None
+}
+
+/// Per-byte constant: `0x01` in every lane.
+const ONES: u64 = 0x0101_0101_0101_0101;
+/// Per-byte high bit: `0x80` in every lane.
+const HIGHS: u64 = 0x8080_8080_8080_8080;
+/// Per-byte `0x7f` (DEL).
+const DELS: u64 = 0x7f7f_7f7f_7f7f_7f7f;
+
+/// SWAR mask: high bit set in every lane whose low 7 bits are `>= m`.
+///
+/// OR-ing the high bit into each lane prevents borrows from crossing bytes, so
+/// the subtraction can only clear a lane's high bit when its 7-bit value is
+/// `< m`. Lanes whose byte is `>= 0x80` are therefore tested on `b & 0x7f`;
+/// callers that care about full 8-bit bytes must mask those lanes out (see
+/// `classify`).
+#[inline]
+fn ge_mask(x: u64, m: u8) -> u64 {
+    (x | HIGHS).wrapping_sub(ONES.wrapping_mul(m as u64)) & HIGHS
+}
+
+/// SWAR: high bit set in every lane whose byte equals `0x7f`.
+#[inline]
+fn eq_del_mask(x: u64) -> u64 {
+    let y = x ^ DELS;
+    y.wrapping_sub(ONES) & !y & HIGHS
+}
+
+/// Classify a byte slice in 8-byte words: `(has_malformed, has_uppercase)`.
+///
+/// Malformed is any byte `< 0x20` or `== 0x7f`; uppercase is any byte in
+/// `A..=Z` (used only to decide whether case folding is needed, so a false
+/// positive would be harmless but a false negative would not — the masks below
+/// are exact). Lanes holding a byte `>= 0x80` (UTF-8 continuation bytes) must
+/// be excluded from both range tests: `ge_mask` reasons about 7-bit lanes, so
+/// on its own it would mistake `0x80..=0x9f` for control bytes. The tail
+/// shorter than one word falls back to a scalar loop.
+#[inline]
+fn classify(bytes: &[u8]) -> (bool, bool) {
+    let mut malformed = false;
+    let mut has_upper = false;
+
+    let mut chunks = bytes.chunks_exact(8);
+    for c in &mut chunks {
+        let x = u64::from_le_bytes(c.try_into().unwrap());
+        let high = x & HIGHS;
+        // `< 0x20`: complement of the `>= 0x20` mask, high-bit lanes dropped.
+        malformed |= (ge_mask(x, 0x20) ^ HIGHS) & !high != 0;
+        malformed |= eq_del_mask(x) != 0;
+        // `A..=Z` == `>= 0x41` and `< 0x5b`, high-bit lanes dropped.
+        has_upper |= ge_mask(x, 0x41) & !ge_mask(x, 0x5b) & !high != 0;
+    }
+
+    for &b in chunks.remainder() {
+        malformed |= b < 0x20 || b == 0x7f;
+        has_upper |= b.is_ascii_uppercase();
+    }
+
+    (malformed, has_upper)
 }
 
 /// Does this path segment name a hidden file or directory that is a known
@@ -476,5 +533,58 @@ mod tests {
         assert_eq!(get("/search?q=.env"), None);
         assert_eq!(inspect(&Method::POST, "/api/graphql"), None);
         assert_eq!(inspect(&Method::OPTIONS, "/"), None);
+    }
+
+    /// Scalar reference for `classify`, kept deliberately dumb.
+    fn classify_ref(bytes: &[u8]) -> (bool, bool) {
+        let mut malformed = false;
+        let mut upper = false;
+        for &b in bytes {
+            malformed |= b < 0x20 || b == 0x7f;
+            upper |= b.is_ascii_uppercase();
+        }
+        (malformed, upper)
+    }
+
+    /// The SWAR classifier must agree with the scalar reference on every single
+    /// byte (at every lane offset) and on random multi-byte inputs, including
+    /// the word/tail boundary.
+    #[test]
+    fn swar_classify_matches_scalar_reference() {
+        // Every byte value, repeated so it lands in each of the 8 lanes and
+        // also in the scalar remainder.
+        for b in 0u8..=255 {
+            for len in 0..=17usize {
+                let bytes = vec![b; len];
+                assert_eq!(
+                    classify(&bytes),
+                    classify_ref(&bytes),
+                    "fill {b:#x} len {len}"
+                );
+            }
+            let mut mixed = vec![b'a'; 5];
+            mixed.push(b);
+            mixed.extend_from_slice(b"abcdefgh");
+            assert_eq!(
+                classify(&mixed),
+                classify_ref(&mixed),
+                "mixed {b:#x}: {mixed:?}"
+            );
+        }
+
+        // Deterministic pseudo-random lengths and contents.
+        let mut seed = 0x53_41_52_57u64;
+        let mut next = || {
+            seed = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = seed;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        };
+        for _ in 0..20_000 {
+            let len = (next() % 40) as usize;
+            let bytes: Vec<u8> = (0..len).map(|_| (next() & 0xff) as u8).collect();
+            assert_eq!(classify(&bytes), classify_ref(&bytes), "{bytes:?}");
+        }
     }
 }
