@@ -446,6 +446,7 @@ fn apply_origin_headers(
         }
         rebuilt.push((name.clone(), value.clone()));
     }
+    coalesce_cookies(&mut rebuilt);
     headers.clear();
     for (n, v) in rebuilt {
         headers.append(n, v);
@@ -511,6 +512,50 @@ fn apply_origin_headers(
         insert_bytes(headers, "forwarded", forwarded.as_bytes());
     }
     Ok(())
+}
+
+/// RFC 9113 §8.2.3: an HTTP/2 field section may carry several `Cookie` fields
+/// for compression. An intermediary MUST concatenate them with `"; "` before
+/// the request enters a non-HTTP/2 context, or a plain HTTP/1.1 origin — every
+/// WSGI/PHP/Node server that reads a single `Cookie` line — keeps only the last
+/// field and silently drops the rest. That is precisely how a `csrftoken`
+/// cookie vanishes and a login POST fails CSRF, even though the browser sent
+/// it.
+///
+/// Only `Cookie` is special-cased: `Set-Cookie` and other repeatable fields
+/// are genuinely several fields and keep their identity.
+fn coalesce_cookies(headers: &mut Vec<(HeaderName, HeaderValue)>) {
+    let Some(first) = headers
+        .iter()
+        .position(|(name, _)| *name == http::header::COOKIE)
+    else {
+        return;
+    };
+    // Fast path: a single cookie field already passed through untouched.
+    if headers[first + 1..]
+        .iter()
+        .all(|(name, _)| *name != http::header::COOKIE)
+    {
+        return;
+    }
+    let mut joined: Vec<u8> = Vec::new();
+    let mut count = 0usize;
+    for (name, value) in headers.iter() {
+        if *name == http::header::COOKIE {
+            if count > 0 {
+                joined.extend_from_slice(b"; ");
+            }
+            joined.extend_from_slice(value.as_bytes());
+            count += 1;
+        }
+    }
+    // Header values are opaque bytes, but a joined cookie that fails
+    // validation is not worth risking: leave the original fields in place.
+    let Ok(joined) = HeaderValue::from_bytes(&joined) else {
+        return;
+    };
+    headers.retain(|(name, _)| *name != http::header::COOKIE);
+    headers.insert(first, (http::header::COOKIE, joined));
 }
 
 fn insert_bytes(headers: &mut http::HeaderMap, name: &str, value: &[u8]) {
@@ -604,4 +649,94 @@ fn bad_gateway_head(len: usize) -> HttpResponseHead {
 /// Compression stance for a response body chunk given the request and head.
 pub fn body_compress(req: &HttpHead, resp: &HttpResponseHead) -> weaver_mux::Compress {
     policy::response_body_compress(req, resp)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::target::{Target, TargetScheme};
+
+    fn cfg() -> ExchangeConfig {
+        ExchangeConfig {
+            head: HttpHead {
+                method: "POST".into(),
+                scheme: "https".into(),
+                authority: "web.laptop.poc.example.com".into(),
+                path: "/login".into(),
+                headers: vec![],
+            },
+            target: Target {
+                scheme: TargetScheme::Http,
+                host: "localhost".into(),
+                port: 8000,
+            },
+            public_origin: "https://web.laptop.poc.example.com".into(),
+            insecure: false,
+            preserve_host: false,
+            no_rewrite: false,
+            append_forwarded: false,
+        }
+    }
+
+    fn cookies(headers: &http::HeaderMap) -> Vec<&str> {
+        headers
+            .get_all(http::header::COOKIE)
+            .iter()
+            .map(|v| v.to_str().unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn split_cookie_fields_are_joined_for_the_origin() {
+        // Chrome splits the HTTP/2 `Cookie` field; an h1 origin must see one
+        // field joined with "; " (RFC 9113 §8.2.3) or the first cookie pair
+        // (here the CSRF token) is silently dropped.
+        let mut headers = http::HeaderMap::new();
+        headers.append(
+            http::header::COOKIE,
+            HeaderValue::from_static("csrftoken=abc"),
+        );
+        headers.append(
+            http::header::COOKIE,
+            HeaderValue::from_static("sessionid=def"),
+        );
+        apply_origin_headers(&mut headers, &cfg(), false).unwrap();
+        assert_eq!(cookies(&headers), vec!["csrftoken=abc; sessionid=def"]);
+    }
+
+    #[test]
+    fn single_cookie_field_is_untouched() {
+        let mut headers = http::HeaderMap::new();
+        headers.append(
+            http::header::COOKIE,
+            HeaderValue::from_static("csrftoken=abc; sessionid=def"),
+        );
+        apply_origin_headers(&mut headers, &cfg(), false).unwrap();
+        assert_eq!(cookies(&headers), vec!["csrftoken=abc; sessionid=def"]);
+    }
+
+    #[test]
+    fn other_repeatable_fields_keep_their_identity() {
+        // Only `Cookie` is special-cased; a repeated end-to-end field must
+        // survive as several fields.
+        let mut headers = http::HeaderMap::new();
+        headers.append(http::header::COOKIE, HeaderValue::from_static("a=1"));
+        headers.append(http::header::COOKIE, HeaderValue::from_static("b=2"));
+        headers.append(
+            HeaderName::from_static("x-custom"),
+            HeaderValue::from_static("one"),
+        );
+        headers.append(
+            HeaderName::from_static("x-custom"),
+            HeaderValue::from_static("two"),
+        );
+        apply_origin_headers(&mut headers, &cfg(), false).unwrap();
+        assert_eq!(cookies(&headers), vec!["a=1; b=2"]);
+        let custom: Vec<&str> = headers
+            .get_all("x-custom")
+            .iter()
+            .map(|v| v.to_str().unwrap())
+            .collect();
+        assert_eq!(custom, vec!["one", "two"]);
+    }
 }

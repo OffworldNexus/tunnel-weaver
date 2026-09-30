@@ -102,6 +102,12 @@ origins must not be cut off.
 - `Location`, `Content-Location` and `Refresh` values whose origin equals
   the target origin are rewritten to the public origin, preserving path and
   query. Relative values and foreign hosts are left alone.
+- Multiple `Cookie` request fields are joined into a single field with `"; "`
+  before the request reaches the origin (RFC 9113 §8.2.3): an HTTP/2 client
+  may split the field for compression, and a plain HTTP/1.1 origin that reads
+  one `Cookie` line would otherwise silently drop all but the last — which
+  breaks CSRF-protected logins. `Set-Cookie` response fields keep their
+  identity.
 - `Set-Cookie` whose `Domain=` equals the target host drops the attribute
   (host-only cookie on the public name) and gains `Secure` when absent.
 - Body content is never rewritten. `--no-rewrite <service>` disables all of
