@@ -1839,6 +1839,96 @@ async fn test_translation_matrix_h1_and_h2() {
     relay.shutdown_token.cancel();
 }
 
+/// Regression for OFF-101. An HTTP/2 client MAY split the `Cookie` field into
+/// several fields (Chrome does). RFC 9113 §8.2.3 requires an intermediary to
+/// concatenate them with `"; "` before the message enters an HTTP/1.1 context;
+/// `weave` is that intermediary toward the origin. Before the fix the origin
+/// saw two `Cookie` lines, and any HTTP/1.1 app that reads a single line
+/// (WSGI/Django and most others) kept only the last one — dropping the
+/// `csrftoken` and failing every CSRF-protected login POST.
+#[tokio::test]
+async fn test_h2_split_cookie_fields_reach_the_origin_joined() {
+    let root = "localhost";
+    let relay = spawn_test_relay(root).await;
+    let origin = spawn_recording_origin().await;
+
+    let token = CancellationToken::new();
+    let c_tok = token.clone();
+    let server = format!("localhost:{}", relay.addr.port());
+    let ca = relay.ca_pem_path.clone();
+    let opts = start_options_multi(server, &ca, &[("m", origin.addr.port())]);
+    let task = tokio::spawn(async move { weave::run_start_with_token(opts, c_tok).await });
+
+    let host = derive_hostname("m", &poc_identity(), root);
+    let mut routed = false;
+    for _ in 0..50 {
+        if relay.registry.lookup(&host).is_some() {
+            routed = true;
+            break;
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+    assert!(routed, "tunnel never registered");
+
+    // A visitor speaking HTTP/2, sending the Cookie field split exactly the
+    // way Chrome does when it carries a session cookie and a CSRF cookie.
+    let connector = TlsConnector::from(create_client_tls_config(vec![b"h2".to_vec()]));
+    let tcp = TcpStream::connect(relay.addr).await.unwrap();
+    let tls = connector
+        .connect(ServerName::try_from(host.clone()).unwrap(), tcp)
+        .await
+        .unwrap();
+    let (mut sender, conn) =
+        hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(tls))
+            .await
+            .unwrap();
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri(format!("https://{host}/back/account/login/"))
+        .header("host", host.as_str())
+        .header("content-type", "application/x-www-form-urlencoded")
+        .header(http::header::COOKIE, "csrftoken=abc")
+        .header(http::header::COOKIE, "sessionid=def")
+        .body(Empty::<Bytes>::new())
+        .unwrap();
+    sender.send_request(req).await.unwrap();
+
+    // The origin must have seen a single Cookie field, joined with "; ".
+    let mut headers = None;
+    for _ in 0..50 {
+        if let Some(seen) = origin
+            .seen
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|s| s.path == "/back/account/login/")
+        {
+            headers = Some(seen.headers.clone());
+            break;
+        }
+        sleep(Duration::from_millis(20)).await;
+    }
+    let headers = headers.expect("origin never saw the request");
+    let cookies: Vec<&str> = headers
+        .iter()
+        .filter(|(name, _)| name == "cookie")
+        .map(|(_, value)| value.as_str())
+        .collect();
+    assert_eq!(
+        cookies,
+        vec!["csrftoken=abc; sessionid=def"],
+        "an HTTP/1.1 origin must see one joined Cookie field"
+    );
+
+    token.cancel();
+    task.await.unwrap().expect("clean shutdown");
+    origin.token.cancel();
+    relay.shutdown_token.cancel();
+}
+
 fn poc_identity() -> Identity {
     Identity {
         person: "poc".into(),
