@@ -20,8 +20,10 @@ use http::Method;
 /// see what the bots are after.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Verdict {
-    /// Hidden file or directory (`/.env`, `/.git/…`, `/.ssh/…`), except the
-    /// `/.well-known/` namespace which is a legitimate public convention.
+    /// Known-sensitive hidden file or directory targeted by scanners
+    /// (`/.env`, `/.git/…`, `/.ssh/…`), except the `/.well-known/` namespace
+    /// which is a legitimate public convention. Frontend tooling dot-dirs are
+    /// not matched.
     Dotfile,
     /// Encoded or literal `..` segment: path traversal.
     Traversal,
@@ -76,13 +78,19 @@ pub fn inspect(method: &Method, raw_path: &str) -> Option<Verdict> {
         return Some(Verdict::Traversal);
     }
 
+    // Only the hidden files and directories scanners actually fish for are
+    // refused. A blanket "any segment starting with `.`" rule is wrong: modern
+    // frontend dev servers legitimately serve assets from dot-directories
+    // (`.svelte-kit`, `.pnpm`, `.vite`, `.next`, `.nuxt`), so an allowlist of
+    // tooling would rot with every new framework. Matching a curated risk list
+    // instead keeps those reachable while still starving the bots.
     for (i, seg) in segments.iter().enumerate() {
-        if seg.starts_with('.') && seg.len() > 1 {
-            // `/.well-known/…` is a public convention (ACME, security.txt,
-            // webfinger, app links); keep it, but only at the root.
-            if i == 0 && *seg == ".well-known" {
-                continue;
-            }
+        // `/.well-known/…` is a public convention (ACME, security.txt,
+        // webfinger, app links); keep it, but only at the root.
+        if i == 0 && *seg == ".well-known" {
+            continue;
+        }
+        if is_risky_dotfile(seg) {
             return Some(Verdict::Dotfile);
         }
     }
@@ -107,6 +115,54 @@ pub fn inspect(method: &Method, raw_path: &str) -> Option<Verdict> {
 
     None
 }
+
+/// Does this path segment name a hidden file or directory that is a known
+/// scanner target? `segment` is the lowercased, percent-decoded path piece.
+///
+/// Exact names cover the usual credential and metadata droppings; prefix
+/// families cover files whose every suffix variant matters (`.env.local`,
+/// `.git/config`, `.gitignore`, …).
+fn is_risky_dotfile(segment: &str) -> bool {
+    DOTFILE_RISK_EXACT.contains(&segment)
+        || DOTFILE_RISK_PREFIXES.iter().any(|p| segment.starts_with(p))
+}
+
+/// Hidden files/directories that no legitimate public app serves but that
+/// mass scanners probe for secrets. Entries must be lowercase: `inspect`
+/// matches against the lowercased path. Unlike a blanket dot-segment rule,
+/// frontend tooling dot-dirs (`.svelte-kit`, `.pnpm`, `.vite`, `.next`,
+/// `.nuxt`) are deliberately absent and therefore pass through.
+const DOTFILE_RISK_EXACT: &[&str] = &[
+    ".ds_store",
+    ".aws",
+    ".bash_history",
+    ".config",
+    ".docker",
+    ".dockercfg",
+    ".gnupg",
+    ".hg",
+    ".htaccess",
+    ".htpasswd",
+    ".idea",
+    ".mysql_history",
+    ".netrc",
+    ".npmrc",
+    ".psql_history",
+    ".pypirc",
+    ".python_history",
+    ".ssh",
+    ".svn",
+    ".terraform",
+    ".vscode",
+    ".wgetrc",
+    ".yarnrc",
+    ".zsh_history",
+];
+
+/// Dot-prefixed families where every variant is a scanner target: `.env`
+/// (`.env.local`, `.env.production`, `.env.backup`) and `.git`
+/// (`.git/config`, `.gitignore`, `.git-credentials`).
+const DOTFILE_RISK_PREFIXES: &[&str] = &[".env", ".git"];
 
 /// Extensions of editor swap files and backups. A dev server never serves
 /// these on purpose.
@@ -293,6 +349,41 @@ mod tests {
         assert_eq!(inspect(&Method::TRACE, "/"), Some(Verdict::Trace));
     }
 
+    /// OFF-96: the dotfile rule matches a curated risk list, not every
+    /// dot-segment, so it must still catch risky names at any depth.
+    #[test]
+    fn blocks_risky_dotfiles_at_any_depth() {
+        for p in [
+            "/.gitignore",
+            "/.git-credentials",
+            "/config/.env.local",
+            "/api/.env.production",
+            "/.aws/credentials",
+            "/.config/gcloud/credentials.db",
+            "/.npmrc",
+            "/.netrc",
+            "/.bash_history",
+            "/.terraform/terraform.tfstate",
+            "/deep/nested/.git/config",
+        ] {
+            assert_eq!(get(p), Some(Verdict::Dotfile), "{p}");
+        }
+    }
+
+    /// OFF-96: framework tooling dot-dirs are not risk names and must pass.
+    #[test]
+    fn permits_frontend_dev_server_assets() {
+        for p in [
+            "/@fs/home/remy/dev/app/.svelte-kit/generated/client/app.js",
+            "/node_modules/.pnpm/@sveltejs+kit@1.0.0/node_modules/@sveltejs/kit/src/runtime/client/entry.js",
+            "/.vite/deps/chunk-abc.js",
+            "/.next/static/chunks/main.js",
+            "/.nuxt/dist/client/app.js",
+        ] {
+            assert_eq!(get(p), None, "{p}");
+        }
+    }
+
     #[test]
     fn leaves_legitimate_apps_alone() {
         for p in [
@@ -314,11 +405,19 @@ mod tests {
             "/api/config",
             "/blog/my.post.with.dots",
             "/files/photo.jpeg",
+            // Frontend dev-server assets live in dot-directories and must
+            // reach the origin (OFF-96).
+            "/@fs/home/remy/dev/app/.svelte-kit/generated/client/app.js",
+            "/node_modules/.pnpm/@sveltejs+kit@1.0.0/node_modules/@sveltejs/kit/src/runtime/client/entry.js",
+            "/.vite/deps/chunk-abc.js",
+            "/.next/static/chunks/main.js",
+            "/.nuxt/dist/client/app.js",
         ] {
             assert_eq!(get(p), None, "{p}");
         }
-        // `.well-known` only at the root; nested it is a hidden dir.
-        assert_eq!(get("/x/.well-known/y"), Some(Verdict::Dotfile));
+        // `.well-known` is a public convention and, since the blanket
+        // dot-segment rule is gone, passes at any depth.
+        assert_eq!(get("/x/.well-known/y"), None);
         // Query strings are ignored.
         assert_eq!(get("/search?q=.env"), None);
         assert_eq!(inspect(&Method::POST, "/api/graphql"), None);
