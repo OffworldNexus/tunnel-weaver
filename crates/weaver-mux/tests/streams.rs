@@ -8,15 +8,15 @@ fn policy() -> Class {
     Class::Interactive
 }
 
-#[test]
-fn round_trip_client_to_server() {
-    let mut p = Pair::authenticated();
+#[tokio::test]
+async fn round_trip_client_to_server() {
+    let mut p = Pair::authenticated().await;
     let id = p.client.open(policy()).unwrap();
     assert_eq!(id, 1, "client ids are odd, starting at 1");
     send(&mut p.client, id, b"GET /");
     send(&mut p.client, id, b"hello");
     p.client.finish(id).unwrap();
-    p.pump();
+    p.pump().await;
 
     let events = p.drain_events(Side::Server);
     assert_eq!(
@@ -37,12 +37,12 @@ fn round_trip_client_to_server() {
     assert_eq!(p.server.recv_msg(id), Err(StreamError::WouldBlock));
 }
 
-#[test]
-fn finished_is_immediate_when_nothing_was_sent() {
-    let mut p = Pair::authenticated();
+#[tokio::test]
+async fn finished_is_immediate_when_nothing_was_sent() {
+    let mut p = Pair::authenticated().await;
     let id = p.client.open(policy()).unwrap();
     p.client.finish(id).unwrap();
-    p.pump();
+    p.pump().await;
     let events = p.drain_events(Side::Server);
     assert_eq!(
         events,
@@ -56,13 +56,13 @@ fn finished_is_immediate_when_nothing_was_sent() {
     );
 }
 
-#[test]
-fn round_trip_server_to_client_and_both_directions() {
-    let mut p = Pair::authenticated();
+#[tokio::test]
+async fn round_trip_server_to_client_and_both_directions() {
+    let mut p = Pair::authenticated().await;
     let id = p.server.open(policy()).unwrap();
     assert_eq!(id, 2, "server ids are even, starting at 2");
     send(&mut p.server, id, b"from server");
-    p.pump();
+    p.pump().await;
     assert!(matches!(
         p.client_event(),
         Some(Event::StreamOpened { id: 2, .. })
@@ -71,12 +71,12 @@ fn round_trip_server_to_client_and_both_directions() {
     // Client answers on the same stream.
     send(&mut p.client, id, b"from client");
     p.client.finish(id).unwrap();
-    p.pump();
+    p.pump().await;
     assert_eq!(read_all(&mut p.server, id), b"from client");
     // Server side still open for writing.
     send(&mut p.server, id, b"more");
     p.server.finish(id).unwrap();
-    p.pump();
+    p.pump().await;
     assert_eq!(read_all(&mut p.client, id), b"more");
     // Both directions are done and both inboxes drained: the stream is
     // gone on both sides.
@@ -90,12 +90,12 @@ fn round_trip_server_to_client_and_both_directions() {
     );
 }
 
-#[test]
-fn half_close_semantics() {
-    let mut p = Pair::authenticated();
+#[tokio::test]
+async fn half_close_semantics() {
+    let mut p = Pair::authenticated().await;
     let id = p.client.open(policy()).unwrap();
     p.client.finish(id).unwrap();
-    p.pump();
+    p.pump().await;
     // Client cannot send after FIN...
     assert_eq!(
         p.client.send(id, b"x", Compress::Auto),
@@ -105,7 +105,7 @@ fn half_close_semantics() {
     // ...but the server still can.
     assert_eq!(p.server.recv_msg(id), Err(StreamError::WouldBlock));
     send(&mut p.server, id, b"late");
-    p.pump();
+    p.pump().await;
     assert_eq!(read_all(&mut p.client, id), b"late");
     assert_eq!(
         p.client.recv_msg(id),
@@ -114,15 +114,15 @@ fn half_close_semantics() {
     );
 }
 
-#[test]
-fn reset_mid_stream() {
-    let mut p = Pair::authenticated();
+#[tokio::test]
+async fn reset_mid_stream() {
+    let mut p = Pair::authenticated().await;
     let id = p.client.open(policy()).unwrap();
     send(&mut p.client, id, b"partial");
-    p.pump();
+    p.pump().await;
     p.drain_events(Side::Server);
     p.client.reset(id, 77).unwrap();
-    p.pump();
+    p.pump().await;
     assert_eq!(
         p.drain_events(Side::Server),
         vec![Event::Reset { id, code: 77 }]
@@ -136,9 +136,9 @@ fn reset_mid_stream() {
     assert!(!p.client.is_closed());
 }
 
-#[test]
-fn ids_have_parity_and_are_never_reused() {
-    let mut p = Pair::authenticated();
+#[tokio::test]
+async fn ids_have_parity_and_are_never_reused() {
+    let mut p = Pair::authenticated().await;
     let mut client_ids = Vec::new();
     let mut server_ids = Vec::new();
     for _ in 0..5 {
@@ -146,11 +146,11 @@ fn ids_have_parity_and_are_never_reused() {
         let s = p.server.open(policy()).unwrap();
         p.client.finish(c).unwrap();
         p.server.finish(s).unwrap();
-        p.pump();
+        p.pump().await;
         // Peer closes its side too so the streams fully drain.
         p.server.finish(c).unwrap();
         p.client.finish(s).unwrap();
-        p.pump();
+        p.pump().await;
         client_ids.push(c);
         server_ids.push(s);
     }
@@ -158,22 +158,22 @@ fn ids_have_parity_and_are_never_reused() {
     assert_eq!(server_ids, vec![2, 4, 6, 8, 10]);
 }
 
-#[test]
-fn peer_open_with_wrong_parity_is_a_protocol_error() {
-    let mut p = Pair::authenticated();
+#[tokio::test]
+async fn peer_open_with_wrong_parity_is_a_protocol_error() {
+    let mut p = Pair::authenticated().await;
     let now = p.clock.now();
     let bogus = Frame {
         stream_id: 2, // even: server parity, sent by the client
         frame_type: FrameType::Open,
         payload: weaver_mux::wire::encode_payload(&Class::Interactive),
     };
-    assert!(p.server.recv(now, &encode(&bogus)).is_err());
+    assert!(p.server.recv(now, &encode(&bogus)).await.is_err());
     assert!(p.server.is_closed());
 }
 
-#[test]
-fn control_class_is_rejected_on_both_ends() {
-    let mut p = Pair::authenticated();
+#[tokio::test]
+async fn control_class_is_rejected_on_both_ends() {
+    let mut p = Pair::authenticated().await;
     assert_eq!(
         p.client.open(Class::Control),
         Err(StreamError::InvalidClass)
@@ -184,16 +184,16 @@ fn control_class_is_rejected_on_both_ends() {
         frame_type: FrameType::Open,
         payload: weaver_mux::wire::encode_payload(&Class::Control),
     };
-    assert!(p.server.recv(now, &encode(&bogus)).is_err());
+    assert!(p.server.recv(now, &encode(&bogus)).await.is_err());
     assert!(p.server.is_closed());
 }
 
-#[test]
-fn send_before_open_leaves_wire_emits_open_first() {
-    let mut p = Pair::authenticated();
+#[tokio::test]
+async fn send_before_open_leaves_wire_emits_open_first() {
+    let mut p = Pair::authenticated().await;
     let id = p.client.open(policy()).unwrap();
     send(&mut p.client, id, b"body");
-    p.pump();
+    p.pump().await;
     let client_frames: Vec<_> = p
         .log
         .iter()
@@ -204,9 +204,9 @@ fn send_before_open_leaves_wire_emits_open_first() {
     assert_eq!(read_all(&mut p.server, id), b"body");
 }
 
-#[test]
-fn large_messages_are_fragmented_and_reassembled() {
-    let mut p = Pair::authenticated();
+#[tokio::test]
+async fn large_messages_are_fragmented_and_reassembled() {
+    let mut p = Pair::authenticated().await;
     let id = p.client.open(policy()).unwrap();
     // Random-ish bytes so compression stays off and the frame count is exact.
     let data: Vec<u8> = (0..100_000u32)
@@ -214,7 +214,7 @@ fn large_messages_are_fragmented_and_reassembled() {
         .collect();
     send(&mut p.client, id, &data);
     send(&mut p.client, id, b"tail");
-    p.pump();
+    p.pump().await;
     let frames = p.frames_of(Side::Client, FrameType::Data);
     let max_frame = p.client.params().unwrap().max_frame as usize;
     assert!(frames.iter().all(|f| f.payload.len() <= max_frame));
@@ -228,19 +228,19 @@ fn large_messages_are_fragmented_and_reassembled() {
     assert_eq!(recv_all(&mut p.server, id), vec![data, b"tail".to_vec()]);
 }
 
-#[test]
-fn empty_message_round_trips() {
-    let mut p = Pair::authenticated();
+#[tokio::test]
+async fn empty_message_round_trips() {
+    let mut p = Pair::authenticated().await;
     let id = p.client.open(policy()).unwrap();
     send(&mut p.client, id, b"");
     send(&mut p.client, id, b"after");
-    p.pump();
+    p.pump().await;
     assert_eq!(recv_all(&mut p.server, id), vec![vec![], b"after".to_vec()]);
 }
 
-#[test]
-fn message_over_max_message_is_refused_locally() {
-    let mut p = Pair::authenticated();
+#[tokio::test]
+async fn message_over_max_message_is_refused_locally() {
+    let mut p = Pair::authenticated().await;
     let id = p.client.open(policy()).unwrap();
     let max = p.client.params().unwrap().max_message;
     let big = vec![0u8; max as usize + 1];
@@ -253,14 +253,14 @@ fn message_over_max_message_is_refused_locally() {
     );
 }
 
-#[test]
-fn oversized_reassembly_from_peer_is_a_protocol_error() {
+#[tokio::test]
+async fn oversized_reassembly_from_peer_is_a_protocol_error() {
     let mut server = server_config(1);
     server_params(&mut server, |p| p.max_message = 16 * 1024);
     let mut p = Pair::new(client_config(1), server);
-    p.pump();
+    p.pump().await;
     let id = p.client.open(policy()).unwrap();
-    p.pump();
+    p.pump().await;
     let now = p.clock.now();
     // Hand-craft MORE fragments past the 16 KiB cap.
     let mut payload = vec![DATA_FLAG_MORE];
@@ -270,42 +270,45 @@ fn oversized_reassembly_from_peer_is_a_protocol_error() {
         frame_type: FrameType::Data,
         payload,
     });
-    p.server.recv(now, &f).unwrap();
-    p.server.recv(now, &f).unwrap();
-    assert!(p.server.recv(now, &f).is_err(), "third fragment overruns");
+    p.server.recv(now, &f).await.unwrap();
+    p.server.recv(now, &f).await.unwrap();
+    assert!(
+        p.server.recv(now, &f).await.is_err(),
+        "third fragment overruns"
+    );
     assert!(p.server.is_closed());
 }
 
-#[test]
-fn fin_inside_a_message_is_a_protocol_error() {
-    let mut p = Pair::authenticated();
+#[tokio::test]
+async fn fin_inside_a_message_is_a_protocol_error() {
+    let mut p = Pair::authenticated().await;
     let id = p.client.open(policy()).unwrap();
-    p.pump();
+    p.pump().await;
     let now = p.clock.now();
     let frag = encode(&Frame {
         stream_id: id,
         frame_type: FrameType::Data,
         payload: vec![DATA_FLAG_MORE, 1, 2, 3],
     });
-    p.server.recv(now, &frag).unwrap();
+    p.server.recv(now, &frag).await.unwrap();
     let fin = encode(&Frame {
         stream_id: id,
         frame_type: FrameType::Fin,
         payload: vec![],
     });
-    assert!(p.server.recv(now, &fin).is_err());
+    assert!(p.server.recv(now, &fin).await.is_err());
 }
 
-#[test]
-fn unknown_data_flag_is_a_protocol_error() {
-    let mut p = Pair::authenticated();
+#[tokio::test]
+async fn unknown_data_flag_is_a_protocol_error() {
+    let mut p = Pair::authenticated().await;
     let id = p.client.open(policy()).unwrap();
-    p.pump();
+    p.pump().await;
     let now = p.clock.now();
     let f = encode(&Frame {
         stream_id: id,
         frame_type: FrameType::Data,
         payload: vec![0x80, 1],
     });
-    assert!(p.server.recv(now, &f).is_err());
+    assert!(p.server.recv(now, &f).await.is_err());
 }

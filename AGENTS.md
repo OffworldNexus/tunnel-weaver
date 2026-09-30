@@ -13,7 +13,7 @@
 - Conformance (nightly / PR to develop only, needs the DO droplet): h2spec
   and Autobahn run in `.github/workflows/nightly.yml`; allow-lists live in
   `ci/conformance/*-allowlist.txt`, one case per line with a justification.
-- Last measured: 2026-09-24, full suite 10.3s (30.6s after Askama dependency addition), ignored suite 0.7s.
+- Last measured: 2026-09-25, full suite 7.0s (warm), ignored suite 0.7s.
 
 ## Crate notes
 

@@ -515,10 +515,14 @@ async fn test_pebble_e2e_tunnel_registration_and_proxying() {
         true,
     );
 
+    let identity_resolver = Arc::new(weaver_server::tunnel::StoreIdentityResolver::new(
+        store.as_ref().clone(),
+    ));
     let registry = Arc::new(weaver_server::tunnel::TunnelRegistry::new(
         root_domain.into(),
         Arc::clone(&manager),
-        Arc::new(weaver_server::tunnel::PocResolver),
+        identity_resolver,
+        store.as_ref().clone(),
     ));
 
     let shutdown_token = CancellationToken::new();

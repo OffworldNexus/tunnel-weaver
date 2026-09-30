@@ -25,7 +25,10 @@ pub use error::StoreError;
 pub use migration::Migrator;
 
 use crate::config::{Config, ConfigError};
-use entity::{acme_account, cert_event, certificate, config, domain};
+use entity::{
+    acme_account, cert_event, certificate, config, domain, machine, machine_key, person, service,
+};
+use weaver_mux::KeyId;
 
 /// Upper bound on pooled connections. SQLite serializes writers anyway; a
 /// small pool lets concurrent readers proceed without contention.
@@ -49,14 +52,6 @@ impl std::fmt::Debug for Store {
             .field("url", &self.url)
             .finish_non_exhaustive()
     }
-}
-
-/// Current Unix time in seconds, used for `updated_at`/`created_at` stamps.
-fn now_unix() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64
 }
 
 impl Store {
@@ -163,7 +158,10 @@ impl Store {
         let model = config::ActiveModel {
             id: Set(config::SINGLETON_ID),
             config_json: Set(json_str),
-            updated_at: Set(now_unix()),
+            updated_at: Set(std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64),
         };
         config::Entity::insert(model)
             .on_conflict(
@@ -507,6 +505,197 @@ impl Store {
         self.set_domain_active(name, active_at).await
     }
 
+    // ----- auth: person, machine, machine_key, service -----
+
+    /// Explicitly creates a new person. Returns an error if the name already exists.
+    pub async fn create_person(&self, name: &str) -> Result<person::Model, StoreError> {
+        let lower = name.to_ascii_lowercase();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        let new_person = person::ActiveModel {
+            name: Set(lower),
+            created_at: Set(now),
+            ..Default::default()
+        };
+        Ok(new_person.insert(&self.db).await?)
+    }
+
+    /// Fetches a person by lowercase name.
+    pub async fn get_person_by_name(
+        &self,
+        name: &str,
+    ) -> Result<Option<person::Model>, StoreError> {
+        let lower = name.to_ascii_lowercase();
+        Ok(person::Entity::find()
+            .filter(person::Column::Name.eq(&lower))
+            .one(&self.db)
+            .await?)
+    }
+
+    /// Explicitly creates a new machine under a person. Returns an error if the machine name already exists for that person.
+    pub async fn create_machine(
+        &self,
+        person_id: i32,
+        name: &str,
+    ) -> Result<machine::Model, StoreError> {
+        let lower = name.to_ascii_lowercase();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        let new_machine = machine::ActiveModel {
+            person_id: Set(person_id),
+            name: Set(lower),
+            created_at: Set(now),
+            ..Default::default()
+        };
+        Ok(new_machine.insert(&self.db).await?)
+    }
+
+    /// Fetches a machine by person ID and lowercase name.
+    pub async fn get_machine_by_name(
+        &self,
+        person_id: i32,
+        name: &str,
+    ) -> Result<Option<machine::Model>, StoreError> {
+        let lower = name.to_ascii_lowercase();
+        Ok(machine::Entity::find()
+            .filter(machine::Column::PersonId.eq(person_id))
+            .filter(machine::Column::Name.eq(&lower))
+            .one(&self.db)
+            .await?)
+    }
+
+    /// Associates an authorized public key identifier with a machine.
+    ///
+    /// Keys are only ever enrolled explicitly — there is no implicit
+    /// creation at authentication time, so a duplicate `key_id` is an error.
+    pub async fn add_machine_key(
+        &self,
+        machine_id: i32,
+        key_id: &KeyId,
+    ) -> Result<machine_key::Model, StoreError> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        let new_key = machine_key::ActiveModel {
+            machine_id: Set(machine_id),
+            key_id: Set(format_key_id(key_id)),
+            created_at: Set(now),
+            ..Default::default()
+        };
+        Ok(new_key.insert(&self.db).await?)
+    }
+
+    /// Resolves an incoming `KeyId` to its registered `(person, machine, machine_key)` tuple.
+    pub async fn resolve_key(
+        &self,
+        key_id: &KeyId,
+    ) -> Result<Option<(person::Model, machine::Model, machine_key::Model)>, StoreError> {
+        let key_str = format_key_id(key_id);
+        let Some((mkey, Some(mach))) = machine_key::Entity::find()
+            .filter(machine_key::Column::KeyId.eq(&key_str))
+            .find_also_related(machine::Entity)
+            .one(&self.db)
+            .await?
+        else {
+            return Ok(None);
+        };
+
+        let Some(pers) = person::Entity::find_by_id(mach.person_id)
+            .one(&self.db)
+            .await?
+        else {
+            return Ok(None);
+        };
+
+        Ok(Some((pers, mach, mkey)))
+    }
+
+    /// Fetches an existing service by machine ID and lowercase name, or creates a new one.
+    pub async fn get_or_create_service(
+        &self,
+        machine_id: i32,
+        name: &str,
+    ) -> Result<service::Model, StoreError> {
+        let lower = name.to_ascii_lowercase();
+        if let Some(existing) = service::Entity::find()
+            .filter(service::Column::MachineId.eq(machine_id))
+            .filter(service::Column::Name.eq(&lower))
+            .one(&self.db)
+            .await?
+        {
+            return Ok(existing);
+        }
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        let new_service = service::ActiveModel {
+            machine_id: Set(machine_id),
+            name: Set(lower.clone()),
+            created_at: Set(now),
+            ..Default::default()
+        };
+        match new_service.insert(&self.db).await {
+            Ok(model) => Ok(model),
+            Err(e) => {
+                if let Some(existing) = service::Entity::find()
+                    .filter(service::Column::MachineId.eq(machine_id))
+                    .filter(service::Column::Name.eq(&lower))
+                    .one(&self.db)
+                    .await?
+                {
+                    Ok(existing)
+                } else {
+                    Err(e.into())
+                }
+            }
+        }
+    }
+
+    /// Sets or updates the service linked to a domain.
+    pub async fn set_domain_service(
+        &self,
+        domain_name: &str,
+        service_id: i32,
+    ) -> Result<domain::Model, StoreError> {
+        let lower = domain_name.to_ascii_lowercase();
+        let domain_model = self.get_or_create_domain(&lower, None).await?;
+        if domain_model.service_id == Some(service_id) {
+            return Ok(domain_model);
+        }
+        let mut active: domain::ActiveModel = domain_model.into();
+        active.service_id = Set(Some(service_id));
+        let updated = active.update(&self.db).await?;
+        Ok(updated)
+    }
+
+    /// Persists a service declared by the machine that owns `key_id` and links
+    /// it to `hostname`.
+    ///
+    /// This never enrols identities: the person and machine behind `key_id`
+    /// must already exist (they are resolved from `machine_key`), otherwise
+    /// [`StoreError::KeyNotEnrolled`] is returned. Declaring the same service
+    /// twice is idempotent — the existing `service` row is reused.
+    pub async fn register_declared_service(
+        &self,
+        key_id: &KeyId,
+        hostname: &str,
+        service: &str,
+    ) -> Result<service::Model, StoreError> {
+        let Some((_, machine, _)) = self.resolve_key(key_id).await? else {
+            return Err(StoreError::KeyNotEnrolled);
+        };
+        let svc = self.get_or_create_service(machine.id, service).await?;
+        self.set_domain_service(hostname, svc.id).await?;
+        Ok(svc)
+    }
+
     // ----- certificate events -----
 
     /// Appends a certificate lifecycle event.
@@ -700,5 +889,54 @@ impl From<cert_event::Model> for CertEventRecord {
             kind: m.kind,
             detail: m.detail,
         }
+    }
+}
+
+/// Formats a `KeyId` into canonical prefixed text representation.
+fn format_key_id(key_id: &KeyId) -> String {
+    use std::fmt::Write;
+    match key_id {
+        KeyId::Ed25519(bytes) => {
+            let mut hex = String::with_capacity(64);
+            for b in bytes {
+                let _ = write!(&mut hex, "{b:02x}");
+            }
+            format!("ed25519:{hex}")
+        }
+        KeyId::P256(bytes) => {
+            let mut hex = String::with_capacity(66);
+            for b in bytes {
+                let _ = write!(&mut hex, "{b:02x}");
+            }
+            format!("p256:{hex}")
+        }
+    }
+}
+
+/// Parses a stored `machine_key.key_id` back into a [`KeyId`].
+///
+/// This is the inverse of [`format_key_id`]; it lets callers (the identity
+/// resolver) serve the *stored* key material rather than trusting the key the
+/// peer claimed. Returns `None` for a malformed or unsupported value.
+pub fn parse_key_id(value: &str) -> Option<KeyId> {
+    let (scheme, hex) = value.split_once(':')?;
+    let decode = |hex: &str, len: usize| -> Option<Vec<u8>> {
+        if hex.len() != len * 2 {
+            return None;
+        }
+        (0..len)
+            .map(|i| u8::from_str_radix(hex.get(i * 2..i * 2 + 2)?, 16).ok())
+            .collect()
+    };
+    match scheme {
+        "ed25519" => {
+            let bytes: [u8; 32] = decode(hex, 32)?.try_into().ok()?;
+            Some(KeyId::Ed25519(bytes))
+        }
+        "p256" => {
+            let bytes: [u8; 33] = decode(hex, 33)?.try_into().ok()?;
+            Some(KeyId::P256(bytes))
+        }
+        _ => None,
     }
 }

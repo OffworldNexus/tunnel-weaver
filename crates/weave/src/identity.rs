@@ -1,8 +1,9 @@
 //! Client key material.
 //!
-//! Milestone 1 ships one hard-coded development key so the relay's
-//! `PocResolver` recognises the client. Real enrolment replaces this with a
-//! key stored in the OS keychain / TPM behind the same [`Signer`] trait.
+//! Milestone 1 ships one hard-coded development key whose public half the
+//! relay's database is seeded with by its initial migration. Real enrolment
+//! replaces this with a key stored in the OS keychain / TPM behind the same
+//! [`Signer`] trait.
 
 use ed25519_dalek::Signer as _;
 use weaver_mux::auth::Signer;
@@ -46,8 +47,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn dev_key_matches_relay_poc_resolver() {
-        // Mirrors `weaver_server::tunnel::PocResolver::PUBLIC_KEY`.
+    fn dev_key_matches_seeded_relay_key() {
+        // Mirrors the `machine_key` row seeded by the relay's initial migration.
         let expected: [u8; 32] = [
             0x9b, 0x01, 0x7a, 0xbe, 0x25, 0x0e, 0x5b, 0x63, 0xf6, 0x81, 0x7a, 0x84, 0xec, 0x9c,
             0x7b, 0x75, 0x98, 0xb1, 0x1f, 0xc8, 0x00, 0x56, 0xec, 0xe2, 0x9e, 0x06, 0xb8, 0xaa,

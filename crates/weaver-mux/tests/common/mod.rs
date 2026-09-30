@@ -65,9 +65,9 @@ impl Pair {
     }
 
     /// A pair that has completed the handshake.
-    pub fn authenticated() -> Self {
+    pub async fn authenticated() -> Self {
         let mut p = Self::default_pair();
-        p.pump();
+        p.pump().await;
         assert!(
             matches!(p.client_event(), Some(Event::Authenticated { .. })),
             "client must authenticate"
@@ -88,7 +88,7 @@ impl Pair {
 
     /// Move one frame from `from` to its peer. Returns the frame if there
     /// was one.
-    pub fn step(&mut self, from: Side) -> Option<Frame> {
+    pub async fn step(&mut self, from: Side) -> Option<Frame> {
         let now = self.clock.now();
         let mut buf = Vec::new();
         if !self.side(from).poll_transmit(now, &mut buf) {
@@ -100,26 +100,26 @@ impl Pair {
             Side::Server => Side::Client,
         };
         // A closed peer rejects everything; that is expected after GOAWAY.
-        let _ = self.side(to).recv(now, &buf);
+        let _ = self.side(to).recv(now, &buf).await;
         self.log.push((from, frame.clone()));
         Some(frame)
     }
 
     /// Alternate sides until neither has anything to send.
-    pub fn pump(&mut self) {
+    pub async fn pump(&mut self) {
         loop {
-            let a = self.step(Side::Server).is_some();
-            let b = self.step(Side::Client).is_some();
+            let a = self.step(Side::Server).await.is_some();
+            let b = self.step(Side::Client).await.is_some();
             if !a && !b {
                 break;
             }
         }
     }
 
-    pub fn advance(&mut self, by: Duration) {
+    pub async fn advance(&mut self, by: Duration) {
         let now = self.clock.advance(by);
-        self.client.handle_timeout(now);
-        self.server.handle_timeout(now);
+        self.client.handle_timeout(now).await;
+        self.server.handle_timeout(now).await;
     }
 
     pub fn client_event(&mut self) -> Option<Event> {

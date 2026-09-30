@@ -9,6 +9,8 @@
 
 use libfuzzer_sys::fuzz_target;
 use std::time::{Duration, Instant};
+mod async_util;
+use async_util::block_on;
 use weaver_mux::testing::{Ed25519TestSigner, MapVerifier, SeededRng};
 use weaver_mux::{Compress, Config, Connection, Signer as _, Class};
 
@@ -27,10 +29,10 @@ fn authenticated_pair() -> (Connection, Connection, Instant) {
     let mut buf = Vec::new();
     for _ in 0..4 {
         while server.poll_transmit(now, &mut buf) {
-            let _ = client.recv(now, &buf);
+            let _ = block_on(client.recv(now, &buf));
         }
         while client.poll_transmit(now, &mut buf) {
-            let _ = server.recv(now, &buf);
+            let _ = block_on(server.recv(now, &buf));
         }
     }
     assert_eq!(server.version(), Some(1));
@@ -45,7 +47,7 @@ fuzz_target!(|data: &[u8]| {
     let _ = client.send(id, b"seed", Compress::Auto);
     let mut buf = Vec::new();
     while client.poll_transmit(now, &mut buf) {
-        let _ = server.recv(now, &buf);
+        let _ = block_on(server.recv(now, &buf));
     }
 
     let mut rest = data;
@@ -56,8 +58,8 @@ fuzz_target!(|data: &[u8]| {
         let (frame, tail) = rest.split_at(take);
         rest = tail;
         now += Duration::from_millis(1);
-        let _ = server.recv(now, frame);
-        server.handle_timeout(now);
+        let _ = block_on(server.recv(now, frame));
+        block_on(server.handle_timeout(now));
         while server.poll_transmit(now, &mut buf) {}
         while server.poll_event().is_some() {}
         while server.recv_msg(id).is_ok() {}

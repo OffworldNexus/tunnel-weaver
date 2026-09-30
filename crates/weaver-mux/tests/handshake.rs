@@ -11,11 +11,11 @@ use weaver_mux::{
     StreamError,
 };
 
-#[test]
-fn happy_path_ed25519() {
+#[tokio::test]
+async fn happy_path_ed25519() {
     let mut p = Pair::default_pair();
     assert!(p.client.version().is_none());
-    p.pump();
+    p.pump().await;
     let key = Ed25519TestSigner::from_seed(1).key_id();
     assert_eq!(
         p.client_event(),
@@ -44,15 +44,15 @@ fn happy_path_ed25519() {
     );
 }
 
-#[test]
-fn happy_path_p256() {
+#[tokio::test]
+async fn happy_path_p256() {
     let signer = P256TestSigner::from_seed(3);
     let verifier = MapVerifier::with_key(signer.key_id(), signer.public_key());
     let key = signer.key_id();
     let client = Config::client(Box::new(signer), SERVER_NAME, Box::new(SeededRng::new(1)));
     let server = Config::server(Box::new(verifier), SERVER_NAME, Box::new(SeededRng::new(2)));
     let mut p = Pair::new(client, server);
-    p.pump();
+    p.pump().await;
     assert_eq!(
         p.server_event(),
         Some(Event::Authenticated {
@@ -62,11 +62,11 @@ fn happy_path_p256() {
     );
 }
 
-#[test]
-fn unknown_key_is_rejected() {
+#[tokio::test]
+async fn unknown_key_is_rejected() {
     // Server knows seed 1, client signs with seed 2.
     let mut p = Pair::new(client_config(2), server_config(1));
-    p.pump();
+    p.pump().await;
     assert_eq!(p.frames_of(Side::Server, FrameType::Reject).len(), 1);
     assert!(matches!(
         p.client_event(),
@@ -87,8 +87,8 @@ fn unknown_key_is_rejected() {
     assert_eq!(p.client.open(Class::Interactive), Err(StreamError::Closed));
 }
 
-#[test]
-fn wrong_signature_is_rejected() {
+#[tokio::test]
+async fn wrong_signature_is_rejected() {
     // Server maps seed-1's key id to seed-2's public key: the id is known,
     // but the signature will not verify.
     let good = Ed25519TestSigner::from_seed(1);
@@ -96,7 +96,7 @@ fn wrong_signature_is_rejected() {
     let verifier = MapVerifier::with_key(good.key_id(), bad.public_key());
     let server = Config::server(Box::new(verifier), SERVER_NAME, Box::new(SeededRng::new(9)));
     let mut p = Pair::new(client_config(1), server);
-    p.pump();
+    p.pump().await;
     assert!(matches!(
         p.client_event(),
         Some(Event::Rejected {
@@ -106,12 +106,12 @@ fn wrong_signature_is_rejected() {
     ));
 }
 
-#[test]
-fn hello_for_another_server_name_is_rejected() {
+#[tokio::test]
+async fn hello_for_another_server_name_is_rejected() {
     let mut client = client_config(1);
     client.server_name = "other.example.test".into();
     let mut p = Pair::new(client, server_config(1));
-    p.pump();
+    p.pump().await;
     assert!(matches!(
         p.client_event(),
         Some(Event::Rejected {
@@ -121,14 +121,14 @@ fn hello_for_another_server_name_is_rejected() {
     ));
 }
 
-#[test]
-fn channel_binding_mismatch_is_rejected() {
+#[tokio::test]
+async fn channel_binding_mismatch_is_rejected() {
     let mut client = client_config(1);
     client.channel_binding = Some([1; 32]);
     let mut server = server_config(1);
     server.channel_binding = Some([2; 32]);
     let mut p = Pair::new(client, server);
-    p.pump();
+    p.pump().await;
     assert!(matches!(
         p.client_event(),
         Some(Event::Rejected {
@@ -142,18 +142,18 @@ fn channel_binding_mismatch_is_rejected() {
     let mut server = server_config(1);
     server.channel_binding = Some([1; 32]);
     let mut p = Pair::new(client, server);
-    p.pump();
+    p.pump().await;
     assert!(matches!(
         p.client_event(),
         Some(Event::Authenticated { .. })
     ));
 }
 
-#[test]
-fn replayed_hello_is_rejected() {
+#[tokio::test]
+async fn replayed_hello_is_rejected() {
     // Capture a valid HELLO from one connection...
     let mut p = Pair::default_pair();
-    p.pump();
+    p.pump().await;
     let hello = p.frames_of(Side::Client, FrameType::Hello)[0].clone();
     // ...and replay it against a fresh server. Its RNG is seeded
     // differently so it draws a different nonce_s, as a real server would.
@@ -163,14 +163,14 @@ fn replayed_hello_is_rejected() {
     let now = q.clock.now();
     let mut buf = Vec::new();
     assert!(q.server.poll_transmit(now, &mut buf)); // CHALLENGE
-    q.server.recv(now, &encode(&hello)).unwrap();
+    q.server.recv(now, &encode(&hello)).await.unwrap();
     assert!(q.server.poll_transmit(now, &mut buf));
     assert_eq!(Frame::parse(&buf).unwrap().frame_type, FrameType::Reject);
     assert!(q.server.is_closed());
 }
 
-#[test]
-fn frame_before_welcome_is_a_protocol_error() {
+#[tokio::test]
+async fn frame_before_welcome_is_a_protocol_error() {
     let mut p = Pair::default_pair();
     let now = p.clock.now();
     let open = Frame {
@@ -178,7 +178,7 @@ fn frame_before_welcome_is_a_protocol_error() {
         frame_type: FrameType::Open,
         payload: weaver_mux::wire::encode_payload(&Class::Interactive),
     };
-    let err = p.server.recv(now, &encode(&open)).unwrap_err();
+    let err = p.server.recv(now, &encode(&open)).await.unwrap_err();
     assert!(matches!(err, ProtocolError::StateViolation(_)));
     let mut buf = Vec::new();
     // Server has CHALLENGE queued but GOAWAY still jumps the line.
@@ -189,11 +189,11 @@ fn frame_before_welcome_is_a_protocol_error() {
         Some(Event::Closed { reason }) if reason.code == CloseCode::ProtocolError
     ));
     // Everything after a close is ignored without panicking.
-    assert_eq!(p.server.recv(now, &encode(&open)), Ok(()));
+    assert_eq!(p.server.recv(now, &encode(&open)).await, Ok(()));
 }
 
-#[test]
-fn handshake_timeout_closes() {
+#[tokio::test]
+async fn handshake_timeout_closes() {
     let mut p = Pair::default_pair();
     let now = p.clock.now();
     assert_eq!(
@@ -201,9 +201,9 @@ fn handshake_timeout_closes() {
         Some(now + Duration::from_secs(10)),
         "default handshake_timeout"
     );
-    p.advance(Duration::from_secs(9));
+    p.advance(Duration::from_secs(9)).await;
     assert!(!p.server.is_closed());
-    p.advance(Duration::from_secs(1));
+    p.advance(Duration::from_secs(1)).await;
     assert!(p.server.is_closed());
     assert!(p.client.is_closed(), "client also gives up waiting");
     assert!(matches!(
@@ -213,8 +213,8 @@ fn handshake_timeout_closes() {
     assert_eq!(p.server.next_timeout(), None);
 }
 
-#[test]
-fn signer_failure_closes_locally() {
+#[tokio::test]
+async fn signer_failure_closes_locally() {
     let key = Ed25519TestSigner::from_seed(1).key_id();
     let client = Config::client(
         Box::new(FailingSigner(key)),
@@ -222,7 +222,7 @@ fn signer_failure_closes_locally() {
         Box::new(SeededRng::new(5)),
     );
     let mut p = Pair::new(client, server_config(1));
-    p.pump();
+    p.pump().await;
     assert!(matches!(
         p.client_event(),
         Some(Event::Closed { reason }) if reason.code == CloseCode::Rejected
@@ -231,8 +231,8 @@ fn signer_failure_closes_locally() {
     assert!(p.server.is_closed(), "GOAWAY reached the server");
 }
 
-#[test]
-fn open_before_authenticated_fails() {
+#[tokio::test]
+async fn open_before_authenticated_fails() {
     let mut p = Pair::default_pair();
     assert_eq!(
         p.client.open(Class::Interactive),

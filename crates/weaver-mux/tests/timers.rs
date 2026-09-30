@@ -8,19 +8,19 @@ use weaver_mux::{Class, CloseCode, Event, Frame, FrameType};
 const PING: Duration = Duration::from_secs(15);
 const IDLE: Duration = Duration::from_secs(60);
 
-#[test]
-fn next_timeout_is_last_activity_plus_ping_interval() {
-    let p = Pair::authenticated();
+#[tokio::test]
+async fn next_timeout_is_last_activity_plus_ping_interval() {
+    let p = Pair::authenticated().await;
     let now = p.clock.now();
     assert_eq!(p.client.next_timeout(), Some(now + PING));
     assert_eq!(p.server.next_timeout(), Some(now + PING));
 }
 
-#[test]
-fn ping_emitted_exactly_once_and_pong_measures_rtt() {
-    let mut p = Pair::authenticated();
+#[tokio::test]
+async fn ping_emitted_exactly_once_and_pong_measures_rtt() {
+    let mut p = Pair::authenticated().await;
     let t0 = p.clock.now();
-    p.advance(PING);
+    p.advance(PING).await;
     let mut buf = Vec::new();
     let now = p.clock.now();
     assert!(p.client.poll_transmit(now, &mut buf));
@@ -32,7 +32,7 @@ fn ping_emitted_exactly_once_and_pong_measures_rtt() {
     // measured from the last frame *received* (WELCOME at t0).
     assert_eq!(p.client.next_timeout(), Some(t0 + IDLE));
     // Calling handle_timeout again does not re-ping.
-    p.client.handle_timeout(now);
+    p.client.handle_timeout(now).await;
     let mut scratch = Vec::new();
     assert!(!p.client.poll_transmit(now, &mut scratch));
 
@@ -46,26 +46,26 @@ fn ping_emitted_exactly_once_and_pong_measures_rtt() {
         Frame::parse(&server_ping).unwrap().frame_type,
         FrameType::Ping
     );
-    p.server.recv(t1, &buf).unwrap();
+    p.server.recv(t1, &buf).await.unwrap();
     let mut pong = Vec::new();
     assert!(p.server.poll_transmit(t1, &mut pong));
     assert_eq!(Frame::parse(&pong).unwrap().frame_type, FrameType::Pong);
     let t2 = p.clock.advance(Duration::from_millis(250));
-    p.client.recv(t2, &pong).unwrap();
+    p.client.recv(t2, &pong).await.unwrap();
     assert_eq!(p.client.rtt(), Some(Duration::from_millis(500)));
     // Ping cadence re-armed from the last activity.
     assert_eq!(p.client.next_timeout(), Some(t2 + PING));
 }
 
-#[test]
-fn no_pong_within_idle_timeout_closes_once() {
-    let mut p = Pair::authenticated();
-    p.advance(PING);
+#[tokio::test]
+async fn no_pong_within_idle_timeout_closes_once() {
+    let mut p = Pair::authenticated().await;
+    p.advance(PING).await;
     let mut buf = Vec::new();
     assert!(p.client.poll_transmit(p.clock.now(), &mut buf)); // PING, never delivered
-    p.advance(IDLE - PING - Duration::from_millis(1));
+    p.advance(IDLE - PING - Duration::from_millis(1)).await;
     assert!(!p.client.is_closed());
-    p.advance(Duration::from_millis(1));
+    p.advance(Duration::from_millis(1)).await;
     assert!(p.client.is_closed());
     let events = p.drain_events(Side::Client);
     assert_eq!(
@@ -80,10 +80,10 @@ fn no_pong_within_idle_timeout_closes_once() {
     assert!(!p.client.poll_transmit(p.clock.now(), &mut buf));
 }
 
-#[test]
-fn late_handle_timeout_closes_only_once() {
-    let mut p = Pair::authenticated();
-    p.advance(Duration::from_secs(600));
+#[tokio::test]
+async fn late_handle_timeout_closes_only_once() {
+    let mut p = Pair::authenticated().await;
+    p.advance(Duration::from_secs(600)).await;
     assert!(p.server.is_closed());
     let closed: Vec<_> = p
         .drain_events(Side::Server)
@@ -91,50 +91,50 @@ fn late_handle_timeout_closes_only_once() {
         .filter(|e| matches!(e, Event::Closed { .. }))
         .collect();
     assert_eq!(closed.len(), 1);
-    p.advance(Duration::from_secs(600));
+    p.advance(Duration::from_secs(600)).await;
     assert!(p.drain_events(Side::Server).is_empty());
     assert_eq!(p.server.next_timeout(), None);
 }
 
-#[test]
-fn any_received_frame_resets_idle() {
-    let mut p = Pair::authenticated();
-    p.advance(Duration::from_secs(50));
+#[tokio::test]
+async fn any_received_frame_resets_idle() {
+    let mut p = Pair::authenticated().await;
+    p.advance(Duration::from_secs(50)).await;
     // Client opens a stream; the OPEN reaching the server counts as liveness.
     p.client.open(Class::Interactive).unwrap();
-    p.pump();
-    p.advance(Duration::from_secs(50));
+    p.pump().await;
+    p.advance(Duration::from_secs(50)).await;
     assert!(!p.server.is_closed(), "idle clock was reset by the OPEN");
 }
 
-#[test]
-fn never_fin_stream_survives_pings() {
-    let mut p = Pair::authenticated();
+#[tokio::test]
+async fn never_fin_stream_survives_pings() {
+    let mut p = Pair::authenticated().await;
     let id = p.client.open(Class::Interactive).unwrap();
-    p.pump();
+    p.pump().await;
     for _ in 0..10 {
-        p.advance(PING);
-        p.pump();
+        p.advance(PING).await;
+        p.pump().await;
     }
     assert!(!p.client.is_closed() && !p.server.is_closed());
     send(&mut p.client, id, b"still here");
-    p.pump();
+    p.pump().await;
     assert_eq!(read_all(&mut p.server, id), b"still here");
     assert!(!p.frames_of(Side::Client, FrameType::Ping).is_empty());
     assert!(!p.frames_of(Side::Server, FrameType::Pong).is_empty());
 }
 
-#[test]
-fn reverify_polls_and_revokes() {
+#[tokio::test]
+async fn reverify_polls_and_revokes() {
     let mut server = server_config(1);
     set_reverify(&mut server, Duration::from_secs(5));
     let mut p = Pair::new(client_config(1), server);
-    p.pump();
+    p.pump().await;
     let now = p.clock.now();
     assert_eq!(p.server.next_timeout(), Some(now + Duration::from_secs(5)));
-    p.advance(Duration::from_secs(5));
+    p.advance(Duration::from_secs(5)).await;
     assert!(!p.server.is_closed(), "key still valid");
-    p.pump();
+    p.pump().await;
     // Revoke: we cannot reach the verifier inside the connection, so build
     // a fresh pair whose verifier is pre-revoked.
     let signer = weaver_mux::testing::Ed25519TestSigner::from_seed(1);
@@ -150,13 +150,13 @@ fn reverify_polls_and_revokes() {
     );
     set_reverify(&mut server, Duration::from_secs(5));
     let mut q = Pair::new(client_config(1), server);
-    q.pump();
+    q.pump().await;
     assert!(matches!(
         q.server_event(),
         Some(Event::Authenticated { .. })
     ));
-    q.advance(Duration::from_secs(5));
-    q.pump();
+    q.advance(Duration::from_secs(5)).await;
+    q.pump().await;
     assert!(matches!(
         q.server_event(),
         Some(Event::Closed { reason }) if reason.code == CloseCode::KeyRevoked
@@ -183,9 +183,9 @@ fn set_reverify(cfg: &mut weaver_mux::Config, every: Duration) {
 /// whether the peer is alive and later closes itself with `Timeout` in the
 /// middle of a healthy transfer. The keepalive clock is the peer's last
 /// frame, not our own last send.
-#[test]
-fn one_way_bulk_sender_still_pings() {
-    let mut p = Pair::authenticated();
+#[tokio::test]
+async fn one_way_bulk_sender_still_pings() {
+    let mut p = Pair::authenticated().await;
     let id = p.client.open(weaver_mux::Class::Bulk).unwrap();
     let chunk = vec![7u8; 1024];
     // Keep the client sending continuously, well past PING, without the
@@ -196,7 +196,7 @@ fn one_way_bulk_sender_still_pings() {
         p.clock.advance(Duration::from_millis(100));
         let now = p.clock.now();
         let _ = p.client.send(id, &chunk, weaver_mux::Compress::Never);
-        p.client.handle_timeout(now);
+        p.client.handle_timeout(now).await;
         // Drain what the client wants to send; deliver DATA to the server,
         // and stop at the first PING.
         while p.client.poll_transmit(now, &mut buf) {
@@ -204,7 +204,7 @@ fn one_way_bulk_sender_still_pings() {
             if ty == FrameType::Ping {
                 return; // pinged while never idle by its own clock: good.
             }
-            p.server.recv(now, &buf).unwrap();
+            p.server.recv(now, &buf).await.unwrap();
             while p.server.poll_event().is_some() {}
         }
     }

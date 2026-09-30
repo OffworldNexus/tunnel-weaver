@@ -7,11 +7,11 @@ use weaver_mux::{Class, Compress, Event, Frame, FrameType, StreamError};
 const WINDOW: u32 = 64 * 1024;
 
 /// Small window so the tests exercise credit exhaustion quickly.
-fn small_window_pair() -> Pair {
+async fn small_window_pair() -> Pair {
     let mut server = server_config(1);
     server_params(&mut server, |p| p.initial_window = WINDOW);
     let mut p = Pair::new(client_config(1), server);
-    p.pump();
+    p.pump().await;
     p.drain_events(Side::Client);
     p.drain_events(Side::Server);
     p
@@ -34,9 +34,9 @@ fn fill(p: &mut Pair, id: u32, msg: &[u8]) -> usize {
     n
 }
 
-#[test]
-fn sender_never_exceeds_credit() {
-    let mut p = small_window_pair();
+#[tokio::test]
+async fn sender_never_exceeds_credit() {
+    let mut p = small_window_pair().await;
     let id = p.client.open(Class::Interactive).unwrap();
     let msg = noise(4000);
     let accepted = fill(&mut p, id, &msg);
@@ -60,13 +60,13 @@ fn sender_never_exceeds_credit() {
     assert!(wire_total <= WINDOW);
 }
 
-#[test]
-fn window_update_cadence_and_writable() {
-    let mut p = small_window_pair();
+#[tokio::test]
+async fn window_update_cadence_and_writable() {
+    let mut p = small_window_pair().await;
     let id = p.client.open(Class::Interactive).unwrap();
     let msg = noise(4000);
     let first = fill(&mut p, id, &msg);
-    p.pump();
+    p.pump().await;
     p.drain_events(Side::Client);
     // Server has the bytes but has not consumed them: no update yet.
     assert!(
@@ -78,7 +78,7 @@ fn window_update_cadence_and_writable() {
     for _ in 0..under_half {
         p.server.recv_msg(id).unwrap();
     }
-    p.pump();
+    p.pump().await;
     assert!(
         p.frames_of(Side::Server, FrameType::WindowUpdate)
             .is_empty(),
@@ -88,7 +88,7 @@ fn window_update_cadence_and_writable() {
     // bytes consumed.
     let rest = recv_all(&mut p.server, id).len();
     assert_eq!(under_half + rest, first);
-    p.pump();
+    p.pump().await;
     let updates = p.frames_of(Side::Server, FrameType::WindowUpdate);
     assert!(!updates.is_empty());
     let credits: Vec<u32> = updates
@@ -113,13 +113,13 @@ fn window_update_cadence_and_writable() {
     p.client.send(id, &msg, Compress::Never).unwrap();
 }
 
-#[test]
-fn stalled_reader_does_not_block_other_streams() {
-    let mut p = small_window_pair();
+#[tokio::test]
+async fn stalled_reader_does_not_block_other_streams() {
+    let mut p = small_window_pair().await;
     let stalled = p.client.open(Class::Interactive).unwrap();
     let live = p.client.open(Class::Interactive).unwrap();
     fill(&mut p, stalled, &noise(4000));
-    p.pump();
+    p.pump().await;
     // Stalled stream is out of credit; nobody reads it on the server.
     assert_eq!(
         p.client.send(stalled, &noise(4000), Compress::Never),
@@ -129,17 +129,17 @@ fn stalled_reader_does_not_block_other_streams() {
     for round in 0..5 {
         let msg = format!("round {round}");
         send(&mut p.client, live, msg.as_bytes());
-        p.pump();
+        p.pump().await;
         assert_eq!(read_all(&mut p.server, live), msg.as_bytes());
     }
     assert!(!p.client.is_closed() && !p.server.is_closed());
 }
 
-#[test]
-fn peer_overrunning_credit_is_a_protocol_error() {
-    let mut p = small_window_pair();
+#[tokio::test]
+async fn peer_overrunning_credit_is_a_protocol_error() {
+    let mut p = small_window_pair().await;
     let id = p.client.open(Class::Interactive).unwrap();
-    p.pump();
+    p.pump().await;
     p.drain_events(Side::Server);
     // Hand-craft DATA frames beyond the window straight into the server.
     let now = p.clock.now();
@@ -151,18 +151,18 @@ fn peer_overrunning_credit_is_a_protocol_error() {
         payload,
     });
     for _ in 0..4 {
-        p.server.recv(now, &frame).unwrap();
+        p.server.recv(now, &frame).await.unwrap();
     }
     assert!(
-        p.server.recv(now, &frame).is_err(),
+        p.server.recv(now, &frame).await.is_err(),
         "fifth frame overruns the 64 KiB window"
     );
     assert!(p.server.is_closed());
 }
 
-#[test]
-fn send_on_unknown_stream_fails() {
-    let mut p = small_window_pair();
+#[tokio::test]
+async fn send_on_unknown_stream_fails() {
+    let mut p = small_window_pair().await;
     assert_eq!(
         p.client.send(99, b"x", Compress::Auto),
         Err(StreamError::UnknownStream)

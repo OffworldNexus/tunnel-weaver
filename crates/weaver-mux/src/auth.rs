@@ -32,16 +32,17 @@ pub trait Signer {
 
 /// Server-side key lookup. Implemented by the adapter (registry, database,
 /// static allow-list, ...).
-pub trait Verifier {
+#[async_trait::async_trait]
+pub trait Verifier: Send {
     /// The public key for `key_id`, or `None` if the key is unknown — which
     /// the server reports to the client as `REJECT { UnknownKey }`.
-    fn public_key(&mut self, key_id: &KeyId) -> Option<PublicKey>;
+    async fn public_key(&mut self, key_id: &KeyId) -> Option<PublicKey>;
 
     /// Lazy revalidation, polled every `Config::reverify_interval`. Returning
     /// `false` closes the connection with `KeyRevoked`. Defaults to always
     /// valid so implementations that do not support revocation need not
     /// override it.
-    fn still_valid(&mut self, _key_id: &KeyId) -> bool {
+    async fn still_valid(&mut self, _key_id: &KeyId) -> bool {
         true
     }
 }

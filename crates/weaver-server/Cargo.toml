@@ -22,6 +22,7 @@ test-util = []
 base64 = { workspace = true }
 bytes = { workspace = true }
 clap = { workspace = true }
+async-trait = { workspace = true }
 comfy-table = { workspace = true }
 crossterm = { workspace = true }
 futures-util = { workspace = true }

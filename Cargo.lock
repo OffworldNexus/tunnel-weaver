@@ -4010,6 +4010,7 @@ dependencies = [
 name = "weaver-mux"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "ed25519-dalek",
  "p256",
  "postcard",
@@ -4018,6 +4019,7 @@ dependencies = [
  "serde",
  "serde-big-array",
  "thiserror",
+ "tokio",
  "weaver-mux",
  "zstd",
 ]
@@ -4036,6 +4038,7 @@ dependencies = [
 name = "weaver-server"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "base64 0.22.1",
  "bytes",
  "clap",

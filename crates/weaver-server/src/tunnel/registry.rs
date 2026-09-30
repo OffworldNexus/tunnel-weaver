@@ -10,6 +10,7 @@ use weaver_mux::KeyId;
 use weaver_proto::control::RefusalCode;
 
 use crate::cert::CertManager;
+use crate::store::Store;
 use crate::tunnel::identity::{IdentityResolver, derive_hostname};
 use crate::tunnel::proxy::ProxyRequest;
 
@@ -37,6 +38,7 @@ pub struct TunnelRegistry {
     root_domain: String,
     cert_manager: Arc<CertManager>,
     identities: Arc<dyn IdentityResolver>,
+    store: Store,
     routes: RwLock<HashMap<String, TunnelRoute>>,
     connections: Mutex<HashMap<KeyId, ActiveConnection>>,
     next_conn_id: AtomicU64,
@@ -48,15 +50,22 @@ impl TunnelRegistry {
         root_domain: String,
         cert_manager: Arc<CertManager>,
         identities: Arc<dyn IdentityResolver>,
+        store: Store,
     ) -> Self {
         Self {
             root_domain,
             cert_manager,
             identities,
+            store,
             routes: RwLock::new(HashMap::new()),
             connections: Mutex::new(HashMap::new()),
             next_conn_id: AtomicU64::new(1),
         }
+    }
+
+    /// Access to the underlying state store.
+    pub fn store(&self) -> Store {
+        self.store.clone()
     }
 
     /// Registers a newly authenticated tunnel connection.
@@ -123,18 +132,31 @@ impl TunnelRegistry {
         service: &str,
         proxy_tx: mpsc::Sender<ProxyRequest>,
     ) -> Result<String, RefusalCode> {
-        let Some(identity) = self.identities.identity(&key_id) else {
+        let Some(identity) = self.identities.identity(&key_id).await else {
             return Err(RefusalCode::Unauthorized);
         };
 
         let host_lower = derive_hostname(service, &identity, &self.root_domain);
 
+        // Refuse duplicates before touching the database: a rejected
+        // registration must not leave `service`/`domain` rows behind.
         {
             let routes = self.routes.read().unwrap();
             if routes.contains_key(&host_lower) {
                 return Err(RefusalCode::AlreadyRegistered);
             }
         }
+
+        // Persist the declared service under the authenticated machine and
+        // link the hostname to it. The person and machine must already exist:
+        // this call never enrols an identity.
+        self.store
+            .register_declared_service(&key_id, &host_lower, service)
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, hostname = %host_lower, "Failed to persist declared service");
+                RefusalCode::Other("failed to persist declared service".into())
+            })?;
 
         {
             let mut routes = self.routes.write().unwrap();

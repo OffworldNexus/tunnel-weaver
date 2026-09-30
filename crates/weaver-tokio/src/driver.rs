@@ -151,7 +151,7 @@ impl<T: Transport, H: StreamHandler> Driver<T, H> {
             // other while the scheduler is saturated — a command channel
             // that never got a turn is how a Ctrl-C failed to stop a flood.
             if self.conn.wants_transmit() {
-                self.conn.handle_timeout(Instant::now());
+                self.conn.handle_timeout(Instant::now()).await;
                 let polled = tokio::select! {
                     biased;
                     msg = self.transport.next() => Some(Input::Transport(msg)),
@@ -159,7 +159,7 @@ impl<T: Transport, H: StreamHandler> Driver<T, H> {
                     () = std::future::ready(()) => None,
                 };
                 match polled {
-                    Some(Input::Transport(msg)) => match self.on_transport(msg) {
+                    Some(Input::Transport(msg)) => match self.on_transport(msg).await {
                         Some(Err(DriverError::Protocol(e))) => {
                             outcome = Some(Err(DriverError::Protocol(e)))
                         }
@@ -184,7 +184,7 @@ impl<T: Transport, H: StreamHandler> Driver<T, H> {
                 // WINDOW_UPDATE is what lets the send side make progress.
                 biased;
                 msg = self.transport.next() => {
-                    match self.on_transport(msg) {
+                    match self.on_transport(msg).await {
                         Some(Err(DriverError::Protocol(e))) => outcome = Some(Err(DriverError::Protocol(e))),
                         Some(r) => return r,
                         None => {}
@@ -196,7 +196,7 @@ impl<T: Transport, H: StreamHandler> Driver<T, H> {
                     }
                 }
                 _ = tokio::time::sleep(sleep_for) => {
-                    self.conn.handle_timeout(Instant::now());
+                    self.conn.handle_timeout(Instant::now()).await;
                 }
             }
 
@@ -210,13 +210,13 @@ impl<T: Transport, H: StreamHandler> Driver<T, H> {
     /// Feed one transport item to the mux. `Some(Err(Protocol))` means the
     /// mux queued its GOAWAY and the caller should flush before returning;
     /// other `Some` results are terminal transport failures.
-    fn on_transport(
+    async fn on_transport(
         &mut self,
         msg: Option<Result<Option<Bytes>, T::Err>>,
     ) -> Option<Result<CloseReason, DriverError>> {
         match msg {
             Some(Ok(Some(bytes))) => {
-                if let Err(e) = self.conn.recv(Instant::now(), &bytes) {
+                if let Err(e) = self.conn.recv(Instant::now(), &bytes).await {
                     debug!(error = %e, "mux protocol error");
                     return Some(Err(DriverError::Protocol(e)));
                 }
@@ -271,7 +271,7 @@ impl<T: Transport, H: StreamHandler> Driver<T, H> {
         let started = Instant::now();
         for _ in 0..MAX_FRAMES_PER_FLUSH {
             let now = Instant::now();
-            self.conn.handle_timeout(now);
+            self.conn.handle_timeout(now).await;
             if now.saturating_duration_since(started) > MAX_FLUSH_TIME {
                 break;
             }
