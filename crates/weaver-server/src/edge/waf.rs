@@ -276,9 +276,9 @@ fn classify(bytes: &[u8]) -> (bool, bool) {
     let mut malformed = false;
     let mut has_upper = false;
 
-    let mut chunks = bytes.chunks_exact(8);
-    for c in &mut chunks {
-        let x = u64::from_le_bytes(c.try_into().unwrap());
+    let (chunks, remainder) = bytes.as_chunks::<8>();
+    for c in chunks {
+        let x = u64::from_le_bytes(*c);
         let high = x & HIGHS;
         // `< 0x20`: complement of the `>= 0x20` mask, high-bit lanes dropped.
         malformed |= (ge_mask(x, 0x20) ^ HIGHS) & !high != 0;
@@ -287,7 +287,7 @@ fn classify(bytes: &[u8]) -> (bool, bool) {
         has_upper |= ge_mask(x, 0x41) & !ge_mask(x, 0x5b) & !high != 0;
     }
 
-    for &b in chunks.remainder() {
+    for &b in remainder {
         malformed |= b < 0x20 || b == 0x7f;
         has_upper |= b.is_ascii_uppercase();
     }
