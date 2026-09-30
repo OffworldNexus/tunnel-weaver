@@ -10,6 +10,10 @@ repository.workspace = true
 name = "weaver_server"
 path = "src/lib.rs"
 
+[[bench]]
+name = "waf"
+harness = false
+
 [[bin]]
 name = "weaver-server"
 path = "src/main.rs"
