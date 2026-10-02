@@ -24,6 +24,8 @@ enum Usage {
     Minute,
     BytesIn,
     BytesOut,
+    TunnelIn,
+    TunnelOut,
     Requests,
     UnusedMs,
 }
@@ -39,6 +41,8 @@ impl MigrationTrait for Migration {
                     .col(big_integer(Usage::Minute).not_null())
                     .col(big_integer(Usage::BytesIn).not_null())
                     .col(big_integer(Usage::BytesOut).not_null())
+                    .col(big_integer(Usage::TunnelIn).not_null())
+                    .col(big_integer(Usage::TunnelOut).not_null())
                     .col(big_integer(Usage::Requests).not_null())
                     .col(integer(Usage::UnusedMs).not_null())
                     .primary_key(Index::create().col(Usage::ServiceId).col(Usage::Minute))

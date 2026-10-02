@@ -113,16 +113,22 @@ async fn send_request_and_read_line(
     Ok(line)
 }
 
-/// Helper to format byte count into human-readable representation.
+/// Helper to format byte count into a decimal SI representation.
+///
+/// SI prefixes are powers of 1000 and "kilo" is lowercase `k`: `kB`, `MB`,
+/// `GB`, `TB`. Values below 1000 stay in bytes.
 fn format_bytes(bytes: u64) -> String {
-    if bytes < 1024 {
+    let b = bytes as f64;
+    if b < 1_000.0 {
         format!("{bytes} B")
-    } else if bytes < 1024 * 1024 {
-        format!("{:.1} KB", bytes as f64 / 1024.0)
-    } else if bytes < 1024 * 1024 * 1024 {
-        format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+    } else if b < 1_000_000.0 {
+        format!("{:.1} kB", b / 1_000.0)
+    } else if b < 1_000_000_000.0 {
+        format!("{:.1} MB", b / 1_000_000.0)
+    } else if b < 1_000_000_000_000.0 {
+        format!("{:.1} GB", b / 1_000_000_000.0)
     } else {
-        format!("{:.1} GB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
+        format!("{:.1} TB", b / 1_000_000_000_000.0)
     }
 }
 
@@ -1037,34 +1043,85 @@ pub async fn client_usage(
         return 0;
     }
 
-    // The server orders by service name; the CLI's summary view is by total
-    // bytes, largest first.
-    let mut services = resp.services;
-    services.sort_by_key(|s| std::cmp::Reverse(s.bytes_in + s.bytes_out));
+    // The server orders by (person, machine, service); keep that order.
+    let services = resp.services;
 
+    let header = |label: &str| {
+        Cell::new(label)
+            .add_attribute(Attribute::Bold)
+            .fg(Color::Cyan)
+    };
     let mut table = create_styled_table();
     table.set_header(vec![
-        "Service",
-        "Machine",
-        "Person",
-        "Bytes In",
-        "Bytes Out",
-        "Open",
-        "Requests",
-        "Minutes",
+        header("PERSON"),
+        header("MACHINE"),
+        header("SERVICE"),
+        header("BYTES IN"),
+        header("BYTES OUT"),
+        header("TUNNEL IN"),
+        header("TUNNEL OUT"),
+        header("RATIO"),
+        header("OPEN"),
+        header("REQUESTS"),
     ]);
     for s in &services {
+        let ratio = format_ratio(s.bytes_in + s.bytes_out, s.tunnel_in + s.tunnel_out);
+
         table.add_row(vec![
-            Cell::new(&s.service),
-            Cell::new(&s.machine),
-            Cell::new(&s.person),
-            Cell::new(format_bytes(s.bytes_in.max(0) as u64)),
-            Cell::new(format_bytes(s.bytes_out.max(0) as u64)),
-            Cell::new(format_open_ms(s.open_ms)),
-            Cell::new(s.requests.to_string()),
-            Cell::new(s.covered_minutes.to_string()),
+            Cell::new(&s.person)
+                .add_attribute(Attribute::Bold)
+                .fg(Color::White),
+            Cell::new(&s.machine).fg(Color::DarkGrey),
+            Cell::new(&s.service).fg(Color::Cyan),
+            Cell::new(format_bytes(s.bytes_in.max(0) as u64)).fg(Color::Green),
+            Cell::new(format_bytes(s.bytes_out.max(0) as u64)).fg(Color::Cyan),
+            Cell::new(format_bytes(s.tunnel_in.max(0) as u64)).fg(Color::DarkGreen),
+            Cell::new(format_bytes(s.tunnel_out.max(0) as u64)).fg(Color::DarkCyan),
+            Cell::new(ratio).fg(Color::Yellow),
+            Cell::new(format_open_ms(s.open_ms)).fg(Color::DarkGrey),
+            Cell::new(s.requests.to_string()).fg(Color::White),
         ]);
     }
     println!("{table}");
+    println!("  RATIO = browser bytes ÷ tunnel bytes    values include unflushed live data");
     0
+}
+
+/// Formats the effective compression ratio (`visitor ÷ tunnel`) as `N.N×`.
+///
+/// Returns `-` when nothing crossed the tunnel leg, where the ratio is
+/// undefined rather than infinite.
+fn format_ratio(visitor: i64, tunnel: i64) -> String {
+    if tunnel <= 0 {
+        return "-".to_string();
+    }
+    format!("{:.1}×", visitor.max(0) as f64 / tunnel as f64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{format_bytes, format_ratio};
+
+    #[test]
+    fn ratio_is_visitor_over_tunnel() {
+        assert_eq!(format_ratio(3_000, 1_000), "3.0×");
+        assert_eq!(format_ratio(1_000, 3_000), "0.3×");
+        // No tunnel bytes means the ratio is undefined, not infinite.
+        assert_eq!(format_ratio(1_000, 0), "-");
+        assert_eq!(format_ratio(0, 0), "-");
+    }
+
+    #[test]
+    fn bytes_use_decimal_si_prefixes() {
+        assert_eq!(format_bytes(0), "0 B");
+        assert_eq!(format_bytes(999), "999 B");
+        assert_eq!(format_bytes(1_000), "1.0 kB");
+        assert_eq!(format_bytes(1_500), "1.5 kB");
+        // 1024 bytes is 1.024 kB in SI, not 1.0 KiB.
+        assert_eq!(format_bytes(1_024), "1.0 kB");
+        assert_eq!(format_bytes(1_000_000), "1.0 MB");
+        assert_eq!(format_bytes(1_500_000), "1.5 MB");
+        assert_eq!(format_bytes(1_000_000_000), "1.0 GB");
+        assert_eq!(format_bytes(1_000_000_000_000), "1.0 TB");
+    }
 }

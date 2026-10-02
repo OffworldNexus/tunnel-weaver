@@ -5,6 +5,15 @@
 //! inverted (`60_000 - open_ms`) so the common "service was up the whole
 //! minute" case is the zero value; readers turn it back into `open_ms` in
 //! exactly one place (`Store::query_usage`).
+//!
+//! Two independent legs are recorded, both as bytes on the wire:
+//!
+//! * `bytes_in` / `bytes_out` — the **visitor leg** (`browser -> relay` and
+//!   `relay -> browser`, i.e. request and response body bytes).
+//! * `tunnel_in` / `tunnel_out` — the **tunnel leg** (`client -> relay` and
+//!   `relay -> client`), the post-compression DATA bytes the mux moves.
+//!
+//! The ratio of the two legs is the effective compression the tunnel applies.
 
 use sea_orm::entity::prelude::*;
 
@@ -15,8 +24,14 @@ pub struct Model {
     pub service_id: i32,
     #[sea_orm(primary_key, auto_increment = false)]
     pub minute: i64,
+    /// Visitor leg: bytes the relay received from the browser (request bodies).
     pub bytes_in: i64,
+    /// Visitor leg: bytes the relay sent to the browser (response bodies).
     pub bytes_out: i64,
+    /// Tunnel leg: compressed bytes the relay received from the client.
+    pub tunnel_in: i64,
+    /// Tunnel leg: compressed bytes the relay sent to the client.
+    pub tunnel_out: i64,
     pub requests: i64,
     pub unused_ms: i32,
 }

@@ -832,12 +832,17 @@ async fn test_usage_control_verb_and_cli() {
     metering.record_request(web.id);
     metering.record_request(web.id);
     metering.record_request(web.id);
-    // A stream's byte report: the mux reports deltas as bytes flow.
+    // Stream byte reports: the relay reports the visitor leg, the mux reports
+    // the compressed tunnel leg.
     metering.register_stream(1, web.id);
-    metering.stream_bytes(1, 1_000, 2_000);
+    metering.visitor_bytes(1, 1_000, 2_000);
+    metering.tunnel_bytes(1, 300, 600);
     metering.unregister_stream(1);
     let meter_task = metering.start(CancellationToken::new());
     tokio::time::sleep(Duration::from_millis(1_100)).await;
+    // Stop the open clock, then flush. The current minute is complete-only-
+    // persisted, so the row the CLI reads is served live from memory.
+    metering.unregister_service(web.id);
     metering.flush().await.expect("flush");
 
     let shutdown_token = CancellationToken::new();
@@ -898,6 +903,8 @@ async fn test_usage_control_verb_and_cli() {
     assert_eq!(val["services"][0]["machine"], "laptop");
     assert_eq!(val["services"][0]["bytes_in"], 1_000);
     assert_eq!(val["services"][0]["bytes_out"], 2_000);
+    assert_eq!(val["services"][0]["tunnel_in"], 300);
+    assert_eq!(val["services"][0]["tunnel_out"], 600);
     assert_eq!(val["services"][0]["requests"], 3);
     assert_eq!(val["services"][0]["covered_minutes"], 1);
     assert!(

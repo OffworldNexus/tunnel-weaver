@@ -6,20 +6,32 @@
 //! * the **first layer**, an in-memory `(service_id, minute)` aggregation of
 //!   traffic counters and registered open time;
 //! * the **flush job**, a 1 s ticker that accrues open time and periodically
-//!   writes *closed* minutes to the [`Store`], with a final flush of the
-//!   partial current minute on shutdown;
+//!   writes *complete* minutes to the [`Store`]; the in-flight minute is never
+//!   written, so a persisted row is always a full nominal minute and its
+//!   `unused_ms` is zero unless the service was genuinely absent mid-minute
+//!   (storage stays "mostly zeroes"). On shutdown the in-flight minute is
+//!   simply dropped;
 //! * the **persistence surface**, the only caller of the store's usage
 //!   upsert/query (so the store's inversion of `unused_ms` never leaks).
 //!
+//! [`query`](MeteringManager::query) blends the persisted rows with the
+//! unflushed in-memory buckets, so the current minute is still visible to
+//! callers even though it is never written.
+//!
 //! Callers report observations through the clock-free methods: the relay calls
 //! [`record_request`](MeteringManager::record_request) when it opens a visitor
-//! stream, [`register_stream`](MeteringManager::register_stream) to map that
-//! stream to its service, and [`unregister_stream`](MeteringManager::unregister_stream)
-//! when it closes. Byte counts arrive by push: the manager publishes itself as
-//! the mux's [`StreamBytesSink`] via [`MeteringManager::sink`], so every DATA
-//! payload the mux moves calls [`stream_bytes`](MeteringManager::stream_bytes)
-//! at the moment it flows. The manager stamps all observations with its own
-//! clock; deterministic tests drive the private `*_at(now_ms)` variants.
+//! stream and [`register_stream`](MeteringManager::register_stream) to map that
+//! stream to its service. Two legs are metered, both keyed by stream:
+//!
+//! * the **visitor leg** — [`visitor_bytes`](MeteringManager::visitor_bytes),
+//!   called by the relay as body bytes cross between the browser and the relay;
+//! * the **tunnel leg** — [`tunnel_bytes`](MeteringManager::tunnel_bytes),
+//!   published to the mux as its [`StreamBytesSink`] via
+//!   [`MeteringManager::sink`], so every compressed DATA payload the mux moves
+//!   reports its wire bytes at the moment it flows.
+//!
+//! The manager stamps all observations with its own clock; deterministic tests
+//! drive the private `*_at(now_ms)` variants.
 //!
 //! Timing rules (OFF-76):
 //! * A minute key is `unix_ms / 60_000`, tagged at observation time, so a late
@@ -54,8 +66,14 @@ const TICK: Duration = Duration::from_secs(1);
 /// Counters accumulated for one `(service_id, minute)` bucket.
 #[derive(Debug, Clone, Copy, Default)]
 struct Bucket {
+    /// Visitor leg: browser -> relay body bytes.
     bytes_in: u64,
+    /// Visitor leg: relay -> browser body bytes.
     bytes_out: u64,
+    /// Tunnel leg: client -> relay compressed bytes (from the mux).
+    tunnel_in: u64,
+    /// Tunnel leg: relay -> client compressed bytes (from the mux).
+    tunnel_out: u64,
     requests: u64,
     /// Milliseconds the service was registered during this minute, `0..=60000`.
     open_ms: u32,
@@ -66,6 +84,18 @@ struct Bucket {
 struct Open {
     /// Unix ms up to which open time has already been accrued.
     accounted_ms: i64,
+}
+
+/// Aggregated unflushed in-memory counters for one service.
+#[derive(Debug, Clone, Copy, Default)]
+struct LiveAgg {
+    bytes_in: i64,
+    bytes_out: i64,
+    tunnel_in: i64,
+    tunnel_out: i64,
+    requests: i64,
+    open_ms: i64,
+    covered_minutes: i64,
 }
 
 #[derive(Default)]
@@ -120,12 +150,23 @@ impl MeteringManager {
         self.lock().streams.remove(&stream_id);
     }
 
-    /// Reports DATA payload bytes the mux observed flowing on a stream.
+    /// Reports visitor-leg body bytes flowing on a stream: `bytes_in` for a
+    /// request body read from the browser, `bytes_out` for a response body
+    /// written to it.
+    ///
+    /// The relay knows the stream and the moment, so long-lived and upgraded
+    /// (WebSocket) exchanges also land in the minute the bytes moved.
+    pub fn visitor_bytes(&self, stream_id: StreamId, bytes_in: u64, bytes_out: u64) {
+        self.visitor_bytes_at(stream_id, unix_ms(), bytes_in, bytes_out);
+    }
+
+    /// Reports tunnel-leg compressed wire bytes the mux moved on a stream.
     ///
     /// This is the mux's push callback: called the moment bytes flow, so a
     /// long-lived stream is attributed to the minute each byte actually moved.
-    pub fn stream_bytes(&self, stream_id: StreamId, bytes_in: u64, bytes_out: u64) {
-        self.stream_bytes_at(stream_id, unix_ms(), bytes_in, bytes_out);
+    /// `bytes_in` is `client -> relay`, `bytes_out` is `relay -> client`.
+    pub fn tunnel_bytes(&self, stream_id: StreamId, bytes_in: u64, bytes_out: u64) {
+        self.tunnel_bytes_at(stream_id, unix_ms(), bytes_in, bytes_out);
     }
 
     /// Publishes this manager as the mux's byte sink.
@@ -149,7 +190,11 @@ impl MeteringManager {
     /// filtered by person and/or service name.
     ///
     /// The window arrives as absolute Unix seconds and is converted to minute
-    /// numbers here. An unknown person or service name matches nothing and
+    /// numbers here. The result is the **sum of persisted rows and the
+    /// unflushed in-memory buckets**, so the current minute and any not-yet-
+    /// flushed data show up immediately rather than only after a flush. Open
+    /// time is first accrued to now so a currently-registered service's live
+    /// row is current. An unknown person or service name matches nothing and
     /// yields an empty result, not an error.
     pub async fn query(
         &self,
@@ -158,22 +203,106 @@ impl MeteringManager {
         since_secs: i64,
         until_secs: i64,
     ) -> Result<Vec<UsageTotal>, StoreError> {
-        self.store
-            .query_usage(
-                person,
-                service,
-                since_secs.div_euclid(60),
-                until_secs.div_euclid(60),
-            )
-            .await
+        let since_min = since_secs.div_euclid(60);
+        // Include every minute bucket that overlaps `[since, until)`. The
+        // bucket containing `until - 1` is the last one that does, so a window
+        // ending "now" still covers the in-flight minute (whose key equals
+        // `minute_of(now)`); a window ending exactly on a boundary does not.
+        let until_min = if until_secs > since_secs {
+            (until_secs - 1).div_euclid(60) + 1
+        } else {
+            since_min
+        };
+        // Bring open time up to the present before snapshotting the live data.
+        self.tick_at(unix_ms());
+
+        let persisted = self
+            .store
+            .query_usage(person, service, since_min, until_min)
+            .await?;
+        let live = self.live_totals(since_min, until_min);
+        if live.is_empty() {
+            return Ok(persisted);
+        }
+
+        let ids: Vec<i32> = live.keys().copied().collect();
+        let identities = self.store.service_identities(&ids).await?;
+        let mut by_id: HashMap<i32, UsageTotal> =
+            persisted.into_iter().map(|t| (t.service_id, t)).collect();
+        for ident in identities {
+            let Some(agg) = live.get(&ident.service_id) else {
+                continue;
+            };
+            // Apply the same filters the SQL query applied to persisted rows.
+            if let Some(person) = person
+                && !ident.person.eq_ignore_ascii_case(person)
+            {
+                continue;
+            }
+            if let Some(service) = service
+                && !ident.service.eq_ignore_ascii_case(service)
+            {
+                continue;
+            }
+            let entry = by_id.entry(ident.service_id).or_insert_with(|| UsageTotal {
+                service_id: ident.service_id,
+                service: ident.service.clone(),
+                machine: ident.machine.clone(),
+                person: ident.person.clone(),
+                bytes_in: 0,
+                bytes_out: 0,
+                tunnel_in: 0,
+                tunnel_out: 0,
+                requests: 0,
+                covered_minutes: 0,
+                open_ms: 0,
+            });
+            entry.bytes_in += agg.bytes_in;
+            entry.bytes_out += agg.bytes_out;
+            entry.tunnel_in += agg.tunnel_in;
+            entry.tunnel_out += agg.tunnel_out;
+            entry.requests += agg.requests;
+            entry.covered_minutes += agg.covered_minutes;
+            entry.open_ms += agg.open_ms;
+        }
+
+        let mut totals: Vec<UsageTotal> = by_id.into_values().collect();
+        totals.sort_by(|a, b| {
+            (&a.person, &a.machine, &a.service).cmp(&(&b.person, &b.machine, &b.service))
+        });
+        Ok(totals)
     }
 
-    /// Flushes every in-memory bucket, including the partial current minute.
+    /// Snapshots the unflushed in-memory buckets in `[since_min, until_min)`,
+    /// aggregated per service.
+    fn live_totals(&self, since_min: i64, until_min: i64) -> HashMap<i32, LiveAgg> {
+        let inner = self.lock();
+        let mut out: HashMap<i32, LiveAgg> = HashMap::new();
+        for (&(service_id, minute), b) in &inner.buckets {
+            if minute < since_min || minute >= until_min {
+                continue;
+            }
+            let agg = out.entry(service_id).or_default();
+            agg.bytes_in += b.bytes_in as i64;
+            agg.bytes_out += b.bytes_out as i64;
+            agg.tunnel_in += b.tunnel_in as i64;
+            agg.tunnel_out += b.tunnel_out as i64;
+            agg.requests += b.requests as i64;
+            agg.open_ms += b.open_ms as i64;
+            agg.covered_minutes += 1;
+        }
+        out
+    }
+
+    /// Flushes every **complete** in-memory bucket to the store.
     ///
-    /// The periodic flush only writes closed minutes; this is the on-demand
-    /// variant used at shutdown and by tests.
+    /// The in-flight minute is deliberately never written: a persisted row
+    /// must be a full nominal minute, so `unused_ms` is zero in the common
+    /// case and the storage stays "mostly zeroes". The current minute remains
+    /// visible to [`query`](Self::query) from memory. Used by the periodic
+    /// ticker and at shutdown.
     pub async fn flush(&self) -> Result<(), StoreError> {
-        self.flush_at(true, unix_ms()).await
+        self.flush_at(unix_ms()).await
     }
 
     /// Spawns the flush job, returning its handle.
@@ -199,7 +328,7 @@ impl MeteringManager {
         bucket.requests = bucket.requests.saturating_add(1);
     }
 
-    fn stream_bytes_at(&self, stream_id: StreamId, now_ms: i64, bytes_in: u64, bytes_out: u64) {
+    fn visitor_bytes_at(&self, stream_id: StreamId, now_ms: i64, bytes_in: u64, bytes_out: u64) {
         let mut inner = self.lock();
         let Some(&service_id) = inner.streams.get(&stream_id) else {
             return;
@@ -210,6 +339,19 @@ impl MeteringManager {
             .or_default();
         bucket.bytes_in = bucket.bytes_in.saturating_add(bytes_in);
         bucket.bytes_out = bucket.bytes_out.saturating_add(bytes_out);
+    }
+
+    fn tunnel_bytes_at(&self, stream_id: StreamId, now_ms: i64, bytes_in: u64, bytes_out: u64) {
+        let mut inner = self.lock();
+        let Some(&service_id) = inner.streams.get(&stream_id) else {
+            return;
+        };
+        let bucket = inner
+            .buckets
+            .entry((service_id, minute_of(now_ms)))
+            .or_default();
+        bucket.tunnel_in = bucket.tunnel_in.saturating_add(bytes_in);
+        bucket.tunnel_out = bucket.tunnel_out.saturating_add(bytes_out);
     }
 
     fn register_service_at(&self, service_id: i32, now_ms: i64) {
@@ -236,7 +378,7 @@ impl MeteringManager {
         }
     }
 
-    async fn flush_at(&self, include_current: bool, now_ms: i64) -> Result<(), StoreError> {
+    async fn flush_at(&self, now_ms: i64) -> Result<(), StoreError> {
         let now_minute = minute_of(now_ms);
         let drained: Vec<((i32, i64), Bucket)> = {
             let mut inner = self.lock();
@@ -244,7 +386,7 @@ impl MeteringManager {
                 .buckets
                 .keys()
                 .copied()
-                .filter(|(_, m)| include_current || *m < now_minute)
+                .filter(|(_, m)| *m < now_minute)
                 .collect();
             keys.into_iter()
                 .filter_map(|key| inner.buckets.remove(&key).map(|b| (key, b)))
@@ -260,6 +402,8 @@ impl MeteringManager {
                 minute: *minute,
                 bytes_in: b.bytes_in as i64,
                 bytes_out: b.bytes_out as i64,
+                tunnel_in: b.tunnel_in as i64,
+                tunnel_out: b.tunnel_out as i64,
                 requests: b.requests as i64,
                 open_ms: b.open_ms as i64,
             })
@@ -272,6 +416,8 @@ impl MeteringManager {
                 let b = inner.buckets.entry(key).or_default();
                 b.bytes_in = b.bytes_in.saturating_add(bucket.bytes_in);
                 b.bytes_out = b.bytes_out.saturating_add(bucket.bytes_out);
+                b.tunnel_in = b.tunnel_in.saturating_add(bucket.tunnel_in);
+                b.tunnel_out = b.tunnel_out.saturating_add(bucket.tunnel_out);
                 b.requests = b.requests.saturating_add(bucket.requests);
                 b.open_ms = (b.open_ms as i64 + bucket.open_ms as i64).clamp(0, MINUTE_MS) as u32;
             }
@@ -296,7 +442,7 @@ impl MeteringManager {
                     self.tick_at(now_ms);
                     if since_flush >= self.flush_interval {
                         since_flush = Duration::ZERO;
-                        if let Err(e) = self.flush_at(false, now_ms).await {
+                        if let Err(e) = self.flush_at(now_ms).await {
                             warn!(error = %e, "Usage flush failed");
                         }
                     }
@@ -305,7 +451,7 @@ impl MeteringManager {
         }
         let now_ms = unix_ms();
         self.tick_at(now_ms);
-        if let Err(e) = self.flush_at(true, now_ms).await {
+        if let Err(e) = self.flush_at(now_ms).await {
             warn!(error = %e, "Final usage flush failed");
         }
     }
@@ -321,7 +467,7 @@ struct ManagerSink {
 
 impl StreamBytesSink for ManagerSink {
     fn bytes(&self, id: StreamId, bytes_in: u64, bytes_out: u64) {
-        self.manager.stream_bytes(id, bytes_in, bytes_out);
+        self.manager.tunnel_bytes(id, bytes_in, bytes_out);
     }
 }
 
@@ -367,6 +513,13 @@ mod tests {
     use super::*;
 
     async fn manager() -> (MeteringManager, i32) {
+        let (meter, svc, _store) = manager_with_store().await;
+        (meter, svc)
+    }
+
+    /// Like [`manager`], but also hands back a clone of the backing store so a
+    /// test can inspect persisted rows without the live in-memory blend.
+    async fn manager_with_store() -> (MeteringManager, i32, Store) {
         let store = Store::connect("sqlite::memory:").await.expect("store");
         let alice = store.create_person("alice").await.expect("person");
         let laptop = store
@@ -377,7 +530,11 @@ mod tests {
             .get_or_create_service(laptop.id, "web")
             .await
             .expect("service");
-        (MeteringManager::new(store, Duration::from_secs(60)), svc.id)
+        (
+            MeteringManager::new(store.clone(), Duration::from_secs(60)),
+            svc.id,
+            store,
+        )
     }
 
     /// Queries a minute window by its numeric bounds.
@@ -399,7 +556,7 @@ mod tests {
         let end = 101 * MINUTE_MS;
         meter.register_service_at(svc, start);
         meter.unregister_service_at(svc, end);
-        meter.flush_at(true, end).await.expect("flush");
+        meter.flush_at(end).await.expect("flush");
 
         let totals = window(&meter, 0, 1_000).await;
         assert_eq!(totals.len(), 1);
@@ -413,7 +570,7 @@ mod tests {
         let start = 100 * MINUTE_MS;
         meter.register_service_at(svc, start);
         meter.unregister_service_at(svc, start + 30_000);
-        meter.flush_at(true, start + 30_000).await.expect("flush");
+        meter.flush_at(101 * MINUTE_MS).await.expect("flush");
 
         let totals = window(&meter, 0, 1_000).await;
         assert_eq!(totals[0].open_ms, 30_000);
@@ -426,7 +583,7 @@ mod tests {
         meter.register_service_at(svc, start);
         meter.tick_at(start + 15_000);
         meter.unregister_service_at(svc, start + 15_000);
-        meter.flush_at(true, start + 15_000).await.expect("flush");
+        meter.flush_at(101 * MINUTE_MS).await.expect("flush");
 
         let m99 = window(&meter, 99, 100).await;
         assert_eq!(m99[0].open_ms, 10_000);
@@ -443,7 +600,7 @@ mod tests {
             meter.tick_at(start + i * 10_000);
         }
         meter.unregister_service_at(svc, start + 50_000);
-        meter.flush_at(true, start + 50_000).await.expect("flush");
+        meter.flush_at(101 * MINUTE_MS).await.expect("flush");
 
         let totals = window(&meter, 100, 101).await;
         assert!(totals[0].open_ms <= 60_000);
@@ -457,18 +614,24 @@ mod tests {
         meter.register_stream(stream, svc);
         meter.record_request_at(svc, 100 * MINUTE_MS + 1_000);
         meter.record_request_at(svc, 100 * MINUTE_MS + 2_000);
-        meter.stream_bytes_at(stream, 100 * MINUTE_MS + 1_500, 10, 20);
-        meter.stream_bytes_at(stream, 101 * MINUTE_MS + 1_500, 5, 7);
-        meter.flush_at(true, 102 * MINUTE_MS).await.expect("flush");
+        meter.visitor_bytes_at(stream, 100 * MINUTE_MS + 1_500, 10, 20);
+        meter.tunnel_bytes_at(stream, 100 * MINUTE_MS + 1_500, 3, 4);
+        meter.visitor_bytes_at(stream, 101 * MINUTE_MS + 1_500, 5, 7);
+        meter.tunnel_bytes_at(stream, 101 * MINUTE_MS + 1_500, 1, 2);
+        meter.flush_at(102 * MINUTE_MS).await.expect("flush");
 
         let m100 = window(&meter, 100, 101).await;
         assert_eq!(m100[0].requests, 2);
         assert_eq!(m100[0].bytes_in, 10);
         assert_eq!(m100[0].bytes_out, 20);
+        assert_eq!(m100[0].tunnel_in, 3);
+        assert_eq!(m100[0].tunnel_out, 4);
         let m101 = window(&meter, 101, 102).await;
         assert_eq!(m101[0].requests, 0);
         assert_eq!(m101[0].bytes_in, 5);
         assert_eq!(m101[0].bytes_out, 7);
+        assert_eq!(m101[0].tunnel_in, 1);
+        assert_eq!(m101[0].tunnel_out, 2);
     }
 
     #[tokio::test]
@@ -476,31 +639,88 @@ mod tests {
         let (meter, svc) = manager().await;
         // A stream nobody registered belongs to no service; the report is
         // dropped rather than misattributed.
-        meter.stream_bytes_at(999, 100 * MINUTE_MS, 10, 20);
+        meter.tunnel_bytes_at(999, 100 * MINUTE_MS, 10, 20);
+        meter.visitor_bytes_at(999, 100 * MINUTE_MS, 10, 20);
         meter.unregister_stream(999);
-        meter.flush_at(true, 101 * MINUTE_MS).await.expect("flush");
+        meter.flush_at(101 * MINUTE_MS).await.expect("flush");
         assert!(window(&meter, 100, 101).await.is_empty());
 
         // Once forgotten, a stream's later reports are dropped too.
         meter.register_stream(1, svc);
         meter.unregister_stream(1);
-        meter.stream_bytes_at(1, 101 * MINUTE_MS, 1, 1);
-        meter.flush_at(true, 102 * MINUTE_MS).await.expect("flush");
+        meter.tunnel_bytes_at(1, 101 * MINUTE_MS, 1, 1);
+        meter.visitor_bytes_at(1, 101 * MINUTE_MS, 1, 1);
+        meter.flush_at(102 * MINUTE_MS).await.expect("flush");
         assert!(window(&meter, 101, 102).await.is_empty());
     }
 
     #[tokio::test]
-    async fn flush_without_include_current_skips_the_open_minute() {
-        let (meter, svc) = manager().await;
+    async fn flush_persists_only_complete_minutes() {
+        let (meter, svc, store) = manager_with_store().await;
         let now = 100 * MINUTE_MS + 30_000;
         meter.record_request_at(svc, 99 * MINUTE_MS + 1_000);
         meter.record_request_at(svc, now);
-        meter.flush_at(false, now).await.expect("flush");
+        meter.flush_at(now).await.expect("flush");
 
-        // Only minute 99 was persisted; the in-flight minute is carried.
+        // Only the complete minute 99 was persisted; the in-flight minute was
+        // carried in memory.
+        let persisted = store
+            .query_usage(None, None, 0, 1_000)
+            .await
+            .expect("query");
+        assert_eq!(persisted.len(), 1);
+        assert_eq!(persisted[0].covered_minutes, 1);
+        assert_eq!(persisted[0].requests, 1);
+
+        // The live query still surfaces the carried in-flight minute.
         let m99 = window(&meter, 99, 100).await;
         assert_eq!(m99[0].requests, 1);
-        assert!(window(&meter, 100, 101).await.is_empty());
+        let m100 = window(&meter, 100, 101).await;
+        assert_eq!(m100[0].requests, 1);
+    }
+
+    #[tokio::test]
+    async fn query_window_includes_the_minute_containing_until() {
+        let (meter, svc) = manager().await;
+        meter.record_request_at(svc, 100 * MINUTE_MS + 1_000);
+
+        // `until` lands 30 s into minute 100: that bucket overlaps the window
+        // and must be included (this is what makes the in-flight minute show
+        // when the window ends at "now").
+        let inside = meter
+            .query(None, None, 100 * 60, 100 * 60 + 30)
+            .await
+            .expect("query");
+        assert_eq!(inside.len(), 1, "window ending mid-minute includes it");
+        assert_eq!(inside[0].requests, 1);
+
+        // `until` exactly on the minute-100 start is half-open and excludes it.
+        let boundary = meter
+            .query(None, None, 99 * 60, 100 * 60)
+            .await
+            .expect("query");
+        assert!(
+            boundary.is_empty(),
+            "bucket starting at `until` is excluded"
+        );
+    }
+
+    #[tokio::test]
+    async fn query_blends_persisted_and_live_buckets() {
+        let (meter, svc, _store) = manager_with_store().await;
+        // Minute 99 is flushed to the store; minute 100 stays in memory.
+        meter.record_request_at(svc, 99 * MINUTE_MS + 1_000);
+        meter.flush_at(100 * MINUTE_MS).await.expect("flush");
+        meter.record_request_at(svc, 100 * MINUTE_MS + 1_000);
+
+        let blended = window(&meter, 99, 101).await;
+        assert_eq!(blended.len(), 1);
+        assert_eq!(blended[0].requests, 2, "persisted + live");
+        assert_eq!(blended[0].covered_minutes, 2);
+
+        // The window still excludes the live minute when it is out of range.
+        let only_99 = window(&meter, 99, 100).await;
+        assert_eq!(only_99[0].requests, 1);
     }
 
     #[tokio::test]
@@ -510,21 +730,22 @@ mod tests {
         meter.register_stream(1, svc);
         // The stream closes; the request it opened must still be counted.
         meter.unregister_stream(1);
-        meter.flush_at(true, 101 * MINUTE_MS).await.expect("flush");
+        meter.flush_at(101 * MINUTE_MS).await.expect("flush");
 
         let totals = window(&meter, 100, 101).await;
         assert_eq!(totals[0].requests, 1);
     }
 
     #[tokio::test]
-    async fn shutdown_flushes_the_partial_current_minute() {
-        let (meter, svc) = manager().await;
+    async fn shutdown_does_not_persist_the_incomplete_minute() {
+        let (meter, svc, store) = manager_with_store().await;
         let meter = Arc::new(meter);
         let minute = minute_of(unix_ms());
         meter.register_service(svc);
         meter.register_stream(1, svc);
         meter.record_request(svc);
-        meter.stream_bytes(1, 11, 22);
+        meter.visitor_bytes(1, 11, 22);
+        meter.tunnel_bytes(1, 33, 44);
 
         let token = CancellationToken::new();
         let task = meter.start(token.clone());
@@ -532,23 +753,44 @@ mod tests {
         token.cancel();
         let _ = task.await;
 
-        // The pre-shutdown ticker never flushed (interval is 60 s); only the
-        // final flush on shutdown wrote the still-open minute.
+        // The in-flight minute was not written: only complete minutes land.
+        let persisted = store
+            .query_usage(None, None, minute - 1, minute + 2)
+            .await
+            .expect("query");
+        assert!(
+            persisted.is_empty(),
+            "the incomplete minute must not be persisted"
+        );
+
+        // It is still visible live until the minute completes.
         let totals = window(&meter, minute - 1, minute + 2).await;
         assert_eq!(totals.len(), 1);
         assert_eq!(totals[0].requests, 1);
         assert_eq!(totals[0].bytes_in, 11);
         assert_eq!(totals[0].bytes_out, 22);
+        assert_eq!(totals[0].tunnel_in, 33);
+        assert_eq!(totals[0].tunnel_out, 44);
         assert!(totals[0].open_ms > 0);
     }
 
     #[tokio::test]
-    async fn public_flush_writes_everything_including_the_current_minute() {
-        let (meter, svc) = manager().await;
+    async fn public_flush_persists_only_complete_minutes() {
+        let (meter, svc, store) = manager_with_store().await;
+        // A request in the current (incomplete) minute is not persisted...
         meter.record_request(svc);
         meter.flush().await.expect("flush");
-        // The manager clock is the only source of the minute; read it back.
         let now_minute = minute_of(unix_ms());
+        assert!(
+            store
+                .query_usage(None, None, now_minute, now_minute + 1)
+                .await
+                .expect("query")
+                .is_empty(),
+            "the current minute must not be persisted"
+        );
+
+        // ...but is still visible live.
         let totals = window(&meter, now_minute, now_minute + 1).await;
         assert_eq!(totals.len(), 1);
         assert_eq!(totals[0].requests, 1);

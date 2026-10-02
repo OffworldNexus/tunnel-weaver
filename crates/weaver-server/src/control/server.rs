@@ -726,6 +726,8 @@ async fn handle_connection(
                             person: t.person,
                             bytes_in: t.bytes_in,
                             bytes_out: t.bytes_out,
+                            tunnel_in: t.tunnel_in,
+                            tunnel_out: t.tunnel_out,
                             open_ms: t.open_ms,
                             requests: t.requests,
                             covered_minutes: t.covered_minutes,

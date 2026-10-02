@@ -2305,13 +2305,13 @@ async fn test_metering_attributes_traffic_per_service() {
     assert!(web[0].requests >= 1, "web requests: {:?}", web[0]);
     assert!(api[0].requests >= 1, "api requests: {:?}", api[0]);
     assert!(
-        web[0].bytes_in > 0 && web[0].bytes_out > 0,
-        "web bytes in/out: {:?}",
+        web[0].bytes_out > 0 && web[0].tunnel_in > 0,
+        "web visitor/tunnel bytes: {:?}",
         web[0]
     );
     assert!(
-        api[0].bytes_in > 0 && api[0].bytes_out > 0,
-        "api bytes in/out: {:?}",
+        api[0].bytes_out > 0 && api[0].tunnel_in > 0,
+        "api visitor/tunnel bytes: {:?}",
         api[0]
     );
     assert!(

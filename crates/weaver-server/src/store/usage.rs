@@ -34,6 +34,8 @@ impl Store {
                 minute: Set(row.minute),
                 bytes_in: Set(row.bytes_in),
                 bytes_out: Set(row.bytes_out),
+                tunnel_in: Set(row.tunnel_in),
+                tunnel_out: Set(row.tunnel_out),
                 requests: Set(row.requests),
                 unused_ms: Set(unused_ms_from_open_ms(row.open_ms)?),
             });
@@ -51,6 +53,14 @@ impl Store {
             .value(
                 usage::Column::BytesOut,
                 Expr::col(usage::Column::BytesOut).add(excluded(usage::Column::BytesOut)),
+            )
+            .value(
+                usage::Column::TunnelIn,
+                Expr::col(usage::Column::TunnelIn).add(excluded(usage::Column::TunnelIn)),
+            )
+            .value(
+                usage::Column::TunnelOut,
+                Expr::col(usage::Column::TunnelOut).add(excluded(usage::Column::TunnelOut)),
             )
             .value(
                 usage::Column::Requests,
@@ -92,6 +102,8 @@ impl Store {
             .column_as(person::Column::Name, "person")
             .column_as(Expr::col(usage::Column::BytesIn).sum(), "bytes_in")
             .column_as(Expr::col(usage::Column::BytesOut).sum(), "bytes_out")
+            .column_as(Expr::col(usage::Column::TunnelIn).sum(), "tunnel_in")
+            .column_as(Expr::col(usage::Column::TunnelOut).sum(), "tunnel_out")
             .column_as(Expr::col(usage::Column::Requests).sum(), "requests")
             .column_as(Expr::col(usage::Column::UnusedMs).sum(), "unused_ms")
             .column_as(Expr::col(usage::Column::Minute).count(), "covered_minutes")
@@ -104,6 +116,8 @@ impl Store {
             .group_by(service::Column::Name)
             .group_by(machine::Column::Name)
             .group_by(person::Column::Name)
+            .order_by_asc(person::Column::Name)
+            .order_by_asc(machine::Column::Name)
             .order_by_asc(service::Column::Name);
         if let Some(person) = person {
             query = query.filter(person::Column::Name.eq(person.to_ascii_lowercase()));
@@ -121,12 +135,67 @@ impl Store {
                 person: r.person,
                 bytes_in: r.bytes_in,
                 bytes_out: r.bytes_out,
+                tunnel_in: r.tunnel_in,
+                tunnel_out: r.tunnel_out,
                 requests: r.requests,
                 covered_minutes: r.covered_minutes,
                 open_ms: r.covered_minutes * 60_000 - r.unused_ms,
             })
             .collect())
     }
+
+    /// Resolves `(service, machine, person)` names for a set of service ids.
+    ///
+    /// Used by the metering manager to name services that only exist in the
+    /// unflushed in-memory buckets and therefore have no persisted usage row
+    /// to join against. Unknown ids are simply absent from the result.
+    pub(crate) async fn service_identities(
+        &self,
+        ids: &[i32],
+    ) -> Result<Vec<ServiceIdentity>, StoreError> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let rows = service::Entity::find()
+            .select_only()
+            .column_as(service::Column::Id, "service_id")
+            .column_as(service::Column::Name, "service")
+            .column_as(machine::Column::Name, "machine")
+            .column_as(person::Column::Name, "person")
+            .join(JoinType::InnerJoin, service::Relation::Machine.def())
+            .join(JoinType::InnerJoin, machine::Relation::Person.def())
+            .filter(service::Column::Id.is_in(ids.iter().copied()))
+            .into_model::<ServiceIdentityRow>()
+            .all(&self.db)
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| ServiceIdentity {
+                service_id: r.service_id,
+                service: r.service,
+                machine: r.machine,
+                person: r.person,
+            })
+            .collect())
+    }
+}
+
+/// One service's display identity, resolved from `service → machine → person`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ServiceIdentity {
+    pub(crate) service_id: i32,
+    pub(crate) service: String,
+    pub(crate) machine: String,
+    pub(crate) person: String,
+}
+
+/// Raw identity row matched to the query's column aliases.
+#[derive(Debug, sea_orm::FromQueryResult)]
+struct ServiceIdentityRow {
+    service_id: i32,
+    service: String,
+    machine: String,
+    person: String,
 }
 
 /// One metered minute for one service, ready to be persisted.
@@ -140,6 +209,8 @@ pub(crate) struct UsageRow {
     pub(crate) minute: i64,
     pub(crate) bytes_in: i64,
     pub(crate) bytes_out: i64,
+    pub(crate) tunnel_in: i64,
+    pub(crate) tunnel_out: i64,
     pub(crate) requests: i64,
     pub(crate) open_ms: i64,
 }
@@ -151,8 +222,14 @@ pub struct UsageTotal {
     pub service: String,
     pub machine: String,
     pub person: String,
+    /// Visitor leg: browser -> relay body bytes.
     pub bytes_in: i64,
+    /// Visitor leg: relay -> browser body bytes.
     pub bytes_out: i64,
+    /// Tunnel leg: client -> relay compressed bytes.
+    pub tunnel_in: i64,
+    /// Tunnel leg: relay -> client compressed bytes.
+    pub tunnel_out: i64,
     pub requests: i64,
     /// Distinct minutes with a persisted bucket in the window.
     pub covered_minutes: i64,
@@ -170,6 +247,8 @@ struct UsageAggRow {
     person: String,
     bytes_in: i64,
     bytes_out: i64,
+    tunnel_in: i64,
+    tunnel_out: i64,
     requests: i64,
     unused_ms: i64,
     covered_minutes: i64,
@@ -212,6 +291,8 @@ mod tests {
             minute: 100,
             bytes_in: 10,
             bytes_out: 20,
+            tunnel_in: 1,
+            tunnel_out: 2,
             requests: 1,
             open_ms: 60_000,
         };
@@ -236,6 +317,8 @@ mod tests {
         let t = &totals[0];
         assert_eq!(t.bytes_in, 15);
         assert_eq!(t.bytes_out, 27);
+        assert_eq!(t.tunnel_in, 2);
+        assert_eq!(t.tunnel_out, 4);
         assert_eq!(t.requests, 3);
         assert_eq!(t.covered_minutes, 1);
         assert_eq!(t.open_ms, 60_000, "a full minute stays a full minute");
@@ -284,6 +367,8 @@ mod tests {
                     minute: 100,
                     bytes_in: 1,
                     bytes_out: 2,
+                    tunnel_in: 10,
+                    tunnel_out: 20,
                     requests: 1,
                     open_ms: 30_000,
                 },
@@ -292,6 +377,8 @@ mod tests {
                     minute: 101,
                     bytes_in: 3,
                     bytes_out: 4,
+                    tunnel_in: 30,
+                    tunnel_out: 40,
                     requests: 2,
                     open_ms: 60_000,
                 },

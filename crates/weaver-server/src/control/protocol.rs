@@ -190,6 +190,9 @@ pub struct UsageService {
     pub person: String,
     pub bytes_in: i64,
     pub bytes_out: i64,
+    /// Tunnel-leg compressed bytes: `client -> relay` and `relay -> client`.
+    pub tunnel_in: i64,
+    pub tunnel_out: i64,
     /// Milliseconds the service was registered across the window. The store's
     /// inverted `unused_ms` storage never appears on the wire.
     pub open_ms: i64,
