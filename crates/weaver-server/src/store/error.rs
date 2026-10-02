@@ -25,6 +25,10 @@ pub enum StoreError {
     #[error("Key is not enrolled against any machine")]
     KeyNotEnrolled,
 
+    /// A metering value fell outside its valid range (e.g. `open_ms > 60000`).
+    #[error("Invalid usage value: {0}")]
+    InvalidUsage(String),
+
     /// The operation is only implemented for some SQL backends (e.g. file backup).
     #[error("Operation '{0}' is not supported on the {1:?} backend")]
     UnsupportedBackend(&'static str, sea_orm::DbBackend),

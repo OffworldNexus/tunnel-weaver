@@ -10,6 +10,7 @@ use weaver_mux::KeyId;
 use weaver_proto::control::RefusalCode;
 
 use crate::cert::CertManager;
+use crate::metering::MeteringManager;
 use crate::store::Store;
 use crate::tunnel::identity::{IdentityResolver, derive_hostname};
 use crate::tunnel::proxy::ProxyRequest;
@@ -21,6 +22,8 @@ pub struct TunnelRoute {
     pub hostname: String,
     /// Registered service name (e.g. "web").
     pub service: String,
+    /// Persisted `service.id` this route meters usage under.
+    pub service_id: i32,
     /// Authenticated public key ID of the tunnel client.
     pub key_id: KeyId,
     /// Channel for forwarding visitor proxy requests to this tunnel connection.
@@ -39,6 +42,7 @@ pub struct TunnelRegistry {
     cert_manager: Arc<CertManager>,
     identities: Arc<dyn IdentityResolver>,
     store: Store,
+    metering: Arc<MeteringManager>,
     routes: RwLock<HashMap<String, TunnelRoute>>,
     connections: Mutex<HashMap<KeyId, ActiveConnection>>,
     next_conn_id: AtomicU64,
@@ -51,12 +55,14 @@ impl TunnelRegistry {
         cert_manager: Arc<CertManager>,
         identities: Arc<dyn IdentityResolver>,
         store: Store,
+        metering: Arc<MeteringManager>,
     ) -> Self {
         Self {
             root_domain,
             cert_manager,
             identities,
             store,
+            metering,
             routes: RwLock::new(HashMap::new()),
             connections: Mutex::new(HashMap::new()),
             next_conn_id: AtomicU64::new(1),
@@ -66,6 +72,11 @@ impl TunnelRegistry {
     /// Access to the underlying state store.
     pub fn store(&self) -> Store {
         self.store.clone()
+    }
+
+    /// The metering manager routes and the relay report traffic to.
+    pub fn metering(&self) -> Arc<MeteringManager> {
+        Arc::clone(&self.metering)
     }
 
     /// Registers a newly authenticated tunnel connection.
@@ -90,7 +101,9 @@ impl TunnelRegistry {
             }
             let mut routes = self.routes.write().unwrap();
             for hostname in old_conn.services {
-                routes.remove(&hostname);
+                if let Some(route) = routes.remove(&hostname) {
+                    self.metering.unregister_service(route.service_id);
+                }
                 self.cert_manager.set_active(&hostname, false);
                 info!(%hostname, "Evicted service from superseded connection");
             }
@@ -108,7 +121,9 @@ impl TunnelRegistry {
             let old_conn = conns.remove(&key_id).unwrap();
             let mut routes = self.routes.write().unwrap();
             for hostname in old_conn.services {
-                routes.remove(&hostname);
+                if let Some(route) = routes.remove(&hostname) {
+                    self.metering.unregister_service(route.service_id);
+                }
                 self.cert_manager.set_active(&hostname, false);
                 info!(%hostname, "Unregistered service on connection close");
             }
@@ -149,8 +164,10 @@ impl TunnelRegistry {
 
         // Persist the declared service under the authenticated machine and
         // link the hostname to it. The person and machine must already exist:
-        // this call never enrols an identity.
-        self.store
+        // this call never enrols an identity. The returned id is what the
+        // meter attributes traffic and open time to.
+        let persisted = self
+            .store
             .register_declared_service(&key_id, &host_lower, service)
             .await
             .map_err(|e| {
@@ -168,11 +185,13 @@ impl TunnelRegistry {
                 TunnelRoute {
                     hostname: host_lower.clone(),
                     service: service.to_string(),
+                    service_id: persisted.id,
                     key_id,
                     proxy_tx,
                 },
             );
         }
+        self.metering.register_service(persisted.id);
 
         {
             let mut conns = self.connections.lock().unwrap();
@@ -219,7 +238,9 @@ impl TunnelRegistry {
         if let Some(route) = routes.get(&lower)
             && route.key_id == key_id
         {
+            let service_id = route.service_id;
             routes.remove(&lower);
+            self.metering.unregister_service(service_id);
             self.cert_manager.set_active(&lower, false);
             info!(hostname = %lower, "Tunnel service unregistered");
 

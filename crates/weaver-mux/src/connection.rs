@@ -1,6 +1,7 @@
 //! The [`Connection`] state machine: the crate's entire public surface.
 
 use std::collections::{HashMap, VecDeque};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::auth;
@@ -11,7 +12,7 @@ use crate::event::Event;
 use crate::frame::{Frame, FrameType};
 use crate::handshake::{self, HandshakeState};
 use crate::sched::{Class, Pick, SchedTree};
-use crate::stream::{RST_CODE_CONNECTION_CLOSED, Stream, StreamId};
+use crate::stream::{RST_CODE_CONNECTION_CLOSED, Stream, StreamBytesSink, StreamId};
 use crate::timers::{Expired, Timers};
 use crate::wire::{
     self, Challenge, DATA_FLAG_COMPRESSED, DATA_FLAG_MORE, DATA_FLAGS_KNOWN, Goaway, Hello, KeyId,
@@ -39,6 +40,9 @@ pub struct Connection {
     params: Option<Params>,
     compression_enabled: bool,
     streams: HashMap<StreamId, Stream>,
+    /// Optional observer the mux reports per-stream DATA payload bytes to.
+    /// Set by the layer above; the mux itself keeps no byte accounting.
+    bytes_sink: Option<Arc<dyn StreamBytesSink>>,
     next_stream_id: u32,
     last_peer_stream_id: u32,
     sched: SchedTree,
@@ -107,6 +111,7 @@ impl Connection {
             params: None,
             compression_enabled: false,
             streams: HashMap::new(),
+            bytes_sink: None,
             next_stream_id,
             last_peer_stream_id: 0,
             sched,
@@ -184,6 +189,17 @@ impl Connection {
     #[cfg(any(test, feature = "test-util"))]
     pub fn pending_messages(&self, id: StreamId) -> Option<usize> {
         self.streams.get(&id).map(Stream::pending_messages)
+    }
+
+    /// Reports per-stream DATA payload byte flow to an observer.
+    ///
+    /// The mux keeps no byte accounting of its own: on every DATA payload it
+    /// sends or receives it calls `sink.bytes(id, bytes_in, bytes_out)`. The
+    /// layer above aggregates (minute buckets, deltas, persistence). Install
+    /// before the connection starts moving traffic; a connection without a
+    /// sink reports nothing.
+    pub fn set_bytes_sink(&mut self, sink: Arc<dyn StreamBytesSink>) {
+        self.bytes_sink = Some(sink);
     }
 
     /// Next event for the application, in order.
@@ -693,6 +709,7 @@ impl Connection {
         } else {
             body.to_vec()
         };
+        let sink = self.bytes_sink.clone();
         let Some(stream) = self.stream_mut(id)? else {
             return Ok(());
         };
@@ -701,6 +718,11 @@ impl Connection {
         }
         if !stream.recv.on_data(wire_len) {
             return Err(ProtocolError::FlowControl(id));
+        }
+        // Report the DATA payload as received, before decompression; the
+        // 5-byte frame header is not part of it.
+        if let Some(sink) = &sink {
+            sink.bytes(id, wire_len as u64, 0);
         }
         if stream.partial.len() + data.len() > max_message {
             return Err(ProtocolError::MessageTooLarge(id));
@@ -828,6 +850,7 @@ impl Connection {
             });
         }
         let compression_enabled = self.compression_enabled;
+        let sink = self.bytes_sink.clone();
         let stream = self
             .streams
             .get_mut(&id)
@@ -874,6 +897,11 @@ impl Connection {
                 payload.extend_from_slice(chunk);
             }
             stream.outbox_bytes += payload.len() as u32;
+            // Report the DATA payload (flags byte + body, post-compression);
+            // the 5-byte frame header is not part of it.
+            if let Some(sink) = &sink {
+                sink.bytes(id, 0, payload.len() as u64);
+            }
             stream.outbox.push_back(payload);
         }
         stream.written_total += msg.len() as u64;

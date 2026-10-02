@@ -13,3 +13,4 @@ pub mod machine;
 pub mod machine_key;
 pub mod person;
 pub mod service;
+pub mod usage;

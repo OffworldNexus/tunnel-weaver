@@ -25,6 +25,7 @@ fn create_valid_test_config(
         acme_eab_hmac: None,
         acme_root_ca_pem: None,
         acme_fallback_providers: Vec::new(),
+        usage_flush_interval_secs: 60,
     }
 }
 

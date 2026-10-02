@@ -55,6 +55,33 @@ pub enum Commands {
         #[arg(long)]
         json: bool,
     },
+
+    /// Shows per-service usage totals over a time window.
+    Usage {
+        /// Filter to a person's name.
+        #[arg(long, value_name = "NAME")]
+        person: Option<String>,
+
+        /// Filter to a service name.
+        #[arg(long, value_name = "NAME")]
+        service: Option<String>,
+
+        /// Window start as a duration before now (e.g. "1d 12h").
+        #[arg(long, value_name = "DURATION", conflicts_with = "from")]
+        since: Option<String>,
+
+        /// Window start: ISO-8601 timestamp or bare Unix seconds.
+        #[arg(long, value_name = "TIME")]
+        from: Option<String>,
+
+        /// Window end: ISO-8601 timestamp or bare Unix seconds (default: now).
+        #[arg(long, value_name = "TIME")]
+        until: Option<String>,
+
+        /// Outputs the usage response as raw JSON.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// Subcommands for certificate operations.
@@ -278,6 +305,10 @@ pub struct ConfigureArgs {
     #[arg(long, value_name = "PATH")]
     pub acme_root_ca: Option<PathBuf>,
 
+    /// Seconds between usage-meter flushes of closed minute buckets.
+    #[arg(long, default_value_t = 60, value_name = "SECS")]
+    pub usage_flush_interval: u64,
+
     /// Non-interactive headless execution mode.
     #[arg(long)]
     pub headless: bool,
@@ -479,6 +510,7 @@ async fn main() {
                 acme_eab_hmac: eab_hmac,
                 acme_root_ca_pem: root_ca_pem,
                 acme_fallback_providers: Vec::new(),
+                usage_flush_interval_secs: args.usage_flush_interval,
             };
 
             if let Err(err) = store.save_config(&config).await {
@@ -572,7 +604,96 @@ async fn main() {
             let code = weaver_server::control::client::client_shutdown(&socket_path, json).await;
             std::process::exit(code);
         }
+        Commands::Usage {
+            person,
+            service,
+            since,
+            from,
+            until,
+            json,
+        } => {
+            let socket_path = cli
+                .socket
+                .unwrap_or_else(|| PathBuf::from("/run/weaver/control.sock"));
+            // Relative windows are resolved here, client-side, so the request
+            // only ever carries absolute Unix seconds.
+            let (since_secs, until_secs) =
+                match resolve_usage_window(since.as_deref(), from.as_deref(), until.as_deref()) {
+                    Ok(window) => window,
+                    Err(msg) => {
+                        eprintln!("Error: {msg}");
+                        std::process::exit(2);
+                    }
+                };
+            let code = weaver_server::control::client::client_usage(
+                &socket_path,
+                person,
+                service,
+                since_secs,
+                until_secs,
+                json,
+            )
+            .await;
+            std::process::exit(code);
+        }
     }
+}
+
+/// Current wall-clock time as absolute Unix seconds.
+fn now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
+}
+
+/// Parses a `--from`/`--until` value: a bare Unix-seconds integer or an
+/// ISO-8601 timestamp.
+fn parse_instant(value: &str) -> Result<i64, String> {
+    let trimmed = value.trim();
+    if let Ok(secs) = trimmed.parse::<i64>() {
+        return Ok(secs);
+    }
+    let ts: jiff::Timestamp = trimmed
+        .parse()
+        .map_err(|e| format!("invalid timestamp '{value}': {e}"))?;
+    Ok(ts.as_second())
+}
+
+/// Resolves the `usage` window into absolute Unix seconds.
+///
+/// `--since` is a duration before now (e.g. `1d 12h`), parsed with `jiff`;
+/// `--from`/`--until` are instants. With neither bound the window is the last
+/// 24 hours, and a missing `--until` defaults to now.
+fn resolve_usage_window(
+    since: Option<&str>,
+    from: Option<&str>,
+    until: Option<&str>,
+) -> Result<(i64, i64), String> {
+    let now = now_secs();
+    let since_secs = match (since, from) {
+        (Some(duration), _) => {
+            let span: jiff::Span = duration
+                .parse()
+                .map_err(|e| format!("invalid --since duration '{duration}': {e}"))?;
+            // Days and weeks are fixed 24-hour/7-day spans for a wall-clock
+            // window; calendar-aware arithmetic is not what the user means.
+            let length = span
+                .to_duration(jiff::SpanRelativeTo::days_are_24_hours())
+                .map_err(|e| format!("invalid --since duration '{duration}': {e}"))?;
+            now - length.as_secs()
+        }
+        (None, Some(from)) => parse_instant(from)?,
+        (None, None) => now - 86_400,
+    };
+    let until_secs = match until {
+        Some(value) => parse_instant(value)?,
+        None => now,
+    };
+    if since_secs >= until_secs {
+        return Err("window start must be before window end".into());
+    }
+    Ok((since_secs, until_secs))
 }
 
 async fn handle_setup(args: SetupArgs, db_path: PathBuf) {

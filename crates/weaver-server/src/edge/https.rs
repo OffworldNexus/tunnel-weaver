@@ -7,6 +7,7 @@
 use std::convert::Infallible;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
+use std::time::Duration;
 
 use http::{Method, Request, Response, StatusCode};
 use hyper::service::service_fn;
@@ -20,11 +21,17 @@ use tokio_util::task::TaskTracker;
 use tracing::{debug, info, trace};
 
 use crate::cert::resolver::CertResolver;
+use crate::edge::counting::{ConnBytes, CountingIo};
 use crate::edge::host::request_host;
 use crate::edge::waf;
 use crate::tunnel::proxy::{BoxBody, empty_body, forward_visitor_request, full_body};
 use crate::tunnel::registry::TunnelRegistry;
 use weaver_assets::{apply_security_headers, render_no_tunnel, render_welcome};
+
+/// How often a live visitor connection reports its accumulated socket bytes to
+/// metering, so long-lived connections land in the right minute rather than
+/// all at close.
+const VISITOR_REPORT_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Shared state for HTTPS request dispatch.
 #[derive(Clone)]
@@ -60,11 +67,16 @@ pub fn is_ip_literal(host: &str) -> bool {
 pub use weaver_tokio::{set_tcp_nodelay, set_tcp_notsent_lowat};
 
 /// Dispatches an HTTPS request based on SNI and Host header validation.
+///
+/// `conn_bytes` is the socket-level counter for this visitor connection; when
+/// the request routes to a tunnel, the connection is attributed to that
+/// service so its bytes can be metered.
 pub async fn handle_https_request(
     mut req: Request<hyper::body::Incoming>,
     config: Arc<HttpsEdgeConfig>,
     client_sni: Option<String>,
     remote_addr: SocketAddr,
+    conn_bytes: Arc<ConnBytes>,
 ) -> Result<Response<BoxBody>, Infallible> {
     // The relay is a reverse proxy, never a forward proxy: a plain `CONNECT`
     // (tunnelling to an arbitrary authority) is rejected with 405. An RFC
@@ -279,6 +291,9 @@ pub async fn handle_https_request(
         if let Some(ref reg) = config.tunnel_registry
             && let Some(route) = reg.lookup(&host_lower)
         {
+            // Attribute this visitor connection's socket bytes to the service
+            // it serves. First tunnel request wins for the whole connection.
+            conn_bytes.set_service(route.service_id);
             let visitor_ip = remote_addr.ip();
             match forward_visitor_request(req, &route, visitor_ip, &host).await {
                 Ok(mut resp) => {
@@ -317,6 +332,27 @@ pub async fn handle_https_request(
             .status(StatusCode::MISDIRECTED_REQUEST)
             .body(full_body("421 Misdirected Request\n"))
             .unwrap())
+    }
+}
+
+/// Reports a visitor connection's unreported socket bytes to metering.
+///
+/// No-op until the connection has been attributed to a tunnel service. Called
+/// periodically and once more at close, so long-lived connections land their
+/// bytes in the minute they actually crossed the wire.
+fn report_conn_bytes(bytes: &ConnBytes, config: &HttpsEdgeConfig) {
+    let service_id = bytes.service_id();
+    if service_id == 0 {
+        return;
+    }
+    let (read, written) = bytes.take_delta();
+    if read == 0 && written == 0 {
+        return;
+    }
+    if let Some(reg) = &config.tunnel_registry {
+        // `read` is browser -> relay, `written` is relay -> browser.
+        reg.metering()
+            .visitor_service_bytes(service_id, read, written);
     }
 }
 
@@ -396,6 +432,7 @@ pub async fn run_https_server_with_registry(
 
                 let tls_acceptor = acceptor.clone();
                 let config = Arc::clone(&edge_config);
+                let report_config = Arc::clone(&edge_config);
                 let auto = auto_builder.clone();
                 let conn_token = shutdown_token.clone();
 
@@ -412,27 +449,44 @@ pub async fn run_https_server_with_registry(
                     let (_, server_conn) = tls_stream.get_ref();
                     let client_sni = server_conn.server_name().map(|s| s.to_string());
 
-                    let io = TokioIo::new(tls_stream);
+                    // Count every byte hyper reads/writes on this visitor
+                    // stream; the request handler attributes it to a service
+                    // once it resolves a tunnel route.
+                    let bytes = Arc::new(ConnBytes::new());
+                    let io = TokioIo::new(CountingIo::new(tls_stream, Arc::clone(&bytes)));
+                    let service_bytes = Arc::clone(&bytes);
                     let service = service_fn(move |req| {
                         let cfg = Arc::clone(&config);
                         let sni = client_sni.clone();
-                        async move { handle_https_request(req, cfg, sni, remote_addr).await }
+                        let bytes = Arc::clone(&service_bytes);
+                        async move { handle_https_request(req, cfg, sni, remote_addr, bytes).await }
                     });
 
                     let conn = auto.serve_connection_with_upgrades(io, service);
                     tokio::pin!(conn);
 
-                    tokio::select! {
-                        res = conn.as_mut() => {
-                            if let Err(err) = res {
-                                trace!(remote = %remote_addr, error = %err, "HTTPS connection error");
+                    let mut report_tick = tokio::time::interval(VISITOR_REPORT_INTERVAL);
+                    report_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                    loop {
+                        tokio::select! {
+                            res = conn.as_mut() => {
+                                if let Err(err) = res {
+                                    trace!(remote = %remote_addr, error = %err, "HTTPS connection error");
+                                }
+                                break;
+                            }
+                            _ = report_tick.tick() => {
+                                report_conn_bytes(&bytes, &report_config);
+                            }
+                            _ = conn_token.cancelled() => {
+                                conn.as_mut().graceful_shutdown();
+                                let _ = conn.as_mut().await;
+                                break;
                             }
                         }
-                        _ = conn_token.cancelled() => {
-                            conn.as_mut().graceful_shutdown();
-                            let _ = conn.as_mut().await;
-                        }
                     }
+                    // Flush whatever accumulated since the last sample.
+                    report_conn_bytes(&bytes, &report_config);
                 });
             }
         }

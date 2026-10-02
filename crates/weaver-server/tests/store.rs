@@ -32,6 +32,7 @@ fn sample_config() -> Config {
         acme_eab_hmac: None,
         acme_root_ca_pem: None,
         acme_fallback_providers: vec!["letsencrypt-staging".into()],
+        usage_flush_interval_secs: 60,
     }
 }
 
@@ -98,19 +99,19 @@ async fn test_store_open_runs_migrations_and_is_idempotent() {
         let store = Store::open(&db_path).await.expect("open failed");
         let count: i64 = scalar(
             &store,
-            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN ('config', 'acme_account', 'domains', 'certificates', 'cert_events', 'seaql_migrations', 'person', 'machine', 'machine_key', 'service')",
+            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN ('config', 'acme_account', 'domains', 'certificates', 'cert_events', 'seaql_migrations', 'person', 'machine', 'machine_key', 'service', 'usage')",
         )
         .await;
-        assert_eq!(count, 10);
-        assert_eq!(store.schema_version().await.expect("schema_version"), 1);
+        assert_eq!(count, 11);
+        assert_eq!(store.schema_version().await.expect("schema_version"), 2);
     }
 
     // Re-open existing database: should succeed and not re-apply migrations
     {
         let store = Store::open(&db_path).await.expect("re-open failed");
         let migration_count: i64 = scalar(&store, "SELECT count(*) FROM seaql_migrations").await;
-        assert_eq!(migration_count, 1);
-        assert_eq!(store.schema_version().await.expect("schema_version"), 1);
+        assert_eq!(migration_count, 2);
+        assert_eq!(store.schema_version().await.expect("schema_version"), 2);
     }
 }
 
@@ -623,4 +624,34 @@ async fn test_cascade_delete_domain() {
     )
     .await;
     assert_eq!(certs_count, 0);
+}
+
+#[tokio::test]
+async fn test_migration_usage_round_trips() {
+    use sea_orm_migration::MigratorTrait;
+
+    let temp = TempDir::new().expect("tempdir");
+    let db_path = temp.path().join("migrate.db");
+    let store = Store::open(&db_path).await.expect("open");
+
+    // Roll back just the usage migration, then re-apply it.
+    weaver_server::Migrator::down(store.db(), Some(1))
+        .await
+        .expect("down");
+    let usage_tables: i64 = scalar(
+        &store,
+        "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='usage'",
+    )
+    .await;
+    assert_eq!(usage_tables, 0, "down must drop the usage table");
+
+    weaver_server::Migrator::up(store.db(), None)
+        .await
+        .expect("up");
+    let usage_tables: i64 = scalar(
+        &store,
+        "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='usage'",
+    )
+    .await;
+    assert_eq!(usage_tables, 1, "up must recreate the usage table");
 }

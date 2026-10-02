@@ -57,6 +57,8 @@ pub enum ProxyError {
 
 /// Request dispatched from the HTTPS edge to the tunnel connection driver.
 pub struct ProxyRequest {
+    /// Persisted `service.id` this request belongs to, for usage metering.
+    pub service_id: i32,
     /// HTTP request metadata and headers forwarded across the stream.
     pub head: HttpHead,
     /// Stream of incoming visitor request body bytes.
@@ -284,6 +286,7 @@ pub async fn forward_visitor_request(
 
     let (response_tx, response_rx) = oneshot::channel();
     let proxy_req = ProxyRequest {
+        service_id: route.service_id,
         head,
         body,
         response_tx,

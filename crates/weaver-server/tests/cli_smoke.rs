@@ -354,3 +354,99 @@ fn test_headless_eab_provider_without_credentials_exits_2() {
         "Expected error message mentioning EAB credentials, got: {stderr}"
     );
 }
+
+#[test]
+fn test_usage_cli_parsing_and_socket_errors() {
+    let bin_path = env!("CARGO_BIN_EXE_weaver-server");
+
+    // `usage` is listed in the top-level help.
+    let help = Command::new(bin_path).arg("--help").output().expect("help");
+    assert!(String::from_utf8_lossy(&help.stdout).contains("usage"));
+
+    // Relative `--since` and `--from` are mutually exclusive.
+    let output = Command::new(bin_path)
+        .arg("--socket")
+        .arg("/tmp/nonexistent-weaver-usage.sock")
+        .arg("usage")
+        .arg("--since")
+        .arg("1d 12h")
+        .arg("--from")
+        .arg("100")
+        .output()
+        .expect("usage conflict");
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("cannot be used with") || stderr.contains("conflicts"));
+
+    // An unparseable instant is rejected before any request is sent.
+    let output = Command::new(bin_path)
+        .arg("--socket")
+        .arg("/tmp/nonexistent-weaver-usage.sock")
+        .arg("usage")
+        .arg("--from")
+        .arg("not-a-time")
+        .output()
+        .expect("usage bad time");
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("invalid timestamp"));
+
+    // A bad range is rejected client-side.
+    let output = Command::new(bin_path)
+        .arg("--socket")
+        .arg("/tmp/nonexistent-weaver-usage.sock")
+        .arg("usage")
+        .arg("--from")
+        .arg("200")
+        .arg("--until")
+        .arg("100")
+        .output()
+        .expect("usage bad range");
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("before window end"));
+
+    // A valid request against a missing socket exits 3, like other commands.
+    let output = Command::new(bin_path)
+        .arg("--socket")
+        .arg("/tmp/nonexistent-weaver-usage.sock")
+        .arg("usage")
+        .arg("--since")
+        .arg("1d 12h")
+        .output()
+        .expect("usage missing socket");
+    assert_eq!(output.status.code(), Some(3));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("Cannot connect to control socket"));
+}
+
+#[test]
+fn test_configure_usage_flush_interval_round_trips() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("flushinterval.db");
+    let bin_path = env!("CARGO_BIN_EXE_weaver-server");
+
+    let output = Command::new(bin_path)
+        .arg("--db")
+        .arg(&db_path)
+        .arg("configure")
+        .arg("--headless")
+        .arg("--root-domain")
+        .arg("flush.example.com")
+        .arg("--email")
+        .arg("admin@example.com")
+        .arg("--usage-flush-interval")
+        .arg("30")
+        .output()
+        .expect("configure");
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let config = rt.block_on(async {
+        let store = Store::open(&db_path).await.unwrap();
+        store.load_config().await.unwrap()
+    });
+    assert_eq!(config.usage_flush_interval_secs, 30);
+}

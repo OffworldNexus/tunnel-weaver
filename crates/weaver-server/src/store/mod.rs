@@ -10,6 +10,7 @@
 pub mod entity;
 pub mod error;
 pub mod migration;
+pub mod usage;
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;

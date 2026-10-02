@@ -2,6 +2,7 @@ pub mod cert;
 pub mod config;
 pub mod control;
 pub mod edge;
+pub mod metering;
 pub mod notify;
 pub mod server;
 pub mod setup;

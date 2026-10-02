@@ -269,6 +269,7 @@ pub async fn execute_install(
         acme_eab_hmac: gathered.acme_eab_hmac.clone(),
         acme_root_ca_pem: root_ca_pem,
         acme_fallback_providers: Vec::new(),
+        usage_flush_interval_secs: 60,
     };
 
     store

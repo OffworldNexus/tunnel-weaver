@@ -219,6 +219,8 @@ struct TestRelay {
     root_domain: String,
     registry: Arc<TunnelRegistry>,
     cert_manager: Arc<CertManager>,
+    store: Arc<Store>,
+    metering: Arc<weaver_server::metering::MeteringManager>,
     shutdown_token: CancellationToken,
     ca_pem_path: std::path::PathBuf,
     _temp_db: NamedTempFile,
@@ -244,6 +246,7 @@ async fn spawn_test_relay(root_domain: &str) -> TestRelay {
         acme_eab_hmac: None,
         acme_root_ca_pem: None,
         acme_fallback_providers: Vec::new(),
+        usage_flush_interval_secs: 60,
     });
 
     let challenge_registry = Arc::new(ChallengeRegistry::new());
@@ -295,11 +298,16 @@ async fn spawn_test_relay(root_domain: &str) -> TestRelay {
     let ca_pem_path = temp_ca.path().to_path_buf();
 
     let resolver = Arc::new(StoreIdentityResolver::new(store.as_ref().clone()));
+    let metering = Arc::new(weaver_server::metering::MeteringManager::new(
+        store.as_ref().clone(),
+        std::time::Duration::from_secs(60),
+    ));
     let registry = Arc::new(TunnelRegistry::new(
         root_domain.to_string(),
         Arc::clone(&cert_manager),
         resolver,
         store.as_ref().clone(),
+        Arc::clone(&metering),
     ));
 
     let shutdown_token = CancellationToken::new();
@@ -317,6 +325,8 @@ async fn spawn_test_relay(root_domain: &str) -> TestRelay {
         root_domain: root_domain.to_string(),
         registry,
         cert_manager,
+        store,
+        metering,
         shutdown_token,
         ca_pem_path,
         _temp_db: temp_db,
@@ -2072,6 +2082,7 @@ async fn test_client_leaving_during_cert_issuance_does_not_leave_hostname_active
         acme_eab_hmac: None,
         acme_root_ca_pem: None,
         acme_fallback_providers: Vec::new(),
+        usage_flush_interval_secs: 60,
     });
     let challenge_registry = Arc::new(ChallengeRegistry::new());
     let resolver = Arc::new(CertResolver::new(
@@ -2092,6 +2103,10 @@ async fn test_client_leaving_during_cert_issuance_does_not_leave_hostname_active
         Arc::clone(&cert_manager),
         identity_resolver,
         store.as_ref().clone(),
+        Arc::new(weaver_server::metering::MeteringManager::new(
+            store.as_ref().clone(),
+            std::time::Duration::from_secs(60),
+        )),
     ));
 
     let key = client_dev_key();
@@ -2217,5 +2232,99 @@ async fn test_store_backed_auth_and_service_domain_persistence() {
 
     client_token.cancel();
     origin.token.cancel();
+    let _ = client_task.await;
+}
+
+#[tokio::test]
+async fn test_metering_attributes_traffic_per_service() {
+    let root = "localhost";
+    let relay = spawn_test_relay(root).await;
+    let web_origin = spawn_test_origin_named("web").await;
+    let api_origin = spawn_test_origin_named("api").await;
+
+    // Two services share one tunnel connection.
+    let client_token = CancellationToken::new();
+    let c_tok = client_token.clone();
+    let server_addr = format!("localhost:{}", relay.addr.port());
+    let ca_path = relay.ca_pem_path.clone();
+    let opts = start_options_multi(
+        server_addr,
+        &ca_path,
+        &[("web", web_origin.port()), ("api", api_origin.port())],
+    );
+    let client_task = tokio::spawn(async move { weave::run_start_with_token(opts, c_tok).await });
+
+    let web_host = derive_hostname("web", &poc_identity(), root);
+    let api_host = derive_hostname("api", &poc_identity(), root);
+    for host in [&web_host, &api_host] {
+        let mut registered = false;
+        for _ in 0..50 {
+            if relay.registry.lookup(host).is_some() {
+                registered = true;
+                break;
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+        assert!(
+            registered,
+            "service for {host} should register within 5 seconds"
+        );
+    }
+
+    // Drive one request to each service.
+    let (status, body) = visitor_get_h1(relay.addr, &web_host, "/hello").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(String::from_utf8_lossy(&body).contains("web"));
+    let (status, body) = visitor_get_h1(relay.addr, &api_host, "/hello").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(String::from_utf8_lossy(&body).contains("api"));
+
+    // Let the relay's 1 s sampler and stream teardown report the byte deltas,
+    // and the manager's own ticker accrue open time.
+    let meter_token = CancellationToken::new();
+    let meter_task = relay.metering.start(meter_token.clone());
+    sleep(Duration::from_millis(1500)).await;
+
+    // Flush everything, including the in-flight minute.
+    relay.metering.flush().await.expect("meter flush");
+
+    let web = relay
+        .metering
+        .query(None, Some("web"), 0, i64::MAX / 60)
+        .await
+        .expect("query web");
+    let api = relay
+        .metering
+        .query(None, Some("api"), 0, i64::MAX / 60)
+        .await
+        .expect("query api");
+
+    // Each service gets its own aggregate row, attributed independently.
+    assert_eq!(web.len(), 1, "one aggregate row for web");
+    assert_eq!(api.len(), 1, "one aggregate row for api");
+    assert!(web[0].requests >= 1, "web requests: {:?}", web[0]);
+    assert!(api[0].requests >= 1, "api requests: {:?}", api[0]);
+    assert!(
+        web[0].bytes_out > 0 && web[0].tunnel_in > 0,
+        "web visitor/tunnel bytes: {:?}",
+        web[0]
+    );
+    assert!(
+        api[0].bytes_out > 0 && api[0].tunnel_in > 0,
+        "api visitor/tunnel bytes: {:?}",
+        api[0]
+    );
+    assert!(
+        web[0].open_ms > 0 && api[0].open_ms > 0,
+        "open time accrued: web={:?} api={:?}",
+        web[0],
+        api[0]
+    );
+
+    meter_token.cancel();
+    let _ = meter_task.await;
+    client_token.cancel();
+    web_origin.token.cancel();
+    api_origin.token.cancel();
     let _ = client_task.await;
 }

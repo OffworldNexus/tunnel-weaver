@@ -35,6 +35,7 @@ http-body-util = { workspace = true }
 hyper = { workspace = true }
 hyper-util = { workspace = true }
 instant-acme = { workspace = true }
+jiff = { workspace = true }
 libc = { workspace = true }
 rcgen = { workspace = true }
 sea-orm = { workspace = true }

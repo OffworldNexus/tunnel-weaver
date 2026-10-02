@@ -4,12 +4,12 @@ use crate::cert::CertState;
 
 /// Envelope for client requests sent across the control socket.
 ///
-/// All requests require `v: 1` and one of the six valid command verbs.
+/// All requests require `v: 1` and one of the seven valid command verbs.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ControlRequest {
     /// Protocol version envelope; must be 1.
     pub v: u32,
-    /// Command verb ("status", "cert.status", "cert.wait", "cert.renew", "backup", "shutdown").
+    /// Command verb ("status", "cert.status", "cert.wait", "cert.renew", "usage", "backup", "shutdown").
     pub cmd: String,
     /// Target domain or hostname for certificate operations.
     #[serde(default)]
@@ -32,6 +32,18 @@ pub struct ControlRequest {
     /// Flag to disable filtering to only the best certificate per domain.
     #[serde(default)]
     pub no_only_best: Option<bool>,
+    /// Usage query: filter to a person's name.
+    #[serde(default)]
+    pub person: Option<String>,
+    /// Usage query: filter to a service name.
+    #[serde(default)]
+    pub service: Option<String>,
+    /// Usage query: lower bound, absolute Unix seconds (inclusive).
+    #[serde(default)]
+    pub since: Option<i64>,
+    /// Usage query: upper bound, absolute Unix seconds (exclusive).
+    #[serde(default)]
+    pub until: Option<i64>,
 }
 
 /// Generic error response returned when a command fails or validation rejects the request.
@@ -167,4 +179,30 @@ pub struct BackupResponse {
 pub struct ShutdownResponse {
     pub ok: bool,
     pub message: String,
+}
+
+/// One service's aggregated usage over the queried window.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UsageService {
+    pub service_id: i32,
+    pub service: String,
+    pub machine: String,
+    pub person: String,
+    pub bytes_in: i64,
+    pub bytes_out: i64,
+    /// Tunnel-leg compressed bytes: `client -> relay` and `relay -> client`.
+    pub tunnel_in: i64,
+    pub tunnel_out: i64,
+    /// Milliseconds the service was registered across the window. The store's
+    /// inverted `unused_ms` storage never appears on the wire.
+    pub open_ms: i64,
+    pub requests: i64,
+    pub covered_minutes: i64,
+}
+
+/// Response payload for `usage`: per-service totals, ordered by service name.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UsageResponse {
+    pub ok: bool,
+    pub services: Vec<UsageService>,
 }

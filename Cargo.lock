@@ -4051,6 +4051,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "instant-acme",
+ "jiff",
  "libc",
  "rcgen",
  "rustls",

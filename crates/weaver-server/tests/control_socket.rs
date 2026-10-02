@@ -26,6 +26,7 @@ fn create_valid_test_config(
         acme_eab_hmac: None,
         acme_root_ca_pem: None,
         acme_fallback_providers: Vec::new(),
+        usage_flush_interval_secs: 60,
     }
 }
 
@@ -324,7 +325,7 @@ async fn test_control_socket_daemon_suite() {
         let val: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
         assert_eq!(val["ok"], true);
         assert_eq!(val["root_domain"], "weaver.test");
-        assert_eq!(val["schema_version"], 1);
+        assert_eq!(val["schema_version"], 2);
         assert_eq!(val["cert_counts"]["issued"], 2); // root + active
         assert_eq!(val["cert_counts"]["inactive"], 1); // inactive
         assert_eq!(val["cert_counts"]["ordering"], 0);
@@ -635,6 +636,7 @@ async fn test_cert_wait_streaming_failed_exit_4_and_renew_rate_limit() {
         acme_eab_hmac: None,
         acme_root_ca_pem: None,
         acme_fallback_providers: Vec::new(),
+        usage_flush_interval_secs: 60,
     });
     store.save_config(&config).await.unwrap();
 
@@ -666,6 +668,10 @@ async fn test_cert_wait_streaming_failed_exit_4_and_renew_rate_limit() {
     let srv_cfg = Arc::clone(&config);
     let srv_store = Arc::clone(&store);
     let srv_mgr = Arc::clone(&cert_manager);
+    let srv_metering = Arc::new(weaver_server::metering::MeteringManager::new(
+        store.as_ref().clone(),
+        Duration::from_secs(60),
+    ));
     tokio::spawn(async move {
         let _ = weaver_server::control::server::run_control_server_with_listener(
             listener,
@@ -673,6 +679,7 @@ async fn test_cert_wait_streaming_failed_exit_4_and_renew_rate_limit() {
             srv_cfg,
             srv_store,
             srv_mgr,
+            srv_metering,
             Instant::now(),
             srv_token,
         )
@@ -758,5 +765,224 @@ async fn test_cert_wait_streaming_failed_exit_4_and_renew_rate_limit() {
     assert_eq!(val["ok"], true);
     assert_eq!(val["renewed"][0], test_host);
 
+    shutdown_token.cancel();
+}
+
+/// Sends a raw control request and returns the parsed response line.
+async fn control_roundtrip(sock: &std::path::Path, req: serde_json::Value) -> serde_json::Value {
+    let mut stream = UnixStream::connect(sock).await.unwrap();
+    let mut data = serde_json::to_vec(&req).unwrap();
+    data.push(b'\n');
+    stream.write_all(&data).await.unwrap();
+    stream.flush().await.unwrap();
+    let (reader, _) = stream.split();
+    let mut buf = BufReader::new(reader);
+    let mut line = String::new();
+    buf.read_line(&mut line).await.unwrap();
+    serde_json::from_str(&line).unwrap()
+}
+
+fn now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+}
+
+#[tokio::test]
+async fn test_usage_control_verb_and_cli() {
+    use std::sync::Arc;
+    use std::time::Instant;
+    use tokio_util::sync::CancellationToken;
+    use weaver_server::cert::{CertManager, CertResolver, ChallengeRegistry, SystemClock};
+    use weaver_server::metering::MeteringManager;
+
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("usage.db");
+    let control_sock_path = dir.path().join("control.sock");
+
+    let store = Arc::new(Store::open(&db_path).await.unwrap());
+    let config = Arc::new(create_valid_test_config(0, 0, control_sock_path.clone()));
+    store.save_config(&config).await.unwrap();
+
+    let challenge_registry = Arc::new(ChallengeRegistry::new());
+    let resolver = Arc::new(CertResolver::new(
+        config.root_domain.clone(),
+        Arc::clone(&challenge_registry),
+    ));
+    let cert_manager = CertManager::new(
+        Arc::clone(&config),
+        Arc::clone(&store),
+        resolver,
+        challenge_registry,
+        Arc::new(SystemClock),
+        true,
+    );
+
+    // Seed one service and drive the manager's own loop so open time accrues.
+    let alice = store.create_person("Alice").await.unwrap();
+    let laptop = store.create_machine(alice.id, "laptop").await.unwrap();
+    let web = store.get_or_create_service(laptop.id, "web").await.unwrap();
+
+    let metering = Arc::new(MeteringManager::new(
+        store.as_ref().clone(),
+        Duration::from_secs(60),
+    ));
+    metering.register_service(web.id);
+    metering.record_request(web.id);
+    metering.record_request(web.id);
+    metering.record_request(web.id);
+    // Stream byte reports: the relay reports the visitor leg, the mux reports
+    // the compressed tunnel leg.
+    metering.register_stream(1, web.id);
+    metering.visitor_service_bytes(web.id, 1_000, 2_000);
+    metering.tunnel_bytes(1, 300, 600);
+    metering.unregister_stream(1);
+    let meter_task = metering.start(CancellationToken::new());
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    // Stop the open clock, then flush. The current minute is complete-only-
+    // persisted, so the row the CLI reads is served live from memory.
+    metering.unregister_service(web.id);
+    metering.flush().await.expect("flush");
+
+    let shutdown_token = CancellationToken::new();
+    let listener =
+        weaver_server::control::server::bind_control_listener(&control_sock_path).unwrap();
+    let srv_token = shutdown_token.clone();
+    let srv_sock = control_sock_path.clone();
+    let srv_cfg = Arc::clone(&config);
+    let srv_store = Arc::clone(&store);
+    let srv_mgr = Arc::clone(&cert_manager);
+    let srv_metering = Arc::clone(&metering);
+    tokio::spawn(async move {
+        let _ = weaver_server::control::server::run_control_server_with_listener(
+            listener,
+            srv_sock,
+            srv_cfg,
+            srv_store,
+            srv_mgr,
+            srv_metering,
+            Instant::now(),
+            srv_token,
+        )
+        .await;
+    });
+
+    let now = now_secs();
+    let from = (now - 3_600).to_string();
+    let until = (now + 3_600).to_string();
+
+    let run_usage = |args: Vec<String>| {
+        let sock = control_sock_path.clone();
+        let bin = env!("CARGO_BIN_EXE_weaver-server");
+        tokio::task::spawn_blocking(move || {
+            let mut cmd = Command::new(bin);
+            cmd.arg("--socket").arg(&sock).arg("usage");
+            for a in args {
+                cmd.arg(a);
+            }
+            cmd.output().expect("run usage")
+        })
+    };
+
+    // JSON round-trip exposes the totals with `open_ms` (never `unused_ms`).
+    let output = run_usage(vec![
+        "--from".into(),
+        from.clone(),
+        "--until".into(),
+        until.clone(),
+        "--json".into(),
+    ])
+    .await
+    .unwrap();
+    assert_eq!(output.status.code(), Some(0));
+    let val: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(val["ok"], true);
+    assert_eq!(val["services"][0]["service"], "web");
+    assert_eq!(val["services"][0]["person"], "alice");
+    assert_eq!(val["services"][0]["machine"], "laptop");
+    assert_eq!(val["services"][0]["bytes_in"], 1_000);
+    assert_eq!(val["services"][0]["bytes_out"], 2_000);
+    assert_eq!(val["services"][0]["tunnel_in"], 300);
+    assert_eq!(val["services"][0]["tunnel_out"], 600);
+    assert_eq!(val["services"][0]["requests"], 3);
+    assert_eq!(val["services"][0]["covered_minutes"], 1);
+    assert!(
+        val["services"][0]["open_ms"].as_i64().unwrap() > 0,
+        "open time accrued: {}",
+        val["services"][0]["open_ms"]
+    );
+
+    // Human output prints the service row.
+    let output = run_usage(vec![
+        "--from".into(),
+        from.clone(),
+        "--until".into(),
+        until.clone(),
+    ])
+    .await
+    .unwrap();
+    assert_eq!(output.status.code(), Some(0));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("web"));
+
+    // Filters: matching names return the row, unknown names return none.
+    for (flag, value, expected) in [
+        ("--service", "web", 1usize),
+        ("--service", "nope", 0),
+        ("--person", "alice", 1),
+        ("--person", "bob", 0),
+    ] {
+        let output = run_usage(vec![
+            "--from".into(),
+            from.clone(),
+            "--until".into(),
+            until.clone(),
+            "--json".into(),
+            flag.into(),
+            value.into(),
+        ])
+        .await
+        .unwrap();
+        assert_eq!(output.status.code(), Some(0));
+        let val: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(
+            val["services"].as_array().unwrap().len(),
+            expected,
+            "{flag} {value}"
+        );
+    }
+
+    // A bad range is rejected client-side with exit 2.
+    let output = run_usage(vec![
+        "--from".into(),
+        until.clone(),
+        "--until".into(),
+        from.clone(),
+    ])
+    .await
+    .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+
+    // `--since` is accepted as a duration.
+    let output = run_usage(vec!["--since".into(), "1d 12h".into(), "--json".into()])
+        .await
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0));
+
+    // The server itself rejects an inverted range sent directly.
+    let resp = control_roundtrip(
+        &control_sock_path,
+        serde_json::json!({"v": 1, "cmd": "usage", "since": 12000, "until": 6000}),
+    )
+    .await;
+    assert_eq!(resp["ok"], false);
+    assert!(
+        resp["error"]
+            .as_str()
+            .unwrap()
+            .contains("'since' must be before 'until'")
+    );
+
+    meter_task.abort();
     shutdown_token.cancel();
 }

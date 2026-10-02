@@ -19,6 +19,23 @@ use crate::sched::Class;
 /// opener chooses the id (client odd, server even).
 pub type StreamId = u32;
 
+/// Observer the mux reports per-stream wire byte flow to.
+///
+/// The mux reports every DATA payload it sends or receives: `bytes_out` when
+/// a payload is queued by [`crate::Connection::send`] (post-compression),
+/// `bytes_in` when one is accepted by the receive path (pre-decompression).
+/// The 5-byte frame header and every non-DATA frame are excluded, and an
+/// application head message carried as the first DATA message *is* counted.
+///
+/// The callback runs on the connection's hot path, so implementations must
+/// not block; they only forward the counts, leaving aggregation and policy to
+/// the layer above.
+pub trait StreamBytesSink: Send + Sync {
+    /// One DATA payload flowed on `id`: `bytes_in` on receive, `bytes_out` on
+    /// send (exactly one is non-zero per call).
+    fn bytes(&self, id: StreamId, bytes_in: u64, bytes_out: u64);
+}
+
 /// RST code used when a stream is aborted because the whole connection is
 /// closing (GOAWAY), as opposed to an application-level `reset`.
 pub const RST_CODE_CONNECTION_CLOSED: u32 = 0;
