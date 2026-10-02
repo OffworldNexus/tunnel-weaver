@@ -835,7 +835,7 @@ async fn test_usage_control_verb_and_cli() {
     // Stream byte reports: the relay reports the visitor leg, the mux reports
     // the compressed tunnel leg.
     metering.register_stream(1, web.id);
-    metering.visitor_bytes(1, 1_000, 2_000);
+    metering.visitor_service_bytes(web.id, 1_000, 2_000);
     metering.tunnel_bytes(1, 300, 600);
     metering.unregister_stream(1);
     let meter_task = metering.start(CancellationToken::new());

@@ -21,14 +21,16 @@
 //! Callers report observations through the clock-free methods: the relay calls
 //! [`record_request`](MeteringManager::record_request) when it opens a visitor
 //! stream and [`register_stream`](MeteringManager::register_stream) to map that
-//! stream to its service. Two legs are metered, both keyed by stream:
+//! stream to its service (used by the tunnel leg). Two legs are metered:
 //!
-//! * the **visitor leg** — [`visitor_bytes`](MeteringManager::visitor_bytes),
-//!   called by the relay as body bytes cross between the browser and the relay;
+//! * the **visitor leg** —
+//!   [`visitor_service_bytes`](MeteringManager::visitor_service_bytes), called
+//!   by the HTTPS edge from a socket-level counter, so it measures every byte
+//!   on the visitor connection (request/response heads, bodies and framing);
 //! * the **tunnel leg** — [`tunnel_bytes`](MeteringManager::tunnel_bytes),
 //!   published to the mux as its [`StreamBytesSink`] via
 //!   [`MeteringManager::sink`], so every compressed DATA payload the mux moves
-//!   reports its wire bytes at the moment it flows.
+//!   reports its wire bytes at the moment it flows, keyed by stream.
 //!
 //! The manager stamps all observations with its own clock; deterministic tests
 //! drive the private `*_at(now_ms)` variants.
@@ -150,14 +152,14 @@ impl MeteringManager {
         self.lock().streams.remove(&stream_id);
     }
 
-    /// Reports visitor-leg body bytes flowing on a stream: `bytes_in` for a
-    /// request body read from the browser, `bytes_out` for a response body
-    /// written to it.
+    /// Reports visitor-leg socket bytes for a service: `bytes_in` read from the
+    /// browser, `bytes_out` written to it.
     ///
-    /// The relay knows the stream and the moment, so long-lived and upgraded
-    /// (WebSocket) exchanges also land in the minute the bytes moved.
-    pub fn visitor_bytes(&self, stream_id: StreamId, bytes_in: u64, bytes_out: u64) {
-        self.visitor_bytes_at(stream_id, unix_ms(), bytes_in, bytes_out);
+    /// Called by the HTTPS edge from its socket-level counter, so heads, body
+    /// and HTTP framing are all included and long-lived connections are
+    /// sampled as their bytes flow.
+    pub fn visitor_service_bytes(&self, service_id: i32, bytes_in: u64, bytes_out: u64) {
+        self.visitor_service_bytes_at(service_id, unix_ms(), bytes_in, bytes_out);
     }
 
     /// Reports tunnel-leg compressed wire bytes the mux moved on a stream.
@@ -328,11 +330,14 @@ impl MeteringManager {
         bucket.requests = bucket.requests.saturating_add(1);
     }
 
-    fn visitor_bytes_at(&self, stream_id: StreamId, now_ms: i64, bytes_in: u64, bytes_out: u64) {
+    fn visitor_service_bytes_at(
+        &self,
+        service_id: i32,
+        now_ms: i64,
+        bytes_in: u64,
+        bytes_out: u64,
+    ) {
         let mut inner = self.lock();
-        let Some(&service_id) = inner.streams.get(&stream_id) else {
-            return;
-        };
         let bucket = inner
             .buckets
             .entry((service_id, minute_of(now_ms)))
@@ -614,9 +619,9 @@ mod tests {
         meter.register_stream(stream, svc);
         meter.record_request_at(svc, 100 * MINUTE_MS + 1_000);
         meter.record_request_at(svc, 100 * MINUTE_MS + 2_000);
-        meter.visitor_bytes_at(stream, 100 * MINUTE_MS + 1_500, 10, 20);
+        meter.visitor_service_bytes_at(svc, 100 * MINUTE_MS + 1_500, 10, 20);
         meter.tunnel_bytes_at(stream, 100 * MINUTE_MS + 1_500, 3, 4);
-        meter.visitor_bytes_at(stream, 101 * MINUTE_MS + 1_500, 5, 7);
+        meter.visitor_service_bytes_at(svc, 101 * MINUTE_MS + 1_500, 5, 7);
         meter.tunnel_bytes_at(stream, 101 * MINUTE_MS + 1_500, 1, 2);
         meter.flush_at(102 * MINUTE_MS).await.expect("flush");
 
@@ -640,7 +645,6 @@ mod tests {
         // A stream nobody registered belongs to no service; the report is
         // dropped rather than misattributed.
         meter.tunnel_bytes_at(999, 100 * MINUTE_MS, 10, 20);
-        meter.visitor_bytes_at(999, 100 * MINUTE_MS, 10, 20);
         meter.unregister_stream(999);
         meter.flush_at(101 * MINUTE_MS).await.expect("flush");
         assert!(window(&meter, 100, 101).await.is_empty());
@@ -649,7 +653,6 @@ mod tests {
         meter.register_stream(1, svc);
         meter.unregister_stream(1);
         meter.tunnel_bytes_at(1, 101 * MINUTE_MS, 1, 1);
-        meter.visitor_bytes_at(1, 101 * MINUTE_MS, 1, 1);
         meter.flush_at(102 * MINUTE_MS).await.expect("flush");
         assert!(window(&meter, 101, 102).await.is_empty());
     }
@@ -744,7 +747,7 @@ mod tests {
         meter.register_service(svc);
         meter.register_stream(1, svc);
         meter.record_request(svc);
-        meter.visitor_bytes(1, 11, 22);
+        meter.visitor_service_bytes(svc, 11, 22);
         meter.tunnel_bytes(1, 33, 44);
 
         let token = CancellationToken::new();

@@ -114,8 +114,6 @@ const UP_HIGH_WATER: usize = 8;
 /// A visitor exchange in progress on one stream.
 struct Exchange {
     req: HttpHead,
-    /// Visitor-leg byte reports for this exchange's stream.
-    metering: Arc<MeteringManager>,
     response_tx: Option<oneshot::Sender<Result<Response<BoxBody>, ProxyError>>>,
     body_tx: Option<mpsc::Sender<BodyFrameItem>>,
     /// Request body frames accepted from hyper but not yet sent (credit).
@@ -439,7 +437,6 @@ impl RelayHandler {
             Exchange {
                 body_compress: policy::request_body_compress(&req.head),
                 req: req.head,
-                metering: Arc::clone(&self.metering),
                 response_tx: Some(req.response_tx),
                 body_tx: None,
                 pending_body: VecDeque::new(),
@@ -626,12 +623,7 @@ impl RelayHandler {
             ex.body_tx = Some(body_tx);
         } else if ex.body_tx.is_some() {
             let item: BodyFrameItem = match weaver_proto::decode::<BodyFrame>(msg) {
-                Ok(BodyFrame::Chunk(data)) => {
-                    // Visitor leg, relay -> browser: the response body bytes
-                    // about to be handed to the visitor.
-                    ex.metering.visitor_bytes(id, 0, data.len() as u64);
-                    Ok(Frame::data(Bytes::from(data)))
-                }
+                Ok(BodyFrame::Chunk(data)) => Ok(Frame::data(Bytes::from(data))),
                 Ok(BodyFrame::Trailers(fields)) => {
                     let mut map = http::HeaderMap::new();
                     for (name, value) in fields {
@@ -864,12 +856,7 @@ impl RelayHandler {
             };
             match conn.send(id, &bytes, ex.body_compress) {
                 Ok(()) => {
-                    let sent = ex.pending_body.pop_front().expect("front() was Some");
-                    // Visitor leg, browser -> relay: request body bytes (or an
-                    // upgraded socket's raw bytes) now on their way to the client.
-                    if let BodyFrame::Chunk(data) = sent {
-                        ex.metering.visitor_bytes(id, data.len() as u64, 0);
-                    }
+                    ex.pending_body.pop_front();
                 }
                 Err(StreamError::WouldBlock) => break,
                 Err(e) => {
