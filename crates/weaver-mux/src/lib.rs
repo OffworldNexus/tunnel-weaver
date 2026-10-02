@@ -109,5 +109,5 @@ pub use error::{CloseCode, CloseReason, ProtocolError, RejectCode, SignError, St
 pub use event::Event;
 pub use frame::{Frame, FrameType};
 pub use sched::Class;
-pub use stream::{RST_CODE_CONNECTION_CLOSED, StreamId};
+pub use stream::{RST_CODE_CONNECTION_CLOSED, StreamBytesSink, StreamId};
 pub use wire::{KeyId, Params, Signature};

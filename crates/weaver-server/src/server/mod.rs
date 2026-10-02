@@ -159,12 +159,22 @@ pub async fn run_server(
     cert_manager.start_renewal_loop(shutdown_token.clone());
 
     let identity_resolver = Arc::new(crate::tunnel::StoreIdentityResolver::new(store.clone()));
+    let metering = Arc::new(crate::metering::MeteringManager::new(
+        store.clone(),
+        Duration::from_secs(config.usage_flush_interval_secs),
+    ));
     let tunnel_registry = Arc::new(crate::tunnel::TunnelRegistry::new(
         config.root_domain.clone(),
         Arc::clone(&cert_manager),
         identity_resolver,
         store.clone(),
+        Arc::clone(&metering),
     ));
+
+    // The manager ticks once a second and flushes on the configured cadence;
+    // on shutdown it performs a final flush that includes the partial current
+    // minute, which the drain below awaits before the store is closed.
+    let usage_task = Arc::clone(&metering).start(shutdown_token.clone());
 
     let http_token = shutdown_token.clone();
     let http_task = tokio::spawn(run_http_server(
@@ -190,6 +200,7 @@ pub async fn run_server(
     let control_config = Arc::new(config.clone());
     let control_store = Arc::new(store.clone());
     let control_cert_mgr = Arc::clone(&cert_manager);
+    let control_metering = Arc::clone(&metering);
     let control_task = tokio::spawn(async move {
         if let Err(err) = crate::control::server::run_control_server_with_listener(
             control_listener,
@@ -197,6 +208,7 @@ pub async fn run_server(
             control_config,
             control_store,
             control_cert_mgr,
+            control_metering,
             control_start_time,
             control_token,
         )
@@ -250,7 +262,7 @@ pub async fn run_server(
     info!(drain_timeout_secs = 10, "Draining active connections");
 
     let drain = async {
-        let _ = tokio::join!(http_task, https_task, control_task);
+        let _ = tokio::join!(http_task, https_task, control_task, usage_task);
     };
 
     if tokio::time::timeout(drain_timeout, drain).await.is_err() {

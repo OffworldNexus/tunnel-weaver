@@ -284,6 +284,7 @@ async fn test_pebble_e2e_issuance_and_lazy_ensure() {
         acme_eab_hmac: None,
         acme_root_ca_pem: Some(PEBBLE_ROOT_CA.into()),
         acme_fallback_providers: Vec::new(),
+        usage_flush_interval_secs: 60,
     });
 
     let challenge_registry = Arc::new(ChallengeRegistry::new());
@@ -415,6 +416,7 @@ async fn test_pebble_e2e_tls_alpn_01_with_unbound_port_80() {
         acme_eab_hmac: None,
         acme_root_ca_pem: Some(PEBBLE_ROOT_CA.into()),
         acme_fallback_providers: Vec::new(),
+        usage_flush_interval_secs: 60,
     });
 
     let challenge_registry = Arc::new(ChallengeRegistry::new());
@@ -498,6 +500,7 @@ async fn test_pebble_e2e_tunnel_registration_and_proxying() {
         acme_eab_hmac: None,
         acme_root_ca_pem: Some(PEBBLE_ROOT_CA.into()),
         acme_fallback_providers: Vec::new(),
+        usage_flush_interval_secs: 60,
     });
 
     let challenge_registry = Arc::new(ChallengeRegistry::new());
@@ -523,6 +526,10 @@ async fn test_pebble_e2e_tunnel_registration_and_proxying() {
         Arc::clone(&manager),
         identity_resolver,
         store.as_ref().clone(),
+        Arc::new(weaver_server::metering::MeteringManager::new(
+            store.as_ref().clone(),
+            std::time::Duration::from_secs(60),
+        )),
     ));
 
     let shutdown_token = CancellationToken::new();

@@ -28,6 +28,7 @@ use weaver_proto::http::{HttpHead, HttpResponseHead};
 use weaver_proto::{BodyFrame, Head, ResetCode, policy};
 use weaver_tokio::{Driver, Handle, StreamHandler, SystemRng, WsTransport};
 
+use crate::metering::MeteringManager;
 use crate::tunnel::identity::ResolverVerifier;
 use crate::tunnel::proxy::{BodyFrameItem, BoxBody, ProxyError, ProxyRequest, TunnelResponseBody};
 use crate::tunnel::registry::TunnelRegistry;
@@ -61,11 +62,12 @@ async fn run_tunnel_connection(
     {
         *reverify_interval = Some(REVERIFY_INTERVAL);
     }
-    let conn = Connection::new(cfg, Instant::now());
+    let mut conn = Connection::new(cfg, Instant::now());
 
     let (proxy_tx, proxy_rx) = mpsc::channel::<ProxyRequest>(64);
     let handler = RelayHandler {
         registry: Arc::clone(&registry),
+        metering: registry.metering(),
         handle: None,
         proxy_tx,
         conn_id: None,
@@ -73,6 +75,8 @@ async fn run_tunnel_connection(
         leases: HashMap::new(),
         inflight: HashMap::new(),
     };
+    // Byte reports go straight from the mux to the manager as bytes flow.
+    conn.set_bytes_sink(registry.metering().sink());
     let driver = Driver::new(conn, WsTransport::new(ws_stream), handler);
     let handle = driver.handle();
     handle.spawn_on({
@@ -160,6 +164,7 @@ enum Lease {
 
 pub(crate) struct RelayHandler {
     registry: Arc<TunnelRegistry>,
+    metering: Arc<MeteringManager>,
     handle: Option<RelayHandle>,
     proxy_tx: mpsc::Sender<ProxyRequest>,
     conn_id: Option<u64>,
@@ -206,6 +211,7 @@ impl StreamHandler for RelayHandler {
                 }
             }
             Event::Finished(id) => {
+                self.metering.unregister_stream(id);
                 self.release_lease(conn, id);
                 if let Some(ex) = self.inflight.get_mut(&id) {
                     // The response is complete, but frames may still be
@@ -225,6 +231,7 @@ impl StreamHandler for RelayHandler {
             }
             Event::Reset { id, code } => {
                 trace!(%id, code, "Stream reset");
+                self.metering.unregister_stream(id);
                 self.release_lease(conn, id);
                 if let Some(mut ex) = self.inflight.remove(&id)
                     && let Some(tx) = ex.response_tx.take()
@@ -238,6 +245,7 @@ impl StreamHandler for RelayHandler {
             }
             Event::Closed { reason } => {
                 debug!(?reason, "Mux closed");
+                // Every stream was reset (and so unregistered) before this.
                 if let (Some(k), Some(c)) = (self.key, self.conn_id) {
                     self.registry.unregister_connection(k, c);
                 }
@@ -397,6 +405,7 @@ impl RelayHandler {
     /// Open a stream for a visitor request: policy from the request, head
     /// as the first message, body chunks streamed in from hyper.
     fn open_visitor_stream(&mut self, conn: &mut Connection, req: ProxyRequest) {
+        let service_id = req.service_id;
         let head_bytes = match weaver_proto::encode(&Head::Http(req.head.clone())) {
             Ok(b) => b,
             Err(e) => {
@@ -411,6 +420,11 @@ impl RelayHandler {
                 return;
             }
         };
+        // Metering follows the stream from here: one request counted on open,
+        // and the manager maps this stream to the service for the mux's byte
+        // reports.
+        self.metering.register_stream(id, service_id);
+        self.metering.record_request(service_id);
         // A fresh stream has a full window (≥ 64 KiB) and the head is
         // bounded by max_message: failure here is an error, not backpressure.
         if let Err(e) = conn.send(id, &head_bytes, policy::HEAD_COMPRESS) {

@@ -10,10 +10,11 @@ use tracing::{debug, info, warn};
 use super::protocol::{
     BackupResponse, CertDetailResponse, CertEventSummary, CertListResponse, CertSummary,
     CertWaitEvent, ControlRequest, ErrorResponse, ListenersInfo, RenewResponse, ShutdownResponse,
-    StatusResponse,
+    StatusResponse, UsageResponse, UsageService,
 };
 use crate::cert::{CertManager, CertState};
 use crate::config::Config;
+use crate::metering::MeteringManager;
 use crate::store::Store;
 
 /// Binds the UNIX domain control socket listener, creates parent directories,
@@ -72,12 +73,14 @@ pub fn bind_control_listener(socket_path: &Path) -> Result<UnixListener, std::io
 }
 
 /// Runs the control server given an already-bound `UnixListener`.
+#[allow(clippy::too_many_arguments)] // Shared runtime handles are threaded explicitly to keep the listener API flat.
 pub async fn run_control_server_with_listener(
     listener: UnixListener,
     socket_path: PathBuf,
     config: Arc<Config>,
     store: Arc<Store>,
     cert_manager: Arc<CertManager>,
+    metering: Arc<MeteringManager>,
     start_time: Instant,
     shutdown_token: CancellationToken,
 ) -> Result<(), std::io::Error> {
@@ -93,6 +96,7 @@ pub async fn run_control_server_with_listener(
                         let config = Arc::clone(&config);
                         let store = Arc::clone(&store);
                         let cert_manager = Arc::clone(&cert_manager);
+                        let metering = Arc::clone(&metering);
                         let shutdown_token = shutdown_token.clone();
 
                         tokio::spawn(async move {
@@ -101,6 +105,7 @@ pub async fn run_control_server_with_listener(
                                 config,
                                 store,
                                 cert_manager,
+                                metering,
                                 start_time,
                                 shutdown_token,
                             ).await {
@@ -127,6 +132,7 @@ pub async fn run_control_server(
     config: Arc<Config>,
     store: Arc<Store>,
     cert_manager: Arc<CertManager>,
+    metering: Arc<MeteringManager>,
     start_time: Instant,
     shutdown_token: CancellationToken,
 ) -> Result<(), std::io::Error> {
@@ -137,6 +143,7 @@ pub async fn run_control_server(
         config,
         store,
         cert_manager,
+        metering,
         start_time,
         shutdown_token,
     )
@@ -149,6 +156,7 @@ async fn handle_connection(
     config: Arc<Config>,
     store: Arc<Store>,
     cert_manager: Arc<CertManager>,
+    metering: Arc<MeteringManager>,
     start_time: Instant,
     shutdown_token: CancellationToken,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -202,12 +210,13 @@ async fn handle_connection(
         }
     };
 
-    // 3. Strict 6-verb dispatcher check
+    // 3. Strict 7-verb dispatcher check
     const ALLOWED_VERBS: &[&str] = &[
         "status",
         "cert.status",
         "cert.wait",
         "cert.renew",
+        "usage",
         "backup",
         "shutdown",
     ];
@@ -683,6 +692,57 @@ async fn handle_connection(
                         writer.write_all(&data).await?;
                         writer.flush().await?;
                     }
+                }
+            }
+        }
+        "usage" => {
+            // Absolute Unix seconds in; the store filters in minute numbers.
+            let since_secs = req.since.unwrap_or(0);
+            let until_secs = req.until.unwrap_or(i64::MAX);
+            if since_secs >= until_secs {
+                let resp = ErrorResponse::new("'since' must be before 'until'");
+                let mut data = serde_json::to_vec(&resp)?;
+                data.push(b'\n');
+                writer.write_all(&data).await?;
+                writer.flush().await?;
+                return Ok(());
+            }
+            match metering
+                .query(
+                    req.person.as_deref(),
+                    req.service.as_deref(),
+                    since_secs,
+                    until_secs,
+                )
+                .await
+            {
+                Ok(totals) => {
+                    let services = totals
+                        .into_iter()
+                        .map(|t| UsageService {
+                            service_id: t.service_id,
+                            service: t.service,
+                            machine: t.machine,
+                            person: t.person,
+                            bytes_in: t.bytes_in,
+                            bytes_out: t.bytes_out,
+                            open_ms: t.open_ms,
+                            requests: t.requests,
+                            covered_minutes: t.covered_minutes,
+                        })
+                        .collect();
+                    let resp = UsageResponse { ok: true, services };
+                    let mut data = serde_json::to_vec(&resp)?;
+                    data.push(b'\n');
+                    writer.write_all(&data).await?;
+                    writer.flush().await?;
+                }
+                Err(err) => {
+                    let resp = ErrorResponse::new(format!("Usage query failed: {err}"));
+                    let mut data = serde_json::to_vec(&resp)?;
+                    data.push(b'\n');
+                    writer.write_all(&data).await?;
+                    writer.flush().await?;
                 }
             }
         }

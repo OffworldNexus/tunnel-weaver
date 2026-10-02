@@ -10,7 +10,7 @@ use tokio::net::UnixStream;
 
 use super::protocol::{
     BackupResponse, CertDetailResponse, CertListResponse, ControlRequest, RenewResponse,
-    StatusResponse,
+    StatusResponse, UsageResponse,
 };
 use crate::cert::format_unix_timestamp;
 
@@ -190,6 +190,10 @@ pub async fn client_status(socket_path: &Path, json: bool) -> i32 {
         force: None,
         path: None,
         no_only_best: None,
+        person: None,
+        service: None,
+        since: None,
+        until: None,
     };
 
     let line = match send_request_and_read_line(socket_path, &req).await {
@@ -311,6 +315,10 @@ pub async fn client_cert_status(
         force: None,
         path: None,
         no_only_best: if no_only_best { Some(true) } else { None },
+        person: None,
+        service: None,
+        since: None,
+        until: None,
     };
 
     let line = match send_request_and_read_line(socket_path, &req).await {
@@ -609,6 +617,10 @@ pub async fn client_cert_wait(
         force: None,
         path: None,
         no_only_best: None,
+        person: None,
+        service: None,
+        since: None,
+        until: None,
     };
 
     let mut stream = match connect_control_socket(socket_path).await {
@@ -760,6 +772,10 @@ pub async fn client_cert_renew(
         force: if force { Some(true) } else { None },
         path: None,
         no_only_best: None,
+        person: None,
+        service: None,
+        since: None,
+        until: None,
     };
 
     let line = match send_request_and_read_line(socket_path, &req).await {
@@ -853,6 +869,10 @@ pub async fn client_backup(socket_path: &Path, path: String, json: bool) -> i32 
         force: None,
         path: Some(path),
         no_only_best: None,
+        person: None,
+        service: None,
+        since: None,
+        until: None,
     };
 
     let line = match send_request_and_read_line(socket_path, &req).await {
@@ -914,6 +934,10 @@ pub async fn client_shutdown(socket_path: &Path, json: bool) -> i32 {
         force: None,
         path: None,
         no_only_best: None,
+        person: None,
+        service: None,
+        since: None,
+        until: None,
     };
 
     let line = match send_request_and_read_line(socket_path, &req).await {
@@ -935,5 +959,112 @@ pub async fn client_shutdown(socket_path: &Path, json: bool) -> i32 {
     }
 
     println!("{} Server shutdown initiated", "✓".yellow().bold());
+    0
+}
+
+/// Formats a duration in milliseconds using the shared uptime formatter.
+fn format_open_ms(ms: i64) -> String {
+    format_uptime((ms.max(0) as u64) / 1000)
+}
+
+/// Executes the `weaver-server usage` CLI command.
+///
+/// The window arrives as absolute Unix seconds (`since`/`until`): relative
+/// durations like `--since '1d 12h'` are resolved by the caller before the
+/// request is sent, so the wire protocol never carries a duration.
+pub async fn client_usage(
+    socket_path: &Path,
+    person: Option<String>,
+    service: Option<String>,
+    since: i64,
+    until: i64,
+    json: bool,
+) -> i32 {
+    let req = ControlRequest {
+        v: 1,
+        cmd: "usage".to_string(),
+        name: None,
+        limit: None,
+        timeout_s: None,
+        all: None,
+        force: None,
+        path: None,
+        no_only_best: None,
+        person,
+        service,
+        since: Some(since),
+        until: Some(until),
+    };
+
+    let line = match send_request_and_read_line(socket_path, &req).await {
+        Ok(l) => l,
+        Err(code) => return code,
+    };
+
+    let trimmed = line.trim();
+    if json {
+        println!("{trimmed}");
+        let val: serde_json::Value = match serde_json::from_str(trimmed) {
+            Ok(v) => v,
+            Err(_) => return 1,
+        };
+        if val.get("ok") == Some(&serde_json::Value::Bool(false)) {
+            return 1;
+        }
+        return 0;
+    }
+
+    let resp: UsageResponse = match serde_json::from_str(trimmed) {
+        Ok(r) => r,
+        Err(_) => {
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed) {
+                let err = val.get("error").and_then(|e| e.as_str()).unwrap_or(trimmed);
+                eprintln!("{} {err}", "✗ Error:".red().bold());
+            } else {
+                eprintln!("{} {trimmed}", "✗ Error:".red().bold());
+            }
+            return 1;
+        }
+    };
+
+    if !resp.ok {
+        eprintln!("{} Usage query failed", "✗ Error:".red().bold());
+        return 1;
+    }
+
+    if resp.services.is_empty() {
+        println!("No usage recorded in the selected window.");
+        return 0;
+    }
+
+    // The server orders by service name; the CLI's summary view is by total
+    // bytes, largest first.
+    let mut services = resp.services;
+    services.sort_by_key(|s| std::cmp::Reverse(s.bytes_in + s.bytes_out));
+
+    let mut table = create_styled_table();
+    table.set_header(vec![
+        "Service",
+        "Machine",
+        "Person",
+        "Bytes In",
+        "Bytes Out",
+        "Open",
+        "Requests",
+        "Minutes",
+    ]);
+    for s in &services {
+        table.add_row(vec![
+            Cell::new(&s.service),
+            Cell::new(&s.machine),
+            Cell::new(&s.person),
+            Cell::new(format_bytes(s.bytes_in.max(0) as u64)),
+            Cell::new(format_bytes(s.bytes_out.max(0) as u64)),
+            Cell::new(format_open_ms(s.open_ms)),
+            Cell::new(s.requests.to_string()),
+            Cell::new(s.covered_minutes.to_string()),
+        ]);
+    }
+    println!("{table}");
     0
 }

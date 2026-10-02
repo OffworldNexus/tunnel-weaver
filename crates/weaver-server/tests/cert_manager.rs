@@ -485,6 +485,7 @@ async fn test_sqlite_caching_and_server_restart_no_reorder() {
         acme_eab_hmac: None,
         acme_root_ca_pem: None,
         acme_fallback_providers: Vec::new(),
+        usage_flush_interval_secs: 60,
     });
 
     let registry = Arc::new(ChallengeRegistry::new());
@@ -531,6 +532,7 @@ async fn test_active_inactive_renewal_policy() {
         acme_eab_hmac: None,
         acme_root_ca_pem: None,
         acme_fallback_providers: Vec::new(),
+        usage_flush_interval_secs: 60,
     });
 
     let registry = Arc::new(ChallengeRegistry::new());
@@ -598,6 +600,7 @@ async fn test_forced_expiration_triggers_renewal_flow_and_event() {
         acme_eab_hmac: None,
         acme_root_ca_pem: None,
         acme_fallback_providers: Vec::new(),
+        usage_flush_interval_secs: 60,
     });
 
     let registry = Arc::new(ChallengeRegistry::new());
@@ -659,6 +662,7 @@ async fn test_exponential_backoff_on_failure() {
         acme_eab_hmac: None,
         acme_root_ca_pem: None,
         acme_fallback_providers: Vec::new(),
+        usage_flush_interval_secs: 60,
     });
 
     let registry = Arc::new(ChallengeRegistry::new());
@@ -724,6 +728,7 @@ async fn test_concurrent_ensure_deduplication() {
         acme_eab_hmac: None,
         acme_root_ca_pem: None,
         acme_fallback_providers: Vec::new(),
+        usage_flush_interval_secs: 60,
     });
 
     let registry = Arc::new(ChallengeRegistry::new());

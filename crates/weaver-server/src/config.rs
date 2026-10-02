@@ -56,6 +56,16 @@ pub struct Config {
     /// Ordered fallback ACME providers if primary provider fails.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub acme_fallback_providers: Vec<String>,
+    /// How often the usage meter flushes closed minute buckets, in seconds.
+    /// Defaults to 60; `#[serde(default)]` lets configs stored before
+    /// metering existed keep loading.
+    #[serde(default = "default_usage_flush_interval")]
+    pub usage_flush_interval_secs: u64,
+}
+
+/// Default usage flush interval, in seconds.
+fn default_usage_flush_interval() -> u64 {
+    60
 }
 
 impl Config {
