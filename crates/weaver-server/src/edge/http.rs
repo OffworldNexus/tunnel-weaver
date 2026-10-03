@@ -1,9 +1,8 @@
 //! Cleartext HTTP edge server.
 //!
 //! Listens on HTTP (port 80) and redirects all cleartext requests to HTTPS
-//! via HTTP 308 Permanent Redirect, preserving host, port, and query string,
-//! while intercepting `/.well-known/acme-challenge/*` requests to solve ACME
-//! HTTP-01 challenges.
+//! via HTTP 308 Permanent Redirect, preserving host, port, and query string.
+//! ACME validation is DNS-01 only, so there is no challenge interception here.
 
 use std::convert::Infallible;
 use std::sync::Arc;
@@ -19,7 +18,6 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 use tracing::{debug, info, trace};
 
-use crate::cert::challenge::ChallengeRegistry;
 use crate::edge::host::{HostError, request_host};
 
 /// Shared state for HTTP edge service.
@@ -29,8 +27,6 @@ pub struct HttpEdgeConfig {
     pub root_domain: String,
     /// Port of the HTTPS listener to redirect to.
     pub https_port: u16,
-    /// Active challenge registry for solving ACME HTTP-01 challenges.
-    pub challenge_registry: Option<Arc<ChallengeRegistry>>,
 }
 
 impl std::fmt::Debug for HttpEdgeConfig {
@@ -38,42 +34,15 @@ impl std::fmt::Debug for HttpEdgeConfig {
         f.debug_struct("HttpEdgeConfig")
             .field("root_domain", &self.root_domain)
             .field("https_port", &self.https_port)
-            .field("has_challenge_registry", &self.challenge_registry.is_some())
             .finish()
     }
 }
 
-/// Handles incoming cleartext HTTP requests.
-///
-/// If the request path targets `/.well-known/acme-challenge/{token}`, queries the challenge
-/// registry and returns HTTP 200 with the key authorization bytes if found, or HTTP 404 if
-/// unknown. All other requests are redirected to HTTPS via HTTP 308.
+/// Handles incoming cleartext HTTP requests, redirecting them to HTTPS.
 pub async fn handle_http_redirect(
     req: Request<hyper::body::Incoming>,
     config: Arc<HttpEdgeConfig>,
 ) -> Result<Response<Full<Bytes>>, Infallible> {
-    let path = req.uri().path();
-    if let Some(token) = path.strip_prefix("/.well-known/acme-challenge/") {
-        if let Some(registry) = &config.challenge_registry
-            && let Some(key_auth) = registry.get_http_01(token)
-        {
-            trace!(token, "Serving HTTP-01 challenge response");
-            let response = Response::builder()
-                .status(StatusCode::OK)
-                .header(http::header::CONTENT_TYPE, "application/octet-stream")
-                .body(Full::new(Bytes::from(key_auth)))
-                .unwrap();
-            return Ok(response);
-        }
-        trace!(token, "Unknown HTTP-01 challenge token, returning 404");
-        let response = Response::builder()
-            .status(StatusCode::NOT_FOUND)
-            .header(http::header::CONTENT_TYPE, "text/plain; charset=utf-8")
-            .body(Full::new(Bytes::from("404 Not Found\n")))
-            .unwrap();
-        return Ok(response);
-    }
-
     // RFC 9112 §3.2: no routing — not even a redirect — on a missing,
     // duplicated or malformed `Host`. HTTP/1.0 without `Host` is the one
     // legitimate hostless shape; it is redirected to the root domain.
@@ -170,13 +139,11 @@ pub async fn run_http_server(
     listener: TcpListener,
     root_domain: String,
     https_port: u16,
-    challenge_registry: Option<Arc<ChallengeRegistry>>,
     shutdown_token: CancellationToken,
 ) {
     let edge_config = Arc::new(HttpEdgeConfig {
         root_domain,
         https_port,
-        challenge_registry,
     });
     let auto_builder = Builder::new(TokioExecutor::new());
     let tracker = TaskTracker::new();

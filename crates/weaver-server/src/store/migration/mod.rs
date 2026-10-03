@@ -10,6 +10,7 @@ use sea_orm_migration::prelude::*;
 
 mod m0001_init;
 mod m0002_usage;
+mod m0003_flat_hostnames;
 
 /// The ordered list of every migration known to this binary.
 pub struct Migrator;
@@ -20,6 +21,7 @@ impl MigratorTrait for Migrator {
         vec![
             Box::new(m0001_init::Migration),
             Box::new(m0002_usage::Migration),
+            Box::new(m0003_flat_hostnames::Migration),
         ]
     }
 }

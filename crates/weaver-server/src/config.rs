@@ -61,6 +61,23 @@ pub struct Config {
     /// metering existed keep loading.
     #[serde(default = "default_usage_flush_interval")]
     pub usage_flush_interval_secs: u64,
+    /// The relay's own public IPv4/IPv6 addresses.
+    ///
+    /// Auto-filled at `setup` from the apex `A`/`AAAA` records it resolves,
+    /// then operator-editable (required behind NAT). These drive the
+    /// reachability probes, the authoritative DNS A/AAAA answers, and the
+    /// explicit address the DNS socket unit binds — never a wildcard, which
+    /// would collide with the `systemd-resolved` stub on `127.0.0.53:53`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub relay_ips: Vec<std::net::IpAddr>,
+    /// Whether `setup` has completed at least once.
+    ///
+    /// The daemon auto-orders the wildcard at startup, but on a fresh install
+    /// the delegation and port-53 checks must pass first. `setup` leaves this
+    /// false until those checks succeed and it has triggered the order, so the
+    /// first boot does not race an unreachable zone.
+    #[serde(default)]
+    pub setup_complete: bool,
 }
 
 /// Default usage flush interval, in seconds.

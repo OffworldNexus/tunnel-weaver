@@ -244,6 +244,18 @@ pub async fn execute_install(
         .await
         .map_err(|e| format!("failed to open database: {e}"))?;
 
+    // Preserve an already-completed setup across upgrades: only the first
+    // install leaves `setup_complete` false so the daemon does not auto-order
+    // the wildcard before setup has verified the delegation and port 53.
+    let previously_setup_complete = store
+        .load_config_json()
+        .await
+        .ok()
+        .flatten()
+        .and_then(|json| serde_json::from_str::<Config>(&json).ok())
+        .map(|existing| existing.setup_complete)
+        .unwrap_or(false);
+
     let root_ca_pem = match &gathered.acme_root_ca_path {
         Some(path) => match fs::read_to_string(path) {
             Ok(content) => Some(content),
@@ -270,6 +282,11 @@ pub async fn execute_install(
         acme_root_ca_pem: root_ca_pem,
         acme_fallback_providers: Vec::new(),
         usage_flush_interval_secs: 60,
+        // The relay's own public IPs, resolved from the apex during planning.
+        // They drive the authoritative DNS answers and the explicit DNS socket
+        // bindings; never a wildcard.
+        relay_ips: plan.relay_ips.clone(),
+        setup_complete: previously_setup_complete,
     };
 
     store
@@ -314,7 +331,7 @@ pub async fn execute_install(
     let socket_path = Path::new("/etc/systemd/system/weaver-server.socket");
     let service_path = Path::new("/etc/systemd/system/weaver-server.service");
 
-    let socket_content = render_socket_unit();
+    let socket_content = render_socket_unit(&plan.relay_ips);
     let service_params = ServiceUnitParams {
         prefix: &plan.prefix,
         db_path: &plan.db_path,

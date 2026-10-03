@@ -89,10 +89,21 @@ pub struct SystemProbe {
     pub root_ips: Vec<IpAddr>,
     /// Resolved IP addresses for the random probe subdomain `probe-<random>.<root>`.
     pub probe_ips: Vec<IpAddr>,
+    /// NS targets observed for `<root>` through the public resolvers.
+    pub ns_targets: Vec<String>,
+    /// Whether `<root>` is self-delegated (the apex is its own nameserver).
+    pub delegation_ok: bool,
+    /// Whether every public resolver returned the apex set for the probe name.
+    pub resolvers_ok: bool,
     /// Reachability probe status on port 80.
     pub port_80: PortReachability,
     /// Reachability probe status on port 443.
     pub port_443: PortReachability,
+    /// Reachability probe status on port 53 (authoritative DNS, TCP and UDP).
+    pub port_53: PortReachability,
+    /// Human-readable description of a `systemd-resolved` stub conflict on
+    /// port 53, when detected.
+    pub resolver_stub_conflict: Option<String>,
     /// Whether setup was invoked in non-interactive headless mode.
     pub is_headless: bool,
     /// Whether the user confirmed changing an existing installed domain.
@@ -147,6 +158,31 @@ pub enum PlanAbort {
     /// Inbound traffic on port 443 failed to reach our own listener.
     #[error("port 443 reachability check failed: {0}")]
     Port443NotReachable(String),
+
+    /// Inbound DNS traffic on port 53 failed to reach the relay's own listeners.
+    #[error("port 53 reachability check failed: {0}")]
+    Port53NotReachable(String),
+
+    /// The apex domain resolved to zero A/AAAA records.
+    #[error("apex domain '{0}' has no A or AAAA records")]
+    ApexMissing(String),
+
+    /// Resolvers disagree about the apex: the probe name did not match.
+    #[error("apex mismatch: expected {expected:?}, but the probe subdomain resolved to {found:?}")]
+    ApexMismatch {
+        /// Addresses the apex resolved to.
+        expected: Vec<IpAddr>,
+        /// Addresses the ephemeral probe subdomain resolved to.
+        found: Vec<IpAddr>,
+    },
+
+    /// The delegated zone could not be resolved consistently through public DNS.
+    #[error("DNS delegation probe failed: {0}")]
+    ProbeResolutionFailed(String),
+
+    /// `systemd-resolved`'s stub listener occupies the port our DNS socket needs.
+    #[error("systemd-resolved conflicts with the relay DNS socket: {0}")]
+    ResolverStubConflict(String),
 }
 
 /// Concrete execution plan approved by the planner.
@@ -168,6 +204,9 @@ pub struct Plan {
     pub is_upgrade: bool,
     /// Whether connect-back reachability checks were bypassed.
     pub reachability_skipped: bool,
+    /// The relay's own public IPs, resolved from the apex. Persisted to config
+    /// and used to render the explicit DNS socket unit bindings.
+    pub relay_ips: Vec<IpAddr>,
 }
 
 /// Evaluates a system probe and produces an execution plan or an abort error.
@@ -197,12 +236,32 @@ pub fn plan_setup(probe: &SystemProbe) -> Result<Plan, PlanAbort> {
         }
     }
 
-    // 4. DNS check: non-empty
-    if probe.root_ips.is_empty() {
-        return Err(PlanAbort::DnsEmpty(probe.target_domain.clone()));
+    // 4. DNS delegation: the zone must be self-delegated through public DNS.
+    if let Some(conflict) = &probe.resolver_stub_conflict {
+        return Err(PlanAbort::ResolverStubConflict(conflict.clone()));
+    }
+    if !probe.delegation_ok {
+        return Err(PlanAbort::ProbeResolutionFailed(format!(
+            "'{}' is not self-delegated; NS targets found: [{}]",
+            probe.target_domain,
+            probe.ns_targets.join(", ")
+        )));
     }
 
-    // 5. DNS check: root and probe IPs must match
+    // 5. DNS check: apex must resolve.
+    if probe.root_ips.is_empty() {
+        return Err(PlanAbort::ApexMissing(probe.target_domain.clone()));
+    }
+
+    // 6. DNS check: every resolver must agree with the apex on the probe name.
+    if !probe.resolvers_ok {
+        return Err(PlanAbort::ApexMismatch {
+            expected: probe.root_ips.clone(),
+            found: probe.probe_ips.clone(),
+        });
+    }
+
+    // 7. DNS check: root and probe IPs must match
     let root_set: BTreeSet<IpAddr> = probe.root_ips.iter().copied().collect();
     let probe_set: BTreeSet<IpAddr> = probe.probe_ips.iter().copied().collect();
     if root_set != probe_set {
@@ -212,14 +271,14 @@ pub fn plan_setup(probe: &SystemProbe) -> Result<Plan, PlanAbort> {
         });
     }
 
-    // 6. DNS check: every resolved IP must be public
+    // 8. DNS check: every resolved IP must be public
     for ip in &root_set {
         if !is_public_ip(ip) {
             return Err(PlanAbort::NonPublicIp(*ip));
         }
     }
 
-    // 7. Reachability checks: both 80 and 443 are mandatory unless skipped
+    // 9. Reachability checks: 80, 443, and 53 are mandatory unless skipped
     if !probe.skip_reachability_check {
         match &probe.port_80 {
             PortReachability::ReachedSelf => {}
@@ -244,6 +303,18 @@ pub fn plan_setup(probe: &SystemProbe) -> Result<Plan, PlanAbort> {
                 ));
             }
         }
+
+        match &probe.port_53 {
+            PortReachability::ReachedSelf => {}
+            PortReachability::Failed(reason) => {
+                return Err(PlanAbort::Port53NotReachable(reason.clone()));
+            }
+            PortReachability::Skipped => {
+                return Err(PlanAbort::Port53NotReachable(
+                    "reachability was not performed".into(),
+                ));
+            }
+        }
     }
 
     Ok(Plan {
@@ -255,5 +326,6 @@ pub fn plan_setup(probe: &SystemProbe) -> Result<Plan, PlanAbort> {
         has_eab: probe.has_eab,
         is_upgrade,
         reachability_skipped: probe.skip_reachability_check,
+        relay_ips: probe.root_ips.clone(),
     })
 }

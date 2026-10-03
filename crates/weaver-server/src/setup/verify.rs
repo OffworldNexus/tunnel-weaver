@@ -12,6 +12,7 @@ use std::time::Duration;
 use crossterm::style::Stylize;
 
 use crate::control::client::client_cert_wait;
+use crate::setup::dns::generate_random_hex;
 
 /// Prints diagnostic instructions on failure.
 pub fn print_failure_guidance() {
@@ -139,7 +140,66 @@ pub async fn verify_setup(root_domain: &str, socket_path: &Path) -> Result<(), S
         }
     }
 
-    // 4. Closing summary
+    // 4. Wildcard coverage: a random single-label name must complete a TLS
+    //    handshake. Any HTTP response (even 404) proves the wildcard
+    //    certificate covers the name; only a TLS failure is a problem.
+    let sample_name = format!("sample-{}", generate_random_hex(4));
+    let sample_url = format!("https://{sample_name}.{root_domain}/");
+    print!(
+        "  {} Testing wildcard HTTPS GET {}/...",
+        "•".blue(),
+        sample_url.trim_start_matches("https://")
+    );
+    let wildcard_res = Command::new("curl")
+        .args([
+            "--silent",
+            "--show-error",
+            "-o",
+            "/dev/null",
+            "-w",
+            "%{http_code}",
+            &sample_url,
+        ])
+        .output();
+
+    match wildcard_res {
+        Ok(out) if out.status.success() => {
+            let status_code = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            println!(
+                "\r  {} Wildcard HTTPS GET for '{}' succeeded (HTTP {})",
+                "✓".green(),
+                sample_name,
+                status_code.bold()
+            );
+        }
+        Ok(out) => {
+            let err_msg = String::from_utf8_lossy(&out.stderr);
+            if err_msg.contains("certificate") || err_msg.contains("SSL") || err_msg.contains("TLS")
+            {
+                println!(
+                    "\r  {} Wildcard certificate problem for '{}': {}",
+                    "✗".red().bold(),
+                    sample_name,
+                    err_msg.trim()
+                );
+            } else {
+                println!(
+                    "\r  {} Wildcard HTTPS request warning for '{}': {}",
+                    "•".yellow(),
+                    sample_name,
+                    err_msg.trim()
+                );
+            }
+        }
+        Err(_) => {
+            println!(
+                "\r  {} curl command not found, skipping wildcard HTTPS check",
+                "•".dim()
+            );
+        }
+    }
+
+    // 5. Closing summary
     println!("\n{}", "Weaver Server Setup Complete".bold().green());
     println!();
 

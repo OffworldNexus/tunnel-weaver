@@ -402,10 +402,11 @@ impl ProxyHandler {
     ///
     /// A visitor can arrive in the window between the relay registering the
     /// service and the client processing the `Registered` reply, so this must
-    /// not depend on the hostname reply. The public hostname is
-    /// `<service>.<machine>.<person>.<root>` (see `derive_hostname`), so the
-    /// first label is the service name; the exact hostname map is consulted
-    /// first for the common case.
+    /// not depend on the hostname reply. The public hostname is the flat
+    /// `<person>-<machine>-<service>.<root>` (see `derive_hostname`); person
+    /// and machine may not contain a dash, so the service is everything after
+    /// the first two dash-separated segments. The exact hostname map is
+    /// consulted first for the common case.
     fn resolve_service(&self, authority: &str) -> Option<String> {
         let authority = authority.to_ascii_lowercase();
         if let Some(service) = self.hostname_to_service.get(&authority) {
@@ -413,8 +414,13 @@ impl ProxyHandler {
         }
         let host = authority.split(':').next().unwrap_or(&authority);
         let label = host.split('.').next()?;
-        if self.services.contains_key(label) {
-            return Some(label.to_string());
+        // Flat service hostname: `<person>-<machine>-<service>`.
+        let mut segments = label.splitn(3, '-');
+        let _person = segments.next()?;
+        let _machine = segments.next()?;
+        let service = segments.next()?;
+        if self.services.contains_key(service) {
+            return Some(service.to_string());
         }
         None
     }

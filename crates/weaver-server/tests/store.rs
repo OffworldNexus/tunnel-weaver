@@ -33,6 +33,8 @@ fn sample_config() -> Config {
         acme_root_ca_pem: None,
         acme_fallback_providers: vec!["letsencrypt-staging".into()],
         usage_flush_interval_secs: 60,
+        relay_ips: Vec::new(),
+        setup_complete: false,
     }
 }
 
@@ -99,19 +101,19 @@ async fn test_store_open_runs_migrations_and_is_idempotent() {
         let store = Store::open(&db_path).await.expect("open failed");
         let count: i64 = scalar(
             &store,
-            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN ('config', 'acme_account', 'domains', 'certificates', 'cert_events', 'seaql_migrations', 'person', 'machine', 'machine_key', 'service', 'usage')",
+            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN ('config', 'acme_account', 'domains', 'certificates', 'cert_events', 'seaql_migrations', 'person', 'machine', 'machine_key', 'service', 'usage', 'challenge')",
         )
         .await;
-        assert_eq!(count, 11);
-        assert_eq!(store.schema_version().await.expect("schema_version"), 2);
+        assert_eq!(count, 12);
+        assert_eq!(store.schema_version().await.expect("schema_version"), 3);
     }
 
     // Re-open existing database: should succeed and not re-apply migrations
     {
         let store = Store::open(&db_path).await.expect("re-open failed");
         let migration_count: i64 = scalar(&store, "SELECT count(*) FROM seaql_migrations").await;
-        assert_eq!(migration_count, 2);
-        assert_eq!(store.schema_version().await.expect("schema_version"), 2);
+        assert_eq!(migration_count, 3);
+        assert_eq!(store.schema_version().await.expect("schema_version"), 3);
     }
 }
 
@@ -343,16 +345,16 @@ async fn test_auth_persistence_and_identity_resolution() {
     assert!(resolver.identity(&unknown_key).await.is_none());
     assert!(resolver.public_key(&unknown_key).await.is_none());
 
-    // A declared service attaches to the machine and links its hostname.
+    // A declared service attaches to the machine and links its flat hostname.
     let svc = store
-        .register_declared_service(&alice_key, "api.workstation.alice.example.com", "API")
+        .register_declared_service(&alice_key, "alice-workstation-api.example.com", "API")
         .await
         .expect("register service");
     assert_eq!(svc.name, "api");
     assert_eq!(svc.machine_id, desktop.id);
 
     let domain = store
-        .get_domain("api.workstation.alice.example.com")
+        .get_domain("alice-workstation-api.example.com")
         .await
         .expect("get domain")
         .expect("domain present");
@@ -378,7 +380,6 @@ async fn test_certificate_and_event_round_trip() {
         issuer: None,
         directory: "https://acme.test/dir".into(),
         obtained_at: 100,
-        active_at: Some(100),
     };
     store
         .save_certificate("host.example.com", cert.clone())
@@ -393,9 +394,8 @@ async fn test_certificate_and_event_round_trip() {
         .expect("present");
     assert_eq!(rec.name, "host.example.com");
     assert_eq!(rec.not_after, 200);
-    assert_eq!(rec.last_active_at, Some(100));
 
-    // Saving another certificate inserts a new certificate row linked to the same domain
+    // Saving under the same name upserts in place: one global row per name.
     store
         .save_certificate(
             "host.example.com",
@@ -407,8 +407,9 @@ async fn test_certificate_and_event_round_trip() {
         .await
         .expect("save 2");
 
-    // only_best = true returns 1 (the best one, not_after = 300)
+    // Both `only_best` variants return the single row.
     assert_eq!(store.list_certificates(true).await.expect("list").len(), 1);
+    assert_eq!(store.list_certificates(false).await.expect("list").len(), 1);
     assert_eq!(
         store
             .get_certificate("host.example.com")
@@ -418,9 +419,6 @@ async fn test_certificate_and_event_round_trip() {
             .not_after,
         300
     );
-
-    // only_best = false returns both certificates
-    assert_eq!(store.list_certificates(false).await.expect("list").len(), 2);
 
     // Lookup by certificate PK ID
     let best_cert = store
@@ -443,20 +441,11 @@ async fn test_certificate_and_event_round_trip() {
         .unwrap();
     assert_eq!(rec_by_id_str.id, best_cert.id);
 
-    // Active flag
-    store
-        .set_cert_active("host.example.com", None)
-        .await
-        .expect("set inactive");
-    assert_eq!(
-        store
-            .get_certificate("host.example.com")
-            .await
-            .unwrap()
-            .unwrap()
-            .last_active_at,
-        None
-    );
+    // The full record carries PEM material for cache hydration.
+    let full = store.list_best_certificates_full().await.unwrap();
+    assert_eq!(full.len(), 1);
+    assert_eq!(full[0].cert_pem, "CERT");
+    assert_eq!(full[0].key_pem, "KEY");
 
     // Events, newest first
     store
@@ -501,86 +490,75 @@ async fn test_acme_account_round_trip() {
 }
 
 #[tokio::test]
-async fn test_multiple_certificates_and_best_resolution() {
+async fn test_multiple_certificates_distinct_names() {
     let store = Store::connect("sqlite::memory:").await.expect("connect");
 
-    let cert_1 = weaver_server::store::NewCertificate {
-        cert_pem: "PEM1".into(),
-        key_pem: "KEY1".into(),
+    let cert = |pem: &str, issuer: &str, not_after: i64| weaver_server::store::NewCertificate {
+        cert_pem: pem.into(),
+        key_pem: format!("KEY-{pem}"),
         not_before: 1_000,
-        not_after: 2_000,
-        issuer: Some("Issuer 1".into()),
-        directory: "dir1".into(),
+        not_after,
+        issuer: Some(issuer.into()),
+        directory: "dir".into(),
         obtained_at: 1_000,
-        active_at: Some(1_000),
-    };
-    let cert_2 = weaver_server::store::NewCertificate {
-        cert_pem: "PEM2".into(),
-        key_pem: "KEY2".into(),
-        not_before: 1_500,
-        not_after: 3_000, // Furthest expiration
-        issuer: Some("Issuer 2".into()),
-        directory: "dir2".into(),
-        obtained_at: 1_500,
-        active_at: Some(1_500),
-    };
-    let cert_3 = weaver_server::store::NewCertificate {
-        cert_pem: "PEM3".into(),
-        key_pem: "KEY3".into(),
-        not_before: 500,
-        not_after: 1_200,
-        issuer: Some("Issuer 3".into()),
-        directory: "dir3".into(),
-        obtained_at: 500,
-        active_at: Some(500),
     };
 
     store
-        .save_certificate("multi.example.com", cert_1)
+        .save_certificate("a.example.com", cert("PEM1", "Issuer 1", 2_000))
         .await
         .unwrap();
     store
-        .save_certificate("multi.example.com", cert_2)
+        .save_certificate("b.example.com", cert("PEM2", "Issuer 2", 3_000))
         .await
         .unwrap();
     store
-        .save_certificate("multi.example.com", cert_3)
+        .save_certificate("c.example.com", cert("PEM3", "Issuer 3", 1_200))
         .await
         .unwrap();
 
-    // Verify count in SQL
-    let count = store
-        .count_certificates_for_domain("multi.example.com")
+    // Certificates are global and keyed by name: three distinct rows, and the
+    // `only_best` flag no longer ranks within a domain.
+    assert_eq!(store.list_certificates(true).await.unwrap().len(), 3);
+    assert_eq!(store.list_certificates(false).await.unwrap().len(), 3);
+    assert_eq!(store.list_best_certificates_full().await.unwrap().len(), 3);
+
+    let names: Vec<String> = store
+        .list_certificates(false)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|c| c.name)
+        .collect();
+    assert_eq!(
+        names,
+        vec!["a.example.com", "b.example.com", "c.example.com"]
+    );
+
+    // Re-saving one name upserts that row and leaves the others untouched.
+    store
+        .save_certificate("b.example.com", cert("PEM2B", "Issuer 2B", 4_000))
         .await
         .unwrap();
-    assert_eq!(count, 3);
-
-    // Verify best certificate resolution chooses cert_2 (furthest not_after = 3000)
-    let best = store
-        .get_certificate("multi.example.com")
+    assert_eq!(store.list_certificates(false).await.unwrap().len(), 3);
+    let b = store
+        .get_certificate("b.example.com")
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(best.not_after, 3_000);
-    assert_eq!(best.issuer.as_deref(), Some("Issuer 2"));
-
-    // Verify list_certificates(true) returns only the single best certificate
-    let list_best = store.list_certificates(true).await.unwrap();
-    assert_eq!(list_best.len(), 1);
-    assert_eq!(list_best[0].not_after, 3_000);
-
-    // Verify list_certificates(false) returns all 3 certificates
-    let list_all = store.list_certificates(false).await.unwrap();
-    assert_eq!(list_all.len(), 3);
-
-    // Verify list_best_certificates_full returns only 1 full record with PEMs
-    let full_best = store.list_best_certificates_full().await.unwrap();
-    assert_eq!(full_best.len(), 1);
-    assert_eq!(full_best[0].cert_pem, "PEM2");
+    assert_eq!(b.not_after, 4_000);
+    assert_eq!(b.issuer.as_deref(), Some("Issuer 2B"));
+    let full_b = store
+        .list_best_certificates_full()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|c| c.name == "b.example.com")
+        .unwrap();
+    assert_eq!(full_b.cert_pem, "PEM2B");
 }
 
 #[tokio::test]
-async fn test_cascade_delete_domain() {
+async fn test_deleting_certificate_clears_domain_reference() {
     use sea_orm::EntityTrait;
     let store = Store::connect("sqlite::memory:").await.expect("connect");
 
@@ -592,38 +570,186 @@ async fn test_cascade_delete_domain() {
         issuer: None,
         directory: "dir".into(),
         obtained_at: 1_000,
-        active_at: None,
     };
-    store
+    let saved = store
         .save_certificate("cascade.example.com", cert)
         .await
         .unwrap();
-    assert_eq!(
-        store
-            .count_certificates_for_domain("cascade.example.com")
-            .await
-            .unwrap(),
-        1
-    );
 
+    // A materialized domain points at the covering certificate.
+    store
+        .get_or_create_domain("cascade.example.com", None)
+        .await
+        .unwrap();
+    store
+        .set_domain_certificate("cascade.example.com", saved.id)
+        .await
+        .unwrap();
     let domain = store
         .get_domain("cascade.example.com")
         .await
         .unwrap()
         .unwrap();
-    // Delete parent domain directly via entity
+    assert_eq!(domain.certificate_id, Some(saved.id));
+
+    // Certificates are global: deleting a domain must not delete them.
     weaver_server::store::entity::domain::Entity::delete_by_id(domain.id)
         .exec(store.db())
         .await
         .unwrap();
+    assert!(
+        store
+            .get_certificate("cascade.example.com")
+            .await
+            .unwrap()
+            .is_some(),
+        "deleting a domain must leave the global certificate alone"
+    );
 
-    // Associated certificates should be cascaded and deleted
-    let certs_count: i64 = scalar(
-        &store,
-        "SELECT count(*) FROM certificates WHERE domain_id = 999 OR domain_id NOT IN (SELECT id FROM domains)",
-    )
-    .await;
-    assert_eq!(certs_count, 0);
+    // Conversely, deleting the certificate nulls the referencing domain
+    // (`ON DELETE SET NULL`) rather than cascading the domain away.
+    let recreated = store
+        .get_or_create_domain("cascade.example.com", None)
+        .await
+        .unwrap();
+    store
+        .set_domain_certificate("cascade.example.com", saved.id)
+        .await
+        .unwrap();
+    weaver_server::store::entity::certificate::Entity::delete_by_id(saved.id)
+        .exec(store.db())
+        .await
+        .unwrap();
+    let after = store
+        .get_domain("cascade.example.com")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(after.id, recreated.id);
+    assert_eq!(after.certificate_id, None);
+}
+
+#[tokio::test]
+async fn test_naming_rules_reject_invalid_names() {
+    use weaver_mux::KeyId;
+
+    let store = Store::connect("sqlite::memory:").await.expect("connect");
+
+    for bad in ["", "has-dash", "under_score", "Upper!", &"a".repeat(16)] {
+        assert!(
+            matches!(
+                store.create_person(bad).await,
+                Err(StoreError::InvalidName(_))
+            ),
+            "person {bad:?} must be rejected"
+        );
+    }
+
+    let alice = store.create_person("alice").await.unwrap();
+    for bad in ["", "has-dash", "under_score", "Upper!", &"a".repeat(16)] {
+        assert!(
+            matches!(
+                store.create_machine(alice.id, bad).await,
+                Err(StoreError::InvalidName(_))
+            ),
+            "machine {bad:?} must be rejected"
+        );
+    }
+
+    let laptop = store.create_machine(alice.id, "laptop").await.unwrap();
+    // Service names allow dashes between alphanumeric runs but not leading,
+    // trailing, doubled, or non-alphanumeric characters.
+    for bad in [
+        "",
+        "-web",
+        "web-",
+        "a--b",
+        "a.b",
+        "web/api",
+        &"a".repeat(32),
+    ] {
+        assert!(
+            matches!(
+                store.get_or_create_service(laptop.id, bad).await,
+                Err(StoreError::InvalidName(_))
+            ),
+            "service {bad:?} must be rejected"
+        );
+    }
+
+    // Valid names still work and are lowercased.
+    let svc = store
+        .get_or_create_service(laptop.id, "My-Web")
+        .await
+        .unwrap();
+    assert_eq!(svc.name, "my-web");
+
+    // A declared service is keyed by the flat hostname and validated at the
+    // store boundary too (an invalid service never reaches persistence).
+    let key = KeyId::Ed25519([0x33; 32]);
+    store.add_machine_key(laptop.id, &key).await.unwrap();
+    assert!(matches!(
+        store
+            .register_declared_service(&key, "alice-laptop-x.example.com", "a--b")
+            .await,
+        Err(StoreError::InvalidName(_))
+    ));
+}
+
+#[tokio::test]
+async fn test_recompute_domain_names_after_machine_rename() {
+    use sea_orm::sea_query::Expr;
+    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+    use weaver_mux::KeyId;
+
+    let store = Store::connect("sqlite::memory:").await.expect("connect");
+    let alice = store.create_person("alice").await.unwrap();
+    let laptop = store.create_machine(alice.id, "laptop").await.unwrap();
+    let key = KeyId::Ed25519([0x44; 32]);
+    store.add_machine_key(laptop.id, &key).await.unwrap();
+
+    store
+        .register_declared_service(&key, "alice-laptop-web.example.com", "web")
+        .await
+        .unwrap();
+    assert!(
+        store
+            .get_domain("alice-laptop-web.example.com")
+            .await
+            .unwrap()
+            .is_some()
+    );
+
+    // Rename the machine directly (there is no public rename API yet) and let
+    // the sweep rewrite the derived `domains.name`.
+    weaver_server::store::entity::machine::Entity::update_many()
+        .col_expr(
+            weaver_server::store::entity::machine::Column::Name,
+            Expr::value("desktop"),
+        )
+        .filter(weaver_server::store::entity::machine::Column::Id.eq(laptop.id))
+        .exec(store.db())
+        .await
+        .unwrap();
+
+    store.recompute_domain_names("example.com").await.unwrap();
+
+    assert!(
+        store
+            .get_domain("alice-desktop-web.example.com")
+            .await
+            .unwrap()
+            .is_some(),
+        "the materialized name must follow the renamed machine"
+    );
+    assert!(
+        store
+            .get_domain("alice-laptop-web.example.com")
+            .await
+            .unwrap()
+            .is_none(),
+        "the stale name must be gone"
+    );
 }
 
 #[tokio::test]
@@ -634,8 +760,10 @@ async fn test_migration_usage_round_trips() {
     let db_path = temp.path().join("migrate.db");
     let store = Store::open(&db_path).await.expect("open");
 
-    // Roll back just the usage migration, then re-apply it.
-    weaver_server::Migrator::down(store.db(), Some(1))
+    // Roll every migration back, then re-apply. `m0003` adds a column to
+    // `domains` and has no data-preserving inverse, so a partial rollback that
+    // leaves the column behind cannot be re-applied; a full rebuild can.
+    weaver_server::Migrator::down(store.db(), Some(3))
         .await
         .expect("down");
     let usage_tables: i64 = scalar(

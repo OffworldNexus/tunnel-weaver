@@ -44,7 +44,7 @@ pub fn generate_placeholder_certified_key(
 }
 
 /// Builds a `rustls::ServerConfig` using the provided dynamic certificate resolver
-/// and configured with ALPN `acme-tls/1`, `h2`, and `http/1.1`.
+/// and configured with ALPN `h2` and `http/1.1`.
 pub fn create_server_config(
     resolver: Arc<dyn ResolvesServerCert>,
 ) -> Result<Arc<ServerConfig>, TlsError> {
@@ -54,7 +54,7 @@ pub fn create_server_config(
         .with_no_client_auth()
         .with_cert_resolver(resolver);
 
-    config.alpn_protocols = vec![b"acme-tls/1".to_vec(), b"h2".to_vec(), b"http/1.1".to_vec()];
+    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
 
     Ok(Arc::new(config))
 }
@@ -78,7 +78,7 @@ pub fn create_self_signed_server_config(root_domain: &str) -> Result<Arc<ServerC
         .with_no_client_auth()
         .with_single_cert(cert_chain, key)?;
 
-    config.alpn_protocols = vec![b"acme-tls/1".to_vec(), b"h2".to_vec(), b"http/1.1".to_vec()];
+    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
 
     Ok(Arc::new(config))
 }
@@ -93,7 +93,7 @@ mod tests {
             .expect("Failed to create TLS server config");
         assert_eq!(
             config.alpn_protocols,
-            vec![b"acme-tls/1".to_vec(), b"h2".to_vec(), b"http/1.1".to_vec()]
+            vec![b"h2".to_vec(), b"http/1.1".to_vec()]
         );
     }
 }

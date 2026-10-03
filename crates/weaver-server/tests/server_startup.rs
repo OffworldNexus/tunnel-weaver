@@ -29,6 +29,8 @@ fn create_valid_test_config(http_port: u16, https_port: u16) -> Config {
         acme_root_ca_pem: None,
         acme_fallback_providers: Vec::new(),
         usage_flush_interval_secs: 60,
+        relay_ips: Vec::new(),
+        setup_complete: false,
     }
 }
 
@@ -152,7 +154,10 @@ fn test_startup_listen_fds_invalid_count_exits_1() {
 
     assert_eq!(output.status.code(), Some(1));
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("Expected exactly 2 sockets in LISTEN_FDS"));
+    assert!(
+        stderr.contains("Expected at least 2 inherited sockets"),
+        "got: {stderr}"
+    );
 }
 
 #[test]

@@ -13,7 +13,7 @@ use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
-use crate::cert::{CertManager, CertResolver, ChallengeRegistry, SystemClock};
+use crate::cert::{CertManager, CertResolver, SystemClock};
 use crate::config::{Config, ConfigError};
 use crate::edge::http::run_http_server;
 use crate::edge::https::run_https_server_with_registry;
@@ -113,19 +113,13 @@ pub async fn run_server(
     };
 
     // 5. Initialize certificate manager and dynamic TLS resolver
-    let challenge_registry = Arc::new(ChallengeRegistry::new());
-    let resolver = Arc::new(CertResolver::new(
-        config.root_domain.clone(),
-        Arc::clone(&challenge_registry),
-    ));
+    let resolver = Arc::new(CertResolver::new(config.root_domain.clone()));
 
     let cert_manager = CertManager::new(
         Arc::new(config.clone()),
         Arc::new(store.clone()),
         Arc::clone(&resolver),
-        Arc::clone(&challenge_registry),
         Arc::new(SystemClock),
-        true,
     );
     cert_manager
         .init()
@@ -181,7 +175,6 @@ pub async fn run_server(
         listeners.http,
         config.root_domain.clone(),
         config.listen_https.port(),
-        Some(Arc::clone(&challenge_registry)),
         http_token,
     ));
 
@@ -194,6 +187,31 @@ pub async fn run_server(
         Some(tunnel_registry),
         https_token,
     ));
+
+    // Authoritative DNS responder: one task per inherited/self-bound socket.
+    // It shares the store, so it sees ACME DNS-01 challenge values live.
+    let dns_responder = Arc::new(crate::dns::DnsResponder::new(
+        &config,
+        Arc::new(store.clone()),
+    ));
+    let mut dns_tasks = Vec::new();
+    for socket in listeners.dns_udp {
+        dns_tasks.push(tokio::spawn(crate::dns::run_udp(
+            socket,
+            Arc::clone(&dns_responder),
+            shutdown_token.clone(),
+        )));
+    }
+    for listener in listeners.dns_tcp {
+        dns_tasks.push(tokio::spawn(crate::dns::run_tcp(
+            listener,
+            Arc::clone(&dns_responder),
+            shutdown_token.clone(),
+        )));
+    }
+    if dns_tasks.is_empty() {
+        info!("No DNS listeners acquired; authoritative DNS is not served in this process");
+    }
 
     let control_token = shutdown_token.clone();
     let control_start_time = Instant::now();
@@ -223,8 +241,18 @@ pub async fn run_server(
         warn!(error = %err, "Failed to send systemd READY notification");
     }
 
-    // Spawn eager issuance for root domain after READY notification
-    cert_manager.spawn_eager_order_if_pending();
+    // Spawn eager issuance for root domain after READY notification.
+    //
+    // On a fresh install `setup_complete` is false until setup has verified the
+    // delegation and port 53 and triggered the order itself; the daemon awaits
+    // that explicit `cert.order` rather than racing an unreachable zone.
+    if config.setup_complete {
+        cert_manager.spawn_eager_order_if_pending();
+    } else {
+        info!(
+            "setup_complete is false; skipping startup auto-order (setup will trigger cert.order)"
+        );
+    }
 
     // 9. Wait for shutdown signal
     let term_token = shutdown_token.clone();
@@ -263,6 +291,7 @@ pub async fn run_server(
 
     let drain = async {
         let _ = tokio::join!(http_task, https_task, control_task, usage_task);
+        let _ = futures_util::future::join_all(dns_tasks).await;
     };
 
     if tokio::time::timeout(drain_timeout, drain).await.is_err() {

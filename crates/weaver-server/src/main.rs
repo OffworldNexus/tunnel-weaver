@@ -121,6 +121,13 @@ pub enum CertCommands {
         json: bool,
     },
 
+    /// Forces the single wildcard certificate order immediately.
+    Order {
+        /// Outputs the order response as raw JSON.
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Manually triggers renewal for a hostname or all active certificates.
     Renew {
         /// Hostname to renew (defaults to root domain).
@@ -511,6 +518,8 @@ async fn main() {
                 acme_root_ca_pem: root_ca_pem,
                 acme_fallback_providers: Vec::new(),
                 usage_flush_interval_secs: args.usage_flush_interval,
+                relay_ips: Vec::new(),
+                setup_complete: false,
             };
 
             if let Err(err) = store.save_config(&config).await {
@@ -584,6 +593,11 @@ async fn main() {
                         json,
                     )
                     .await;
+                    std::process::exit(code);
+                }
+                CertCommands::Order { json } => {
+                    let code =
+                        weaver_server::control::client::client_cert_order(&socket_path, json).await;
                     std::process::exit(code);
                 }
             }
@@ -918,7 +932,7 @@ async fn handle_setup(args: SetupArgs, db_path: PathBuf) {
     };
 
     // 6. Reachability verification
-    let (port_80, port_443) = if args.skip_reachability_check {
+    let (port_80, port_443, port_53) = if args.skip_reachability_check {
         println!(
             "  {} Skipping reachability check (--skip-reachability-check)",
             "•".dim()
@@ -926,9 +940,10 @@ async fn handle_setup(args: SetupArgs, db_path: PathBuf) {
         (
             weaver_server::setup::planner::PortReachability::Skipped,
             weaver_server::setup::planner::PortReachability::Skipped,
+            weaver_server::setup::planner::PortReachability::Skipped,
         )
     } else {
-        // If our own systemd sockets are active, stop them temporarily so ports 80 and 443 can be probed
+        // If our own systemd sockets are active, stop them temporarily so ports 80, 443, and 53 can be probed
         let socket_active = std::process::Command::new("systemctl")
             .args(["is-active", "--quiet", "weaver-server.socket"])
             .status()
@@ -948,6 +963,28 @@ async fn handle_setup(args: SetupArgs, db_path: PathBuf) {
         weaver_server::setup::reachability::verify_reachability(&dns_result.root_ips).await
     };
 
+    // A `systemd-resolved` stub already holding a port-53 socket is the most
+    // common reason the DNS bind fails; surface it as a first-class abort with
+    // operator guidance rather than a generic bind error.
+    let resolver_stub_conflict = if matches!(
+        port_53,
+        weaver_server::setup::planner::PortReachability::Failed(_)
+    ) {
+        weaver_server::setup::reachability::find_occupying_process(53).and_then(|(pid, comm)| {
+            if comm.to_ascii_lowercase().contains("systemd-resolve") {
+                Some(format!(
+                    "port 53 is held by '{comm}' (PID {pid}); disable the systemd-resolved stub listener \
+                     (set DNSStubListener=no in /etc/systemd/resolved.conf, then systemctl restart systemd-resolved) \
+                     and re-run setup"
+                ))
+            } else {
+                None
+            }
+        })
+    } else {
+        None
+    };
+
     // 7. Planning
     let probe = weaver_server::setup::planner::SystemProbe {
         systemd_present: true,
@@ -956,8 +993,13 @@ async fn handle_setup(args: SetupArgs, db_path: PathBuf) {
         existing_install,
         root_ips: dns_result.root_ips,
         probe_ips: dns_result.probe_ips,
+        ns_targets: dns_result.ns_targets,
+        delegation_ok: dns_result.delegation_ok,
+        resolvers_ok: dns_result.resolvers_ok,
         port_80,
         port_443,
+        port_53,
+        resolver_stub_conflict,
         is_headless: args.headless,
         confirmed_domain_change: false,
         skip_reachability_check: args.skip_reachability_check,
@@ -1047,8 +1089,21 @@ async fn handle_setup(args: SetupArgs, db_path: PathBuf) {
         println!("\n{}", "already up to date".bold().green());
     }
 
-    // 10. Verification & Cert Wait
+    // 10. Trigger the wildcard order, then verify (which waits for issuance)
     let socket_path = PathBuf::from("/run/weaver/control.sock");
+
+    // The daemon gates its startup auto-order on `setup_complete`, so setup
+    // must explicitly kick off the first wildcard order before waiting.
+    println!("  {} Triggering wildcard certificate order...", "•".blue());
+    let order_code = weaver_server::control::client::client_cert_order(&socket_path, true).await;
+    if order_code != 0 {
+        eprintln!(
+            "{} Failed to queue the wildcard certificate order (control exit {order_code})",
+            "✗ Error:".red().bold()
+        );
+        std::process::exit(1);
+    }
+
     if let Err(err) =
         weaver_server::setup::verify::verify_setup(&plan.root_domain, &socket_path).await
     {
@@ -1057,6 +1112,35 @@ async fn handle_setup(args: SetupArgs, db_path: PathBuf) {
             "✗ Error:".red().bold()
         );
         std::process::exit(1);
+    }
+
+    // 11. Mark setup complete only after delegation, port 53, and the wildcard
+    //     order all succeeded. Future daemon restarts may then auto-order.
+    match Store::open(&db_path).await {
+        Ok(store) => {
+            if let Ok(Some(json)) = store.load_config_json().await {
+                match serde_json::from_str::<Config>(&json) {
+                    Ok(mut cfg) => {
+                        cfg.setup_complete = true;
+                        if let Err(e) = store.save_config(&cfg).await {
+                            eprintln!(
+                                "{} Failed to persist setup_complete: {e}",
+                                "✗ Error:".red().bold()
+                            );
+                        }
+                    }
+                    Err(e) => eprintln!(
+                        "{} Failed to parse stored config while marking setup complete: {e}",
+                        "✗ Error:".red().bold()
+                    ),
+                }
+            }
+            let _ = store.close().await;
+        }
+        Err(e) => eprintln!(
+            "{} Failed to reopen the store to mark setup complete: {e}",
+            "✗ Error:".red().bold()
+        ),
     }
 }
 

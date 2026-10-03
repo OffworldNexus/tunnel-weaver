@@ -759,6 +759,68 @@ pub async fn client_cert_wait(
     exit_code
 }
 
+/// Triggers a forced wildcard certificate order via the `cert.order` control command.
+///
+/// Setup calls this after the systemd units start and before `cert.wait`, so
+/// the first boot does not depend on the daemon's auto-order (which is gated on
+/// `setup_complete`).
+pub async fn client_cert_order(socket_path: &Path, json: bool) -> i32 {
+    let req = ControlRequest {
+        v: 1,
+        cmd: "cert.order".to_string(),
+        name: None,
+        limit: None,
+        timeout_s: None,
+        all: None,
+        force: Some(true),
+        path: None,
+        no_only_best: None,
+        person: None,
+        service: None,
+        since: None,
+        until: None,
+    };
+
+    let line = match send_request_and_read_line(socket_path, &req).await {
+        Ok(l) => l,
+        Err(code) => return code,
+    };
+
+    let trimmed = line.trim();
+    if json {
+        println!("{trimmed}");
+        let val: serde_json::Value = match serde_json::from_str(trimmed) {
+            Ok(v) => v,
+            Err(_) => return 1,
+        };
+        if val.get("ok") == Some(&serde_json::Value::Bool(false)) {
+            return 1;
+        }
+        return 0;
+    }
+
+    let resp: RenewResponse = match serde_json::from_str(trimmed) {
+        Ok(r) => r,
+        Err(_) => {
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed) {
+                let err = val.get("error").and_then(|e| e.as_str()).unwrap_or(trimmed);
+                eprintln!("{} {err}", "✗ Error:".red().bold());
+            } else {
+                eprintln!("{} {trimmed}", "✗ Error:".red().bold());
+            }
+            return 1;
+        }
+    };
+
+    if !resp.ok {
+        eprintln!("{} Wildcard order rejected", "✗ Error:".red().bold());
+        return 1;
+    }
+
+    println!("{} Wildcard certificate order queued", "✓".green().bold());
+    0
+}
+
 /// Executes the `weaver-server cert renew [NAME | --all] [--force] [--wait]` CLI command.
 pub async fn client_cert_renew(
     socket_path: &Path,

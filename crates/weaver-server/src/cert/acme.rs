@@ -19,10 +19,9 @@ use rustls::pki_types::CertificateDer;
 use rustls::pki_types::pem::PemObject;
 use tracing::{debug, info, warn};
 
-use crate::cert::challenge::{ChallengeRegistry, create_tls_alpn_01_certified_key};
 use crate::cert::clock::{Clock, format_unix_timestamp};
 use crate::cert::events::record_cert_event;
-use crate::cert::providers::{find_provider, resolve_directory_url};
+use crate::cert::providers::{find_provider, is_wildcard_capable, resolve_directory_url};
 use crate::config::Config;
 use crate::store::Store;
 
@@ -77,70 +76,75 @@ pub struct AcmeEngine {
     config: Arc<Config>,
     store: Arc<Store>,
     clock: Arc<dyn Clock>,
-    challenge_registry: Arc<ChallengeRegistry>,
 }
 
 impl AcmeEngine {
     /// Creates a new ACME engine instance.
-    pub fn new(
-        config: Arc<Config>,
-        store: Arc<Store>,
-        clock: Arc<dyn Clock>,
-        challenge_registry: Arc<ChallengeRegistry>,
-    ) -> Self {
+    pub fn new(config: Arc<Config>, store: Arc<Store>, clock: Arc<dyn Clock>) -> Self {
         Self {
             config,
             store,
             clock,
-            challenge_registry,
         }
     }
 
-    /// Issues or renews a certificate for `hostname`, trying primary and fallback providers.
-    pub async fn issue_certificate(
-        &self,
-        hostname: &str,
-        http_enabled: bool,
-    ) -> Result<IssuedCertificate, AcmeError> {
+    /// Issues or renews the single wildcard certificate for `root`.
+    ///
+    /// One DNS-01 order carries both SANs, `<root>` and `*.<root>`. The two
+    /// authorizations share the challenge name `_acme-challenge.<root>`, so
+    /// both TXT values are published before either authorization is marked
+    /// ready; the authoritative responder answers that name with a multi-value
+    /// RRset.
+    pub async fn issue_wildcard(&self, root: &str) -> Result<IssuedCertificate, AcmeError> {
+        let root = root.to_ascii_lowercase();
+        if !is_wildcard_capable(&self.config.acme_provider) {
+            return Err(AcmeError::Other(format!(
+                "provider '{}' cannot issue wildcard certificates",
+                self.config.acme_provider
+            )));
+        }
+
         let directories = self.resolve_directory_list();
         if directories.is_empty() {
-            return Err(AcmeError::Other("No ACME directories available".into()));
+            return Err(AcmeError::Other(
+                "No wildcard-capable ACME directories available".into(),
+            ));
         }
 
         let mut last_err = String::from("No providers attempted");
 
         for (idx, (provider_id, dir_url)) in directories.iter().enumerate() {
             debug!(
-                hostname,
+                root,
                 provider_id,
                 dir_url,
                 attempt = idx + 1,
                 total = directories.len(),
-                "Attempting ACME issuance"
+                "Attempting ACME wildcard issuance"
             );
 
             match self
-                .issue_against_directory(hostname, provider_id, dir_url, http_enabled)
+                .issue_against_directory(&root, provider_id, dir_url)
                 .await
             {
                 Ok(cert) => {
                     info!(
-                        hostname,
+                        root,
                         provider = provider_id,
                         dir_url,
                         valid_from = %format_unix_timestamp(cert.not_before),
                         valid_until = %format_unix_timestamp(cert.not_after),
-                        "ACME certificate issued successfully"
+                        "ACME wildcard certificate issued successfully"
                     );
                     return Ok(cert);
                 }
                 Err(err) => {
                     warn!(
-                        hostname,
+                        root,
                         provider_id,
                         dir_url,
                         error = %err,
-                        "ACME issuance failed against provider"
+                        "ACME wildcard issuance failed against provider"
                     );
                     last_err = err.to_string();
 
@@ -155,7 +159,6 @@ impl AcmeEngine {
                         continue;
                     }
 
-                    // Otherwise stop and return error
                     return Err(err);
                 }
             }
@@ -164,18 +167,28 @@ impl AcmeEngine {
         Err(AcmeError::AllProvidersFailed(last_err))
     }
 
-    /// Resolves the list of ACME directories to try: primary provider first, then fallbacks.
+    /// Resolves the list of ACME directories to try: primary provider first,
+    /// then fallbacks, restricted to wildcard-capable providers.
     fn resolve_directory_list(&self) -> Vec<(String, String)> {
         let mut list = Vec::new();
 
-        if let Some(primary_url) = resolve_directory_url(
-            &self.config.acme_provider,
-            self.config.acme_directory.as_deref(),
-        ) {
+        if is_wildcard_capable(&self.config.acme_provider)
+            && let Some(primary_url) = resolve_directory_url(
+                &self.config.acme_provider,
+                self.config.acme_directory.as_deref(),
+            )
+        {
             list.push((self.config.acme_provider.clone(), primary_url));
         }
 
         for fallback in &self.config.acme_fallback_providers {
+            if !is_wildcard_capable(fallback) {
+                warn!(
+                    provider = %fallback,
+                    "Skipping ACME fallback provider: wildcard-incapable"
+                );
+                continue;
+            }
             if let Some(url) = resolve_directory_url(fallback, None)
                 && !list.iter().any(|(_, u)| u == &url)
             {
@@ -186,13 +199,13 @@ impl AcmeEngine {
         list
     }
 
-    /// Executes the full ACME order lifecycle against a single directory endpoint.
+    /// Executes the full DNS-01 ACME order lifecycle for the wildcard
+    /// certificate against a single directory endpoint.
     async fn issue_against_directory(
         &self,
-        hostname: &str,
+        root: &str,
         provider_id: &str,
         directory_url: &str,
-        http_enabled: bool,
     ) -> Result<IssuedCertificate, AcmeError> {
         let account = self
             .get_or_create_account(provider_id, directory_url)
@@ -203,94 +216,61 @@ impl AcmeEngine {
             .map_err(|e| AcmeError::Other(format!("Failed to generate P-256 keypair: {e}")))?;
         let key_pem = key_pair.serialize_pem();
 
-        // 2. Generate CSR for hostname
-        let mut params = CertificateParams::new(vec![hostname.to_string()])
+        // 2. Generate CSR covering the apex and the single-label wildcard
+        let wildcard = format!("*.{root}");
+        let mut params = CertificateParams::new(vec![root.to_string(), wildcard.clone()])
             .map_err(|e| AcmeError::Other(format!("Failed to create CertificateParams: {e}")))?;
         params.distinguished_name = DistinguishedName::new();
         let csr = params
             .serialize_request(&key_pair)
             .map_err(|e| AcmeError::Other(format!("Failed to generate CSR: {e}")))?;
 
-        // 3. Create new order
-        let identifier = Identifier::Dns(hostname.to_string());
-        let identifiers = [identifier];
+        // 3. Create new order for both identifiers in one order
+        let identifiers = [Identifier::Dns(root.to_string()), Identifier::Dns(wildcard)];
         let new_order = NewOrder::new(&identifiers);
         let mut order = account
             .new_order(&new_order)
             .await
             .map_err(Self::map_instant_acme_error)?;
 
-        // 4. Solve authorizations
-        let mut registered_http_tokens = Vec::new();
-        let mut registered_tls_hosts = Vec::new();
+        // 4. Publish every DNS-01 challenge value before marking any ready,
+        //    so both authorizations for the shared challenge name are present.
+        let challenge_name = format!("_acme-challenge.{root}");
+        let now = self.clock.now_unix();
+        let mut published: Vec<String> = Vec::new();
 
         let mut authzs = order.authorizations();
         while let Some(authz_res) = authzs.next().await {
             let mut authz = authz_res.map_err(Self::map_instant_acme_error)?;
 
-            let has_http = authz
-                .challenges
-                .iter()
-                .any(|c| c.r#type == ChallengeType::Http01);
-            let has_alpn = authz
-                .challenges
-                .iter()
-                .any(|c| c.r#type == ChallengeType::TlsAlpn01);
+            let mut chal = authz.challenge(ChallengeType::Dns01).ok_or_else(|| {
+                AcmeError::Other(format!(
+                    "No DNS-01 challenge offered for an authorization of {root}"
+                ))
+            })?;
 
-            let target_type = if http_enabled && has_http {
-                Some(ChallengeType::Http01)
-            } else if has_alpn {
-                Some(ChallengeType::TlsAlpn01)
-            } else if has_http {
-                Some(ChallengeType::Http01)
-            } else {
-                None
-            };
+            let value = chal.key_authorization().dns_value();
+            self.store
+                .publish_challenge(&challenge_name, &value, now)
+                .await
+                .map_err(|e| {
+                    AcmeError::Other(format!("Failed to publish DNS-01 challenge: {e}"))
+                })?;
+            published.push(value);
 
-            let Some(target) = target_type else {
-                return Err(AcmeError::Other(format!(
-                    "No supported challenge type found in authorization for {hostname}"
-                )));
-            };
-
-            let mut chal = authz.challenge(target).unwrap();
-
-            let key_auth = chal.key_authorization();
-            let key_auth_str = key_auth.as_str().to_string();
-
-            if chal.r#type == ChallengeType::Http01 {
-                let token = chal.token.clone();
-                self.challenge_registry
-                    .register_http_01(token.clone(), key_auth_str);
-                registered_http_tokens.push(token);
-            } else if chal.r#type == ChallengeType::TlsAlpn01 {
-                let certified_key = create_tls_alpn_01_certified_key(hostname, &key_auth_str)
-                    .map_err(|e| {
-                        AcmeError::Other(format!("Failed to create TLS-ALPN-01 cert: {e}"))
-                    })?;
-                self.challenge_registry
-                    .register_tls_alpn_01(hostname.to_string(), certified_key);
-                registered_tls_hosts.push(hostname.to_string());
-            }
-
-            // Signal readiness to ACME server
             chal.set_ready()
                 .await
                 .map_err(Self::map_instant_acme_error)?;
         }
 
-        // 5. Poll order readiness
+        // 5. Poll order readiness, then withdraw the challenge records.
         let ready_res = order
             .poll_ready(&RetryPolicy::default())
             .await
             .map_err(Self::map_instant_acme_error);
 
-        // Clean up registered challenge responders
-        for token in registered_http_tokens {
-            self.challenge_registry.remove_http_01(&token);
-        }
-        for host in registered_tls_hosts {
-            self.challenge_registry.remove_tls_alpn_01(&host);
+        for value in &published {
+            let _ = self.store.remove_challenge(&challenge_name, value).await;
         }
 
         ready_res?;
@@ -317,10 +297,10 @@ impl AcmeEngine {
 
         let now = self.clock.now_unix();
 
-        // 8. Persist into the certificates table
+        // 8. Persist into the certificates table, keyed by the apex
         self.store
             .save_certificate(
-                hostname,
+                root,
                 crate::store::NewCertificate {
                     cert_pem: cert_pem.clone(),
                     key_pem: key_pem.clone(),
@@ -329,7 +309,6 @@ impl AcmeEngine {
                     issuer: None,
                     directory: directory_url.to_string(),
                     obtained_at: now,
-                    active_at: Some(now),
                 },
             )
             .await
@@ -338,7 +317,7 @@ impl AcmeEngine {
         // Record event
         let _ = record_cert_event(
             &self.store,
-            hostname,
+            root,
             now,
             "issued",
             Some(&format!("directory: {directory_url}")),
@@ -346,7 +325,7 @@ impl AcmeEngine {
         .await;
 
         Ok(IssuedCertificate {
-            name: hostname.to_string(),
+            name: root.to_string(),
             cert_pem,
             key_pem,
             not_before,

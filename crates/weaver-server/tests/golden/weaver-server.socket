@@ -5,6 +5,8 @@ Description=Tunnel Weaver relay sockets
 [Socket]
 ListenStream=[::]:80
 ListenStream=[::]:443
+ListenDatagram=203.0.113.7:53
+ListenStream=203.0.113.7:53
 BindIPv6Only=both
 NoDelay=true
 Backlog=1024

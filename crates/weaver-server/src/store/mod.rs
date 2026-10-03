@@ -10,15 +10,16 @@
 pub mod entity;
 pub mod error;
 pub mod migration;
+pub mod names;
 pub mod usage;
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use sea_orm::sea_query::{Alias, Expr, OnConflict, Query};
+use sea_orm::sea_query::{Expr, OnConflict};
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectOptions, ConnectionTrait, Database, DatabaseConnection,
-    DbBackend, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Set, Statement,
+    DbBackend, EntityTrait, QueryFilter, QueryOrder, QuerySelect, Set, Statement,
 };
 use sea_orm_migration::MigratorTrait;
 
@@ -27,7 +28,8 @@ pub use migration::Migrator;
 
 use crate::config::{Config, ConfigError};
 use entity::{
-    acme_account, cert_event, certificate, config, domain, machine, machine_key, person, service,
+    acme_account, cert_event, certificate, challenge, config, domain, machine, machine_key, person,
+    service,
 };
 use weaver_mux::KeyId;
 
@@ -316,17 +318,19 @@ impl Store {
         self.get_domain(identifier).await
     }
 
-    /// Saves a newly issued certificate, ensuring the parent domain exists.
+    /// Inserts or replaces the certificate stored under `name`.
+    ///
+    /// In the wildcard model a certificate is global and keyed by its own name
+    /// (the zone apex); a renewal swaps the material in place rather than
+    /// appending a row, so at most one row per name exists.
     pub async fn save_certificate(
         &self,
-        domain_name: &str,
+        name: &str,
         cert: NewCertificate,
     ) -> Result<certificate::Model, StoreError> {
-        let domain = self
-            .get_or_create_domain(domain_name, cert.active_at)
-            .await?;
+        let lower = name.to_ascii_lowercase();
         let active = certificate::ActiveModel {
-            domain_id: Set(domain.id),
+            name: Set(lower.clone()),
             cert_pem: Set(cert.cert_pem),
             key_pem: Set(cert.key_pem),
             not_before: Set(cert.not_before),
@@ -336,66 +340,58 @@ impl Store {
             obtained_at: Set(cert.obtained_at),
             ..Default::default()
         };
-        let model = active.insert(&self.db).await?;
-        Ok(model)
-    }
-
-    /// Base query joining certificates with their parent domain.
-    fn certs_with_domains() -> sea_orm::SelectTwo<certificate::Entity, domain::Entity> {
-        certificate::Entity::find().find_also_related(domain::Entity)
-    }
-
-    /// Query for the best certificate per domain, filtered directly in SQL.
-    fn best_certs_with_domains() -> sea_orm::SelectTwo<certificate::Entity, domain::Entity> {
-        let best_ids = Query::select()
-            .column(Alias::new("id"))
-            .from_subquery(
-                Query::select()
-                    .column(certificate::Column::Id)
-                    .expr_as(
-                        Expr::cust(
-                            "ROW_NUMBER() OVER (PARTITION BY domain_id ORDER BY not_after DESC, id DESC)",
-                        ),
-                        Alias::new("rn"),
-                    )
-                    .from(certificate::Entity)
+        certificate::Entity::insert(active)
+            .on_conflict(
+                OnConflict::column(certificate::Column::Name)
+                    .update_columns([
+                        certificate::Column::CertPem,
+                        certificate::Column::KeyPem,
+                        certificate::Column::NotBefore,
+                        certificate::Column::NotAfter,
+                        certificate::Column::Issuer,
+                        certificate::Column::Directory,
+                        certificate::Column::ObtainedAt,
+                    ])
                     .to_owned(),
-                Alias::new("ranked"),
             )
-            .and_where(Expr::cust("ranked.rn = 1"))
-            .to_owned();
+            .exec_without_returning(&self.db)
+            .await?;
 
-        Self::certs_with_domains().filter(certificate::Column::Id.in_subquery(best_ids))
+        certificate::Entity::find()
+            .filter(certificate::Column::Name.eq(lower))
+            .one(&self.db)
+            .await?
+            .ok_or_else(|| {
+                sea_orm::DbErr::RecordNotFound("certificate row missing after upsert".into()).into()
+            })
     }
 
-    /// Fetches a specific certificate record by its certificate PK ID via a single join query.
+    /// Fetches a certificate record by its certificate PK ID.
     pub async fn get_certificate_by_id(
         &self,
         cert_id: i32,
     ) -> Result<Option<CertRecord>, StoreError> {
-        let row = Self::certs_with_domains()
-            .filter(certificate::Column::Id.eq(cert_id))
+        let row = certificate::Entity::find_by_id(cert_id)
             .one(&self.db)
             .await?;
-
-        Ok(row.map(|(cert, domain)| to_cert_record(cert, domain)))
+        Ok(row.map(to_cert_record))
     }
 
-    /// Fetches the best certificate metadata for a domain by hostname via a single join query.
+    /// Fetches the certificate stored under `name` (the root domain in the
+    /// wildcard model).
     pub async fn get_certificate(
         &self,
         domain_name: &str,
     ) -> Result<Option<CertRecord>, StoreError> {
         let lower = domain_name.to_ascii_lowercase();
-        let row = Self::best_certs_with_domains()
-            .filter(domain::Column::Name.eq(lower))
+        let row = certificate::Entity::find()
+            .filter(certificate::Column::Name.eq(lower))
             .one(&self.db)
             .await?;
-
-        Ok(row.map(|(cert, domain)| to_cert_record(cert, domain)))
+        Ok(row.map(to_cert_record))
     }
 
-    /// Fetches a certificate by integer certificate ID or by domain name (best cert).
+    /// Fetches a certificate by integer certificate ID or by name.
     pub async fn get_certificate_by_id_or_name(
         &self,
         identifier: &str,
@@ -407,52 +403,17 @@ impl Store {
         }
     }
 
-    /// Counts the total number of certificates stored for a domain by ID or hostname directly in SQL.
-    pub async fn count_certificates_for_domain(
-        &self,
-        identifier: &str,
-    ) -> Result<usize, StoreError> {
-        let Some(domain) = self.get_domain_by_id_or_name(identifier).await? else {
-            return Ok(0);
-        };
-        let count = certificate::Entity::find()
-            .filter(certificate::Column::DomainId.eq(domain.id))
-            .count(&self.db)
-            .await?;
-        Ok(count as usize)
-    }
-
-    /// Fetches all certificates for a domain by ID or hostname directly via SQL.
-    pub async fn get_certificates_for_domain(
-        &self,
-        identifier: &str,
-    ) -> Result<Vec<CertRecord>, StoreError> {
-        let Some(domain) = self.get_domain_by_id_or_name(identifier).await? else {
-            return Ok(Vec::new());
-        };
-        let rows = Self::certs_with_domains()
-            .filter(certificate::Column::DomainId.eq(domain.id))
-            .order_by_desc(certificate::Column::NotAfter)
-            .order_by_desc(certificate::Column::Id)
-            .all(&self.db)
-            .await?;
-        Ok(rows
-            .into_iter()
-            .map(|(cert, domain)| to_cert_record(cert, domain))
-            .collect())
-    }
-
-    /// Lists certificate records: either only the best certificate per domain or all certificates.
+    /// Lists certificate records in name order.
+    ///
+    /// `only_best` is retained for the control surface: with one row per name
+    /// there is nothing to rank, so both variants return the same rows.
     pub async fn list_certificates(&self, only_best: bool) -> Result<Vec<CertRecord>, StoreError> {
-        let rows = if only_best {
-            Self::best_certs_with_domains().all(&self.db).await?
-        } else {
-            Self::certs_with_domains().all(&self.db).await?
-        };
-
-        let mut results: Vec<CertRecord> = rows
+        let _ = only_best;
+        let mut results: Vec<CertRecord> = certificate::Entity::find()
+            .all(&self.db)
+            .await?
             .into_iter()
-            .map(|(cert, domain)| to_cert_record(cert, domain))
+            .map(to_cert_record)
             .collect();
         results.sort_by(|a, b| {
             a.name
@@ -462,12 +423,13 @@ impl Store {
         Ok(results)
     }
 
-    /// Lists the best certificate per domain including PEM material, directly queried via SQL.
+    /// Lists every certificate including PEM material.
     pub async fn list_best_certificates_full(&self) -> Result<Vec<FullCertRecord>, StoreError> {
-        let rows = Self::best_certs_with_domains().all(&self.db).await?;
-        let mut results: Vec<FullCertRecord> = rows
+        let mut results: Vec<FullCertRecord> = certificate::Entity::find()
+            .all(&self.db)
+            .await?
             .into_iter()
-            .map(|(cert, domain)| to_full_cert_record(cert, domain))
+            .map(to_full_cert_record)
             .collect();
         results.sort_by(|a, b| {
             a.name
@@ -477,9 +439,93 @@ impl Store {
         Ok(results)
     }
 
-    /// Lists all certificates including PEM material across all domains.
+    /// Alias for [`Store::list_best_certificates_full`].
     pub async fn list_certificates_full(&self) -> Result<Vec<FullCertRecord>, StoreError> {
         self.list_best_certificates_full().await
+    }
+
+    /// Points a materialized domain at the certificate that covers it.
+    ///
+    /// In the wildcard model every domain points at the single apex
+    /// certificate, which is what keeps the routing join to one hop.
+    pub async fn set_domain_certificate(
+        &self,
+        domain_name: &str,
+        certificate_id: i32,
+    ) -> Result<(), StoreError> {
+        let lower = domain_name.to_ascii_lowercase();
+        domain::Entity::update_many()
+            .col_expr(
+                domain::Column::CertificateId,
+                Expr::value(Some(certificate_id)),
+            )
+            .filter(domain::Column::Name.eq(lower))
+            .exec(&self.db)
+            .await?;
+        Ok(())
+    }
+
+    // ----- ACME challenge registry (DNS-01, multi-value) -----
+
+    /// Publishes one TXT value for `name`, ignoring duplicates.
+    ///
+    /// A DNS-01 challenge name maps to a *set* of values: the apex and the
+    /// wildcard authorisations of a single order share
+    /// `_acme-challenge.<root>` and must both be answerable at once.
+    pub async fn publish_challenge(
+        &self,
+        name: &str,
+        value: &str,
+        at: i64,
+    ) -> Result<(), StoreError> {
+        let lower = name.to_ascii_lowercase();
+        let active = challenge::ActiveModel {
+            name: Set(lower),
+            value: Set(value.to_string()),
+            created_at: Set(at),
+            ..Default::default()
+        };
+        challenge::Entity::insert(active)
+            .on_conflict(
+                OnConflict::columns([challenge::Column::Name, challenge::Column::Value])
+                    .do_nothing()
+                    .to_owned(),
+            )
+            .exec_without_returning(&self.db)
+            .await?;
+        Ok(())
+    }
+
+    /// Removes one TXT value for `name`.
+    pub async fn remove_challenge(&self, name: &str, value: &str) -> Result<(), StoreError> {
+        let lower = name.to_ascii_lowercase();
+        challenge::Entity::delete_many()
+            .filter(challenge::Column::Name.eq(lower))
+            .filter(challenge::Column::Value.eq(value))
+            .exec(&self.db)
+            .await?;
+        Ok(())
+    }
+
+    /// Removes every TXT value for `name`.
+    pub async fn clear_challenges(&self, name: &str) -> Result<(), StoreError> {
+        let lower = name.to_ascii_lowercase();
+        challenge::Entity::delete_many()
+            .filter(challenge::Column::Name.eq(lower))
+            .exec(&self.db)
+            .await?;
+        Ok(())
+    }
+
+    /// Returns the current TXT values for `name`, oldest first.
+    pub async fn get_challenges(&self, name: &str) -> Result<Vec<String>, StoreError> {
+        let lower = name.to_ascii_lowercase();
+        let rows = challenge::Entity::find()
+            .filter(challenge::Column::Name.eq(lower))
+            .order_by_asc(challenge::Column::Id)
+            .all(&self.db)
+            .await?;
+        Ok(rows.into_iter().map(|r| r.value).collect())
     }
 
     /// Sets or clears `last_active_at` for a domain.
@@ -511,6 +557,11 @@ impl Store {
     /// Explicitly creates a new person. Returns an error if the name already exists.
     pub async fn create_person(&self, name: &str) -> Result<person::Model, StoreError> {
         let lower = name.to_ascii_lowercase();
+        if !names::is_valid_person_or_machine(&lower) {
+            return Err(StoreError::InvalidName(format!(
+                "person '{name}' must match ^[a-z0-9]{{1,15}}$"
+            )));
+        }
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -542,6 +593,11 @@ impl Store {
         name: &str,
     ) -> Result<machine::Model, StoreError> {
         let lower = name.to_ascii_lowercase();
+        if !names::is_valid_person_or_machine(&lower) {
+            return Err(StoreError::InvalidName(format!(
+                "machine '{name}' must match ^[a-z0-9]{{1,15}}$"
+            )));
+        }
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -623,6 +679,11 @@ impl Store {
         name: &str,
     ) -> Result<service::Model, StoreError> {
         let lower = name.to_ascii_lowercase();
+        if !names::is_valid_service(&lower) {
+            return Err(StoreError::InvalidName(format!(
+                "service '{name}' must match ^[a-z0-9]+(?:-[a-z0-9]+)*$ and be 1-31 chars"
+            )));
+        }
         if let Some(existing) = service::Entity::find()
             .filter(service::Column::MachineId.eq(machine_id))
             .filter(service::Column::Name.eq(&lower))
@@ -695,6 +756,47 @@ impl Store {
         let svc = self.get_or_create_service(machine.id, service).await?;
         self.set_domain_service(hostname, svc.id).await?;
         Ok(svc)
+    }
+
+    /// Recomputes every materialized `domains.name` from the current
+    /// `(person, machine, service)` names.
+    ///
+    /// The flat hostname is derived, so renaming a person or machine must
+    /// rewrite the affected rows; this is that sweep. It is intentionally
+    /// root-parameterized because the `Store` does not itself know the zone
+    /// apex. There is no public rename API yet (a follow-up ticket owns the
+    /// control/API surface); this exists so the invariant is enforced and
+    /// tested from day one.
+    pub async fn recompute_domain_names(&self, root: &str) -> Result<(), StoreError> {
+        let services = service::Entity::find()
+            .find_also_related(machine::Entity)
+            .all(&self.db)
+            .await?;
+
+        for (svc, machine) in services {
+            let Some(machine) = machine else {
+                continue;
+            };
+            let Some(person) = person::Entity::find_by_id(machine.person_id)
+                .one(&self.db)
+                .await?
+            else {
+                continue;
+            };
+            let new_name = names::flat_hostname(&person.name, &machine.name, &svc.name, root);
+
+            if let Some(domain) = domain::Entity::find()
+                .filter(domain::Column::ServiceId.eq(svc.id))
+                .one(&self.db)
+                .await?
+                && domain.name != new_name
+            {
+                let mut active: domain::ActiveModel = domain.into();
+                active.name = Set(new_name);
+                active.update(&self.db).await?;
+            }
+        }
+        Ok(())
     }
 
     // ----- certificate events -----
@@ -799,37 +901,25 @@ pub struct NewCertificate {
     pub issuer: Option<String>,
     pub directory: String,
     pub obtained_at: i64,
-    pub active_at: Option<i64>,
 }
 
-/// Maps a certificate model and its joined domain model into a `CertRecord`.
-fn to_cert_record(cert: certificate::Model, domain: Option<domain::Model>) -> CertRecord {
-    let (name, last_active_at) = match domain {
-        Some(d) => (d.name, d.last_active_at),
-        None => (String::new(), None),
-    };
+/// Maps a certificate model into a `CertRecord`.
+fn to_cert_record(cert: certificate::Model) -> CertRecord {
     CertRecord {
         id: cert.id,
-        domain_id: cert.domain_id,
-        name,
+        name: cert.name,
         not_before: cert.not_before,
         not_after: cert.not_after,
         issuer: cert.issuer,
         directory: cert.directory,
         obtained_at: cert.obtained_at,
-        last_active_at,
     }
 }
 
-fn to_full_cert_record(cert: certificate::Model, domain: Option<domain::Model>) -> FullCertRecord {
-    let (name, last_active_at) = match domain {
-        Some(d) => (d.name, d.last_active_at),
-        None => (String::new(), None),
-    };
+fn to_full_cert_record(cert: certificate::Model) -> FullCertRecord {
     FullCertRecord {
         id: cert.id,
-        domain_id: cert.domain_id,
-        name,
+        name: cert.name,
         cert_pem: cert.cert_pem,
         key_pem: cert.key_pem,
         not_before: cert.not_before,
@@ -837,29 +927,25 @@ fn to_full_cert_record(cert: certificate::Model, domain: Option<domain::Model>) 
         issuer: cert.issuer,
         directory: cert.directory,
         obtained_at: cert.obtained_at,
-        last_active_at,
     }
 }
 
-/// Certificate database record metadata joined with domain metadata (no key material).
+/// Certificate database record metadata (no key material).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CertRecord {
     pub id: i32,
-    pub domain_id: i32,
     pub name: String,
     pub not_before: i64,
     pub not_after: i64,
     pub issuer: Option<String>,
     pub directory: String,
     pub obtained_at: i64,
-    pub last_active_at: Option<i64>,
 }
 
 /// Full certificate record with PEM material, used for startup cache hydration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FullCertRecord {
     pub id: i32,
-    pub domain_id: i32,
     pub name: String,
     pub cert_pem: String,
     pub key_pem: String,
@@ -868,7 +954,6 @@ pub struct FullCertRecord {
     pub issuer: Option<String>,
     pub directory: String,
     pub obtained_at: i64,
-    pub last_active_at: Option<i64>,
 }
 
 /// Certificate event database record.

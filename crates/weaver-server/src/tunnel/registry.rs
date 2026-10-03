@@ -202,15 +202,17 @@ impl TunnelRegistry {
             }
         }
 
-        // Trigger certificate issuance. `ensure` marks the hostname active
-        // before it awaits the ACME order; the order can take long enough
-        // for the client to have gone away meanwhile, in which case
-        // `unregister_*` already removed the route and deactivated the
-        // hostname. The active flag must follow the *route*, so it is
-        // reconciled against the table after the await rather than set
-        // unconditionally — otherwise a departed tunnel leaves an orphaned
-        // hostname that the renewal loop keeps re-issuing forever.
+        // Trigger certificate issuance. The wildcard covers every hostname, so
+        // `ensure` resolves to the apex and waits (bounded) for it to be valid.
+        // The hostname->service link is already materialized in `domains`; point
+        // it at the covering certificate so the routing join is self-contained.
         let _ = self.cert_manager.ensure(&host_lower).await;
+        if let Ok(Some(cert)) = self.store.get_certificate(&self.root_domain).await {
+            let _ = self
+                .store
+                .set_domain_certificate(&host_lower, cert.id)
+                .await;
+        }
         let still_routed = {
             // Held across `set_active` so an unregister cannot slip in
             // between the check and the flag (it takes the same lock
@@ -257,9 +259,21 @@ impl TunnelRegistry {
         Arc::clone(&self.identities)
     }
 
-    pub fn lookup(&self, hostname: &str) -> Option<TunnelRoute> {
+    /// Resolves an incoming `Host` to its live tunnel.
+    ///
+    /// The materialized `domains` table is the source of truth for
+    /// `hostname -> service_id` (the "one join" of OFF-190); the in-memory map
+    /// only supplies the process-local `proxy_tx` channel, which cannot be a DB
+    /// row. A domain with no live route, or a route whose `service_id` does not
+    /// match the database, resolves to `None`.
+    pub async fn resolve(&self, hostname: &str) -> Option<TunnelRoute> {
         let lower = hostname.to_ascii_lowercase();
+        let domain = self.store.get_domain(&lower).await.ok().flatten()?;
+        let service_id = domain.service_id?;
         let routes = self.routes.read().unwrap();
-        routes.get(&lower).cloned()
+        routes
+            .get(&lower)
+            .filter(|route| route.service_id == service_id)
+            .cloned()
     }
 }

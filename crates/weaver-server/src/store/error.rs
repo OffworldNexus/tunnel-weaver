@@ -25,6 +25,11 @@ pub enum StoreError {
     #[error("Key is not enrolled against any machine")]
     KeyNotEnrolled,
 
+    /// An entity name failed the flat-hostname naming rules, or collided with
+    /// a zone label the responder owns.
+    #[error("Invalid name: {0}")]
+    InvalidName(String),
+
     /// A metering value fell outside its valid range (e.g. `open_ms > 60000`).
     #[error("Invalid usage value: {0}")]
     InvalidUsage(String),

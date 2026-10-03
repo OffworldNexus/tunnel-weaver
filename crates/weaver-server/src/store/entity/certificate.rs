@@ -1,4 +1,10 @@
-//! `certificates` table: issued TLS certificates linked to a parent domain.
+//! `certificates` table: issued TLS certificates.
+//!
+//! One row per certificate, keyed by its own `name`. In the wildcard model
+//! there is exactly one row — the `[<root>, *.<root>]` certificate held under
+//! the zone apex — but the table itself does not hard-code that cardinality so
+//! a future per-name path could return without a schema change. `domains`
+//! references rows here.
 
 use sea_orm::entity::prelude::*;
 
@@ -7,7 +13,8 @@ use sea_orm::entity::prelude::*;
 pub struct Model {
     #[sea_orm(primary_key)]
     pub id: i32,
-    pub domain_id: i32,
+    #[sea_orm(unique)]
+    pub name: String,
     pub cert_pem: String,
     pub key_pem: String,
     pub not_before: i64,
@@ -19,19 +26,13 @@ pub struct Model {
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
 pub enum Relation {
-    #[sea_orm(
-        belongs_to = "super::domain::Entity",
-        from = "Column::DomainId",
-        to = "super::domain::Column::Id",
-        on_update = "Cascade",
-        on_delete = "Cascade"
-    )]
-    Domain,
+    #[sea_orm(has_many = "super::domain::Entity")]
+    Domains,
 }
 
 impl Related<super::domain::Entity> for Entity {
     fn to() -> RelationDef {
-        Relation::Domain.def()
+        Relation::Domains.def()
     }
 }
 

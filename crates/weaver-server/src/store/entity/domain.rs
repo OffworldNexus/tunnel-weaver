@@ -1,7 +1,10 @@
-//! `domains` table: registered hostnames/domains and their activity tracking.
+//! `domains` table: materialized flat service hostnames.
 //!
-//! `last_active_at` is `NULL` for hostnames no tunnel currently serves; the
-//! renewal loop skips those so unused certificates are allowed to lapse.
+//! Each row's `name` is the full `<person>-<machine>-<service>.<root>` label
+//! derived from entity names, so an incoming `Host` resolves to its service in
+//! one join. `certificate_id` points at the certificate covering the name; in
+//! the wildcard model every domain shares the single apex certificate, so the
+//! column is the routing half of "one cert covers all tunnels".
 
 use sea_orm::entity::prelude::*;
 
@@ -14,12 +17,19 @@ pub struct Model {
     pub name: String,
     pub last_active_at: Option<i64>,
     pub service_id: Option<i32>,
+    pub certificate_id: Option<i32>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
 pub enum Relation {
-    #[sea_orm(has_many = "super::certificate::Entity")]
-    Certificates,
+    #[sea_orm(
+        belongs_to = "super::certificate::Entity",
+        from = "Column::CertificateId",
+        to = "super::certificate::Column::Id",
+        on_update = "Cascade",
+        on_delete = "SetNull"
+    )]
+    Certificate,
     #[sea_orm(
         belongs_to = "super::service::Entity",
         from = "Column::ServiceId",
@@ -31,7 +41,7 @@ pub enum Relation {
 
 impl Related<super::certificate::Entity> for Entity {
     fn to() -> RelationDef {
-        Relation::Certificates.def()
+        Relation::Certificate.def()
     }
 }
 

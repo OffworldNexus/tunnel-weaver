@@ -215,6 +215,7 @@ async fn handle_connection(
         "status",
         "cert.status",
         "cert.wait",
+        "cert.order",
         "cert.renew",
         "usage",
         "backup",
@@ -512,7 +513,9 @@ async fn handle_connection(
                         .map(|r| r.directory.clone())
                         .unwrap_or_else(|| config.acme_provider.clone());
                     let active = cert_manager.is_active(&target);
-                    let last_active_at = cert_rec.as_ref().and_then(|r| r.last_active_at);
+                    // Activity now lives on the domain, not the certificate;
+                    // the wildcard row has no per-name activity timestamp.
+                    let last_active_at = None;
                     let cert_id = cert_rec.as_ref().map(|r| r.id);
 
                     let resp = CertDetailResponse {
@@ -644,6 +647,33 @@ async fn handle_connection(
                         writer.flush().await?;
                         break;
                     }
+                }
+            }
+        }
+        "cert.order" => {
+            // Setup triggers this once, forcing the wildcard order before it
+            // waits on `cert.wait`. Force bypasses backoff so a fresh install
+            // is never held by a stale failure counter.
+            let root_domain = config.root_domain.to_ascii_lowercase();
+            match cert_manager.renew_hostname(&root_domain, true).await {
+                Ok(()) => {
+                    let resp = RenewResponse {
+                        ok: true,
+                        renewed: vec![root_domain],
+                        status: "queued".to_string(),
+                        skipped_inactive: Vec::new(),
+                    };
+                    let mut data = serde_json::to_vec(&resp)?;
+                    data.push(b'\n');
+                    writer.write_all(&data).await?;
+                    writer.flush().await?;
+                }
+                Err(err) => {
+                    let resp = ErrorResponse::new(err.to_string());
+                    let mut data = serde_json::to_vec(&resp)?;
+                    data.push(b'\n');
+                    writer.write_all(&data).await?;
+                    writer.flush().await?;
                 }
             }
         }

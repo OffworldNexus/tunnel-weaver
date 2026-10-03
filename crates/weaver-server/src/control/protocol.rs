@@ -4,12 +4,12 @@ use crate::cert::CertState;
 
 /// Envelope for client requests sent across the control socket.
 ///
-/// All requests require `v: 1` and one of the seven valid command verbs.
+/// All requests require `v: 1` and one of the eight valid command verbs.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ControlRequest {
     /// Protocol version envelope; must be 1.
     pub v: u32,
-    /// Command verb ("status", "cert.status", "cert.wait", "cert.renew", "usage", "backup", "shutdown").
+    /// Command verb ("status", "cert.status", "cert.wait", "cert.order", "cert.renew", "usage", "backup", "shutdown").
     pub cmd: String,
     /// Target domain or hostname for certificate operations.
     #[serde(default)]

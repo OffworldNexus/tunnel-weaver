@@ -287,9 +287,10 @@ pub async fn handle_https_request(
             return Ok(resp);
         }
 
-        // Check if there is an active tunnel for this subdomain
+        // Check if there is an active tunnel for this subdomain. Resolution is
+        // DB-backed: `domains.name -> service -> live proxy channel`.
         if let Some(ref reg) = config.tunnel_registry
-            && let Some(route) = reg.lookup(&host_lower)
+            && let Some(route) = reg.resolve(&host_lower).await
         {
             // Attribute this visitor connection's socket bytes to the service
             // it serves. First tunnel request wins for the whole connection.
