@@ -29,7 +29,7 @@ use tracing::{debug, trace, warn};
 
 use crate::config::Config;
 use crate::store::Store;
-use crate::zone::Zone;
+use crate::zone::{Zone, normalize_domain};
 
 /// TTL for static records (A/AAAA/NS/CAA/SOA), in seconds.
 pub const STATIC_TTL: u32 = 3600;
@@ -204,7 +204,7 @@ impl DnsResponder {
         }
 
         let query = &req.queries[0];
-        let qname = normalize(query.name().to_utf8());
+        let qname = normalize_domain(&query.name().to_utf8());
         let qtype = query.query_type();
         let qclass = query.query_class();
 
@@ -317,11 +317,6 @@ impl DnsResponder {
 
         Some(resp)
     }
-}
-
-/// Lowercases and strips the trailing dot from a presentation-format name.
-fn normalize(name: String) -> String {
-    name.trim_end_matches('.').to_ascii_lowercase()
 }
 
 /// Serves DNS over UDP until the shutdown token fires.

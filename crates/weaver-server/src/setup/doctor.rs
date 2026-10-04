@@ -34,6 +34,7 @@ use tokio::net::{TcpStream, UdpSocket};
 use super::dns;
 use super::planner::PortReachability;
 use super::reachability;
+use crate::zone::normalize_domain;
 
 /// Per-attempt timeout for a daemon self-connect probe.
 const SELF_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -532,19 +533,17 @@ pub async fn run_in_process(
     relay_ips_override: &[IpAddr],
     skip_reachability: bool,
 ) -> DoctorReport {
-    let root = normalize(root_domain);
-    let admin = normalize(admin_domain);
+    let root = normalize_domain(root_domain);
+    let admin = normalize_domain(admin_domain);
 
     let admin_resolved = dns::resolve_public(&admin).await;
-    let egress_ips = dns::host_egress_ips();
-    let mut relay_ips = relay_ips_override.to_vec();
-    if relay_ips.is_empty() {
-        relay_ips.extend(admin_resolved.iter().copied());
-        relay_ips.extend(egress_ips.iter().copied());
-        relay_ips.retain(super::planner::is_public_ip);
-        relay_ips.sort();
-        relay_ips.dedup();
-    }
+    // Shared with setup's own planning path so the admin-vs-egress union and
+    // public filtering cannot diverge between `doctor` and `setup`.
+    let relay_ips = if relay_ips_override.is_empty() {
+        dns::detect_relay_ips(&admin).await
+    } else {
+        relay_ips_override.to_vec()
+    };
 
     let (ns_targets, delegation_error) = match dns::probe_registrar_delegation(&root, &admin).await
     {
@@ -726,11 +725,6 @@ pub fn admin_addresses_check(
         ),
         remediation: None,
     }
-}
-
-/// Lowercases and strips any trailing dot from a domain for comparison.
-fn normalize(domain: &str) -> String {
-    domain.trim().trim_end_matches('.').to_ascii_lowercase()
 }
 
 #[cfg(test)]

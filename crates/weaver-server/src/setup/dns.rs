@@ -17,6 +17,8 @@ use hickory_proto::rr::{Name, RData, RecordType};
 use sha2::Digest;
 use tokio::net::UdpSocket;
 
+use crate::zone::normalize_domain;
+
 /// Public recursive resolvers queried directly during setup.
 pub const PUBLIC_RESOLVERS: &[&str] = &["1.1.1.1", "8.8.8.8", "9.9.9.9"];
 
@@ -67,11 +69,6 @@ pub fn generate_random_hex(len: usize) -> String {
         *b = hash[i % hash.len()];
     }
     bytes.iter().map(|b| format!("{b:02x}")).collect()
-}
-
-/// Normalizes a presentation-format name: lowercased, no trailing dot.
-fn normalize_name(name: &str) -> String {
-    name.trim_end_matches('.').to_ascii_lowercase()
 }
 
 /// A random transaction ID for a DNS query.
@@ -173,7 +170,7 @@ fn collect_ns_targets(msg: &Message) -> Vec<String> {
         .iter()
         .chain(msg.authorities.iter())
         .filter_map(|record| match &record.data {
-            RData::NS(ns) => Some(normalize_name(&ns.0.to_utf8())),
+            RData::NS(ns) => Some(normalize_domain(&ns.0.to_utf8())),
             _ => None,
         })
         .collect()
@@ -205,7 +202,7 @@ async fn resolve_both(resolver: IpAddr, qname: &str) -> Result<Vec<IpAddr>, Stri
 /// relay's own responder is running — which is what lets `setup` bring DNS up
 /// first and verify delegation second.
 pub async fn probe_delegation(root_domain: &str) -> Result<(Vec<String>, bool), String> {
-    let root = normalize_name(root_domain);
+    let root = normalize_domain(root_domain);
     let resolvers: Vec<IpAddr> = PUBLIC_RESOLVERS
         .iter()
         .filter_map(|s| s.parse::<IpAddr>().ok())
@@ -261,8 +258,8 @@ pub async fn probe_registrar_delegation(
     root_domain: &str,
     expected_ns: &str,
 ) -> Result<(Vec<String>, bool), String> {
-    let root = normalize_name(root_domain);
-    let expected = normalize_name(expected_ns);
+    let root = normalize_domain(root_domain);
+    let expected = normalize_domain(expected_ns);
     let labels: Vec<&str> = root.split('.').collect();
     if labels.len() < 2 {
         return Err(format!(
@@ -332,10 +329,10 @@ pub async fn probe_registrar_delegation(
 /// lives outside the delegation and is therefore always resolvable), not to the
 /// apex itself. Comparison is case-insensitive with any trailing dot ignored.
 pub fn delegation_matches(targets: &[String], expected_ns: &str) -> bool {
-    let expected = normalize_name(expected_ns);
+    let expected = normalize_domain(expected_ns);
     targets
         .iter()
-        .any(|target| normalize_name(target) == expected)
+        .any(|target| normalize_domain(target) == expected)
 }
 
 /// Resolves the apex and a fresh probe name through the public recursives.
@@ -343,7 +340,7 @@ pub fn delegation_matches(targets: &[String], expected_ns: &str) -> bool {
 /// This needs the relay's authoritative responder to be up (and the delegation
 /// to point at it), so call it *after* the DNS socket is started.
 pub async fn probe_zone(root_domain: &str) -> ZoneProbe {
-    let root = normalize_name(root_domain);
+    let root = normalize_domain(root_domain);
     let resolvers: Vec<IpAddr> = PUBLIC_RESOLVERS
         .iter()
         .filter_map(|s| s.parse::<IpAddr>().ok())
@@ -395,7 +392,7 @@ pub async fn probe_zone(root_domain: &str) -> ZoneProbe {
 /// Used by the setup/doctor preflight to report what the admin hostname
 /// currently points at before any host modification.
 pub async fn resolve_public(name: &str) -> Vec<IpAddr> {
-    let qname = normalize_name(name);
+    let qname = normalize_domain(name);
     let resolvers: Vec<IpAddr> = PUBLIC_RESOLVERS
         .iter()
         .filter_map(|s| s.parse::<IpAddr>().ok())
@@ -469,7 +466,7 @@ mod tests {
 
     #[test]
     fn normalize_strips_trailing_dot_and_lowercases() {
-        assert_eq!(normalize_name("Example.COM."), "example.com");
+        assert_eq!(normalize_domain("Example.COM."), "example.com");
     }
 
     #[test]
