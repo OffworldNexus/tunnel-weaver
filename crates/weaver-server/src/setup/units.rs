@@ -78,6 +78,14 @@ pub fn render_service_unit(params: &ServiceUnitParams<'_>) -> String {
     let prefix = params.prefix.trim_end_matches('/');
     let db = params.db_path;
     let user = params.user;
+    // The service runs with ProtectSystem=strict, so the database's parent
+    // directory must be explicitly writable; derive it from `db_path` so a
+    // non-default database location is not silently denied.
+    let state_dir = std::path::Path::new(db)
+        .parent()
+        .and_then(|p| p.to_str())
+        .filter(|p| !p.is_empty())
+        .unwrap_or("/var/lib/weaver");
 
     format!(
         r#"# weaver-server.service
@@ -112,7 +120,7 @@ LockPersonality=yes
 MemoryDenyWriteExecute=yes
 SystemCallFilter=@system-service
 SystemCallArchitectures=native
-ReadWritePaths=/var/lib/weaver
+ReadWritePaths={state_dir}
 LimitNOFILE=65536
 
 [Install]

@@ -54,7 +54,10 @@ async fn spawn_dns_responder(
     store: Arc<Store>,
     token: CancellationToken,
 ) -> Option<(tokio::task::JoinHandle<()>, tokio::task::JoinHandle<()>)> {
-    let responder = Arc::new(weaver_server::dns::DnsResponder::new(config, store));
+    let responder = Arc::new(weaver_server::dns::DnsResponder::new(
+        &weaver_server::dns::DnsResponderConfig::from_config(config),
+        store,
+    ));
 
     let mut udp = None;
     let mut tcp = None;

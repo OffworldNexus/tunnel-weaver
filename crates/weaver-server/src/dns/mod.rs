@@ -31,6 +31,39 @@ use crate::config::Config;
 use crate::store::Store;
 use crate::zone::{Zone, normalize_domain};
 
+/// The subset of relay configuration the authoritative responder needs.
+///
+/// A narrow input instead of the whole [`Config`]: the responder never reads
+/// ACME credentials, listen addresses or the control socket, and
+/// [`DnsResponderConfig::from_config`] is the one place the CAA issuer policy
+/// is resolved from the provider catalog.
+pub struct DnsResponderConfig {
+    /// The delegated tunnel zone apex.
+    pub root_domain: String,
+    /// The relay's own admin hostname (the zone's NS/SOA target).
+    pub admin_domain: String,
+    /// The relay's public addresses, answered for every in-zone name.
+    pub relay_ips: Vec<IpAddr>,
+    /// CA issuer domains for the `issue`/`issuewild` CAA records. Empty means
+    /// the CA is unknown, so no CAA is served (permissive).
+    pub caa_issuers: Vec<String>,
+}
+
+impl DnsResponderConfig {
+    /// Builds the responder inputs from relay configuration.
+    pub fn from_config(config: &Config) -> Self {
+        Self {
+            root_domain: config.root_domain.clone(),
+            admin_domain: config.admin_domain.clone(),
+            relay_ips: config.relay_ips.clone(),
+            caa_issuers: crate::cert::providers::caa_identifiers(
+                &config.acme_provider,
+                &config.acme_fallback_providers,
+            ),
+        }
+    }
+}
+
 /// TTL for static records (A/AAAA/NS/CAA/SOA), in seconds.
 pub const STATIC_TTL: u32 = 3600;
 
@@ -84,7 +117,7 @@ impl std::fmt::Debug for DnsResponder {
 
 impl DnsResponder {
     /// Builds a responder for the configured root zone.
-    pub fn new(config: &Config, store: Arc<Store>) -> Self {
+    pub fn new(config: &DnsResponderConfig, store: Arc<Store>) -> Self {
         let zone = Zone::new(&config.root_domain, &config.admin_domain);
         let root_name =
             Name::from_str(&format!("{}.", zone.root())).expect("root domain is a Name");
@@ -108,10 +141,7 @@ impl DnsResponder {
             admin_name,
             relay_ips: config.relay_ips.clone(),
             soa,
-            caa_issuers: crate::cert::providers::caa_identifiers(
-                &config.acme_provider,
-                &config.acme_fallback_providers,
-            ),
+            caa_issuers: config.caa_issuers.clone(),
             store,
         }
     }
@@ -451,7 +481,10 @@ mod tests {
             relay_ips,
             setup_complete: false,
         };
-        Arc::new(DnsResponder::new(&config, Arc::new(store)))
+        Arc::new(DnsResponder::new(
+            &DnsResponderConfig::from_config(&config),
+            Arc::new(store),
+        ))
     }
 
     fn query(qname: &str, qtype: RecordType, class: hickory_proto::rr::DNSClass) -> Message {

@@ -198,7 +198,7 @@ pub async fn run_server(
     // Authoritative DNS responder: one task per inherited/self-bound socket.
     // It shares the store, so it sees ACME DNS-01 challenge values live.
     let dns_responder = Arc::new(crate::dns::DnsResponder::new(
-        &config,
+        &crate::dns::DnsResponderConfig::from_config(&config),
         Arc::new(store.clone()),
     ));
     let mut dns_tasks = Vec::new();
