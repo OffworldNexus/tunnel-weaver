@@ -49,7 +49,11 @@ async fn is_pebble_available() -> bool {
 /// pointed at (`-dnsserver 127.0.0.1:1053`). The responder reads DNS-01 TXT
 /// values straight from the shared `Store`, so the challenge the ACME engine
 /// publishes is visible to Pebble without a test-only stub.
-async fn spawn_dns_responder(config: &Config, store: Arc<Store>, token: CancellationToken) {
+async fn spawn_dns_responder(
+    config: &Config,
+    store: Arc<Store>,
+    token: CancellationToken,
+) -> Option<(tokio::task::JoinHandle<()>, tokio::task::JoinHandle<()>)> {
     let responder = Arc::new(weaver_server::dns::DnsResponder::new(config, store));
 
     let mut udp = None;
@@ -64,19 +68,20 @@ async fn spawn_dns_responder(config: &Config, store: Arc<Store>, token: Cancella
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    let Some(udp) = udp else {
-        return;
-    };
-    let Some(tcp) = tcp else {
-        return;
-    };
+    let udp = udp?;
+    let tcp = tcp?;
 
-    tokio::spawn(weaver_server::dns::run_udp(
+    // Hand the join handles back so a test can await them on teardown. The two
+    // Pebble tests both need 127.0.0.1:1053 (Pebble's `-dnsserver` is fixed), so
+    // releasing the socket deterministically before the next test binds is
+    // required, not just a 200ms sleep.
+    let udp_task = tokio::spawn(weaver_server::dns::run_udp(
         udp,
         Arc::clone(&responder),
         token.clone(),
     ));
-    tokio::spawn(weaver_server::dns::run_tcp(tcp, responder, token));
+    let tcp_task = tokio::spawn(weaver_server::dns::run_tcp(tcp, responder, token));
+    Some((udp_task, tcp_task))
 }
 
 #[derive(Debug)]
@@ -214,7 +219,9 @@ async fn test_pebble_e2e_issuance_and_lazy_ensure() {
     });
 
     let dns_token = CancellationToken::new();
-    spawn_dns_responder(&config, Arc::clone(&store), dns_token.clone()).await;
+    let dns_tasks = spawn_dns_responder(&config, Arc::clone(&store), dns_token.clone())
+        .await
+        .expect("test DNS responder could not bind 127.0.0.1:1053");
 
     let resolver = Arc::new(CertResolver::new(root_domain.into()));
 
@@ -305,7 +312,10 @@ async fn test_pebble_e2e_issuance_and_lazy_ensure() {
 
     shutdown_token.cancel();
     dns_token.cancel();
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    // Await the responder tasks so 127.0.0.1:1053 is released before the next
+    // Pebble test binds it.
+    let (dns_udp, dns_tcp) = dns_tasks;
+    let _ = tokio::join!(dns_udp, dns_tcp);
 }
 
 #[tokio::test]
@@ -346,7 +356,9 @@ async fn test_pebble_e2e_tunnel_registration_and_proxying() {
     });
 
     let dns_token = CancellationToken::new();
-    spawn_dns_responder(&config, Arc::clone(&store), dns_token.clone()).await;
+    let dns_tasks = spawn_dns_responder(&config, Arc::clone(&store), dns_token.clone())
+        .await
+        .expect("test DNS responder could not bind 127.0.0.1:1053");
 
     let resolver = Arc::new(CertResolver::new(root_domain.into()));
 
@@ -544,5 +556,8 @@ async fn test_pebble_e2e_tunnel_registration_and_proxying() {
 
     shutdown_token.cancel();
     dns_token.cancel();
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    // Await the responder tasks so 127.0.0.1:1053 is released before the next
+    // Pebble test binds it.
+    let (dns_udp, dns_tcp) = dns_tasks;
+    let _ = tokio::join!(dns_udp, dns_tcp);
 }
