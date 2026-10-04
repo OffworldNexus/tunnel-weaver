@@ -156,7 +156,20 @@ pub fn execute_uninstall(opts: &UninstallOptions) -> Result<(), String> {
                     let l = ans.to_ascii_lowercase();
                     l == "y" || l == "yes"
                 }
-                Err(_) => false,
+                // Ctrl-C / Ctrl-D / Esc is a request to quit, not a "no":
+                // stop before deleting anything rather than finish a partial
+                // uninstall the operator tried to abort.
+                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {
+                    eprintln!("\n{} Cancelled by user.", "•".blue());
+                    std::process::exit(130);
+                }
+                Err(err) => {
+                    eprintln!(
+                        "{} Interactive prompt failed: {err}",
+                        "✗ Error:".red().bold()
+                    );
+                    std::process::exit(1);
+                }
             }
         };
 

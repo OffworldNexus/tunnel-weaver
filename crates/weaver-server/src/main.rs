@@ -771,6 +771,30 @@ struct GatheredAcme {
     acme_root_ca: Option<PathBuf>,
 }
 
+/// Runs an interactive prompt, exiting the process when the operator aborts.
+///
+/// `inquire` reports Ctrl-C as an interrupt and Ctrl-D / Esc as a cancel; the
+/// `interactive` module surfaces both as [`std::io::ErrorKind::Interrupted`]. An
+/// abort is a request to stop and must never be mistaken for an empty answer
+/// that gets retried. Any other prompt failure is fatal too — silently falling
+/// back to a default would invent an answer the operator never gave.
+fn prompt_required<T>(prompt: impl FnOnce() -> std::io::Result<T>) -> T {
+    match prompt() {
+        Ok(value) => value,
+        Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {
+            eprintln!("\n{} Cancelled by user.", "•".blue());
+            std::process::exit(130);
+        }
+        Err(err) => {
+            eprintln!(
+                "{} Interactive prompt failed: {err}",
+                "✗ Error:".red().bold()
+            );
+            std::process::exit(1);
+        }
+    }
+}
+
 /// Gathers and validates the domain and ACME settings for `setup` and `configure`.
 ///
 /// Both commands ask for the same fields with the same validation; only the
@@ -870,9 +894,9 @@ fn gather_acme_config(mut inputs: AcmeConfigInputs, options: GatherOptions) -> G
                 d
             }
             None => loop {
-                let input =
+                let input = prompt_required(|| {
                     interactive::prompt_line("Tunnel domain (delegated to this relay)", None)
-                        .unwrap_or_default();
+                });
                 if interactive::validate_fqdn(&input) {
                     break input;
                 }
@@ -892,11 +916,12 @@ fn gather_acme_config(mut inputs: AcmeConfigInputs, options: GatherOptions) -> G
                 d
             }
             None => loop {
-                let input = interactive::prompt_line(
-                    "Admin domain (the relay's own hostname, outside the tunnel zone)",
-                    None,
-                )
-                .unwrap_or_default();
+                let input = prompt_required(|| {
+                    interactive::prompt_line(
+                        "Admin domain (the relay's own hostname, outside the tunnel zone)",
+                        None,
+                    )
+                });
                 if interactive::validate_fqdn(&input) {
                     break input;
                 }
@@ -924,7 +949,7 @@ fn gather_acme_config(mut inputs: AcmeConfigInputs, options: GatherOptions) -> G
                 e
             }
             None => loop {
-                let input = interactive::prompt_line("Admin email", None).unwrap_or_default();
+                let input = prompt_required(|| interactive::prompt_line("Admin email", None));
                 if interactive::validate_email(&input) {
                     break input;
                 }
@@ -937,32 +962,36 @@ fn gather_acme_config(mut inputs: AcmeConfigInputs, options: GatherOptions) -> G
             && acme_directory.is_none()
             && acme_provider == "letsencrypt"
         {
-            let (chosen_prov, custom_dir) = interactive::prompt_provider_choice().unwrap();
+            let (chosen_prov, custom_dir) = prompt_required(interactive::prompt_provider_choice);
             acme_provider = chosen_prov;
             if let Some(dir) = custom_dir {
                 acme_directory = Some(dir);
             }
             let prov_info = weaver_server::cert::providers::find_provider(&acme_provider);
             if prov_info.is_some_and(|p| p.eab_required) {
-                let kid = interactive::prompt_line("EAB Key Identifier (KID)", None).unwrap();
-                let hmac = interactive::read_masked_input("EAB HMAC Key").unwrap();
+                let kid =
+                    prompt_required(|| interactive::prompt_line("EAB Key Identifier (KID)", None));
+                let hmac = prompt_required(|| interactive::read_masked_input("EAB HMAC Key"));
                 eab_kid = Some(kid);
                 eab_hmac = Some(hmac);
             } else if acme_provider == "custom" {
-                let need_eab =
+                let need_eab = prompt_required(|| {
                     interactive::prompt_line("Does this directory require EAB? [y/N]", Some("n"))
-                        .unwrap_or_default();
+                });
                 if need_eab.eq_ignore_ascii_case("y") || need_eab.eq_ignore_ascii_case("yes") {
-                    let kid = interactive::prompt_line("EAB Key Identifier (KID)", None).unwrap();
-                    let hmac = interactive::read_masked_input("EAB HMAC Key").unwrap();
+                    let kid = prompt_required(|| {
+                        interactive::prompt_line("EAB Key Identifier (KID)", None)
+                    });
+                    let hmac = prompt_required(|| interactive::read_masked_input("EAB HMAC Key"));
                     eab_kid = Some(kid);
                     eab_hmac = Some(hmac);
                 }
-                let ca_path_str = interactive::prompt_line(
-                    "Custom Root CA PEM path (optional, press enter to skip)",
-                    None,
-                )
-                .unwrap_or_default();
+                let ca_path_str = prompt_required(|| {
+                    interactive::prompt_line(
+                        "Custom Root CA PEM path (optional, press enter to skip)",
+                        None,
+                    )
+                });
                 if !ca_path_str.is_empty() {
                     root_ca = Some(PathBuf::from(ca_path_str));
                 }
@@ -1034,11 +1063,24 @@ async fn handle_setup(args: SetupArgs, db_path: PathBuf) {
 
     // 2. Display execution plan & confirm (if not already elevated)
     if !args.no_prompt_values {
-        let confirmed =
-            weaver_server::setup::interactive::display_plan_and_confirm(&gathered, args.headless);
-        if !confirmed {
-            println!("Setup cancelled by user.");
-            std::process::exit(0);
+        match weaver_server::setup::interactive::display_plan_and_confirm(&gathered, args.headless)
+        {
+            Ok(true) => {}
+            Ok(false) => {
+                println!("Setup cancelled by user.");
+                std::process::exit(0);
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {
+                eprintln!("\n{} Cancelled by user.", "•".blue());
+                std::process::exit(130);
+            }
+            Err(err) => {
+                eprintln!(
+                    "{} Interactive prompt failed: {err}",
+                    "✗ Error:".red().bold()
+                );
+                std::process::exit(1);
+            }
         }
 
         // 3. Privilege elevation if needed

@@ -340,6 +340,17 @@ pub fn print_domain_step_intro() {
     println!();
     print_labeled_wrapped(
         "  ",
+        "Admin domain:",
+        "the relay's own address; the admin console runs here.",
+    );
+    println!(
+        "    e.g. for {} → {}",
+        "bar.foo".cyan(),
+        "admin.bar.foo".cyan()
+    );
+    println!();
+    print_labeled_wrapped(
+        "  ",
         "Tunnel domain:",
         "all future tunnels will be subdomains of this one, so pick a dedicated name.",
     );
@@ -349,24 +360,13 @@ pub fn print_domain_step_intro() {
         "tunnel.bar.foo".cyan()
     );
     println!();
-    print_labeled_wrapped(
-        "  ",
-        "Admin domain:",
-        "the relay's own address; the admin console runs here.",
-    );
-    println!(
-        "    e.g. for {} → {}",
-        "bar.foo".cyan(),
-        "relay.bar.foo".cyan()
-    );
-    println!();
     print_wrapped("  ", "So now, pick for your own domain:");
     let records = [
-        ("relay.<your-domain>", "A/AAAA", "-> this VM's public IP(s)"),
+        ("admin.<your-domain>", "A/AAAA", "-> this VM's public IP(s)"),
         (
             "tunnel.<your-domain>",
             "NS",
-            "-> relay.<your-domain> (yes, the NS points at the domain defined above)",
+            "-> admin.<your-domain> (yes, the NS points at the domain defined above)",
         ),
     ];
     let name_width = records.iter().map(|(n, _, _)| n.len()).max().unwrap_or(0);
@@ -400,7 +400,15 @@ pub fn print_domain_step_intro() {
 }
 
 /// Displays the structured plan and asks for user confirmation.
-pub fn display_plan_and_confirm(config: &GatheredConfig, is_headless: bool) -> bool {
+///
+/// Returns `Ok(true)` to proceed and `Ok(false)` when the operator declines. A
+/// cancelled or interrupted prompt (Ctrl-C / Ctrl-D / Esc) is surfaced as
+/// [`std::io::ErrorKind::Interrupted`] rather than being folded into `false`, so
+/// the caller can distinguish "answered no" from "asked to quit".
+pub fn display_plan_and_confirm(
+    config: &GatheredConfig,
+    is_headless: bool,
+) -> std::io::Result<bool> {
     println!("\n{}", "Weaver Server Setup Plan".bold().cyan());
     println!();
 
@@ -465,15 +473,15 @@ pub fn display_plan_and_confirm(config: &GatheredConfig, is_headless: bool) -> b
     println!();
 
     if is_headless {
-        return true;
+        return Ok(true);
     }
 
-    // `Confirm` defaults to "no", so an accidental Enter cancels rather than
-    // installing; a cancel/IO error is also treated as "no".
+    // `Confirm` defaults to "no", so an accidental Enter declines rather than
+    // installing.
     Confirm::new("Proceed with installation?")
         .with_default(false)
         .prompt()
-        .unwrap_or(false)
+        .map_err(inquire_err)
 }
 
 #[cfg(test)]
