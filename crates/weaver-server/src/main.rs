@@ -635,7 +635,11 @@ async fn main() {
                 acme_fallback_providers: Vec::new(),
                 usage_flush_interval_secs: args.usage_flush_interval,
                 relay_ips: existing_relay_ips,
-                setup_complete: false,
+                // `configure` is the non-systemd (container) flavour: there is no
+                // interactive preflight to gate on, and the operator owns DNS.
+                // Mark setup complete so the daemon auto-orders the wildcard at
+                // startup instead of waiting for a `setup` that never runs.
+                setup_complete: true,
             };
 
             if let Err(err) = store.save_config(&config).await {

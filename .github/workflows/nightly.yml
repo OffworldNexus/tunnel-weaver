@@ -45,16 +45,27 @@ jobs:
           echo "zone=$ZONE" >> "$GITHUB_OUTPUT"
 
           RUN_HEX=$(openssl rand -hex 4)
-          FULL_DOMAIN="t${RUN_HEX}.${BASE_DOMAIN}"
-          echo "full_domain=$FULL_DOMAIN" >> "$GITHUB_OUTPUT"
 
+          # Two names under the operator's domain:
+          #   admin  A/AAAA -> droplet  (relay's own hostname; HTTP-01 cert)
+          #   tunnel NS admin           (delegated zone; DNS-01 wildcard)
           if [ "$BASE_DOMAIN" = "$ZONE" ]; then
-            REC_PREFIX="t${RUN_HEX}"
+            SUB_PREFIX=""
           else
-            SUB="${BASE_DOMAIN%."$ZONE"}"
-            REC_PREFIX="t${RUN_HEX}.${SUB}"
+            SUB_PREFIX="${BASE_DOMAIN%."$ZONE"}."
           fi
-          echo "rec_prefix=$REC_PREFIX" >> "$GITHUB_OUTPUT"
+          ADMIN_DOMAIN="a${RUN_HEX}.${BASE_DOMAIN}"
+          TUNNEL_DOMAIN="t${RUN_HEX}.${BASE_DOMAIN}"
+          ADMIN_REC="${SUB_PREFIX}a${RUN_HEX}"
+          TUNNEL_REC="${SUB_PREFIX}t${RUN_HEX}"
+
+          echo "admin_domain=$ADMIN_DOMAIN" >> "$GITHUB_OUTPUT"
+          echo "tunnel_domain=$TUNNEL_DOMAIN" >> "$GITHUB_OUTPUT"
+          echo "admin_rec=$ADMIN_REC" >> "$GITHUB_OUTPUT"
+          echo "tunnel_rec=$TUNNEL_REC" >> "$GITHUB_OUTPUT"
+          # `full_domain` is the tunnel domain; most steps treat it as the relay
+          # hostname they talk to.
+          echo "full_domain=$TUNNEL_DOMAIN" >> "$GITHUB_OUTPUT"
 
       - name: Install stable Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -120,36 +131,39 @@ jobs:
             sleep 3
           done
 
-      - name: Configure DNS record in DigitalOcean zone
+      - name: Configure DNS records in DigitalOcean zone
         id: dns
         run: |
           IP="${{ steps.droplet.outputs.ip }}"
           ZONE="${{ steps.domain.outputs.zone }}"
-          RECORD_NAME="${{ steps.domain.outputs.rec_prefix }}"
-          WILDCARD_NAME="*.${{ steps.domain.outputs.rec_prefix }}"
+          ADMIN_REC="${{ steps.domain.outputs.admin_rec }}"
+          TUNNEL_REC="${{ steps.domain.outputs.tunnel_rec }}"
+          ADMIN_DOMAIN="${{ steps.domain.outputs.admin_domain }}"
 
-          # Base record
+          # Admin A record: the relay's own hostname (and the glue for the NS
+          # target, since it lives in this same zone).
           RESP_A=$(curl -s -X POST "https://api.digitalocean.com/v2/domains/$ZONE/records" \
             -H "Authorization: Bearer $DO_TOKEN" \
             -H "Content-Type: application/json" \
-            -d "{\"type\": \"A\", \"name\": \"$RECORD_NAME\", \"data\": \"$IP\", \"ttl\": 60}")
+            -d "{\"type\": \"A\", \"name\": \"$ADMIN_REC\", \"data\": \"$IP\", \"ttl\": 60}")
           REC_A_ID=$(echo "$RESP_A" | jq -r '.domain_record.id // empty')
 
-          # Wildcard record
-          RESP_W=$(curl -s -X POST "https://api.digitalocean.com/v2/domains/$ZONE/records" \
+          # Delegate the tunnel zone to the admin hostname. The relay is its
+          # own nameserver; there is no wildcard A record.
+          RESP_NS=$(curl -s -X POST "https://api.digitalocean.com/v2/domains/$ZONE/records" \
             -H "Authorization: Bearer $DO_TOKEN" \
             -H "Content-Type: application/json" \
-            -d "{\"type\": \"A\", \"name\": \"$WILDCARD_NAME\", \"data\": \"$IP\", \"ttl\": 60}")
-          REC_W_ID=$(echo "$RESP_W" | jq -r '.domain_record.id // empty')
+            -d "{\"type\": \"NS\", \"name\": \"$TUNNEL_REC\", \"data\": \"$ADMIN_DOMAIN.\", \"ttl\": 60}")
+          REC_NS_ID=$(echo "$RESP_NS" | jq -r '.domain_record.id // empty')
 
           echo "zone=$ZONE" >> "$GITHUB_OUTPUT"
           echo "rec_a_id=$REC_A_ID" >> "$GITHUB_OUTPUT"
-          echo "rec_w_id=$REC_W_ID" >> "$GITHUB_OUTPUT"
+          echo "rec_ns_id=$REC_NS_ID" >> "$GITHUB_OUTPUT"
 
       - name: Wait for SSH and DNS propagation
         run: |
           IP="${{ steps.droplet.outputs.ip }}"
-          TARGET_DOMAIN="${{ steps.domain.outputs.full_domain }}"
+          ADMIN_DOMAIN="${{ steps.domain.outputs.admin_domain }}"
 
           echo "Waiting for SSH on $IP:22..."
           for i in $(seq 1 30); do
@@ -161,11 +175,13 @@ jobs:
           done
 
           command -v dig || sudo apt-get install -y -qq dnsutils
-          echo "Waiting for DNS propagation of $TARGET_DOMAIN to $IP..."
+          # Wait on the admin name: the tunnel zone is already delegated but the
+          # relay is not serving DNS yet, so it cannot resolve until setup.
+          echo "Waiting for DNS propagation of $ADMIN_DOMAIN to $IP..."
           for i in $(seq 1 40); do
-            RESOLVED=$(dig +short "$TARGET_DOMAIN" @8.8.8.8 | tail -n 1)
+            RESOLVED=$(dig +short "$ADMIN_DOMAIN" @8.8.8.8 | tail -n 1)
             if [ "$RESOLVED" = "$IP" ]; then
-              echo "DNS propagated successfully: $TARGET_DOMAIN -> $IP"
+              echo "DNS propagated successfully: $ADMIN_DOMAIN -> $IP"
               break
             fi
             sleep 3
@@ -175,6 +191,7 @@ jobs:
         run: |
           IP="${{ steps.droplet.outputs.ip }}"
           TARGET_DOMAIN="${{ steps.domain.outputs.full_domain }}"
+          ADMIN_DOMAIN="${{ steps.domain.outputs.admin_domain }}"
 
           scp -o StrictHostKeyChecking=no -i ~/.ssh/id_nightly \
             target/release/weaver-server root@"$IP":/tmp/weaver-server
@@ -183,6 +200,7 @@ jobs:
             "install -m 755 /tmp/weaver-server /usr/local/bin/weaver-server && \
              /usr/local/bin/weaver-server setup --headless \
                --root-domain $TARGET_DOMAIN \
+               --admin-domain $ADMIN_DOMAIN \
                --email admin@$TARGET_DOMAIN \
                --acme-provider letsencrypt-staging"
 
@@ -190,13 +208,16 @@ jobs:
         run: |
           IP="${{ steps.droplet.outputs.ip }}"
           TARGET_DOMAIN="${{ steps.domain.outputs.full_domain }}"
+          ADMIN_DOMAIN="${{ steps.domain.outputs.admin_domain }}"
 
-          # Verify control socket cert status
+          # Verify control socket cert status (tunnel wildcard + admin single).
           ssh -o StrictHostKeyChecking=no -i ~/.ssh/id_nightly root@"$IP" \
             "/usr/local/bin/weaver-server cert status --json"
 
-          # Verify HTTPS reachability
+          # Verify HTTPS reachability for both domains. At this point DNS for
+          # the tunnel zone is served by the relay itself.
           curl -k -v --fail --max-time 15 "https://$TARGET_DOMAIN/"
+          curl -k -v --fail --max-time 15 "https://$ADMIN_DOMAIN/"
 
       - name: Verify tunnel registration, certificate issuance, and HTTP proxying
         run: |
@@ -218,7 +239,7 @@ jobs:
           ./target/release/weave start web=18080 --server "$TARGET_DOMAIN" --insecure-root-ca /tmp/certs/staging-ca.pem > /tmp/weave.log 2>&1 &
           WEAVE_PID=$!
 
-          TUNNEL_HOST="web.laptop.poc.$TARGET_DOMAIN"
+          TUNNEL_HOST="poc-laptop-web.$TARGET_DOMAIN"
           echo "Waiting for tunnel registration on $TUNNEL_HOST..."
           for i in $(seq 1 60); do
             if grep -q "https://$TUNNEL_HOST/" /tmp/weave.log; then
@@ -272,7 +293,7 @@ jobs:
         continue-on-error: true
         run: |
           TARGET_DOMAIN="${{ steps.domain.outputs.full_domain }}"
-          TUNNEL_HOST="web.laptop.poc.$TARGET_DOMAIN"
+          TUNNEL_HOST="poc-laptop-web.$TARGET_DOMAIN"
           H2SPEC_VERSION="2.6.0"
           curl -sSL "https://github.com/summerwind/h2spec/releases/download/v${H2SPEC_VERSION}/h2spec_linux_amd64.tar.gz" | tar xz -C /tmp
           chmod +x /tmp/h2spec
@@ -303,7 +324,7 @@ jobs:
         continue-on-error: true
         run: |
           TARGET_DOMAIN="${{ steps.domain.outputs.full_domain }}"
-          TUNNEL_HOST="web.laptop.poc.$TARGET_DOMAIN"
+          TUNNEL_HOST="poc-laptop-web.$TARGET_DOMAIN"
 
           git clone --depth 1 https://github.com/MDA2AV/Http11Probe /tmp/http11probe
           (cd /tmp/http11probe && dotnet build Http11Probe.slnx -c Release -v q)
@@ -337,7 +358,7 @@ jobs:
         continue-on-error: true
         run: |
           TARGET_DOMAIN="${{ steps.domain.outputs.full_domain }}"
-          WS_HOST="ws.laptop.poc.$TARGET_DOMAIN"
+          WS_HOST="poc-laptop-ws.$TARGET_DOMAIN"
 
           # Echo origin: Python `websockets`, which implements the close
           # handshake and permessage-deflate correctly (websocat's mirror
@@ -405,7 +426,7 @@ jobs:
       - name: Tunnel teardown → 404
         run: |
           TARGET_DOMAIN="${{ steps.domain.outputs.full_domain }}"
-          TUNNEL_HOST="web.laptop.poc.$TARGET_DOMAIN"
+          TUNNEL_HOST="poc-laptop-web.$TARGET_DOMAIN"
           WEAVE_PID=$(cat /tmp/weave.pid)
           echo "Stopping weave client (PID $WEAVE_PID)..."
           # The client may already be gone: the WebSocket step starts a second
@@ -436,8 +457,8 @@ jobs:
             curl -s -X DELETE "https://api.digitalocean.com/v2/domains/$ZONE/records/${{ steps.dns.outputs.rec_a_id }}" \
               -H "Authorization: Bearer $DO_TOKEN" || true
           fi
-          if [ -n "${{ steps.dns.outputs.rec_w_id }}" ] && [ -n "$ZONE" ]; then
-            curl -s -X DELETE "https://api.digitalocean.com/v2/domains/$ZONE/records/${{ steps.dns.outputs.rec_w_id }}" \
+          if [ -n "${{ steps.dns.outputs.rec_ns_id }}" ] && [ -n "$ZONE" ]; then
+            curl -s -X DELETE "https://api.digitalocean.com/v2/domains/$ZONE/records/${{ steps.dns.outputs.rec_ns_id }}" \
               -H "Authorization: Bearer $DO_TOKEN" || true
           fi
 

@@ -93,7 +93,7 @@ jobs:
 
       - name: Configure test hostnames
         run: |
-          echo "127.0.0.1 pebble.test root.pebble.test subdomain.pebble.test web.laptop.poc.pebble.test web.laptop.remy.pebble.test" | sudo tee -a /etc/hosts
+          echo "127.0.0.1 pebble.test root.pebble.test admin.pebble.test relay-admin.test poc-laptop-web.pebble.test remy-laptop-web.pebble.test" | sudo tee -a /etc/hosts
 
       - name: Start Pebble ACME server
         run: |
@@ -140,6 +140,7 @@ jobs:
               apt-get update -qq && apt-get install -y -qq curl ca-certificates >/dev/null 2>&1
               weaver-server --db /var/lib/weaver/smoke.db configure --headless \
                 --root-domain root.pebble.test \
+                --admin-domain admin.pebble.test \
                 --email admin@pebble.test \
                 --acme-provider custom \
                 --acme-directory https://localhost:14000/dir \
@@ -177,6 +178,7 @@ jobs:
           done
           docker exec systemd-smoke /usr/local/bin/weaver-server setup --headless \
             --root-domain root.pebble.test \
+            --admin-domain admin.pebble.test \
             --email admin@pebble.test \
             --acme-provider custom \
             --acme-directory https://localhost:14000/dir \
