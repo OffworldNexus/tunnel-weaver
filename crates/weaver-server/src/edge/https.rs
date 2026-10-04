@@ -27,6 +27,7 @@ use crate::edge::host::request_host;
 use crate::edge::waf;
 use crate::tunnel::proxy::{BoxBody, empty_body, forward_visitor_request, full_body};
 use crate::tunnel::registry::TunnelRegistry;
+use crate::zone::{CertKind, Zone};
 use weaver_assets::{apply_security_headers, render_no_tunnel, render_welcome};
 
 /// How often a live visitor connection reports its accumulated socket bytes to
@@ -37,11 +38,10 @@ const VISITOR_REPORT_INTERVAL: Duration = Duration::from_secs(5);
 /// Shared state for HTTPS request dispatch.
 #[derive(Clone)]
 pub struct HttpsEdgeConfig {
-    /// Configured root domain (e.g. "example.com").
-    pub root_domain: String,
-    /// The relay's own stable hostname, served by the admin certificate and
-    /// given the same welcome/health surface as the apex.
-    pub admin_domain: Option<String>,
+    /// The relay's serving area: the tunnel apex and the admin hostname. The
+    /// admin host is served by its own certificate and never the tunnel
+    /// WebSocket endpoint.
+    pub zone: Zone,
     /// Dynamic certificate resolver used to determine if certificate is placeholder.
     pub cert_resolver: Option<Arc<CertResolver>>,
     /// Certificate manager, used to record visitor-triggered renewals.
@@ -53,8 +53,8 @@ pub struct HttpsEdgeConfig {
 impl std::fmt::Debug for HttpsEdgeConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("HttpsEdgeConfig")
-            .field("root_domain", &self.root_domain)
-            .field("admin_domain", &self.admin_domain)
+            .field("root_domain", &self.zone.root())
+            .field("admin_domain", &self.zone.admin())
             .field("has_cert_resolver", &self.cert_resolver.is_some())
             .field("has_cert_manager", &self.cert_manager.is_some())
             .field("has_tunnel_registry", &self.tunnel_registry.is_some())
@@ -151,8 +151,7 @@ pub async fn handle_https_request(
     }
 
     let host_lower = host.to_ascii_lowercase();
-    let root_lower = config.root_domain.to_ascii_lowercase();
-    let admin_lower = config.admin_domain.as_ref().map(|d| d.to_ascii_lowercase());
+    let zone = &config.zone;
 
     let include_hsts = config
         .cert_resolver
@@ -162,14 +161,14 @@ pub async fn handle_https_request(
     // The relay's own (admin) hostname is outside the tunnel zone and is served
     // by its own single-name certificate. It gets the same welcome/health
     // surface as the apex but never the tunnel WebSocket endpoint.
-    if admin_lower.as_deref() == Some(host_lower.as_str()) {
+    if zone.covering_cert(&host_lower) == Some(CertKind::Admin) {
         if let Some(mgr) = &config.cert_manager {
             mgr.note_visit(&host_lower);
         }
         return Ok(static_host_response(&req, include_hsts));
     }
 
-    if host_lower == root_lower {
+    if host_lower == zone.root() {
         if let Some(mgr) = &config.cert_manager {
             mgr.note_visit(&host_lower);
         }
@@ -221,7 +220,7 @@ pub async fn handle_https_request(
 
             if let Some(ref reg) = config.tunnel_registry {
                 let reg = Arc::clone(reg);
-                let root = config.root_domain.clone();
+                let root = config.zone.root().to_string();
                 tokio::spawn(async move {
                     match on_upgrade.await {
                         Ok(upgraded) => {
@@ -281,9 +280,7 @@ pub async fn handle_https_request(
                 Ok(resp)
             }
         }
-    } else if host_lower.ends_with(&format!(".{root_lower}"))
-        && host_lower.len() > root_lower.len() + 1
-    {
+    } else if zone.in_tunnel_zone(&host_lower) {
         // Always-on edge firewall: scanner probes are refused here so they
         // never open a tunnel stream or reach the origin (see `edge::waf`).
         let raw_path = req
@@ -353,7 +350,7 @@ pub async fn handle_https_request(
         Ok(resp)
     } else {
         // Unrecognized domain -> 421 Misdirected Request
-        debug!(%host, root_domain = %config.root_domain, "Unrecognized domain, returning 421");
+        debug!(%host, root_domain = %config.zone.root(), "Unrecognized domain, returning 421");
         Ok(Response::builder()
             .status(StatusCode::MISDIRECTED_REQUEST)
             .body(full_body("421 Misdirected Request\n"))
@@ -438,8 +435,7 @@ pub async fn run_https_server_with_registry(
         listener,
         tls_config,
         HttpsEdgeConfig {
-            root_domain,
-            admin_domain: None,
+            zone: Zone::new(&root_domain, &root_domain),
             cert_resolver,
             cert_manager: None,
             tunnel_registry,
@@ -475,7 +471,7 @@ pub async fn run_https_server_full(
 
     info!(
         addr = %addr_str,
-        root_domain = %edge_config.root_domain,
+        root_domain = %edge_config.zone.root(),
         "HTTPS edge server running"
     );
 

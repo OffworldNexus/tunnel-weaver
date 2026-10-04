@@ -29,6 +29,7 @@ use tracing::{debug, trace, warn};
 
 use crate::config::Config;
 use crate::store::Store;
+use crate::zone::Zone;
 
 /// TTL for static records (A/AAAA/NS/CAA/SOA), in seconds.
 pub const STATIC_TTL: u32 = 3600;
@@ -55,7 +56,10 @@ const _ACME_PREFIX: &str = "_acme-challenge";
 
 /// Generative authoritative responder bound to one root zone.
 pub struct DnsResponder {
-    root_domain: String,
+    /// The relay's serving area: the delegated tunnel apex and the admin host.
+    /// The admin host is the zone's NS/SOA MNAME but is *not* in the tunnel
+    /// zone, so the responder answers only `<root>` and one label beneath it.
+    zone: Zone,
     root_name: Name,
     /// The name server target for the zone's NS and SOA MNAME records: the
     /// relay's own stable (admin) hostname, which lives outside the delegation.
@@ -71,7 +75,7 @@ pub struct DnsResponder {
 impl std::fmt::Debug for DnsResponder {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DnsResponder")
-            .field("root_domain", &self.root_domain)
+            .field("root_domain", &self.zone.root())
             .field("admin_name", &self.admin_name)
             .field("relay_ips", &self.relay_ips)
             .finish()
@@ -81,14 +85,14 @@ impl std::fmt::Debug for DnsResponder {
 impl DnsResponder {
     /// Builds a responder for the configured root zone.
     pub fn new(config: &Config, store: Arc<Store>) -> Self {
-        let root_domain = config.root_domain.to_ascii_lowercase();
-        let root_name = Name::from_str(&format!("{root_domain}.")).expect("root domain is a Name");
+        let zone = Zone::new(&config.root_domain, &config.admin_domain);
+        let root_name =
+            Name::from_str(&format!("{}.", zone.root())).expect("root domain is a Name");
         // The zone is delegated to the relay, whose own stable hostname is the
         // admin domain; NS and SOA advertise that name, never the apex (an
         // apex self-reference is not resolvable once delegated).
-        let admin_domain = config.admin_domain.to_ascii_lowercase();
         let admin_name =
-            Name::from_str(&format!("{admin_domain}.")).expect("admin domain is a Name");
+            Name::from_str(&format!("{}.", zone.admin())).expect("admin domain is a Name");
         let soa = SOA::new(
             admin_name.clone(),
             admin_name.clone(),
@@ -99,7 +103,7 @@ impl DnsResponder {
             NEGATIVE_TTL,
         );
         Self {
-            root_domain,
+            zone,
             root_name,
             admin_name,
             relay_ips: config.relay_ips.clone(),
@@ -116,13 +120,7 @@ impl DnsResponder {
     /// beneath it. The wildcard matches exactly one label, so deeper names are
     /// out of zone.
     fn in_zone(&self, name: &str) -> bool {
-        if name == self.root_domain {
-            return true;
-        }
-        match name.strip_suffix(&format!(".{}", self.root_domain)) {
-            Some(label) => !label.is_empty() && !label.contains('.'),
-            None => false,
-        }
+        self.zone.in_tunnel_zone(name)
     }
 
     fn a_records(&self, owner: &Name) -> Vec<Record> {
@@ -273,17 +271,17 @@ impl DnsResponder {
                     }
                 }
             }
-            RecordType::SOA if qname == self.root_domain => {
+            RecordType::SOA if qname == self.zone.root() => {
                 resp.add_answer(self.soa_record());
             }
-            RecordType::NS if qname == self.root_domain => {
+            RecordType::NS if qname == self.zone.root() => {
                 resp.add_answer(Record::from_rdata(
                     self.root_name.clone(),
                     STATIC_TTL,
                     RData::NS(NS(self.admin_name.clone())),
                 ));
             }
-            RecordType::CAA if qname == self.root_domain => {
+            RecordType::CAA if qname == self.zone.root() => {
                 // Authorise the configured CA(s) for both ordinary and wildcard
                 // issuance. An empty `issuewild` would *forbid* wildcards, so if
                 // the CA is unknown we serve no CAA at all (NODATA).

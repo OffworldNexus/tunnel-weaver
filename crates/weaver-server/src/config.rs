@@ -107,8 +107,8 @@ fn default_usage_flush_interval() -> u64 {
 /// Returns `None` when the pair is acceptable. Callers are expected to have
 /// already rejected empty names, but an empty input is reported here too.
 pub fn domain_split_issue(admin_domain: &str, root_domain: &str) -> Option<String> {
-    let admin = normalize_domain(admin_domain);
-    let root = normalize_domain(root_domain);
+    let admin = crate::zone::normalize_domain(admin_domain);
+    let root = crate::zone::normalize_domain(root_domain);
     if admin.is_empty() || root.is_empty() {
         return Some("admin_domain and root_domain must both be non-empty".into());
     }
@@ -121,11 +121,6 @@ pub fn domain_split_issue(admin_domain: &str, root_domain: &str) -> Option<Strin
         ));
     }
     None
-}
-
-/// Lowercases a domain and strips any trailing dot for comparison.
-fn normalize_domain(domain: &str) -> String {
-    domain.trim().trim_end_matches('.').to_ascii_lowercase()
 }
 
 impl Config {

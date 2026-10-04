@@ -10,6 +10,7 @@ use tracing::{debug, trace};
 
 use crate::cert::acme::parse_cert_validity;
 use crate::cert::clock::{Clock, SystemClock};
+use crate::zone::Zone;
 
 /// In-memory stored certificate with its parsed expiration timestamp.
 #[derive(Clone)]
@@ -68,11 +69,10 @@ pub const DEFAULT_HOLD_TIMEOUT: Duration = Duration::from_secs(30);
 /// - Rejects unknown hostnames, missing SNI, failed orders, and timed-out orders at the TCP level
 /// - Strictly prohibits serving self-signed or placeholder certificates to public HTTPS clients
 pub struct CertResolver {
-    root_domain: String,
-    /// The relay's own stable hostname. It gets its own single-name certificate
-    /// and must never be covered by the tunnel wildcard, nor a tunnel name by
-    /// the admin certificate.
-    admin_domain: String,
+    /// The relay's serving area. The admin host gets its own single-name
+    /// certificate and must never be covered by the tunnel wildcard, nor a
+    /// tunnel name by the admin certificate.
+    zone: Zone,
     certs: RwLock<HashMap<String, StoredCert>>,
     ordering_waiters: Mutex<HashMap<String, Arc<HandshakeWaiter>>>,
     clock: Arc<dyn Clock>,
@@ -82,8 +82,8 @@ pub struct CertResolver {
 impl std::fmt::Debug for CertResolver {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CertResolver")
-            .field("root_domain", &self.root_domain)
-            .field("admin_domain", &self.admin_domain)
+            .field("root_domain", &self.zone.root())
+            .field("admin_domain", &self.zone.admin())
             .field("certs_count", &self.certs.read().unwrap().len())
             .finish()
     }
@@ -100,10 +100,9 @@ impl CertResolver {
 
     /// Creates a new `CertResolver` with an injected clock for deterministic time in tests.
     pub fn with_clock(root_domain: String, clock: Arc<dyn Clock>) -> Self {
-        let root = root_domain.to_ascii_lowercase();
+        let zone = Zone::new(&root_domain, &root_domain);
         Self {
-            root_domain: root.clone(),
-            admin_domain: root,
+            zone,
             certs: RwLock::new(HashMap::new()),
             ordering_waiters: Mutex::new(HashMap::new()),
             clock,
@@ -116,7 +115,7 @@ impl CertResolver {
     /// Builder form keeps the many root-only test constructors unchanged while
     /// letting production wire in the real split.
     pub fn with_admin_domain(mut self, admin_domain: String) -> Self {
-        self.admin_domain = admin_domain.to_ascii_lowercase();
+        self.zone = Zone::new(self.zone.root(), admin_domain);
         self
     }
 
@@ -133,18 +132,7 @@ impl CertResolver {
     /// a tunnel name is not the admin name, and a name under the tunnel zone
     /// cannot fall through to the admin certificate (or vice versa).
     fn cert_name_for(&self, host: &str) -> Option<String> {
-        if host == self.admin_domain {
-            return Some(self.admin_domain.clone());
-        }
-        if host == self.root_domain {
-            return Some(self.root_domain.clone());
-        }
-        let suffix = format!(".{}", self.root_domain);
-        let label = host.strip_suffix(&suffix)?;
-        if label.is_empty() || label.contains('.') {
-            return None;
-        }
-        Some(self.root_domain.clone())
+        self.zone.cert_name_for(host)
     }
 
     /// Checks whether the certificate currently served for `name` is a placeholder certificate.

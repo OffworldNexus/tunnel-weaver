@@ -55,6 +55,7 @@ pub enum RenewError {
 use crate::config::Config;
 use crate::notify::notify_cert_status;
 use crate::store::Store;
+use crate::zone::{CertKind, Zone};
 
 /// High-level certificate manager daemon for the relay's managed certificates.
 ///
@@ -74,11 +75,13 @@ use crate::store::Store;
 /// The admin certificate is independent: its failure affects only the relay's
 /// own endpoint.
 pub struct CertManager {
-    config: Arc<Config>,
     store: Arc<Store>,
     clock: Arc<dyn Clock>,
     resolver: Arc<CertResolver>,
     acme_engine: Arc<AcmeEngine>,
+    /// The relay's serving area: maps a hostname to the one managed
+    /// certificate that covers it, and names each certificate's store key.
+    zone: Zone,
     states: RwLock<HashMap<String, CertState>>,
     /// Hostnames with a live or recently-live tunnel. Kept only for the
     /// control surface; it never gates renewal — the wildcard must be valid
@@ -106,12 +109,13 @@ impl CertManager {
 
         let (state_change_tx, _) = broadcast::channel(128);
 
+        let zone = Zone::new(&config.root_domain, &config.admin_domain);
         Arc::new(Self {
-            config,
             store,
             clock,
             resolver,
             acme_engine,
+            zone,
             states: RwLock::new(HashMap::new()),
             active_hosts: RwLock::new(HashSet::new()),
             failure_counts: RwLock::new(HashMap::new()),
@@ -123,12 +127,12 @@ impl CertManager {
 
     /// The wildcard certificate name (the zone apex), lowercased.
     fn root_name(&self) -> String {
-        self.config.root_domain.to_ascii_lowercase()
+        self.zone.root().to_string()
     }
 
     /// The admin certificate name (the relay's own hostname), lowercased.
     fn admin_name(&self) -> String {
-        self.config.admin_domain.to_ascii_lowercase()
+        self.zone.admin().to_string()
     }
 
     /// Resolves a hostname to the certificate name that covers it.
@@ -137,21 +141,7 @@ impl CertManager {
     /// wildcard covers the apex and exactly one label beneath it. Returns
     /// `None` for hostnames no managed certificate covers.
     pub fn cert_name_for(&self, host: &str) -> Option<String> {
-        let host = host.to_ascii_lowercase();
-        let admin = self.admin_name();
-        let root = self.root_name();
-        if host == admin {
-            return Some(admin);
-        }
-        if host == root {
-            return Some(root);
-        }
-        let suffix = format!(".{root}");
-        let label = host.strip_suffix(&suffix)?;
-        if label.is_empty() || label.contains('.') {
-            return None;
-        }
-        Some(root)
+        self.zone.cert_name_for(host)
     }
 
     /// Initializes the cached certificates from the store and marks handshakes
@@ -338,7 +328,7 @@ impl CertManager {
     /// Dispatches on the name: the admin certificate uses HTTP-01, the tunnel
     /// wildcard uses DNS-01.
     async fn execute_issuance(self: &Arc<Self>, cert_name: String) -> Result<(), AcmeError> {
-        let is_admin = cert_name == self.admin_name();
+        let is_admin = matches!(self.zone.kind_of(&cert_name), CertKind::Admin);
 
         let is_renewing = matches!(
             self.status(&cert_name),

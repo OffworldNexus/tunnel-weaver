@@ -187,8 +187,7 @@ pub async fn run_server(
         listeners.https,
         tls_config,
         crate::edge::https::HttpsEdgeConfig {
-            root_domain: config.root_domain.clone(),
-            admin_domain: Some(config.admin_domain.clone()),
+            zone: crate::zone::Zone::new(&config.root_domain, &config.admin_domain),
             cert_resolver: Some(Arc::clone(&resolver)),
             cert_manager: Some(Arc::clone(&cert_manager)),
             tunnel_registry: Some(tunnel_registry),
