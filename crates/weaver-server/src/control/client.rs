@@ -125,6 +125,37 @@ async fn send_request_and_read_line(
     Ok(line)
 }
 
+/// Prints the raw response line when `json` was requested and returns the exit
+/// code the envelope implies, or `None` when a typed renderer should run.
+///
+/// Every `client_*` command shares this: `--json` prints the server's line
+/// verbatim and exits nonzero only when the envelope says `ok:false`.
+fn json_short_circuit(line: &str, json: bool) -> Option<i32> {
+    if !json {
+        return None;
+    }
+    println!("{line}");
+    match serde_json::from_str::<serde_json::Value>(line) {
+        Ok(val) if val.get("ok") == Some(&serde_json::Value::Bool(false)) => Some(1),
+        Ok(_) => Some(0),
+        Err(_) => Some(1),
+    }
+}
+
+/// Reports a response that could not be parsed as the expected typed payload.
+///
+/// Prints the `error` field of a JSON error envelope, or the raw line, and
+/// returns the standard failure exit code.
+fn response_error(line: &str) -> i32 {
+    if let Ok(val) = serde_json::from_str::<serde_json::Value>(line) {
+        let err = val.get("error").and_then(|e| e.as_str()).unwrap_or(line);
+        eprintln!("{} {err}", "✗ Error:".red().bold());
+    } else {
+        eprintln!("{} {line}", "✗ Error:".red().bold());
+    }
+    1
+}
+
 /// Helper to format byte count into a decimal SI representation.
 ///
 /// SI prefixes are powers of 1000 and "kilo" is lowercase `k`: `kB`, `MB`,
@@ -199,19 +230,7 @@ fn styled_state_cell(state: &str) -> Cell {
 /// Executes the `weaver-server status` CLI command.
 pub async fn client_status(socket_path: &Path, json: bool) -> i32 {
     let req = ControlRequest {
-        v: 1,
-        cmd: "status".to_string(),
-        name: None,
-        limit: None,
-        timeout_s: None,
-        all: None,
-        force: None,
-        path: None,
-        no_only_best: None,
-        person: None,
-        service: None,
-        since: None,
-        until: None,
+        ..ControlRequest::new("status")
     };
 
     let line = match send_request_and_read_line(socket_path, &req).await {
@@ -220,29 +239,13 @@ pub async fn client_status(socket_path: &Path, json: bool) -> i32 {
     };
 
     let trimmed = line.trim();
-    if json {
-        println!("{trimmed}");
-        let val: serde_json::Value = match serde_json::from_str(trimmed) {
-            Ok(v) => v,
-            Err(_) => return 1,
-        };
-        if val.get("ok") == Some(&serde_json::Value::Bool(false)) {
-            return 1;
-        }
-        return 0;
+    if let Some(code) = json_short_circuit(trimmed, json) {
+        return code;
     }
 
     let resp: StatusResponse = match serde_json::from_str(trimmed) {
         Ok(r) => r,
-        Err(_) => {
-            if let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed) {
-                let err = val.get("error").and_then(|e| e.as_str()).unwrap_or(trimmed);
-                eprintln!("{} {err}", "✗ Error:".red().bold());
-            } else {
-                eprintln!("{} {trimmed}", "✗ Error:".red().bold());
-            }
-            return 1;
-        }
+        Err(_) => return response_error(trimmed),
     };
 
     if !resp.ok {
@@ -331,19 +334,10 @@ pub async fn client_cert_status(
 ) -> i32 {
     let has_name = name.is_some();
     let req = ControlRequest {
-        v: 1,
-        cmd: "cert.status".to_string(),
         name,
         limit,
-        timeout_s: None,
-        all: None,
-        force: None,
-        path: None,
         no_only_best: if no_only_best { Some(true) } else { None },
-        person: None,
-        service: None,
-        since: None,
-        until: None,
+        ..ControlRequest::new("cert.status")
     };
 
     let line = match send_request_and_read_line(socket_path, &req).await {
@@ -352,16 +346,8 @@ pub async fn client_cert_status(
     };
 
     let trimmed = line.trim();
-    if json {
-        println!("{trimmed}");
-        let val: serde_json::Value = match serde_json::from_str(trimmed) {
-            Ok(v) => v,
-            Err(_) => return 1,
-        };
-        if val.get("ok") == Some(&serde_json::Value::Bool(false)) {
-            return 1;
-        }
-        return 0;
+    if let Some(code) = json_short_circuit(trimmed, json) {
+        return code;
     }
 
     let now = SystemTime::now()
@@ -373,15 +359,7 @@ pub async fn client_cert_status(
         // Table view
         let resp: CertListResponse = match serde_json::from_str(trimmed) {
             Ok(r) => r,
-            Err(_) => {
-                if let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed) {
-                    let err = val.get("error").and_then(|e| e.as_str()).unwrap_or(trimmed);
-                    eprintln!("{} {err}", "✗ Error:".red().bold());
-                } else {
-                    eprintln!("{} {trimmed}", "✗ Error:".red().bold());
-                }
-                return 1;
-            }
+            Err(_) => return response_error(trimmed),
         };
 
         if !resp.ok {
@@ -507,15 +485,7 @@ pub async fn client_cert_status(
         // Detail view
         let resp: CertDetailResponse = match serde_json::from_str(trimmed) {
             Ok(r) => r,
-            Err(_) => {
-                if let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed) {
-                    let err = val.get("error").and_then(|e| e.as_str()).unwrap_or(trimmed);
-                    eprintln!("{} {err}", "✗ Error:".red().bold());
-                } else {
-                    eprintln!("{} {trimmed}", "✗ Error:".red().bold());
-                }
-                return 1;
-            }
+            Err(_) => return response_error(trimmed),
         };
 
         if !resp.ok {
@@ -663,19 +633,9 @@ pub async fn client_cert_wait(
     json: bool,
 ) -> i32 {
     let req = ControlRequest {
-        v: 1,
-        cmd: "cert.wait".to_string(),
         name,
-        limit: None,
         timeout_s,
-        all: None,
-        force: None,
-        path: None,
-        no_only_best: None,
-        person: None,
-        service: None,
-        since: None,
-        until: None,
+        ..ControlRequest::new("cert.wait")
     };
 
     let mut stream = match connect_control_socket(socket_path).await {
@@ -815,19 +775,8 @@ pub async fn client_cert_wait(
 /// `setup_complete`).
 pub async fn client_cert_order(socket_path: &Path, json: bool) -> i32 {
     let req = ControlRequest {
-        v: 1,
-        cmd: "cert.order".to_string(),
-        name: None,
-        limit: None,
-        timeout_s: None,
-        all: None,
         force: Some(true),
-        path: None,
-        no_only_best: None,
-        person: None,
-        service: None,
-        since: None,
-        until: None,
+        ..ControlRequest::new("cert.order")
     };
 
     let line = match send_request_and_read_line(socket_path, &req).await {
@@ -836,29 +785,13 @@ pub async fn client_cert_order(socket_path: &Path, json: bool) -> i32 {
     };
 
     let trimmed = line.trim();
-    if json {
-        println!("{trimmed}");
-        let val: serde_json::Value = match serde_json::from_str(trimmed) {
-            Ok(v) => v,
-            Err(_) => return 1,
-        };
-        if val.get("ok") == Some(&serde_json::Value::Bool(false)) {
-            return 1;
-        }
-        return 0;
+    if let Some(code) = json_short_circuit(trimmed, json) {
+        return code;
     }
 
     let resp: RenewResponse = match serde_json::from_str(trimmed) {
         Ok(r) => r,
-        Err(_) => {
-            if let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed) {
-                let err = val.get("error").and_then(|e| e.as_str()).unwrap_or(trimmed);
-                eprintln!("{} {err}", "✗ Error:".red().bold());
-            } else {
-                eprintln!("{} {trimmed}", "✗ Error:".red().bold());
-            }
-            return 1;
-        }
+        Err(_) => return response_error(trimmed),
     };
 
     if !resp.ok {
@@ -876,19 +809,8 @@ pub async fn client_cert_order(socket_path: &Path, json: bool) -> i32 {
 /// own clean confirmation instead of the control client's JSON envelope.
 pub async fn client_cert_order_quiet(socket_path: &Path) -> i32 {
     let req = ControlRequest {
-        v: 1,
-        cmd: "cert.order".to_string(),
-        name: None,
-        limit: None,
-        timeout_s: None,
-        all: None,
         force: Some(true),
-        path: None,
-        no_only_best: None,
-        person: None,
-        service: None,
-        since: None,
-        until: None,
+        ..ControlRequest::new("cert.order")
     };
 
     let line = match send_request_and_read_line(socket_path, &req).await {
@@ -922,19 +844,10 @@ pub async fn client_cert_renew(
     json: bool,
 ) -> i32 {
     let req = ControlRequest {
-        v: 1,
-        cmd: "cert.renew".to_string(),
         name,
-        limit: None,
-        timeout_s: None,
         all: if all { Some(true) } else { None },
         force: if force { Some(true) } else { None },
-        path: None,
-        no_only_best: None,
-        person: None,
-        service: None,
-        since: None,
-        until: None,
+        ..ControlRequest::new("cert.renew")
     };
 
     let line = match send_request_and_read_line(socket_path, &req).await {
@@ -968,15 +881,7 @@ pub async fn client_cert_renew(
 
     let resp: RenewResponse = match serde_json::from_str(trimmed) {
         Ok(r) => r,
-        Err(_) => {
-            if let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed) {
-                let err = val.get("error").and_then(|e| e.as_str()).unwrap_or(trimmed);
-                eprintln!("{} {err}", "✗ Error:".red().bold());
-            } else {
-                eprintln!("{} {trimmed}", "✗ Error:".red().bold());
-            }
-            return 1;
-        }
+        Err(_) => return response_error(trimmed),
     };
 
     if !resp.ok {
@@ -1019,19 +924,8 @@ pub async fn client_cert_renew(
 /// Executes the `weaver-server backup <PATH>` CLI command.
 pub async fn client_backup(socket_path: &Path, path: String, json: bool) -> i32 {
     let req = ControlRequest {
-        v: 1,
-        cmd: "backup".to_string(),
-        name: None,
-        limit: None,
-        timeout_s: None,
-        all: None,
-        force: None,
         path: Some(path),
-        no_only_best: None,
-        person: None,
-        service: None,
-        since: None,
-        until: None,
+        ..ControlRequest::new("backup")
     };
 
     let line = match send_request_and_read_line(socket_path, &req).await {
@@ -1040,29 +934,13 @@ pub async fn client_backup(socket_path: &Path, path: String, json: bool) -> i32 
     };
 
     let trimmed = line.trim();
-    if json {
-        println!("{trimmed}");
-        let val: serde_json::Value = match serde_json::from_str(trimmed) {
-            Ok(v) => v,
-            Err(_) => return 1,
-        };
-        if val.get("ok") == Some(&serde_json::Value::Bool(false)) {
-            return 1;
-        }
-        return 0;
+    if let Some(code) = json_short_circuit(trimmed, json) {
+        return code;
     }
 
     let resp: BackupResponse = match serde_json::from_str(trimmed) {
         Ok(r) => r,
-        Err(_) => {
-            if let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed) {
-                let err = val.get("error").and_then(|e| e.as_str()).unwrap_or(trimmed);
-                eprintln!("{} {err}", "✗ Error:".red().bold());
-            } else {
-                eprintln!("{} {trimmed}", "✗ Error:".red().bold());
-            }
-            return 1;
-        }
+        Err(_) => return response_error(trimmed),
     };
 
     if !resp.ok {
@@ -1084,19 +962,7 @@ pub async fn client_backup(socket_path: &Path, path: String, json: bool) -> i32 
 /// Executes the `weaver-server shutdown` CLI command.
 pub async fn client_shutdown(socket_path: &Path, json: bool) -> i32 {
     let req = ControlRequest {
-        v: 1,
-        cmd: "shutdown".to_string(),
-        name: None,
-        limit: None,
-        timeout_s: None,
-        all: None,
-        force: None,
-        path: None,
-        no_only_best: None,
-        person: None,
-        service: None,
-        since: None,
-        until: None,
+        ..ControlRequest::new("shutdown")
     };
 
     let line = match send_request_and_read_line(socket_path, &req).await {
@@ -1105,16 +971,8 @@ pub async fn client_shutdown(socket_path: &Path, json: bool) -> i32 {
     };
 
     let trimmed = line.trim();
-    if json {
-        println!("{trimmed}");
-        let val: serde_json::Value = match serde_json::from_str(trimmed) {
-            Ok(v) => v,
-            Err(_) => return 1,
-        };
-        if val.get("ok") == Some(&serde_json::Value::Bool(false)) {
-            return 1;
-        }
-        return 0;
+    if let Some(code) = json_short_circuit(trimmed, json) {
+        return code;
     }
 
     println!("{} Server shutdown initiated", "✓".yellow().bold());
@@ -1140,19 +998,11 @@ pub async fn client_usage(
     json: bool,
 ) -> i32 {
     let req = ControlRequest {
-        v: 1,
-        cmd: "usage".to_string(),
-        name: None,
-        limit: None,
-        timeout_s: None,
-        all: None,
-        force: None,
-        path: None,
-        no_only_best: None,
         person,
         service,
         since: Some(since),
         until: Some(until),
+        ..ControlRequest::new("usage")
     };
 
     let line = match send_request_and_read_line(socket_path, &req).await {
@@ -1161,29 +1011,13 @@ pub async fn client_usage(
     };
 
     let trimmed = line.trim();
-    if json {
-        println!("{trimmed}");
-        let val: serde_json::Value = match serde_json::from_str(trimmed) {
-            Ok(v) => v,
-            Err(_) => return 1,
-        };
-        if val.get("ok") == Some(&serde_json::Value::Bool(false)) {
-            return 1;
-        }
-        return 0;
+    if let Some(code) = json_short_circuit(trimmed, json) {
+        return code;
     }
 
     let resp: UsageResponse = match serde_json::from_str(trimmed) {
         Ok(r) => r,
-        Err(_) => {
-            if let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed) {
-                let err = val.get("error").and_then(|e| e.as_str()).unwrap_or(trimmed);
-                eprintln!("{} {err}", "✗ Error:".red().bold());
-            } else {
-                eprintln!("{} {trimmed}", "✗ Error:".red().bold());
-            }
-            return 1;
-        }
+        Err(_) => return response_error(trimmed),
     };
 
     if !resp.ok {
@@ -1258,19 +1092,7 @@ fn format_ratio(visitor: i64, tunnel: i64) -> String {
 /// nonzero when any check failed.
 pub async fn client_doctor(socket_path: &Path, json: bool) -> i32 {
     let req = ControlRequest {
-        v: 1,
-        cmd: "doctor".to_string(),
-        name: None,
-        limit: None,
-        timeout_s: None,
-        all: None,
-        force: None,
-        path: None,
-        no_only_best: None,
-        person: None,
-        service: None,
-        since: None,
-        until: None,
+        ..ControlRequest::new("doctor")
     };
 
     let line = match send_request_and_read_line(socket_path, &req).await {
@@ -1281,15 +1103,7 @@ pub async fn client_doctor(socket_path: &Path, json: bool) -> i32 {
     let trimmed = line.trim();
     let report: crate::setup::doctor::DoctorReport = match serde_json::from_str(trimmed) {
         Ok(report) => report,
-        Err(_) => {
-            if let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed) {
-                let err = val.get("error").and_then(|e| e.as_str()).unwrap_or(trimmed);
-                eprintln!("{} {err}", "✗ Error:".red().bold());
-            } else {
-                eprintln!("{} {trimmed}", "✗ Error:".red().bold());
-            }
-            return 1;
-        }
+        Err(_) => return response_error(trimmed),
     };
 
     if json {

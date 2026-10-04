@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
@@ -262,6 +262,26 @@ async fn certificate_health_checks(
     checks
 }
 
+/// Serializes `resp` and writes it as a single newline-terminated JSON line.
+///
+/// The control protocol is one response line per request; every branch of
+/// [`handle_connection`] used to spell out the serialize/push/write/flush
+/// sequence by hand.
+async fn reply<W, T>(
+    writer: &mut W,
+    resp: &T,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+where
+    W: tokio::io::AsyncWriteExt + Unpin,
+    T: serde::Serialize,
+{
+    let mut data = serde_json::to_vec(resp)?;
+    data.push(b'\n');
+    writer.write_all(&data).await?;
+    writer.flush().await?;
+    Ok(())
+}
+
 /// Handles a single control socket connection: reads one JSON request, dispatches it, and writes response.
 async fn handle_connection(
     mut stream: UnixStream,
@@ -291,10 +311,7 @@ async fn handle_connection(
         Ok(v) => v,
         Err(_) => {
             let resp = ErrorResponse::new("Malformed JSON request");
-            let mut data = serde_json::to_vec(&resp)?;
-            data.push(b'\n');
-            writer.write_all(&data).await?;
-            writer.flush().await?;
+            reply(&mut writer, &resp).await?;
             return Ok(());
         }
     };
@@ -303,10 +320,7 @@ async fn handle_connection(
     let v = val.get("v").and_then(|v| v.as_u64());
     if v != Some(1) {
         let resp = ErrorResponse::new("Unsupported protocol version: expected 1");
-        let mut data = serde_json::to_vec(&resp)?;
-        data.push(b'\n');
-        writer.write_all(&data).await?;
-        writer.flush().await?;
+        reply(&mut writer, &resp).await?;
         return Ok(());
     }
 
@@ -314,10 +328,7 @@ async fn handle_connection(
         Some(c) => c,
         None => {
             let resp = ErrorResponse::new("Missing or invalid 'cmd' field");
-            let mut data = serde_json::to_vec(&resp)?;
-            data.push(b'\n');
-            writer.write_all(&data).await?;
-            writer.flush().await?;
+            reply(&mut writer, &resp).await?;
             return Ok(());
         }
     };
@@ -337,10 +348,7 @@ async fn handle_connection(
 
     if !ALLOWED_VERBS.contains(&cmd) {
         let resp = ErrorResponse::new(format!("Unknown command '{cmd}'"));
-        let mut data = serde_json::to_vec(&resp)?;
-        data.push(b'\n');
-        writer.write_all(&data).await?;
-        writer.flush().await?;
+        reply(&mut writer, &resp).await?;
         return Ok(());
     }
 
@@ -348,10 +356,7 @@ async fn handle_connection(
         Ok(r) => r,
         Err(err) => {
             let resp = ErrorResponse::new(format!("Invalid request format: {err}"));
-            let mut data = serde_json::to_vec(&resp)?;
-            data.push(b'\n');
-            writer.write_all(&data).await?;
-            writer.flush().await?;
+            reply(&mut writer, &resp).await?;
             return Ok(());
         }
     };
@@ -396,10 +401,7 @@ async fn handle_connection(
                 control_socket: config.control_socket.display().to_string(),
             };
 
-            let mut data = serde_json::to_vec(&resp)?;
-            data.push(b'\n');
-            writer.write_all(&data).await?;
-            writer.flush().await?;
+            reply(&mut writer, &resp).await?;
         }
         "cert.status" => {
             let root_domain = config.root_domain.to_ascii_lowercase();
@@ -576,10 +578,7 @@ async fn handle_connection(
                         ok: true,
                         certificates: summaries,
                     };
-                    let mut data = serde_json::to_vec(&resp)?;
-                    data.push(b'\n');
-                    writer.write_all(&data).await?;
-                    writer.flush().await?;
+                    reply(&mut writer, &resp).await?;
                 }
                 Some(name) => {
                     let cert_rec = if let Ok(cert_id) = name.parse::<i32>() {
@@ -605,10 +604,7 @@ async fn handle_connection(
 
                     if target != root_domain && cert_rec.is_none() && !in_states {
                         let resp = ErrorResponse::new(format!("Certificate '{name}' not found"));
-                        let mut data = serde_json::to_vec(&resp)?;
-                        data.push(b'\n');
-                        writer.write_all(&data).await?;
-                        writer.flush().await?;
+                        reply(&mut writer, &resp).await?;
                         return Ok(());
                     }
 
@@ -660,10 +656,7 @@ async fn handle_connection(
                         validation,
                         wildcard,
                     };
-                    let mut data = serde_json::to_vec(&resp)?;
-                    data.push(b'\n');
-                    writer.write_all(&data).await?;
-                    writer.flush().await?;
+                    reply(&mut writer, &resp).await?;
                 }
             }
         }
@@ -688,10 +681,7 @@ async fn handle_connection(
                 let resp = ErrorResponse::new(format!(
                     "Hostname '{target}' not found in certificate store"
                 ));
-                let mut data = serde_json::to_vec(&resp)?;
-                data.push(b'\n');
-                writer.write_all(&data).await?;
-                writer.flush().await?;
+                reply(&mut writer, &resp).await?;
                 return Ok(());
             }
 
@@ -711,10 +701,7 @@ async fn handle_connection(
                     _ => None,
                 },
             };
-            let mut data = serde_json::to_vec(&init_event)?;
-            data.push(b'\n');
-            writer.write_all(&data).await?;
-            writer.flush().await?;
+            reply(&mut writer, &init_event).await?;
 
             // If initial state is already terminal, finish immediately
             if matches!(
@@ -730,10 +717,7 @@ async fn handle_connection(
                 if elapsed >= timeout_dur {
                     let resp =
                         ErrorResponse::new("Timed out waiting for certificate state transition");
-                    let mut data = serde_json::to_vec(&resp)?;
-                    data.push(b'\n');
-                    writer.write_all(&data).await?;
-                    writer.flush().await?;
+                    reply(&mut writer, &resp).await?;
                     break;
                 }
 
@@ -751,10 +735,7 @@ async fn handle_connection(
                                     _ => None,
                                 },
                             };
-                            let mut data = serde_json::to_vec(&event)?;
-                            data.push(b'\n');
-                            writer.write_all(&data).await?;
-                            writer.flush().await?;
+                            reply(&mut writer, &event).await?;
 
                             if matches!(state, CertState::Issued { .. } | CertState::Failed { .. })
                             {
@@ -770,10 +751,7 @@ async fn handle_connection(
                         let resp = ErrorResponse::new(
                             "Timed out waiting for certificate state transition",
                         );
-                        let mut data = serde_json::to_vec(&resp)?;
-                        data.push(b'\n');
-                        writer.write_all(&data).await?;
-                        writer.flush().await?;
+                        reply(&mut writer, &resp).await?;
                         break;
                     }
                 }
@@ -786,17 +764,11 @@ async fn handle_connection(
             // tunnel wildcard (DNS-01) and the admin certificate (HTTP-01).
             match cert_manager.renew_all(true).await {
                 Ok(resp) => {
-                    let mut data = serde_json::to_vec(&resp)?;
-                    data.push(b'\n');
-                    writer.write_all(&data).await?;
-                    writer.flush().await?;
+                    reply(&mut writer, &resp).await?;
                 }
                 Err(err) => {
                     let resp = ErrorResponse::new(err.to_string());
-                    let mut data = serde_json::to_vec(&resp)?;
-                    data.push(b'\n');
-                    writer.write_all(&data).await?;
-                    writer.flush().await?;
+                    reply(&mut writer, &resp).await?;
                 }
             }
         }
@@ -805,17 +777,11 @@ async fn handle_connection(
             if req.all == Some(true) {
                 match cert_manager.renew_all(force).await {
                     Ok(resp) => {
-                        let mut data = serde_json::to_vec(&resp)?;
-                        data.push(b'\n');
-                        writer.write_all(&data).await?;
-                        writer.flush().await?;
+                        reply(&mut writer, &resp).await?;
                     }
                     Err(err) => {
                         let resp = ErrorResponse::new(err.to_string());
-                        let mut data = serde_json::to_vec(&resp)?;
-                        data.push(b'\n');
-                        writer.write_all(&data).await?;
-                        writer.flush().await?;
+                        reply(&mut writer, &resp).await?;
                     }
                 }
             } else {
@@ -833,17 +799,11 @@ async fn handle_connection(
                             status: "queued".to_string(),
                             skipped_inactive: Vec::new(),
                         };
-                        let mut data = serde_json::to_vec(&resp)?;
-                        data.push(b'\n');
-                        writer.write_all(&data).await?;
-                        writer.flush().await?;
+                        reply(&mut writer, &resp).await?;
                     }
                     Err(err) => {
                         let resp = ErrorResponse::new(err.to_string());
-                        let mut data = serde_json::to_vec(&resp)?;
-                        data.push(b'\n');
-                        writer.write_all(&data).await?;
-                        writer.flush().await?;
+                        reply(&mut writer, &resp).await?;
                     }
                 }
             }
@@ -854,10 +814,7 @@ async fn handle_connection(
             let until_secs = req.until.unwrap_or(i64::MAX);
             if since_secs >= until_secs {
                 let resp = ErrorResponse::new("'since' must be before 'until'");
-                let mut data = serde_json::to_vec(&resp)?;
-                data.push(b'\n');
-                writer.write_all(&data).await?;
-                writer.flush().await?;
+                reply(&mut writer, &resp).await?;
                 return Ok(());
             }
             match metering
@@ -887,17 +844,11 @@ async fn handle_connection(
                         })
                         .collect();
                     let resp = UsageResponse { ok: true, services };
-                    let mut data = serde_json::to_vec(&resp)?;
-                    data.push(b'\n');
-                    writer.write_all(&data).await?;
-                    writer.flush().await?;
+                    reply(&mut writer, &resp).await?;
                 }
                 Err(err) => {
                     let resp = ErrorResponse::new(format!("Usage query failed: {err}"));
-                    let mut data = serde_json::to_vec(&resp)?;
-                    data.push(b'\n');
-                    writer.write_all(&data).await?;
-                    writer.flush().await?;
+                    reply(&mut writer, &resp).await?;
                 }
             }
         }
@@ -906,10 +857,7 @@ async fn handle_connection(
                 Some(p) => p,
                 None => {
                     let resp = ErrorResponse::new("Missing target backup path");
-                    let mut data = serde_json::to_vec(&resp)?;
-                    data.push(b'\n');
-                    writer.write_all(&data).await?;
-                    writer.flush().await?;
+                    reply(&mut writer, &resp).await?;
                     return Ok(());
                 }
             };
@@ -925,17 +873,11 @@ async fn handle_connection(
                         path: path_str,
                         size,
                     };
-                    let mut data = serde_json::to_vec(&resp)?;
-                    data.push(b'\n');
-                    writer.write_all(&data).await?;
-                    writer.flush().await?;
+                    reply(&mut writer, &resp).await?;
                 }
                 Err(err) => {
                     let resp = ErrorResponse::new(format!("Backup failed: {err}"));
-                    let mut data = serde_json::to_vec(&resp)?;
-                    data.push(b'\n');
-                    writer.write_all(&data).await?;
-                    writer.flush().await?;
+                    reply(&mut writer, &resp).await?;
                 }
             }
         }
@@ -943,20 +885,14 @@ async fn handle_connection(
             // The daemon owns 80/443/53, so it self-connects instead of
             // binding; certificate health comes from the store + manager.
             let report = build_doctor_report(&config, &store, &cert_manager).await;
-            let mut data = serde_json::to_vec(&report)?;
-            data.push(b'\n');
-            writer.write_all(&data).await?;
-            writer.flush().await?;
+            reply(&mut writer, &report).await?;
         }
         "shutdown" => {
             let resp = ShutdownResponse {
                 ok: true,
                 message: "Server shutting down".to_string(),
             };
-            let mut data = serde_json::to_vec(&resp)?;
-            data.push(b'\n');
-            writer.write_all(&data).await?;
-            writer.flush().await?;
+            reply(&mut writer, &resp).await?;
 
             info!("Control socket received shutdown command, triggering graceful daemon stop");
             shutdown_token.cancel();

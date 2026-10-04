@@ -63,6 +63,29 @@ impl ErrorResponse {
     }
 }
 
+impl ControlRequest {
+    /// Builds a request for `cmd` with protocol `v: 1` and every optional field
+    /// unset. Callers override only the fields they need with struct-update
+    /// syntax, so a new field added here needs no change at the call sites.
+    pub fn new(cmd: impl Into<String>) -> Self {
+        Self {
+            v: 1,
+            cmd: cmd.into(),
+            name: None,
+            limit: None,
+            timeout_s: None,
+            all: None,
+            force: None,
+            path: None,
+            no_only_best: None,
+            person: None,
+            service: None,
+            since: None,
+            until: None,
+        }
+    }
+}
+
 /// Bound listener socket information.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ListenersInfo {
