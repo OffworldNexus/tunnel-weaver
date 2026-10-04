@@ -10,6 +10,7 @@ fn base_probe() -> SystemProbe {
         systemd_present: true,
         supported_arch: true,
         target_domain: "example.com".into(),
+        admin_domain: "relay-admin.test".into(),
         existing_install: None,
         root_ips: vec![IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))],
         probe_ips: vec![IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))],
@@ -68,6 +69,17 @@ fn test_unsupported_arch_aborts() {
         err.to_string(),
         "unsupported target platform: Linux x86_64 or aarch64 required"
     );
+}
+
+#[test]
+fn test_unsafe_admin_tunnel_split_aborts() {
+    let mut probe = base_probe();
+    // Admin under the delegated tunnel zone would put the relay's own DNS under
+    // the zone it is meant to control.
+    probe.admin_domain = "relay.example.com".into();
+    let err = plan_setup(&probe).unwrap_err();
+    assert!(matches!(err, PlanAbort::UnsafeDomainSplit(_)));
+    assert!(err.to_string().contains("subdomain"));
 }
 
 #[test]

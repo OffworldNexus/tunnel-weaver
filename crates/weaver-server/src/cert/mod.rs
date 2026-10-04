@@ -6,6 +6,7 @@ pub mod events;
 pub mod providers;
 pub mod renewal;
 pub mod resolver;
+pub mod solver;
 pub mod state;
 
 use std::collections::{HashMap, HashSet};
@@ -55,20 +56,23 @@ use crate::config::Config;
 use crate::notify::notify_cert_status;
 use crate::store::Store;
 
-/// High-level certificate manager daemon for the single wildcard certificate.
+/// High-level certificate manager daemon for the relay's managed certificates.
 ///
 /// Coordinates:
-/// - Eager initial issuance of `[<root>, *.<root>]` at startup
-/// - Waiting for that certificate during service registration (`ensure`)
+/// - Eager initial issuance of the tunnel wildcard `[<root>, *.<root>]`
+///   (DNS-01) and the single-name admin certificate (HTTP-01)
+/// - Waiting for the covering certificate during service registration (`ensure`)
 /// - Deduplication of concurrent waiters
 /// - Certificate state tracking (`Pending`, `Ordering`, `Issued`, `Failed`, `Renewing`)
-/// - Systemd status mirroring for the root domain
+/// - Systemd status mirroring for the tunnel domain
 /// - Background renewal loop (every 12 hours) with exponential backoff on failure
 ///
-/// Unlike the old per-name model there is exactly one certificate; a renewal
-/// swaps it in atomically, and a failure near expiry takes every tunnel down
+/// The tunnel wildcard covers every tunnel hostname, so a wildcard renewal
+/// swaps it in atomically and a failure near expiry takes every tunnel down
 /// with it. That blast radius is the deliberate cost of keeping service names
 /// out of Certificate Transparency, and is what the WARN/ERROR alerts target.
+/// The admin certificate is independent: its failure affects only the relay's
+/// own endpoint.
 pub struct CertManager {
     config: Arc<Config>,
     store: Arc<Store>,
@@ -122,23 +126,46 @@ impl CertManager {
         self.config.root_domain.to_ascii_lowercase()
     }
 
-    /// Initializes the cached wildcard certificate from the store and marks
-    /// handshakes as held if none is valid.
+    /// The admin certificate name (the relay's own hostname), lowercased.
+    fn admin_name(&self) -> String {
+        self.config.admin_domain.to_ascii_lowercase()
+    }
+
+    /// Resolves a hostname to the certificate name that covers it.
+    ///
+    /// The admin certificate covers exactly the admin domain; the tunnel
+    /// wildcard covers the apex and exactly one label beneath it. Returns
+    /// `None` for hostnames no managed certificate covers.
+    pub fn cert_name_for(&self, host: &str) -> Option<String> {
+        let host = host.to_ascii_lowercase();
+        let admin = self.admin_name();
+        let root = self.root_name();
+        if host == admin {
+            return Some(admin);
+        }
+        if host == root {
+            return Some(root);
+        }
+        let suffix = format!(".{root}");
+        let label = host.strip_suffix(&suffix)?;
+        if label.is_empty() || label.contains('.') {
+            return None;
+        }
+        Some(root)
+    }
+
+    /// Initializes the cached certificates from the store and marks handshakes
+    /// as held for any managed certificate without a valid row.
     pub async fn init(self: &Arc<Self>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let admin = self.admin_name();
         let root = self.root_name();
 
         let certs = self.store.list_best_certificates_full().await?;
         let now = self.clock.now_unix();
-        let mut root_valid = false;
+        let mut valid: HashSet<String> = HashSet::new();
 
         for cert in certs {
             let lower = cert.name.to_ascii_lowercase();
-            if lower != root {
-                // Legacy or foreign rows cannot be served: the resolver only
-                // maps SNI onto the apex and its wildcard.
-                continue;
-            }
-
             if cert.not_after > now {
                 match parse_certified_key(&cert.cert_pem, &cert.key_pem) {
                     Ok(certified_key) => {
@@ -153,11 +180,11 @@ impl CertManager {
                                 not_after: cert.not_after,
                             },
                         );
-                        root_valid = true;
+                        valid.insert(lower.clone());
                         info!(
                             hostname = %lower,
                             expires_at = %format_unix_timestamp(cert.not_after),
-                            "Loaded valid wildcard TLS certificate from database"
+                            "Loaded valid TLS certificate from database"
                         );
                     }
                     Err(err) => {
@@ -169,53 +196,62 @@ impl CertManager {
             }
         }
 
-        if !root_valid {
-            info!(
-                root_domain = %root,
-                "No valid cached wildcard certificate found; holding incoming handshakes while initiating eager ACME issuance"
-            );
-            self.set_state(&root, CertState::Pending);
-            self.resolver.mark_ordering(&root);
+        for name in [&admin, &root] {
+            if !valid.contains(name) {
+                info!(
+                    hostname = %name,
+                    "No valid cached certificate found; holding incoming handshakes while initiating eager ACME issuance"
+                );
+                self.set_state(name, CertState::Pending);
+                self.resolver.mark_ordering(name);
+            }
         }
 
         Ok(())
     }
 
-    /// Spawns background eager issuance for the wildcard if it is `Pending`.
+    /// Spawns background eager issuance for any managed certificate that is
+    /// still `Pending` (fresh install, or a cache miss after an outage).
     pub fn spawn_eager_order_if_pending(self: &Arc<Self>) {
-        let root = self.root_name();
-        let is_pending = {
-            let states = self.states.read().unwrap();
-            matches!(states.get(&root), Some(CertState::Pending))
-        };
+        for name in [self.root_name(), self.admin_name()] {
+            let is_pending = {
+                let states = self.states.read().unwrap();
+                matches!(states.get(&name), Some(CertState::Pending))
+            };
 
-        if is_pending {
-            let manager = Arc::clone(self);
-            tokio::spawn(async move {
-                debug!(root_domain = %root, "Spawning eager wildcard ACME order");
-                if let Err(err) = manager.ensure(&root).await {
-                    warn!(root_domain = %root, error = %err, "Initial wildcard issuance failed");
-                }
-            });
+            if is_pending {
+                let manager = Arc::clone(self);
+                tokio::spawn(async move {
+                    debug!(hostname = %name, "Spawning eager ACME order");
+                    if let Err(err) = manager.ensure(&name).await {
+                        warn!(hostname = %name, error = %err, "Initial ACME issuance failed");
+                    }
+                });
+            }
         }
     }
 
-    /// Waits (bounded) for the wildcard certificate to be valid.
+    /// Waits (bounded) for the certificate covering `name` to be valid.
     ///
-    /// Any hostname under the root is covered by the same certificate, so this
-    /// resolves `name` to the apex and either returns immediately or joins the
-    /// in-flight order.
+    /// `name` is resolved to its covering certificate — the admin name exactly,
+    /// or the tunnel apex for any flat tunnel hostname — and the caller either
+    /// returns immediately or joins that certificate's in-flight order.
     pub async fn ensure(self: &Arc<Self>, name: &str) -> Result<(), AcmeError> {
-        let root = self.root_name();
+        let Some(cert_name) = self.cert_name_for(name) else {
+            return Err(AcmeError::Other(format!(
+                "Hostname '{name}' is not covered by a managed certificate"
+            )));
+        };
+
         // Keep the display-only activity set truthful even though it no longer
         // affects renewal.
-        self.set_active(&root, true);
-        if !name.eq_ignore_ascii_case(&root) {
+        self.set_active(&cert_name, true);
+        if !name.eq_ignore_ascii_case(&cert_name) {
             self.set_active(name, true);
         }
 
         if let Some(CertState::Issued { not_after }) =
-            self.states.read().unwrap().get(&root).cloned()
+            self.states.read().unwrap().get(&cert_name).cloned()
             && not_after > self.clock.now_unix()
         {
             return Ok(());
@@ -223,13 +259,13 @@ impl CertManager {
 
         let mut rx = {
             let mut in_flight = self.in_flight.lock().await;
-            if let Some(tx) = in_flight.get(&root) {
+            if let Some(tx) = in_flight.get(&cert_name) {
                 tx.subscribe()
             } else {
                 let (tx, _) = broadcast::channel(1);
-                in_flight.insert(root.clone(), tx);
+                in_flight.insert(cert_name.clone(), tx);
                 drop(in_flight);
-                return self.execute_issuance(root).await;
+                return self.execute_issuance(cert_name).await;
             }
         };
 
@@ -238,21 +274,80 @@ impl CertManager {
             Ok(Ok(Err(err))) => Err(AcmeError::Other(err)),
             Ok(Err(_)) => Err(AcmeError::Other("In-flight order channel closed".into())),
             Err(_) => Err(AcmeError::Other(
-                "Timed out waiting for the wildcard certificate".into(),
+                "Timed out waiting for the certificate".into(),
             )),
         }
     }
 
-    /// Internal execution of the single wildcard ACME order.
-    async fn execute_issuance(self: &Arc<Self>, root: String) -> Result<(), AcmeError> {
+    /// Records a visitor touch for `host` and kicks issuance when the covering
+    /// certificate is missing or inside its renewal window.
+    ///
+    /// Called from the HTTPS edge on the request path, so it must never block
+    /// the visitor: all work runs in a spawned task. Rate limiting reuses the
+    /// existing `CertState::Failed` backoff and [`ensure`](Self::ensure)'s
+    /// in-flight dedup, so a trickle of visits cannot stampede the CA. The 12 h
+    /// loop remains the floor; this only shortens the worst case after an outage
+    /// or an early-expiry scare.
+    pub fn note_visit(self: &Arc<Self>, host: &str) {
+        let Some(cert_name) = self.cert_name_for(host) else {
+            return;
+        };
+        let manager = Arc::clone(self);
+        let host = host.to_ascii_lowercase();
+        tokio::spawn(async move {
+            let now = manager.clock.now_unix();
+            let _ = record_cert_event(&manager.store, &cert_name, now, "visit", Some(&host)).await;
+
+            match manager.status(&cert_name) {
+                // A live order already covers this host.
+                CertState::Ordering | CertState::Renewing { .. } => {}
+                // Respect the backoff before retrying a failed order.
+                CertState::Failed { next_retry, .. } => {
+                    if now >= next_retry
+                        && let Err(err) = manager.ensure(&cert_name).await
+                    {
+                        debug!(hostname = %cert_name, error = %err, "Visitor-triggered issuance did not complete");
+                    }
+                }
+                CertState::Issued { not_after } if not_after <= now => {
+                    if let Err(err) = manager.ensure(&cert_name).await {
+                        debug!(hostname = %cert_name, error = %err, "Visitor-triggered re-issuance did not complete");
+                    }
+                }
+                CertState::Issued { .. } => {
+                    // Valid but possibly inside the renewal window. `ensure`
+                    // would return immediately, so drive an actual renewal.
+                    if let Ok(Some(cert)) = manager.store.get_certificate(&cert_name).await
+                        && should_renew(cert.not_before, cert.not_after, now)
+                        && let Err(err) = manager.renew_hostname(&cert_name, false).await
+                    {
+                        debug!(hostname = %cert_name, error = %err, "Visitor-triggered renewal did not start");
+                    }
+                }
+                CertState::Pending => {
+                    if let Err(err) = manager.ensure(&cert_name).await {
+                        debug!(hostname = %cert_name, error = %err, "Visitor-triggered issuance did not complete");
+                    }
+                }
+            }
+        });
+    }
+
+    /// Internal execution of one certificate's ACME order.
+    ///
+    /// Dispatches on the name: the admin certificate uses HTTP-01, the tunnel
+    /// wildcard uses DNS-01.
+    async fn execute_issuance(self: &Arc<Self>, cert_name: String) -> Result<(), AcmeError> {
+        let is_admin = cert_name == self.admin_name();
+
         let is_renewing = matches!(
-            self.status(&root),
+            self.status(&cert_name),
             CertState::Renewing { not_after } if not_after > self.clock.now_unix()
         );
 
         if !is_renewing {
-            self.set_state(&root, CertState::Ordering);
-            self.resolver.mark_ordering(&root);
+            self.set_state(&cert_name, CertState::Ordering);
+            self.resolver.mark_ordering(&cert_name);
             let _ = notify_cert_status("ordering");
         } else {
             let _ = notify_cert_status("renewing");
@@ -264,9 +359,17 @@ impl CertManager {
             .await
             .map_err(|e| AcmeError::Other(format!("Semaphore error: {e}")))?;
 
-        info!(root_domain = %root, "Initiating wildcard ACME certificate order");
+        info!(
+            hostname = %cert_name,
+            mechanism = if is_admin { "http-01" } else { "dns-01" },
+            "Initiating ACME certificate order"
+        );
 
-        let issue_result = self.acme_engine.issue_wildcard(&root).await;
+        let issue_result = if is_admin {
+            self.acme_engine.issue_admin(&cert_name).await
+        } else {
+            self.acme_engine.issue_wildcard(&cert_name).await
+        };
 
         match issue_result {
             Ok(cert) => {
@@ -276,35 +379,35 @@ impl CertManager {
                 // Atomic swap: the resolver replaces the cached key only when
                 // the new one is at least as new, so live handshakes keep
                 // being served throughout a renewal.
-                self.resolver.insert_cert(&root, certified_key);
+                self.resolver.insert_cert(&cert_name, certified_key);
                 self.set_state(
-                    &root,
+                    &cert_name,
                     CertState::Issued {
                         not_after: cert.not_after,
                     },
                 );
-                self.failure_counts.write().unwrap().remove(&root);
+                self.failure_counts.write().unwrap().remove(&cert_name);
 
                 info!(
-                    root_domain = %root,
+                    hostname = %cert_name,
                     valid_from = %format_unix_timestamp(cert.not_before),
                     valid_until = %format_unix_timestamp(cert.not_after),
-                    "Wildcard certificate issued and active in TLS resolver"
+                    "Certificate issued and active in TLS resolver"
                 );
                 let _ = notify_cert_status("issued");
 
                 let mut in_flight = self.in_flight.lock().await;
-                if let Some(tx) = in_flight.remove(&root) {
+                if let Some(tx) = in_flight.remove(&cert_name) {
                     let _ = tx.send(Ok(()));
                 }
                 Ok(())
             }
             Err(err) => {
-                self.resolver.clear_ordering(&root);
+                self.resolver.clear_ordering(&cert_name);
 
                 let count = {
                     let mut counts = self.failure_counts.write().unwrap();
-                    let c = counts.entry(root.clone()).or_insert(0);
+                    let c = counts.entry(cert_name.clone()).or_insert(0);
                     *c += 1;
                     *c
                 };
@@ -320,7 +423,7 @@ impl CertManager {
                 let next_retry = self.clock.now_unix() + backoff.as_secs() as i64;
 
                 self.set_state(
-                    &root,
+                    &cert_name,
                     CertState::Failed {
                         error: err.to_string(),
                         next_retry,
@@ -329,15 +432,15 @@ impl CertManager {
                 let _ = notify_cert_status("failed");
 
                 error!(
-                    root_domain = %root,
+                    hostname = %cert_name,
                     error = %err,
                     retry_at = %format_unix_timestamp(next_retry),
-                    "Wildcard certificate issuance failed; all tunnels will be without a valid certificate until it succeeds"
+                    "Certificate issuance failed; affected hostnames will be without a valid certificate until it succeeds"
                 );
 
                 let _ = record_cert_event(
                     &self.store,
-                    &root,
+                    &cert_name,
                     self.clock.now_unix(),
                     "failed",
                     Some(&err.to_string()),
@@ -345,7 +448,7 @@ impl CertManager {
                 .await;
 
                 let mut in_flight = self.in_flight.lock().await;
-                if let Some(tx) = in_flight.remove(&root) {
+                if let Some(tx) = in_flight.remove(&cert_name) {
                     let _ = tx.send(Err(err.to_string()));
                 }
 
@@ -380,17 +483,17 @@ impl CertManager {
         self.active_hosts.read().unwrap().contains(&lower)
     }
 
-    /// Retrieves the current certificate state for a hostname.
+    /// Retrieves the current certificate state for a hostname, resolving it to
+    /// the certificate that covers it (so a flat tunnel hostname reports the
+    /// state of the tunnel wildcard).
     pub fn status(&self, name: &str) -> CertState {
-        let lower = if name.eq_ignore_ascii_case(&self.root_name()) {
-            self.root_name()
-        } else {
-            name.to_ascii_lowercase()
-        };
+        let key = self
+            .cert_name_for(name)
+            .unwrap_or_else(|| name.to_ascii_lowercase());
         self.states
             .read()
             .unwrap()
-            .get(&lower)
+            .get(&key)
             .cloned()
             .unwrap_or(CertState::Pending)
     }
@@ -410,41 +513,46 @@ impl CertManager {
         self.state_change_tx.subscribe()
     }
 
-    /// Certificate counts for the control surface, over the single wildcard.
+    /// Certificate counts for the control surface, over both managed
+    /// certificates (tunnel wildcard and admin).
     pub async fn cert_counts(&self) -> crate::control::protocol::CertCounts {
-        let root = self.root_name();
         let mut counts = crate::control::protocol::CertCounts::default();
 
-        if self.is_active(&root) {
-            match self.status(&root) {
-                CertState::Issued { .. } | CertState::Renewing { .. } => counts.issued += 1,
-                CertState::Ordering | CertState::Pending => counts.ordering += 1,
-                CertState::Failed { .. } => counts.failed += 1,
+        for name in [self.root_name(), self.admin_name()] {
+            if self.is_active(&name) {
+                match self.status(&name) {
+                    CertState::Issued { .. } | CertState::Renewing { .. } => counts.issued += 1,
+                    CertState::Ordering | CertState::Pending => counts.ordering += 1,
+                    CertState::Failed { .. } => counts.failed += 1,
+                }
+            } else {
+                counts.inactive += 1;
             }
-        } else {
-            counts.inactive += 1;
         }
 
         counts
     }
 
-    /// Manually triggers renewal of the wildcard certificate.
+    /// Manually triggers renewal of the certificate covering `name`.
     ///
-    /// Any hostname is accepted and mapped to the apex; the wildcard covers
-    /// them all. Respects the backoff and in-flight cap unless `force`.
+    /// Any hostname is mapped to its covering certificate (admin exact, tunnel
+    /// apex for a flat name). Respects the backoff and in-flight cap unless
+    /// `force`.
     pub async fn renew_hostname(
         self: &Arc<Self>,
-        _name: &str,
+        name: &str,
         force: bool,
     ) -> Result<(), RenewError> {
-        let root = self.root_name();
+        let Some(cert_name) = self.cert_name_for(name) else {
+            return Err(RenewError::NotFound(name.to_string()));
+        };
 
         if !force {
-            if let CertState::Failed { next_retry, .. } = self.status(&root) {
+            if let CertState::Failed { next_retry, .. } = self.status(&cert_name) {
                 let now = self.clock.now_unix();
                 if now < next_retry {
                     return Err(RenewError::RateLimited {
-                        name: root,
+                        name: cert_name,
                         retry_at: next_retry,
                     });
                 }
@@ -455,38 +563,40 @@ impl CertManager {
             }
         }
 
-        let not_after = match self.status(&root) {
+        let not_after = match self.status(&cert_name) {
             CertState::Issued { not_after } | CertState::Renewing { not_after } => not_after,
             _ => 0,
         };
 
         if not_after > 0 {
-            self.set_state(&root, CertState::Renewing { not_after });
+            self.set_state(&cert_name, CertState::Renewing { not_after });
         } else {
-            self.set_state(&root, CertState::Ordering);
+            self.set_state(&cert_name, CertState::Ordering);
         }
 
         let mgr = Arc::clone(self);
-        let target = root.clone();
+        let target = cert_name.clone();
         tokio::spawn(async move {
             if let Err(err) = mgr.execute_issuance(target.clone()).await {
-                warn!(root_domain = %target, error = %err, "Manual wildcard renewal failed");
+                warn!(hostname = %target, error = %err, "Manual certificate renewal failed");
             }
         });
 
         Ok(())
     }
 
-    /// Triggers renewal of the wildcard certificate.
+    /// Triggers renewal of both managed certificates.
     pub async fn renew_all(
         self: &Arc<Self>,
         force: bool,
     ) -> Result<crate::control::protocol::RenewResponse, RenewError> {
-        let root = self.root_name();
-        self.renew_hostname(&root, force).await?;
+        let names = [self.admin_name(), self.root_name()];
+        for name in &names {
+            self.renew_hostname(name, force).await?;
+        }
         Ok(crate::control::protocol::RenewResponse {
             ok: true,
-            renewed: vec![root],
+            renewed: names.to_vec(),
             status: "queued".to_string(),
             skipped_inactive: Vec::new(),
         })
@@ -503,64 +613,76 @@ impl CertManager {
         self.status(&root).label()
     }
 
-    /// Renews the wildcard if it is within the renewal window (< 1/3 lifetime).
+    /// Renews either managed certificate if it is within the renewal window
+    /// (< 1/3 lifetime).
     ///
     /// There is no active-host gating: an idle relay must still hold a valid
-    /// wildcard so a tunnel can be served the moment it registers.
+    /// wildcard (and admin certificate) so a tunnel can be served the moment it
+    /// registers.
     pub async fn renew_eligible(self: &Arc<Self>) -> Vec<Result<String, String>> {
-        let root = self.root_name();
         let now = self.clock.now_unix();
+        let mut results = Vec::new();
 
-        let cert = match self.store.get_certificate(&root).await {
-            Ok(Some(c)) => c,
-            Ok(None) => {
-                warn!(root_domain = %root, "No stored wildcard certificate to renew");
-                return Vec::new();
-            }
-            Err(e) => {
-                error!(error = %e, "Failed to query wildcard certificate for renewal");
-                return vec![Err(e.to_string())];
-            }
-        };
+        for cert_name in [self.admin_name(), self.root_name()] {
+            let cert = match self.store.get_certificate(&cert_name).await {
+                Ok(Some(c)) => c,
+                Ok(None) => {
+                    warn!(hostname = %cert_name, "No stored certificate to renew");
+                    continue;
+                }
+                Err(e) => {
+                    error!(hostname = %cert_name, error = %e, "Failed to query certificate for renewal");
+                    results.push(Err(e.to_string()));
+                    continue;
+                }
+            };
 
-        if !should_renew(cert.not_before, cert.not_after, now) {
-            return Vec::new();
+            if !should_renew(cert.not_before, cert.not_after, now) {
+                continue;
+            }
+
+            info!(
+                hostname = %cert_name,
+                not_before = cert.not_before,
+                not_after = cert.not_after,
+                now,
+                "Renewing certificate"
+            );
+
+            self.set_state(
+                &cert_name,
+                CertState::Renewing {
+                    not_after: cert.not_after,
+                },
+            );
+            let _ = notify_cert_status("renewing");
+
+            match self.execute_issuance(cert_name.clone()).await {
+                Ok(()) => {
+                    let _ = record_cert_event(
+                        &self.store,
+                        &cert_name,
+                        self.clock.now_unix(),
+                        "renewed",
+                        None,
+                    )
+                    .await;
+                    results.push(Ok(cert_name));
+                }
+                Err(e) => {
+                    let remaining = cert.not_after.saturating_sub(now);
+                    error!(
+                        hostname = %cert_name,
+                        error = %e,
+                        expires_in_secs = remaining,
+                        "Certificate renewal failed; service will hard-fail at expiry if it does not recover"
+                    );
+                    results.push(Err(format!("Renewal for {cert_name} failed: {e}")));
+                }
+            }
         }
 
-        info!(
-            root_domain = %root,
-            not_before = cert.not_before,
-            not_after = cert.not_after,
-            now,
-            "Renewing wildcard certificate"
-        );
-
-        self.set_state(
-            &root,
-            CertState::Renewing {
-                not_after: cert.not_after,
-            },
-        );
-        let _ = notify_cert_status("renewing");
-
-        match self.execute_issuance(root.clone()).await {
-            Ok(()) => {
-                let _ =
-                    record_cert_event(&self.store, &root, self.clock.now_unix(), "renewed", None)
-                        .await;
-                vec![Ok(root)]
-            }
-            Err(e) => {
-                let remaining = cert.not_after.saturating_sub(now);
-                error!(
-                    root_domain = %root,
-                    error = %e,
-                    expires_in_secs = remaining,
-                    "Wildcard certificate renewal failed; service will hard-fail at expiry if it does not recover"
-                );
-                vec![Err(format!("Renewal for {root} failed: {e}"))]
-            }
-        }
+        results
     }
 
     /// Spawns the background renewal loop task running every 12 hours (+ jitter).

@@ -4,7 +4,7 @@
 //! - ECDSA P-256 account and certificate keys
 //! - External Account Binding (EAB) for commercial CAs
 //! - Custom Root CA PEM for private/staging environments (Pebble)
-//! - Challenge solving via HTTP-01 and TLS-ALPN-01
+//! - Challenge solving via a `ChallengeSolver` registry (DNS-01, HTTP-01)
 //! - Provider fallback on rate limiting (429) or upstream 5xx errors
 
 use std::sync::Arc;
@@ -12,7 +12,7 @@ use std::sync::Arc;
 use base64::Engine;
 use instant_acme::{
     Account, AccountBuilder, AccountCredentials, ChallengeType, ExternalAccountKey, Identifier,
-    NewAccount, NewOrder, RetryPolicy,
+    NewAccount, NewOrder, OrderStatus, RetryPolicy,
 };
 use rcgen::{CertificateParams, DistinguishedName, KeyPair, PKCS_ECDSA_P256_SHA256};
 use rustls::pki_types::CertificateDer;
@@ -22,6 +22,7 @@ use tracing::{debug, info, warn};
 use crate::cert::clock::{Clock, format_unix_timestamp};
 use crate::cert::events::record_cert_event;
 use crate::cert::providers::{find_provider, is_wildcard_capable, resolve_directory_url};
+use crate::cert::solver::{SolverRegistry, validation_label};
 use crate::config::Config;
 use crate::store::Store;
 
@@ -76,15 +77,20 @@ pub struct AcmeEngine {
     config: Arc<Config>,
     store: Arc<Store>,
     clock: Arc<dyn Clock>,
+    /// DCV mechanisms the engine can drive. The engine itself never knows what
+    /// DNS or HTTP mean; it only maps an offered `ChallengeType` onto a solver.
+    registry: SolverRegistry,
 }
 
 impl AcmeEngine {
     /// Creates a new ACME engine instance.
     pub fn new(config: Arc<Config>, store: Arc<Store>, clock: Arc<dyn Clock>) -> Self {
+        let registry = SolverRegistry::with_defaults(Arc::clone(&store));
         Self {
             config,
             store,
             clock,
+            registry,
         }
     }
 
@@ -111,44 +117,89 @@ impl AcmeEngine {
             ));
         }
 
+        // One DNS-01 order carries both SANs. The apex and wildcard
+        // authorizations derive the same `_acme-challenge.<root>` owner name, so
+        // both TXT digests are published before either is marked ready.
+        let names = vec![root.clone(), format!("*.{root}")];
+        self.issue_with_fallback(&root, &names, ChallengeType::Dns01, &directories)
+            .await
+    }
+
+    /// Issues or renews the single-name admin certificate for `admin_domain`
+    /// using HTTP-01.
+    ///
+    /// The admin domain is deliberately *outside* the tunnel delegation, so no
+    /// DNS-01 TXT can be published for it and no CAA is served by our responder.
+    /// HTTP-01 only needs port 80, which the edge already owns; the solver
+    /// stores token rows for the port-80 responder to serve.
+    pub async fn issue_admin(&self, admin_domain: &str) -> Result<IssuedCertificate, AcmeError> {
+        let admin = admin_domain.to_ascii_lowercase();
+        let directories = self.resolve_admin_directory_list();
+        if directories.is_empty() {
+            return Err(AcmeError::Other(
+                "No ACME directories available for the admin certificate".into(),
+            ));
+        }
+
+        let names = vec![admin.clone()];
+        self.issue_with_fallback(&admin, &names, ChallengeType::Http01, &directories)
+            .await
+    }
+
+    /// Tries each resolved directory in order, falling over to the next on a
+    /// rate limit or an upstream 5xx.
+    async fn issue_with_fallback(
+        &self,
+        cert_name: &str,
+        names: &[String],
+        challenge_type: ChallengeType,
+        directories: &[(String, String)],
+    ) -> Result<IssuedCertificate, AcmeError> {
         let mut last_err = String::from("No providers attempted");
 
         for (idx, (provider_id, dir_url)) in directories.iter().enumerate() {
             debug!(
-                root,
+                cert_name,
                 provider_id,
                 dir_url,
+                mechanism = validation_label(&challenge_type),
                 attempt = idx + 1,
                 total = directories.len(),
-                "Attempting ACME wildcard issuance"
+                "Attempting ACME issuance"
             );
 
             match self
-                .issue_against_directory(&root, provider_id, dir_url)
+                .issue_order_against_directory(
+                    cert_name,
+                    names,
+                    challenge_type.clone(),
+                    provider_id,
+                    dir_url,
+                )
                 .await
             {
                 Ok(cert) => {
                     info!(
-                        root,
+                        cert_name,
                         provider = provider_id,
                         dir_url,
                         valid_from = %format_unix_timestamp(cert.not_before),
                         valid_until = %format_unix_timestamp(cert.not_after),
-                        "ACME wildcard certificate issued successfully"
+                        "ACME certificate issued successfully"
                     );
                     return Ok(cert);
                 }
                 Err(err) => {
                     warn!(
-                        root,
+                        cert_name,
                         provider_id,
                         dir_url,
                         error = %err,
-                        "ACME wildcard issuance failed against provider"
+                        "ACME issuance failed against provider"
                     );
                     last_err = err.to_string();
 
-                    // Fallback on rate limits or 5xx server errors
+                    // Fallback on rate limits or 5xx server errors.
                     if (err.is_rate_limited() || err.is_server_error())
                         && idx + 1 < directories.len()
                     {
@@ -167,12 +218,220 @@ impl AcmeEngine {
         Err(AcmeError::AllProvidersFailed(last_err))
     }
 
+    /// Executes the full order lifecycle against a single directory endpoint.
+    ///
+    /// This method is mechanism-agnostic: it provisions through whichever
+    /// solver the registry maps `challenge_type` to and never names DNS or HTTP.
+    async fn issue_order_against_directory(
+        &self,
+        cert_name: &str,
+        names: &[String],
+        challenge_type: ChallengeType,
+        provider_id: &str,
+        directory_url: &str,
+    ) -> Result<IssuedCertificate, AcmeError> {
+        let account = self
+            .get_or_create_account(provider_id, directory_url)
+            .await?;
+        let solver = self.registry.get(&challenge_type).ok_or_else(|| {
+            AcmeError::Other(format!(
+                "no challenge solver registered for '{}'",
+                validation_label(&challenge_type)
+            ))
+        })?;
+
+        // 1. Generate certificate keypair (ECDSA P-256)
+        let key_pair = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256)
+            .map_err(|e| AcmeError::Other(format!("Failed to generate P-256 keypair: {e}")))?;
+        let key_pem = key_pair.serialize_pem();
+
+        // 2. Generate the CSR for every SAN (one name for admin, apex+wildcard
+        //    for the tunnel).
+        let mut params = CertificateParams::new(names.to_vec())
+            .map_err(|e| AcmeError::Other(format!("Failed to create CertificateParams: {e}")))?;
+        params.distinguished_name = DistinguishedName::new();
+        let csr = params
+            .serialize_request(&key_pair)
+            .map_err(|e| AcmeError::Other(format!("Failed to generate CSR: {e}")))?;
+
+        // 3. Create the order.
+        let identifiers: Vec<Identifier> = names
+            .iter()
+            .map(|name| Identifier::Dns(name.clone()))
+            .collect();
+        let new_order = NewOrder::new(&identifiers);
+        let mut order = account
+            .new_order(&new_order)
+            .await
+            .map_err(Self::map_instant_acme_error)?;
+
+        // 4. Provision every authorization before marking any ready. The guards
+        //    withdraw each response when this scope ends, whatever the outcome.
+        let mut guards = Vec::new();
+        let mut authzs = order.authorizations();
+        while let Some(authz_res) = authzs.next().await {
+            let mut authz = authz_res.map_err(Self::map_instant_acme_error)?;
+
+            let mut chal = authz.challenge(challenge_type.clone()).ok_or_else(|| {
+                AcmeError::Other(format!(
+                    "no '{}' challenge offered for an authorization of {cert_name}",
+                    validation_label(&challenge_type)
+                ))
+            })?;
+
+            let identifier = chal.identifier().to_string();
+            let key_auth = chal.key_authorization().as_str().to_string();
+            let token = chal.token.clone();
+            let guard = solver
+                .provision(&identifier, &token, &key_auth)
+                .await
+                .map_err(|e| AcmeError::Other(format!("Failed to provision challenge: {e}")))?;
+            guards.push(guard);
+
+            chal.set_ready()
+                .await
+                .map_err(Self::map_instant_acme_error)?;
+        }
+
+        // 5. Poll order readiness. `poll_ready` returns the status even on
+        //    failure, so an `Invalid` order must be turned into an error with
+        //    the per-authorization reason rather than allowed to reach
+        //    `finalize_csr`.
+        let ready_res = order
+            .poll_ready(&RetryPolicy::default())
+            .await
+            .map_err(Self::map_instant_acme_error);
+
+        let status = match ready_res {
+            Ok(status) => Some(status),
+            Err(err) => {
+                drop(guards);
+                return Err(err);
+            }
+        };
+
+        if status == Some(OrderStatus::Invalid) {
+            let mut details = Vec::new();
+            let mut authzs = order.authorizations();
+            while let Some(authz_res) = authzs.next().await {
+                let Ok(mut authz) = authz_res else {
+                    continue;
+                };
+                if let Ok(state) = authz.refresh().await {
+                    for challenge in &state.challenges {
+                        if let Some(error) = &challenge.error {
+                            details.push(format!(
+                                "{:?}: {} ({})",
+                                challenge.r#type,
+                                error.detail.clone().unwrap_or_default(),
+                                error.r#type.clone().unwrap_or_default()
+                            ));
+                        }
+                    }
+                }
+            }
+
+            drop(guards);
+
+            let detail = if details.is_empty() {
+                "no authorization error detail returned".to_string()
+            } else {
+                details.join("; ")
+            };
+            return Err(AcmeError::Other(format!(
+                "'{}' validation failed for {cert_name}: {detail}",
+                validation_label(&challenge_type)
+            )));
+        }
+
+        // 6. Withdraw the challenge responses before finalizing.
+        drop(guards);
+
+        order
+            .finalize_csr(csr.der())
+            .await
+            .map_err(Self::map_instant_acme_error)?;
+
+        let cert_pem = order
+            .poll_certificate(&RetryPolicy::default())
+            .await
+            .map_err(Self::map_instant_acme_error)?;
+
+        // 7. Parse validity from the first certificate in the PEM chain.
+        let first_der = CertificateDer::pem_slice_iter(cert_pem.as_bytes())
+            .next()
+            .ok_or_else(|| AcmeError::Other("Empty certificate chain returned".into()))?
+            .map_err(|e| AcmeError::Other(format!("Invalid certificate DER: {e}")))?;
+
+        let (not_before, not_after) = parse_cert_validity(&first_der)
+            .map_err(|e| AcmeError::Other(format!("Failed to parse validity: {e}")))?;
+
+        let now = self.clock.now_unix();
+
+        // 8. Persist into the certificates table, keyed by the certificate name.
+        //    Whether any SAN is a wildcard is recorded on the row so the control
+        //    surface can label the tunnel cert vs the admin cert without
+        //    re-deriving it from the name.
+        let wildcard = names.iter().any(|name| name.starts_with("*."));
+        self.store
+            .save_certificate(
+                cert_name,
+                crate::store::NewCertificate {
+                    cert_pem: cert_pem.clone(),
+                    key_pem: key_pem.clone(),
+                    not_before,
+                    not_after,
+                    issuer: None,
+                    directory: directory_url.to_string(),
+                    obtained_at: now,
+                    validation: validation_label(&challenge_type).to_string(),
+                    wildcard,
+                },
+            )
+            .await
+            .map_err(|e| AcmeError::Other(format!("Failed to save certificate: {e}")))?;
+
+        let _ = record_cert_event(
+            &self.store,
+            cert_name,
+            now,
+            "issued",
+            Some(&format!("directory: {directory_url}")),
+        )
+        .await;
+
+        Ok(IssuedCertificate {
+            name: cert_name.to_string(),
+            cert_pem,
+            key_pem,
+            not_before,
+            not_after,
+            directory: directory_url.to_string(),
+        })
+    }
+
     /// Resolves the list of ACME directories to try: primary provider first,
     /// then fallbacks, restricted to wildcard-capable providers.
     fn resolve_directory_list(&self) -> Vec<(String, String)> {
+        self.resolve_directory_list_filtered(true)
+    }
+
+    /// Resolves the directories for an HTTP-01, single-name admin order.
+    ///
+    /// Wildcard capability is irrelevant here (the admin certificate is one
+    /// exact name), so every configured provider — including e.g. Buypass — is
+    /// eligible.
+    fn resolve_admin_directory_list(&self) -> Vec<(String, String)> {
+        self.resolve_directory_list_filtered(false)
+    }
+
+    /// Builds the ordered provider/directory list, optionally requiring
+    /// wildcard capability.
+    fn resolve_directory_list_filtered(&self, require_wildcard: bool) -> Vec<(String, String)> {
+        let eligible = |id: &str| !require_wildcard || is_wildcard_capable(id);
         let mut list = Vec::new();
 
-        if is_wildcard_capable(&self.config.acme_provider)
+        if eligible(&self.config.acme_provider)
             && let Some(primary_url) = resolve_directory_url(
                 &self.config.acme_provider,
                 self.config.acme_directory.as_deref(),
@@ -182,7 +441,7 @@ impl AcmeEngine {
         }
 
         for fallback in &self.config.acme_fallback_providers {
-            if !is_wildcard_capable(fallback) {
+            if !eligible(fallback) {
                 warn!(
                     provider = %fallback,
                     "Skipping ACME fallback provider: wildcard-incapable"
@@ -197,141 +456,6 @@ impl AcmeEngine {
         }
 
         list
-    }
-
-    /// Executes the full DNS-01 ACME order lifecycle for the wildcard
-    /// certificate against a single directory endpoint.
-    async fn issue_against_directory(
-        &self,
-        root: &str,
-        provider_id: &str,
-        directory_url: &str,
-    ) -> Result<IssuedCertificate, AcmeError> {
-        let account = self
-            .get_or_create_account(provider_id, directory_url)
-            .await?;
-
-        // 1. Generate certificate keypair (ECDSA P-256)
-        let key_pair = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256)
-            .map_err(|e| AcmeError::Other(format!("Failed to generate P-256 keypair: {e}")))?;
-        let key_pem = key_pair.serialize_pem();
-
-        // 2. Generate CSR covering the apex and the single-label wildcard
-        let wildcard = format!("*.{root}");
-        let mut params = CertificateParams::new(vec![root.to_string(), wildcard.clone()])
-            .map_err(|e| AcmeError::Other(format!("Failed to create CertificateParams: {e}")))?;
-        params.distinguished_name = DistinguishedName::new();
-        let csr = params
-            .serialize_request(&key_pair)
-            .map_err(|e| AcmeError::Other(format!("Failed to generate CSR: {e}")))?;
-
-        // 3. Create new order for both identifiers in one order
-        let identifiers = [Identifier::Dns(root.to_string()), Identifier::Dns(wildcard)];
-        let new_order = NewOrder::new(&identifiers);
-        let mut order = account
-            .new_order(&new_order)
-            .await
-            .map_err(Self::map_instant_acme_error)?;
-
-        // 4. Publish every DNS-01 challenge value before marking any ready,
-        //    so both authorizations for the shared challenge name are present.
-        let challenge_name = format!("_acme-challenge.{root}");
-        let now = self.clock.now_unix();
-        let mut published: Vec<String> = Vec::new();
-
-        let mut authzs = order.authorizations();
-        while let Some(authz_res) = authzs.next().await {
-            let mut authz = authz_res.map_err(Self::map_instant_acme_error)?;
-
-            let mut chal = authz.challenge(ChallengeType::Dns01).ok_or_else(|| {
-                AcmeError::Other(format!(
-                    "No DNS-01 challenge offered for an authorization of {root}"
-                ))
-            })?;
-
-            let value = chal.key_authorization().dns_value();
-            self.store
-                .publish_challenge(&challenge_name, &value, now)
-                .await
-                .map_err(|e| {
-                    AcmeError::Other(format!("Failed to publish DNS-01 challenge: {e}"))
-                })?;
-            published.push(value);
-
-            chal.set_ready()
-                .await
-                .map_err(Self::map_instant_acme_error)?;
-        }
-
-        // 5. Poll order readiness, then withdraw the challenge records.
-        let ready_res = order
-            .poll_ready(&RetryPolicy::default())
-            .await
-            .map_err(Self::map_instant_acme_error);
-
-        for value in &published {
-            let _ = self.store.remove_challenge(&challenge_name, value).await;
-        }
-
-        ready_res?;
-
-        // 6. Finalize CSR and retrieve certificate
-        order
-            .finalize_csr(csr.der())
-            .await
-            .map_err(Self::map_instant_acme_error)?;
-
-        let cert_pem = order
-            .poll_certificate(&RetryPolicy::default())
-            .await
-            .map_err(Self::map_instant_acme_error)?;
-
-        // 7. Parse validity from first certificate in PEM chain
-        let first_der = CertificateDer::pem_slice_iter(cert_pem.as_bytes())
-            .next()
-            .ok_or_else(|| AcmeError::Other("Empty certificate chain returned".into()))?
-            .map_err(|e| AcmeError::Other(format!("Invalid certificate DER: {e}")))?;
-
-        let (not_before, not_after) = parse_cert_validity(&first_der)
-            .map_err(|e| AcmeError::Other(format!("Failed to parse validity: {e}")))?;
-
-        let now = self.clock.now_unix();
-
-        // 8. Persist into the certificates table, keyed by the apex
-        self.store
-            .save_certificate(
-                root,
-                crate::store::NewCertificate {
-                    cert_pem: cert_pem.clone(),
-                    key_pem: key_pem.clone(),
-                    not_before,
-                    not_after,
-                    issuer: None,
-                    directory: directory_url.to_string(),
-                    obtained_at: now,
-                },
-            )
-            .await
-            .map_err(|e| AcmeError::Other(format!("Failed to save certificate: {e}")))?;
-
-        // Record event
-        let _ = record_cert_event(
-            &self.store,
-            root,
-            now,
-            "issued",
-            Some(&format!("directory: {directory_url}")),
-        )
-        .await;
-
-        Ok(IssuedCertificate {
-            name: root.to_string(),
-            cert_pem,
-            key_pem,
-            not_before,
-            not_after,
-            directory: directory_url.to_string(),
-        })
     }
 
     /// Fetches existing ACME account credentials from SQLite or creates a new account.

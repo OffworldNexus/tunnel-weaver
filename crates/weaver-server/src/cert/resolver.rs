@@ -61,13 +61,18 @@ pub const DEFAULT_HOLD_TIMEOUT: Duration = Duration::from_secs(30);
 /// Dynamic TLS certificate resolver.
 ///
 /// Dispatches incoming TLS connections:
-/// - Serves the single wildcard certificate: SNI `<root>` matches the apex,
-///   exactly one label under `<root>` matches `*.<root>`, anything else is rejected
-/// - Holds handshakes up to 30s while the wildcard order is in flight
+/// - Serves the tunnel wildcard: SNI `<root>` matches the apex, exactly one
+///   label under `<root>` matches `*.<root>`
+/// - Serves the admin certificate for the exact `admin_domain` SNI
+/// - Holds handshakes up to 30s while the covering order is in flight
 /// - Rejects unknown hostnames, missing SNI, failed orders, and timed-out orders at the TCP level
 /// - Strictly prohibits serving self-signed or placeholder certificates to public HTTPS clients
 pub struct CertResolver {
     root_domain: String,
+    /// The relay's own stable hostname. It gets its own single-name certificate
+    /// and must never be covered by the tunnel wildcard, nor a tunnel name by
+    /// the admin certificate.
+    admin_domain: String,
     certs: RwLock<HashMap<String, StoredCert>>,
     ordering_waiters: Mutex<HashMap<String, Arc<HandshakeWaiter>>>,
     clock: Arc<dyn Clock>,
@@ -78,6 +83,7 @@ impl std::fmt::Debug for CertResolver {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CertResolver")
             .field("root_domain", &self.root_domain)
+            .field("admin_domain", &self.admin_domain)
             .field("certs_count", &self.certs.read().unwrap().len())
             .finish()
     }
@@ -85,19 +91,33 @@ impl std::fmt::Debug for CertResolver {
 
 impl CertResolver {
     /// Creates a new `CertResolver` with the given root domain.
+    ///
+    /// The admin domain defaults to the root domain; production callers set it
+    /// with [`CertResolver::with_admin_domain`].
     pub fn new(root_domain: String) -> Self {
         Self::with_clock(root_domain, Arc::new(SystemClock))
     }
 
     /// Creates a new `CertResolver` with an injected clock for deterministic time in tests.
     pub fn with_clock(root_domain: String, clock: Arc<dyn Clock>) -> Self {
+        let root = root_domain.to_ascii_lowercase();
         Self {
-            root_domain: root_domain.to_ascii_lowercase(),
+            root_domain: root.clone(),
+            admin_domain: root,
             certs: RwLock::new(HashMap::new()),
             ordering_waiters: Mutex::new(HashMap::new()),
             clock,
             hold_timeout: DEFAULT_HOLD_TIMEOUT,
         }
+    }
+
+    /// Sets the relay's own (admin) hostname, served by its own certificate.
+    ///
+    /// Builder form keeps the many root-only test constructors unchanged while
+    /// letting production wire in the real split.
+    pub fn with_admin_domain(mut self, admin_domain: String) -> Self {
+        self.admin_domain = admin_domain.to_ascii_lowercase();
+        self
     }
 
     /// Overrides the handshake hold timeout (defaults to 30s).
@@ -108,10 +128,14 @@ impl CertResolver {
 
     /// Maps an SNI to the certificate name that serves it.
     ///
-    /// The wildcard covers exactly one label, so `a.b.<root>` matches nothing:
-    /// that is what keeps the certificate from covering more than a single flat
-    /// service label.
+    /// The admin certificate covers exactly `admin_domain`; the tunnel wildcard
+    /// covers the apex and exactly one label beneath it. The two never overlap:
+    /// a tunnel name is not the admin name, and a name under the tunnel zone
+    /// cannot fall through to the admin certificate (or vice versa).
     fn cert_name_for(&self, host: &str) -> Option<String> {
+        if host == self.admin_domain {
+            return Some(self.admin_domain.clone());
+        }
         if host == self.root_domain {
             return Some(self.root_domain.clone());
         }

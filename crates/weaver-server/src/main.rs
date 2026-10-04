@@ -16,6 +16,13 @@ pub enum Commands {
     /// Orchestrates host preflight, DNS verification, reachability checks, and systemd installation.
     Setup(Box<SetupArgs>),
 
+    /// Runs the same domain/DNS/reachability preflight as setup, standalone.
+    ///
+    /// Works before install (pass both domains as arguments) and on an
+    /// installed host (omitted domains fall back to the stored config). Exits
+    /// nonzero if any check fails.
+    Doctor(Box<DoctorArgs>),
+
     /// Uninstalls systemd units and binary.
     Uninstall(Box<UninstallArgs>),
 
@@ -186,6 +193,11 @@ pub struct SetupArgs {
     #[arg(long, value_name = "DOMAIN")]
     pub root_domain: Option<String>,
 
+    /// The relay's own stable hostname (e.g. "relay.example.net"), kept outside
+    /// the tunnel delegation and issued its own HTTP-01 certificate.
+    #[arg(long, value_name = "DOMAIN")]
+    pub admin_domain: Option<String>,
+
     /// Administrator contact email for ACME registration.
     #[arg(long, alias = "admin-email", value_name = "EMAIL")]
     pub email: Option<String>,
@@ -222,6 +234,11 @@ pub struct SetupArgs {
     #[arg(long)]
     pub skip_reachability_check: bool,
 
+    /// The relay's own public IP address(es), repeatable. Overrides automatic
+    /// detection; required behind NAT where the bindable address differs.
+    #[arg(long = "relay-ip", value_name = "ADDR")]
+    pub relay_ips: Vec<std::net::IpAddr>,
+
     /// Dedicated system user for the service.
     #[arg(long, default_value = "weaver", value_name = "NAME")]
     pub user: String,
@@ -233,6 +250,31 @@ pub struct SetupArgs {
     /// Internal flag signaling that interactive prompt values are already provided.
     #[arg(long, hide = true)]
     pub no_prompt_values: bool,
+}
+
+/// Arguments for the standalone `weaver-server doctor` preflight.
+#[derive(Args, Debug, Clone)]
+pub struct DoctorArgs {
+    /// Tunnel domain (the delegated zone). Falls back to the stored config.
+    #[arg(long, value_name = "DOMAIN")]
+    pub root_domain: Option<String>,
+
+    /// The relay's own admin hostname. Falls back to the stored config.
+    #[arg(long, value_name = "DOMAIN")]
+    pub admin_domain: Option<String>,
+
+    /// The relay's own public IP address(es), repeatable. Overrides automatic
+    /// detection; use behind NAT where the bindable address differs.
+    #[arg(long = "relay-ip", value_name = "ADDR")]
+    pub relay_ips: Vec<std::net::IpAddr>,
+
+    /// Skip the 80/443/53 self-reachability probe.
+    #[arg(long)]
+    pub skip_reachability_check: bool,
+
+    /// Outputs the report as raw JSON.
+    #[arg(long)]
+    pub json: bool,
 }
 
 /// Arguments for removing systemd units and relay installation.
@@ -261,6 +303,10 @@ pub struct ConfigureArgs {
     /// Base domain for routed public tunnels (e.g. "example.com").
     #[arg(long, value_name = "DOMAIN")]
     pub root_domain: Option<String>,
+
+    /// The relay's own stable hostname (e.g. "relay.example.net").
+    #[arg(long, value_name = "DOMAIN")]
+    pub admin_domain: Option<String>,
 
     /// Administrator contact email for ACME registration.
     #[arg(long, alias = "admin-email", value_name = "EMAIL")]
@@ -335,9 +381,20 @@ async fn main() {
     let matches = Cli::command().version(version).get_matches();
     let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|err| err.exit());
 
-    // Configure structured stderr logging
-    let filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&cli.log_level));
+    // Configure structured stderr logging. The daemon gets the operator's
+    // requested level; the one-shot CLI commands (setup/doctor/uninstall) run
+    // with logging off so their own wizard output is the only thing on screen
+    // — migration and driver INFO lines otherwise leak straight through.
+    // `RUST_LOG` still overrides everything for debugging.
+    let is_daemon = matches!(cli.command, Commands::Run);
+    let filter = match EnvFilter::try_from_default_env() {
+        Ok(filter) => filter,
+        Err(_) if is_daemon => EnvFilter::new(&cli.log_level),
+        // An explicit `--log-level`/`WEAVER_LOG_LEVEL` is an operator debugging
+        // override even for the quiet CLI commands.
+        Err(_) if std::env::var_os("WEAVER_LOG_LEVEL").is_some() => EnvFilter::new(&cli.log_level),
+        Err(_) => EnvFilter::new("off"),
+    };
 
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
@@ -388,6 +445,15 @@ async fn main() {
                 .unwrap_or_else(|| PathBuf::from("/var/lib/weaver/weaver.db"));
             handle_setup(*args, db_path).await;
         }
+        Commands::Doctor(args) => {
+            let db_path = cli
+                .db
+                .unwrap_or_else(|| PathBuf::from("/var/lib/weaver/weaver.db"));
+            let socket_path = cli
+                .socket
+                .unwrap_or_else(|| PathBuf::from("/run/weaver/control.sock"));
+            handle_doctor(*args, db_path, socket_path).await;
+        }
         Commands::Uninstall(args) => {
             let db_path = cli
                 .db
@@ -420,9 +486,13 @@ async fn main() {
                 (None, None) => None,
             };
 
-            let (root_domain, admin_email) = if args.headless {
+            let (root_domain, admin_domain, admin_email) = if args.headless {
                 let Some(rd) = args.root_domain else {
                     eprintln!("Error: Missing required option --root-domain in headless mode");
+                    std::process::exit(2);
+                };
+                let Some(ad) = args.admin_domain else {
+                    eprintln!("Error: Missing required option --admin-domain in headless mode");
                     std::process::exit(2);
                 };
                 let Some(email) = args.email else {
@@ -431,6 +501,14 @@ async fn main() {
                 };
                 if !weaver_server::setup::interactive::validate_fqdn(&rd) {
                     eprintln!("Error: Invalid root domain '{rd}'. Must be a valid FQDN.");
+                    std::process::exit(2);
+                }
+                if !weaver_server::setup::interactive::validate_fqdn(&ad) {
+                    eprintln!("Error: Invalid admin domain '{ad}'. Must be a valid FQDN.");
+                    std::process::exit(2);
+                }
+                if let Some(issue) = weaver_server::config::domain_split_issue(&ad, &rd) {
+                    eprintln!("Error: {issue}");
                     std::process::exit(2);
                 }
                 if !weaver_server::setup::interactive::validate_email(&email) {
@@ -446,7 +524,7 @@ async fn main() {
                     );
                     std::process::exit(2);
                 }
-                (rd, email)
+                (rd, ad, email)
             } else {
                 let rd = match args.root_domain {
                     Some(d) => {
@@ -468,6 +546,32 @@ async fn main() {
                         );
                     },
                 };
+                let ad = match args.admin_domain {
+                    Some(d) => {
+                        if !weaver_server::setup::interactive::validate_fqdn(&d) {
+                            eprintln!("Error: Invalid admin domain '{d}'. Must be a valid FQDN.");
+                            std::process::exit(2);
+                        }
+                        d
+                    }
+                    None => loop {
+                        let input = weaver_server::setup::interactive::prompt_line(
+                            "Admin domain (the relay's own hostname)",
+                            None,
+                        )
+                        .unwrap_or_default();
+                        if weaver_server::setup::interactive::validate_fqdn(&input) {
+                            break input;
+                        }
+                        println!(
+                            "Invalid admin domain. Please provide a valid FQDN (e.g. relay.example.net)."
+                        );
+                    },
+                };
+                if let Some(issue) = weaver_server::config::domain_split_issue(&ad, &rd) {
+                    eprintln!("Error: {issue}");
+                    std::process::exit(2);
+                }
                 let email = match args.email {
                     Some(e) => {
                         if !weaver_server::setup::interactive::validate_email(&e) {
@@ -486,13 +590,24 @@ async fn main() {
                         println!("Invalid email. Please provide a valid email address.");
                     },
                 };
-                (rd, email)
+                (rd, ad, email)
             };
 
             let store = Store::open(&db_path).await.unwrap_or_else(|err| {
                 eprintln!("Failed to open database at {}: {err}", db_path.display());
                 std::process::exit(1);
             });
+
+            // Preserve the relay's detected public addresses across a config
+            // rewrite; re-running setup is the path that refreshes them.
+            let existing_relay_ips = store
+                .load_config_json()
+                .await
+                .ok()
+                .flatten()
+                .and_then(|json| serde_json::from_str::<Config>(&json).ok())
+                .map(|cfg| cfg.relay_ips)
+                .unwrap_or_default();
 
             let root_ca_pem = match args.acme_root_ca {
                 Some(path) => match std::fs::read_to_string(&path) {
@@ -507,6 +622,7 @@ async fn main() {
 
             let config = Config {
                 root_domain,
+                admin_domain,
                 admin_email,
                 acme_provider,
                 listen_http: args.listen_http,
@@ -518,7 +634,7 @@ async fn main() {
                 acme_root_ca_pem: root_ca_pem,
                 acme_fallback_providers: Vec::new(),
                 usage_flush_interval_secs: args.usage_flush_interval,
-                relay_ips: Vec::new(),
+                relay_ips: existing_relay_ips,
                 setup_complete: false,
             };
 
@@ -736,15 +852,21 @@ async fn handle_setup(args: SetupArgs, db_path: PathBuf) {
     let mut root_ca_path = args.acme_root_ca;
 
     // 1. Gather configuration
-    let (root_domain, admin_email) = if args.no_prompt_values {
+    let (root_domain, admin_domain, admin_email) = if args.no_prompt_values {
         (
             args.root_domain
                 .expect("root_domain missing with --no-prompt-values"),
+            args.admin_domain
+                .expect("admin_domain missing with --no-prompt-values"),
             args.email.expect("email missing with --no-prompt-values"),
         )
     } else if args.headless {
         let Some(rd) = args.root_domain else {
             eprintln!("Error: Missing required option --root-domain in headless mode");
+            std::process::exit(2);
+        };
+        let Some(ad) = args.admin_domain else {
+            eprintln!("Error: Missing required option --admin-domain in headless mode");
             std::process::exit(2);
         };
         let Some(email) = args.email else {
@@ -753,6 +875,14 @@ async fn handle_setup(args: SetupArgs, db_path: PathBuf) {
         };
         if !weaver_server::setup::interactive::validate_fqdn(&rd) {
             eprintln!("Error: Invalid root domain '{rd}'. Must be a valid FQDN.");
+            std::process::exit(2);
+        }
+        if !weaver_server::setup::interactive::validate_fqdn(&ad) {
+            eprintln!("Error: Invalid admin domain '{ad}'. Must be a valid FQDN.");
+            std::process::exit(2);
+        }
+        if let Some(issue) = weaver_server::config::domain_split_issue(&ad, &rd) {
+            eprintln!("Error: {issue}");
             std::process::exit(2);
         }
         if !weaver_server::setup::interactive::validate_email(&email) {
@@ -766,27 +896,9 @@ async fn handle_setup(args: SetupArgs, db_path: PathBuf) {
             );
             std::process::exit(2);
         }
-        (rd, email)
+        (rd, ad, email)
     } else {
-        println!(
-            "\n{} {} {}",
-            "Weaver Server Setup".bold().cyan(),
-            "—".dark_grey(),
-            "Host & Relay Deployment".white()
-        );
-        println!(
-            "  {}",
-            "Configure your host to run a public Tunnel Weaver relay with automated ACME TLS."
-                .dark_grey()
-        );
-        println!();
-        println!("{}", "Step 1: Domain & Contact".bold().white());
-        println!(
-            "  {}",
-            "Enter the public domain pointing to this host, and an admin contact email:"
-                .dark_grey()
-        );
-        println!();
+        weaver_server::setup::interactive::print_domain_step_intro();
 
         let rd = match args.root_domain {
             Some(d) => {
@@ -797,8 +909,11 @@ async fn handle_setup(args: SetupArgs, db_path: PathBuf) {
                 d
             }
             None => loop {
-                let input = weaver_server::setup::interactive::prompt_line("Root domain", None)
-                    .unwrap_or_default();
+                let input = weaver_server::setup::interactive::prompt_line(
+                    "Tunnel domain (delegated to this relay)",
+                    None,
+                )
+                .unwrap_or_default();
                 if weaver_server::setup::interactive::validate_fqdn(&input) {
                     break input;
                 }
@@ -808,6 +923,38 @@ async fn handle_setup(args: SetupArgs, db_path: PathBuf) {
                 );
             },
         };
+
+        let ad = match args.admin_domain {
+            Some(d) => {
+                if !weaver_server::setup::interactive::validate_fqdn(&d) {
+                    eprintln!("Error: Invalid admin domain '{d}'. Must be a valid FQDN.");
+                    std::process::exit(2);
+                }
+                d
+            }
+            None => loop {
+                let input = weaver_server::setup::interactive::prompt_line(
+                    "Admin domain (the relay's own hostname, outside the tunnel zone)",
+                    None,
+                )
+                .unwrap_or_default();
+                if weaver_server::setup::interactive::validate_fqdn(&input) {
+                    break input;
+                }
+                println!(
+                    "{} Invalid domain name. Must be a valid FQDN (e.g. relay.example.net).",
+                    "✗".red().bold()
+                );
+            },
+        };
+
+        // The foot-gun check runs before anything is installed: an admin domain
+        // inside the delegated tunnel zone would hand the relay's own DNS to the
+        // zone the relay is meant to control.
+        if let Some(issue) = weaver_server::config::domain_split_issue(&ad, &rd) {
+            eprintln!("Error: {issue}");
+            std::process::exit(2);
+        }
 
         let email = match args.email {
             Some(e) => {
@@ -873,11 +1020,12 @@ async fn handle_setup(args: SetupArgs, db_path: PathBuf) {
             }
         }
 
-        (rd, email)
+        (rd, ad, email)
     };
 
     let gathered = weaver_server::setup::interactive::GatheredConfig {
         root_domain: root_domain.clone(),
+        admin_domain: admin_domain.clone(),
         admin_email: admin_email.clone(),
         acme_provider: acme_provider.clone(),
         acme_directory: acme_directory.clone(),
@@ -888,6 +1036,7 @@ async fn handle_setup(args: SetupArgs, db_path: PathBuf) {
         user: args.user.clone(),
         prefix: args.prefix.clone(),
         skip_reachability_check: args.skip_reachability_check,
+        relay_ips: args.relay_ips.clone(),
     };
 
     // 2. Display execution plan & confirm (if not already elevated)
@@ -917,51 +1066,66 @@ async fn handle_setup(args: SetupArgs, db_path: PathBuf) {
 
     let existing_install = weaver_server::setup::preflight::detect_existing_install(&db_path).await;
 
-    // 5. Public DNS verification
-    println!(
-        "  {} Verifying DNS records for '{}'...",
-        "•".blue(),
-        root_domain
-    );
-    let dns_result = match weaver_server::setup::dns::probe_dns(&root_domain).await {
-        Ok(res) => res,
-        Err(err) => {
-            eprintln!("{} DNS verification failed: {err}", "✗ Error:".red().bold());
-            std::process::exit(1);
-        }
-    };
-
-    // 6. Reachability verification
-    let (port_80, port_443, port_53) = if args.skip_reachability_check {
-        println!(
-            "  {} Skipping reachability check (--skip-reachability-check)",
-            "•".dim()
-        );
-        (
-            weaver_server::setup::planner::PortReachability::Skipped,
-            weaver_server::setup::planner::PortReachability::Skipped,
-            weaver_server::setup::planner::PortReachability::Skipped,
-        )
-    } else {
-        // If our own systemd sockets are active, stop them temporarily so ports 80, 443, and 53 can be probed
+    // 5. Preflight: validate the domain split, admin resolution, DNS
+    //    delegation, and port reachability BEFORE anything on the host is
+    //    modified. This is the same check `weaver-server doctor` exposes, so a
+    //    misconfigured or undelegated zone aborts identically in both places.
+    //
+    //    If our own sockets are already active (an upgrade), stop them first so
+    //    the throwaway listeners can bind the public ports.
+    let mut stopped_sockets = false;
+    if !args.skip_reachability_check {
         let socket_active = std::process::Command::new("systemctl")
             .args(["is-active", "--quiet", "weaver-server.socket"])
-            .status()
-            .map(|s| s.success())
+            .output()
+            .map(|out| out.status.success())
             .unwrap_or(false);
 
         if socket_active {
             let _ = std::process::Command::new("systemctl")
                 .args(["stop", "weaver-server.service", "weaver-server.socket"])
-                .status();
+                .output();
+            stopped_sockets = true;
         }
+    }
 
-        println!(
-            "  {} Verifying port reachability via public IP...",
-            "•".blue()
+    println!("\n{}", "Preflight Checks".bold().white());
+    let report = weaver_server::setup::doctor::run_in_process(
+        &root_domain,
+        &admin_domain,
+        &args.relay_ips,
+        args.skip_reachability_check,
+    )
+    .await;
+
+    println!("{}", report.render());
+    // Abort *before* installing anything. `report.ok()` is false when any
+    // checklist item failed, and each failure printed its own remediation.
+    // If we paused an existing install for the port probe, bring it back so a
+    // failed upgrade does not leave the relay down.
+    if !report.ok() {
+        if stopped_sockets {
+            let _ = std::process::Command::new("systemctl")
+                .args(["start", "weaver-server.socket", "weaver-server.service"])
+                .output();
+        }
+        eprintln!(
+            "\n{} Setup aborted before making any host changes.",
+            "✗ Error:".red().bold()
         );
-        weaver_server::setup::reachability::verify_reachability(&dns_result.root_ips).await
-    };
+        std::process::exit(1);
+    }
+
+    let relay_ips = report.relay_ips.clone();
+    let ns_targets = report.ns_targets.clone();
+    let delegation_ok = report
+        .checks
+        .iter()
+        .find(|check| check.title == "Delegation")
+        .is_some_and(|check| check.ok);
+    let port_80 = weaver_server::setup::doctor::port_status(&report, 80);
+    let port_443 = weaver_server::setup::doctor::port_status(&report, 443);
+    let port_53 = weaver_server::setup::doctor::port_status(&report, 53);
 
     // A `systemd-resolved` stub already holding a port-53 socket is the most
     // common reason the DNS bind fails; surface it as a first-class abort with
@@ -985,26 +1149,29 @@ async fn handle_setup(args: SetupArgs, db_path: PathBuf) {
         None
     };
 
-    // 7. Planning
+    // 6. Build the execution plan from the preflight report. The delegation,
+    //    reachability, and domain-split gates have already passed, so the
+    //    planner's copy now carries the real values rather than placeholders.
     let probe = weaver_server::setup::planner::SystemProbe {
         systemd_present: true,
         supported_arch: true,
         target_domain: root_domain.clone(),
-        existing_install,
-        root_ips: dns_result.root_ips,
-        probe_ips: dns_result.probe_ips,
-        ns_targets: dns_result.ns_targets,
-        delegation_ok: dns_result.delegation_ok,
-        resolvers_ok: dns_result.resolvers_ok,
-        port_80,
-        port_443,
-        port_53,
-        resolver_stub_conflict,
+        admin_domain: admin_domain.clone(),
+        existing_install: existing_install.clone(),
+        root_ips: relay_ips.clone(),
+        probe_ips: relay_ips.clone(),
+        ns_targets: ns_targets.clone(),
+        delegation_ok,
+        resolvers_ok: true,
+        port_80: port_80.clone(),
+        port_443: port_443.clone(),
+        port_53: port_53.clone(),
+        resolver_stub_conflict: resolver_stub_conflict.clone(),
         is_headless: args.headless,
         confirmed_domain_change: false,
         skip_reachability_check: args.skip_reachability_check,
         db_path: db_path.display().to_string(),
-        user: args.user,
+        user: args.user.clone(),
         prefix: args.prefix.display().to_string(),
         acme_provider: acme_provider.clone(),
         has_eab: eab_kid.is_some(),
@@ -1021,7 +1188,7 @@ async fn handle_setup(args: SetupArgs, db_path: PathBuf) {
         }
     };
 
-    // 8. Pre-register ACME account against directory before modifying system files or installing
+    // 7. Pre-register ACME account against directory before modifying system files or installing
     let root_ca_pem = match &root_ca_path {
         Some(path) => match std::fs::read_to_string(path) {
             Ok(c) => Some(c),
@@ -1069,7 +1236,9 @@ async fn handle_setup(args: SetupArgs, db_path: PathBuf) {
         }
     };
 
-    // 9. Installation
+    // 8. Installation: writes the DNS-enabled socket unit and starts the
+    //     responder with `setup_complete = false`, so it serves DNS but does
+    //     not auto-order the wildcard yet.
     let install_res = match weaver_server::setup::install::execute_install(
         &plan,
         &gathered,
@@ -1089,23 +1258,34 @@ async fn handle_setup(args: SetupArgs, db_path: PathBuf) {
         println!("\n{}", "already up to date".bold().green());
     }
 
-    // 10. Trigger the wildcard order, then verify (which waits for issuance)
+    // 9. The delegation was confirmed during preflight, so the relay can start
+    //    serving the zone immediately. Trigger both orders (tunnel wildcard via
+    //    DNS-01, admin via HTTP-01), then verify — which waits for both and
+    //    probes both HTTPS endpoints.
     let socket_path = PathBuf::from("/run/weaver/control.sock");
 
     // The daemon gates its startup auto-order on `setup_complete`, so setup
-    // must explicitly kick off the first wildcard order before waiting.
-    println!("  {} Triggering wildcard certificate order...", "•".blue());
-    let order_code = weaver_server::control::client::client_cert_order(&socket_path, true).await;
+    // must explicitly kick off the first orders before waiting. Use the quiet
+    // client: the wizard prints its own confirmation instead of the raw JSON.
+    let order_code = weaver_server::control::client::client_cert_order_quiet(&socket_path).await;
     if order_code != 0 {
         eprintln!(
-            "{} Failed to queue the wildcard certificate order (control exit {order_code})",
+            "{} Failed to queue the certificate orders (control exit {order_code})",
             "✗ Error:".red().bold()
         );
         std::process::exit(1);
     }
+    println!(
+        "  {} Queued tunnel and admin certificate orders",
+        "✓".green()
+    );
 
-    if let Err(err) =
-        weaver_server::setup::verify::verify_setup(&plan.root_domain, &socket_path).await
+    if let Err(err) = weaver_server::setup::verify::verify_setup(
+        &plan.root_domain,
+        &plan.admin_domain,
+        &socket_path,
+    )
+    .await
     {
         eprintln!(
             "{} Deployment verification failed: {err}",
@@ -1114,8 +1294,9 @@ async fn handle_setup(args: SetupArgs, db_path: PathBuf) {
         std::process::exit(1);
     }
 
-    // 11. Mark setup complete only after delegation, port 53, and the wildcard
-    //     order all succeeded. Future daemon restarts may then auto-order.
+    // 10. Mark setup complete only after delegation, port 53, and both
+    //     certificate orders succeeded. Future daemon restarts may then
+    //     auto-order.
     match Store::open(&db_path).await {
         Ok(store) => {
             if let Ok(Some(json)) = store.load_config_json().await {
@@ -1142,6 +1323,89 @@ async fn handle_setup(args: SetupArgs, db_path: PathBuf) {
             "✗ Error:".red().bold()
         ),
     }
+}
+
+/// Loads the tunnel and admin domains from the stored config when they were
+/// not supplied on the command line, so `doctor` works on an installed host
+/// with no arguments. Returns `None` when no readable config exists.
+async fn load_stored_domains(db_path: &std::path::Path) -> Option<(String, String)> {
+    if !db_path.exists() {
+        return None;
+    }
+    let store = Store::open(db_path).await.ok()?;
+    let config = store.load_config().await.ok()?;
+    let _ = store.close().await;
+    Some((config.root_domain, config.admin_domain))
+}
+
+/// Runs the standalone `weaver-server doctor` preflight.
+///
+/// The command runs against whichever context is available. If the relay
+/// answers on the control socket it owns 80/443/53 and composes the report
+/// itself (normal life); otherwise the command runs the shared preflight
+/// in-process with throwaway listeners (pre-install, or the host is down).
+/// Domains come from the arguments when given, otherwise from the installed
+/// config. Exits nonzero when any check fails.
+async fn handle_doctor(args: DoctorArgs, db_path: PathBuf, socket_path: PathBuf) {
+    // Normal-life path: prefer the running relay, which self-connects instead
+    // of pausing itself for the port probe.
+    if weaver_server::control::client::control_socket_available(&socket_path).await {
+        let code = weaver_server::control::client::client_doctor(&socket_path, args.json).await;
+        std::process::exit(code);
+    }
+
+    // Pre-install / host-down path: resolve the domains from the arguments,
+    // falling back to the installed config, and bind the ports in-process.
+    let (root_domain, admin_domain) = match (args.root_domain, args.admin_domain) {
+        (Some(root), Some(admin)) => (root, admin),
+        (root, admin) => {
+            let stored = load_stored_domains(std::path::Path::new(&db_path)).await;
+            let root = root.or_else(|| stored.as_ref().map(|(r, _)| r.clone()));
+            let admin = admin.or_else(|| stored.as_ref().map(|(_, a)| a.clone()));
+            match (root, admin) {
+                (Some(root), Some(admin)) => (root, admin),
+                _ => {
+                    eprintln!(
+                        "Error: --root-domain and --admin-domain are required when no installed \
+                         configuration exists at {}",
+                        db_path.display()
+                    );
+                    std::process::exit(2);
+                }
+            }
+        }
+    };
+
+    if !weaver_server::setup::interactive::validate_fqdn(&root_domain) {
+        eprintln!("Error: Invalid root domain '{root_domain}'. Must be a valid FQDN.");
+        std::process::exit(2);
+    }
+    if !weaver_server::setup::interactive::validate_fqdn(&admin_domain) {
+        eprintln!("Error: Invalid admin domain '{admin_domain}'. Must be a valid FQDN.");
+        std::process::exit(2);
+    }
+
+    let report = weaver_server::setup::doctor::run_in_process(
+        &root_domain,
+        &admin_domain,
+        &args.relay_ips,
+        args.skip_reachability_check,
+    )
+    .await;
+
+    if args.json {
+        match serde_json::to_string_pretty(&report.to_json()) {
+            Ok(json) => println!("{json}"),
+            Err(err) => {
+                eprintln!("Error serializing report: {err}");
+                std::process::exit(1);
+            }
+        }
+    } else {
+        println!("{}", report.render());
+    }
+
+    std::process::exit(if report.ok() { 0 } else { 1 });
 }
 
 fn handle_uninstall(args: UninstallArgs, db_path: PathBuf) {

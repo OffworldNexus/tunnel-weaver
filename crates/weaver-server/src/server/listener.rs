@@ -126,7 +126,7 @@ pub fn acquire_listeners(config: &Config) -> Result<EdgeListeners, ListenerError
                 https_listener = Some(TcpListener::from_std(std_listener).map_err(|e| {
                     ListenerError::Activation(format!("Failed to convert fd {fd} to tokio: {e}"))
                 })?);
-            } else if port == DNS_PORT && dns_tcp.is_empty() {
+            } else if port == DNS_PORT {
                 std_listener.set_nonblocking(true).map_err(|e| {
                     ListenerError::Activation(format!("Failed to set nonblocking on fd {fd}: {e}"))
                 })?;

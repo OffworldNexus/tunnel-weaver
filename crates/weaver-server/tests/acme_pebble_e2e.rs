@@ -197,6 +197,7 @@ async fn test_pebble_e2e_issuance_and_lazy_ensure() {
     let root_domain = "pebble.test";
     let config = Arc::new(Config {
         root_domain: root_domain.into(),
+        admin_domain: "relay-admin.test".into(),
         admin_email: "admin@pebble.test".into(),
         acme_provider: "custom".into(),
         listen_http: "0.0.0.0:5002".parse().unwrap(),
@@ -228,8 +229,16 @@ async fn test_pebble_e2e_issuance_and_lazy_ensure() {
 
     // Start HTTP and HTTPS servers
     let s_tok1 = shutdown_token.clone();
+    let http_store = Arc::clone(&store);
     tokio::spawn(async move {
-        run_http_server(http_listener, root_domain.into(), https_port, s_tok1).await;
+        run_http_server(
+            http_listener,
+            root_domain.into(),
+            https_port,
+            http_store,
+            s_tok1,
+        )
+        .await;
     });
 
     let tls_config =
@@ -320,6 +329,7 @@ async fn test_pebble_e2e_tunnel_registration_and_proxying() {
     let root_domain = "pebble.test";
     let config = Arc::new(Config {
         root_domain: root_domain.into(),
+        admin_domain: "relay-admin.test".into(),
         admin_email: "admin@pebble.test".into(),
         acme_provider: "custom".into(),
         listen_http: "0.0.0.0:5002".parse().unwrap(),
@@ -364,8 +374,16 @@ async fn test_pebble_e2e_tunnel_registration_and_proxying() {
     let shutdown_token = CancellationToken::new();
 
     let s_tok1 = shutdown_token.clone();
+    let http_store = Arc::clone(&store);
     tokio::spawn(async move {
-        run_http_server(http_listener, root_domain.into(), https_port, s_tok1).await;
+        run_http_server(
+            http_listener,
+            root_domain.into(),
+            https_port,
+            http_store,
+            s_tok1,
+        )
+        .await;
     });
 
     let tls_config =

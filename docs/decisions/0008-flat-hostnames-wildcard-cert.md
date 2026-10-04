@@ -4,7 +4,8 @@ Date: 2026-10-04
 
 ## Status
 
-Accepted. Implements OFF-190. Supersedes the per-machine-wildcard direction in
+Accepted. Implements OFF-190, amended by OFF-198 (see the amendment at the end).
+Supersedes the per-machine-wildcard direction in
 ADR 0007 (which was Proposed, never shipped) and corrects two of its calls:
 out-of-zone answers are `REFUSED`, not `NXDOMAIN`, and DNS is a hard setup
 precondition rather than an optional strategy.
@@ -117,3 +118,53 @@ the certificate is missing or expired.
 
 DNSSEC, DNS Cookies, a rate limiter, secondary nameservers, disabling
 systemd-resolved, and automated operator paging on renewal failure.
+
+## Amendment: admin domain split (OFF-198)
+
+OFF-190 made the tunnel zone self-delegated (`NS <root> -> <root>`) and gave the
+relay one wildcard certificate. That couples the relay's own hostname and DNS to
+the delegated zone. OFF-198 splits them:
+
+- `root_domain` is the **tunnel** domain, delegated in full to the relay.
+- `admin_domain` is the relay's own stable hostname, *outside* the delegation.
+  `A`/`AAAA <admin>` points at the relay and `NS <root>` points at `<admin>`.
+
+`Config::load` rejects an empty admin domain, `admin == root`, and an admin
+domain nested under the tunnel domain (`admin` ends with `.<root>`). The reverse
+nesting — tunnel under admin — is allowed. This is the foot-gun the split
+exists to prevent: an admin domain under the delegated zone would let that zone
+control the relay's own DNS and the admin certificate's DCV.
+
+Two certificates are now issued and renewed together (the 12 h loop covers
+both):
+
+| Certificate | Names | DCV | Depends on |
+|---|---|---|---|
+| tunnel | `[<root>, *.<root>]` | DNS-01 | parent `NS <root> -> <admin>` |
+| admin | `[<admin>]` | HTTP-01 | inbound port 80 |
+
+The authoritative responder's `NS`/SOA MNAME is `<admin>`, and it serves CAA
+(`issue`/`issuewild`) for the tunnel apex only — we do not own the admin zone and
+must not publish CAA for it. `CertResolver` maps the exact admin SNI to the
+admin certificate and the apex/first-label tunnel SNI to the wildcard, never
+cross-matching.
+
+Both mechanisms live behind one `ChallengeSolver` interface
+(`cert/solver.rs`): `Dns01Solver` writes the `_acme-challenge.<root>` TXT digest
+and `Http01Solver` writes the token/key-authorization row, each returning a
+`ChallengeGuard` that withdraws its response on drop. `AcmeEngine` holds a
+`SolverRegistry` and picks the solver for the offered `ChallengeType`, so it
+carries no DNS- or HTTP-specific code. The `challenge` table gained a `kind`
+column (`dns-01`/`http-01`) and `certificates` gained `validation`, so each
+responder only ever reads its own rows and renewal can dispatch per row.
+
+`setup` asks for both domains, validates the split first, resolves `relay_ips`
+from the admin `A`/`AAAA`, verifies the `NS <root> -> <admin>` delegation, issues
+both certificates, probes both HTTPS endpoints, and only then persists
+`setup_complete`.
+
+HTTPS-edge visits to a covered host call `CertManager::note_visit`, which records
+a lifecycle event and (outside the existing backoff) triggers issuance when the
+covering certificate is missing or inside its renewal window. This shortens the
+worst case after an outage; the 12 h loop remains the floor.
+

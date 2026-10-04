@@ -92,6 +92,7 @@ fn create_test_client_config() -> Arc<rustls::ClientConfig> {
 fn test_config(root_domain: &str, acme_provider: &str, acme_directory: Option<String>) -> Config {
     Config {
         root_domain: root_domain.to_string(),
+        admin_domain: "relay-admin.test".to_string(),
         admin_email: "admin@example.com".into(),
         acme_provider: acme_provider.to_string(),
         listen_http: "127.0.0.1:80".parse().unwrap(),
@@ -346,6 +347,8 @@ async fn test_sqlite_caching_and_server_restart_no_reorder() {
                 issuer: None,
                 directory: "https://acme-staging-v02.api.letsencrypt.org/directory".into(),
                 obtained_at: 1_700_000_000,
+                validation: "dns-01".to_string(),
+                wildcard: true,
             },
         )
         .await
@@ -434,11 +437,14 @@ async fn test_active_inactive_renewal_policy() {
     manager.set_active("host1.example.com", true);
     assert!(manager.is_active("host1.example.com"));
 
-    // Cert counts are computed over the single wildcard, so an inactive root
-    // simply reports one inactive certificate.
+    // Cert counts span both managed certificates (tunnel wildcard + admin), so
+    // with neither active both report inactive.
+    let counts = manager.cert_counts().await;
+    assert_eq!(counts.inactive, 2);
+    manager.set_active("example.com", true);
     let counts = manager.cert_counts().await;
     assert_eq!(counts.inactive, 1);
-    manager.set_active("example.com", true);
+    manager.set_active("relay-admin.test", true);
     let counts = manager.cert_counts().await;
     assert_eq!(counts.inactive, 0);
 }
@@ -471,6 +477,8 @@ async fn test_forced_expiration_triggers_renewal_flow_and_event() {
                 issuer: None,
                 directory: "https://acme-staging-v02.api.letsencrypt.org/directory".into(),
                 obtained_at: 1_600_000_000,
+                validation: "dns-01".to_string(),
+                wildcard: true,
             },
         )
         .await
@@ -830,4 +838,67 @@ async fn test_strict_tls_hold_timeout_terminates_tcp() {
     );
 
     shutdown_token.cancel();
+}
+
+#[tokio::test]
+async fn test_cert_name_selection_admin_vs_tunnel() {
+    let dir = tempdir().unwrap();
+    let store = Arc::new(Store::open(dir.path().join("select.db")).await.unwrap());
+    let config = Arc::new(test_config("example.com", "letsencrypt-staging", None));
+    let resolver = Arc::new(CertResolver::new("example.com".into()));
+    let manager = CertManager::new(config, store, resolver, Arc::new(MockClock::new(0)));
+
+    // The admin host maps to its own certificate, never the tunnel wildcard.
+    assert_eq!(
+        manager.cert_name_for("relay-admin.test").as_deref(),
+        Some("relay-admin.test")
+    );
+    // The apex and exactly one label beneath it map to the tunnel wildcard.
+    assert_eq!(
+        manager.cert_name_for("example.com").as_deref(),
+        Some("example.com")
+    );
+    assert_eq!(
+        manager
+            .cert_name_for("poc-laptop-web.example.com")
+            .as_deref(),
+        Some("example.com")
+    );
+    // Deeper names and unrelated hosts are not covered by either.
+    assert_eq!(manager.cert_name_for("a.b.example.com"), None);
+    assert_eq!(manager.cert_name_for("other.net"), None);
+}
+
+#[tokio::test]
+async fn test_note_visit_records_event_and_triggers_issuance() {
+    let dir = tempdir().unwrap();
+    let store = Arc::new(Store::open(dir.path().join("visit.db")).await.unwrap());
+    let clock = Arc::new(MockClock::new(1_700_000_000));
+    // A custom directory at a closed port makes the order fail fast without
+    // touching a real CA; the point is the visit-triggered wiring, not issuance.
+    let config = Arc::new(test_config(
+        "example.com",
+        "custom",
+        Some("http://127.0.0.1:1/directory".into()),
+    ));
+    let resolver = Arc::new(CertResolver::new("example.com".into()));
+    let manager = CertManager::new(config, Arc::clone(&store), resolver, clock);
+    manager.init().await.unwrap();
+
+    manager.note_visit("poc-laptop-web.example.com");
+
+    for _ in 0..600 {
+        let events = store.get_cert_events("example.com", 10).await.unwrap();
+        let visited = events.iter().any(|e| e.kind == "visit");
+        if visited
+            && matches!(
+                manager.status("example.com"),
+                CertState::Ordering | CertState::Failed { .. }
+            )
+        {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    panic!("visitor-triggered issuance did not start");
 }

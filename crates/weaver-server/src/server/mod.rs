@@ -16,7 +16,6 @@ use tracing::{error, info, warn};
 use crate::cert::{CertManager, CertResolver, SystemClock};
 use crate::config::{Config, ConfigError};
 use crate::edge::http::run_http_server;
-use crate::edge::https::run_https_server_with_registry;
 use crate::edge::tls::{TlsError, create_server_config};
 use crate::notify::{notify_ready_with_cert_status, notify_stopping};
 use crate::server::listener::{ListenerError, acquire_listeners};
@@ -96,6 +95,7 @@ pub async fn run_server(
 
     info!(
         root_domain = %config.root_domain,
+        admin_domain = %config.admin_domain,
         http_listen = %config.listen_http,
         https_listen = %config.listen_https,
         "Configuration loaded and validated"
@@ -113,7 +113,10 @@ pub async fn run_server(
     };
 
     // 5. Initialize certificate manager and dynamic TLS resolver
-    let resolver = Arc::new(CertResolver::new(config.root_domain.clone()));
+    let resolver = Arc::new(
+        CertResolver::new(config.root_domain.clone())
+            .with_admin_domain(config.admin_domain.clone()),
+    );
 
     let cert_manager = CertManager::new(
         Arc::new(config.clone()),
@@ -175,16 +178,21 @@ pub async fn run_server(
         listeners.http,
         config.root_domain.clone(),
         config.listen_https.port(),
+        Arc::new(store.clone()),
         http_token,
     ));
 
     let https_token = shutdown_token.clone();
-    let https_task = tokio::spawn(run_https_server_with_registry(
+    let https_task = tokio::spawn(crate::edge::https::run_https_server_full(
         listeners.https,
         tls_config,
-        config.root_domain.clone(),
-        Some(Arc::clone(&resolver)),
-        Some(tunnel_registry),
+        crate::edge::https::HttpsEdgeConfig {
+            root_domain: config.root_domain.clone(),
+            admin_domain: Some(config.admin_domain.clone()),
+            cert_resolver: Some(Arc::clone(&resolver)),
+            cert_manager: Some(Arc::clone(&cert_manager)),
+            tunnel_registry: Some(tunnel_registry),
+        },
         https_token,
     ));
 

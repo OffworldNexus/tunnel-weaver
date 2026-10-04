@@ -20,6 +20,7 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 use tracing::{debug, info, trace};
 
+use crate::cert::CertManager;
 use crate::cert::resolver::CertResolver;
 use crate::edge::counting::{ConnBytes, CountingIo};
 use crate::edge::host::request_host;
@@ -38,8 +39,13 @@ const VISITOR_REPORT_INTERVAL: Duration = Duration::from_secs(5);
 pub struct HttpsEdgeConfig {
     /// Configured root domain (e.g. "example.com").
     pub root_domain: String,
+    /// The relay's own stable hostname, served by the admin certificate and
+    /// given the same welcome/health surface as the apex.
+    pub admin_domain: Option<String>,
     /// Dynamic certificate resolver used to determine if certificate is placeholder.
     pub cert_resolver: Option<Arc<CertResolver>>,
+    /// Certificate manager, used to record visitor-triggered renewals.
+    pub cert_manager: Option<Arc<CertManager>>,
     /// Active tunnel registry for routing subdomain requests and handling connection upgrades.
     pub tunnel_registry: Option<Arc<TunnelRegistry>>,
 }
@@ -48,7 +54,9 @@ impl std::fmt::Debug for HttpsEdgeConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("HttpsEdgeConfig")
             .field("root_domain", &self.root_domain)
+            .field("admin_domain", &self.admin_domain)
             .field("has_cert_resolver", &self.cert_resolver.is_some())
+            .field("has_cert_manager", &self.cert_manager.is_some())
             .field("has_tunnel_registry", &self.tunnel_registry.is_some())
             .finish()
     }
@@ -144,13 +152,27 @@ pub async fn handle_https_request(
 
     let host_lower = host.to_ascii_lowercase();
     let root_lower = config.root_domain.to_ascii_lowercase();
+    let admin_lower = config.admin_domain.as_ref().map(|d| d.to_ascii_lowercase());
 
     let include_hsts = config
         .cert_resolver
         .as_ref()
         .is_some_and(|r| !r.is_placeholder(&host));
 
+    // The relay's own (admin) hostname is outside the tunnel zone and is served
+    // by its own single-name certificate. It gets the same welcome/health
+    // surface as the apex but never the tunnel WebSocket endpoint.
+    if admin_lower.as_deref() == Some(host_lower.as_str()) {
+        if let Some(mgr) = &config.cert_manager {
+            mgr.note_visit(&host_lower);
+        }
+        return Ok(static_host_response(&req, include_hsts));
+    }
+
     if host_lower == root_lower {
+        if let Some(mgr) = &config.cert_manager {
+            mgr.note_visit(&host_lower);
+        }
         // Handle WebSocket upgrade endpoint GET /_weaver/connect on root domain
         if req.uri().path() == "/_weaver/connect" {
             if req.method() != Method::GET {
@@ -292,6 +314,9 @@ pub async fn handle_https_request(
         if let Some(ref reg) = config.tunnel_registry
             && let Some(route) = reg.resolve(&host_lower).await
         {
+            if let Some(mgr) = &config.cert_manager {
+                mgr.note_visit(&host_lower);
+            }
             // Attribute this visitor connection's socket bytes to the service
             // it serves. First tunnel request wins for the whole connection.
             conn_bytes.set_service(route.service_id);
@@ -357,6 +382,30 @@ fn report_conn_bytes(bytes: &ConnBytes, config: &HttpsEdgeConfig) {
     }
 }
 
+/// Welcome/health/404 surface shared by the tunnel apex and the admin host.
+fn static_host_response(
+    req: &Request<hyper::body::Incoming>,
+    include_hsts: bool,
+) -> Response<BoxBody> {
+    let mut resp = match (req.method(), req.uri().path()) {
+        (&Method::GET, "/") => Response::builder()
+            .status(StatusCode::OK)
+            .body(full_body(render_welcome()))
+            .unwrap(),
+        (&Method::GET, "/healthz") => Response::builder()
+            .status(StatusCode::OK)
+            .header(http::header::CONTENT_TYPE, "text/plain; charset=utf-8")
+            .body(full_body("ok\n"))
+            .unwrap(),
+        _ => Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .body(full_body("404 Not Found\n"))
+            .unwrap(),
+    };
+    apply_security_headers(&mut resp, include_hsts);
+    resp
+}
+
 /// Runs the HTTPS TLS edge server on the given listener until the cancellation token is triggered.
 pub async fn run_https_server(
     listener: TcpListener,
@@ -385,11 +434,33 @@ pub async fn run_https_server_with_registry(
     tunnel_registry: Option<Arc<TunnelRegistry>>,
     shutdown_token: CancellationToken,
 ) {
-    let edge_config = Arc::new(HttpsEdgeConfig {
-        root_domain,
-        cert_resolver,
-        tunnel_registry,
-    });
+    run_https_server_full(
+        listener,
+        tls_config,
+        HttpsEdgeConfig {
+            root_domain,
+            admin_domain: None,
+            cert_resolver,
+            cert_manager: None,
+            tunnel_registry,
+        },
+        shutdown_token,
+    )
+    .await;
+}
+
+/// Runs the HTTPS TLS edge server with a fully-populated [`HttpsEdgeConfig`].
+///
+/// The full form is what the daemon uses: it additionally knows the admin
+/// domain (served by its own certificate) and the certificate manager
+/// (visitor-triggered renewal).
+pub async fn run_https_server_full(
+    listener: TcpListener,
+    tls_config: Arc<ServerConfig>,
+    config: HttpsEdgeConfig,
+    shutdown_token: CancellationToken,
+) {
+    let edge_config = Arc::new(config);
     let acceptor = TlsAcceptor::from(tls_config);
     let mut auto_builder = Builder::new(TokioExecutor::new());
     // Advertise SETTINGS_ENABLE_CONNECT_PROTOCOL so h2 visitors can carry

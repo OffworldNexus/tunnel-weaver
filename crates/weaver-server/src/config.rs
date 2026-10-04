@@ -30,7 +30,17 @@ pub enum ConfigError {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Config {
     /// Base domain for routed public tunnels (e.g. "example.com").
+    ///
+    /// This is the *delegated* zone: the parent delegates it in full to the
+    /// relay, which then owns every name beneath it.
     pub root_domain: String,
+    /// The relay's own stable hostname (e.g. "relay.example.net").
+    ///
+    /// Kept outside the tunnel delegation so the relay's own DNS, control
+    /// endpoint, and admin certificate are never controlled by the delegated
+    /// zone. Setup detects `relay_ips` from its A/AAAA records and serves the
+    /// authoritative NS/SOA under this name.
+    pub admin_domain: String,
     /// Administrator contact email for ACME registration.
     pub admin_email: String,
     /// ACME directory provider (e.g. "letsencrypt", "letsencrypt-staging", "google", "zerossl", "buypass", "custom").
@@ -85,6 +95,39 @@ fn default_usage_flush_interval() -> u64 {
     60
 }
 
+/// Checks the admin/tunnel domain split and returns a reason when it is unsafe.
+///
+/// The tunnel domain is delegated in full to this relay, so an admin domain
+/// *under* the tunnel zone would put the relay's own DNS — and therefore the
+/// admin certificate's HTTP-01 DCV and the authoritative NS records — under the
+/// delegated zone's control. The reverse nesting (tunnel under admin) is safe
+/// and allowed. Both names are compared case-insensitively with any trailing
+/// dot ignored.
+///
+/// Returns `None` when the pair is acceptable. Callers are expected to have
+/// already rejected empty names, but an empty input is reported here too.
+pub fn domain_split_issue(admin_domain: &str, root_domain: &str) -> Option<String> {
+    let admin = normalize_domain(admin_domain);
+    let root = normalize_domain(root_domain);
+    if admin.is_empty() || root.is_empty() {
+        return Some("admin_domain and root_domain must both be non-empty".into());
+    }
+    if admin == root {
+        return Some("admin_domain and root_domain must differ".into());
+    }
+    if admin.ends_with(&format!(".{root}")) {
+        return Some(format!(
+            "admin_domain '{admin}' must not be a subdomain of the tunnel domain '{root}'"
+        ));
+    }
+    None
+}
+
+/// Lowercases a domain and strips any trailing dot for comparison.
+fn normalize_domain(domain: &str) -> String {
+    domain.trim().trim_end_matches('.').to_ascii_lowercase()
+}
+
 impl Config {
     /// Loads and validates configuration from the store.
     pub async fn load(store: &Store) -> Result<Self, ConfigError> {
@@ -96,6 +139,7 @@ impl Config {
         let Some(json_str) = raw_json else {
             return Err(ConfigError::MissingKeys(vec![
                 "root_domain".into(),
+                "admin_domain".into(),
                 "admin_email".into(),
                 "acme_provider".into(),
                 "listen_http".into(),
@@ -113,6 +157,7 @@ impl Config {
 
         let required_keys = [
             "root_domain",
+            "admin_domain",
             "admin_email",
             "acme_provider",
             "listen_http",
@@ -138,6 +183,17 @@ impl Config {
         let mut validation_issues = Vec::new();
         if config.root_domain.trim().is_empty() {
             validation_issues.push("root_domain must not be empty".into());
+        }
+        if config.admin_domain.trim().is_empty() {
+            validation_issues.push("admin_domain must not be empty".into());
+        }
+        // Only compare the pair once both are present; the empty checks above
+        // already reported the missing side.
+        if !config.root_domain.trim().is_empty()
+            && !config.admin_domain.trim().is_empty()
+            && let Some(issue) = domain_split_issue(&config.admin_domain, &config.root_domain)
+        {
+            validation_issues.push(issue);
         }
 
         let email = config.admin_email.trim();

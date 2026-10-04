@@ -1,5 +1,9 @@
 //! Initial schema: singleton config, ACME accounts, person, machine, machine_key,
-//! service, domains, certificates, cert events.
+//! service, certificates, domains, cert events, per-service usage buckets, and
+//! the persistent ACME challenge registry.
+//!
+//! There has been no release, so this one migration describes the whole current
+//! schema and supersedes the former incremental `m0002`–`m0004`.
 
 use sea_orm_migration::prelude::*;
 use sea_orm_migration::schema::*;
@@ -64,20 +68,12 @@ enum Service {
     CreatedAt,
 }
 
-#[derive(DeriveIden)]
-enum Domains {
-    Table,
-    Id,
-    Name,
-    LastActiveAt,
-    ServiceId,
-}
-
+#[allow(clippy::enum_variant_names)]
 #[derive(DeriveIden)]
 enum Certificates {
     Table,
     Id,
-    DomainId,
+    Name,
     CertPem,
     KeyPem,
     NotBefore,
@@ -85,6 +81,18 @@ enum Certificates {
     Issuer,
     Directory,
     ObtainedAt,
+    Validation,
+    Wildcard,
+}
+
+#[derive(DeriveIden)]
+enum Domains {
+    Table,
+    Id,
+    Name,
+    LastActiveAt,
+    ServiceId,
+    CertificateId,
 }
 
 #[derive(DeriveIden)]
@@ -95,6 +103,29 @@ enum CertEvents {
     At,
     Kind,
     Detail,
+}
+
+#[derive(DeriveIden)]
+enum Usage {
+    Table,
+    ServiceId,
+    Minute,
+    BytesIn,
+    BytesOut,
+    TunnelIn,
+    TunnelOut,
+    Requests,
+    UnusedMs,
+}
+
+#[derive(DeriveIden)]
+enum Challenge {
+    Table,
+    Id,
+    Name,
+    Value,
+    CreatedAt,
+    Kind,
 }
 
 #[async_trait::async_trait]
@@ -229,7 +260,47 @@ impl MigrationTrait for Migration {
             )
             .await?;
 
-        // 5. domains table
+        // 5. certificates table: global rows keyed by their own name. There are
+        // two long-lived rows in the OFF-198 model (the `[<root>, *.<root>]`
+        // wildcard held under the zone apex and the single-name admin
+        // certificate) but the table does not hard-code that cardinality.
+        manager
+            .create_table(
+                Table::create()
+                    .table(Certificates::Table)
+                    .col(pk_auto(Certificates::Id))
+                    .col(text(Certificates::Name))
+                    .col(text(Certificates::CertPem))
+                    .col(text(Certificates::KeyPem))
+                    .col(big_integer(Certificates::NotBefore))
+                    .col(big_integer(Certificates::NotAfter))
+                    .col(text_null(Certificates::Issuer))
+                    .col(text(Certificates::Directory))
+                    .col(big_integer(Certificates::ObtainedAt))
+                    .col(text(Certificates::Validation).default("dns-01"))
+                    // Whether the certificate carries a wildcard SAN. Stored
+                    // explicitly rather than re-derived from the name so
+                    // `cert status` can label a row accurately even after the
+                    // zone model changes.
+                    .col(boolean(Certificates::Wildcard).default(false))
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_certificates_name")
+                    .table(Certificates::Table)
+                    .col(Certificates::Name)
+                    .unique()
+                    .to_owned(),
+            )
+            .await?;
+
+        // 6. domains table: materialized flat service hostnames. `service_id`
+        // and `certificate_id` are nullable so a domain survives either side
+        // being removed (`ON DELETE SET NULL`).
         manager
             .create_table(
                 Table::create()
@@ -238,11 +309,20 @@ impl MigrationTrait for Migration {
                     .col(text(Domains::Name).unique_key())
                     .col(big_integer_null(Domains::LastActiveAt))
                     .col(integer_null(Domains::ServiceId))
+                    .col(integer_null(Domains::CertificateId))
                     .foreign_key(
                         ForeignKey::create()
                             .name("fk_domains_service_id")
                             .from(Domains::Table, Domains::ServiceId)
                             .to(Service::Table, Service::Id)
+                            .on_delete(ForeignKeyAction::SetNull)
+                            .on_update(ForeignKeyAction::Cascade),
+                    )
+                    .foreign_key(
+                        ForeignKey::create()
+                            .name("fk_domains_certificate_id")
+                            .from(Domains::Table, Domains::CertificateId)
+                            .to(Certificates::Table, Certificates::Id)
                             .on_delete(ForeignKeyAction::SetNull)
                             .on_update(ForeignKeyAction::Cascade),
                     )
@@ -256,42 +336,6 @@ impl MigrationTrait for Migration {
                     .name("idx_domains_service_id")
                     .table(Domains::Table)
                     .col(Domains::ServiceId)
-                    .to_owned(),
-            )
-            .await?;
-
-        // 6. certificates table
-        manager
-            .create_table(
-                Table::create()
-                    .table(Certificates::Table)
-                    .col(pk_auto(Certificates::Id))
-                    .col(integer(Certificates::DomainId))
-                    .col(text(Certificates::CertPem))
-                    .col(text(Certificates::KeyPem))
-                    .col(big_integer(Certificates::NotBefore))
-                    .col(big_integer(Certificates::NotAfter))
-                    .col(text_null(Certificates::Issuer))
-                    .col(text(Certificates::Directory))
-                    .col(big_integer(Certificates::ObtainedAt))
-                    .foreign_key(
-                        ForeignKey::create()
-                            .name("fk_certificates_domain_id")
-                            .from(Certificates::Table, Certificates::DomainId)
-                            .to(Domains::Table, Domains::Id)
-                            .on_delete(ForeignKeyAction::Cascade)
-                            .on_update(ForeignKeyAction::Cascade),
-                    )
-                    .to_owned(),
-            )
-            .await?;
-
-        manager
-            .create_index(
-                Index::create()
-                    .name("idx_certificates_domain_id")
-                    .table(Certificates::Table)
-                    .col(Certificates::DomainId)
                     .to_owned(),
             )
             .await?;
@@ -322,7 +366,73 @@ impl MigrationTrait for Migration {
             )
             .await?;
 
-        // 8. seed default PoC person ("poc"), machine ("laptop"), and dev key.
+        // 8. usage table: per-service, per-minute metering buckets. The
+        // composite primary key makes the flush upsert idempotent and the extra
+        // index on `minute` serves cross-service range scans.
+        manager
+            .create_table(
+                Table::create()
+                    .table(Usage::Table)
+                    .col(integer(Usage::ServiceId).not_null())
+                    .col(big_integer(Usage::Minute).not_null())
+                    .col(big_integer(Usage::BytesIn).not_null())
+                    .col(big_integer(Usage::BytesOut).not_null())
+                    .col(big_integer(Usage::TunnelIn).not_null())
+                    .col(big_integer(Usage::TunnelOut).not_null())
+                    .col(big_integer(Usage::Requests).not_null())
+                    .col(integer(Usage::UnusedMs).not_null())
+                    .primary_key(Index::create().col(Usage::ServiceId).col(Usage::Minute))
+                    .foreign_key(
+                        ForeignKey::create()
+                            .name("fk_usage_service_id")
+                            .from(Usage::Table, Usage::ServiceId)
+                            .to(Service::Table, Service::Id)
+                            .on_delete(ForeignKeyAction::Cascade)
+                            .on_update(ForeignKeyAction::Cascade),
+                    )
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_usage_minute")
+                    .table(Usage::Table)
+                    .col(Usage::Minute)
+                    .to_owned(),
+            )
+            .await?;
+
+        // 9. challenge table: persistent, multi-value DNS-01 / HTTP-01 registry.
+        // The apex and wildcard authorisations share the challenge name, so the
+        // composite unique index is what makes a name a set of values.
+        manager
+            .create_table(
+                Table::create()
+                    .table(Challenge::Table)
+                    .col(big_pk_auto(Challenge::Id))
+                    .col(text(Challenge::Name))
+                    .col(text(Challenge::Value))
+                    .col(big_integer(Challenge::CreatedAt))
+                    .col(text(Challenge::Kind).default("dns-01"))
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_challenge_name_value")
+                    .table(Challenge::Table)
+                    .col(Challenge::Name)
+                    .col(Challenge::Value)
+                    .unique()
+                    .to_owned(),
+            )
+            .await?;
+
+        // 10. seed default PoC person ("poc"), machine ("laptop"), and dev key.
         // Foreign keys are resolved by name (person/machine names are unique)
         // so the seed never depends on auto-increment values.
         manager
@@ -384,13 +494,19 @@ impl MigrationTrait for Migration {
 
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         manager
+            .drop_table(Table::drop().table(Challenge::Table).to_owned())
+            .await?;
+        manager
+            .drop_table(Table::drop().table(Usage::Table).to_owned())
+            .await?;
+        manager
             .drop_table(Table::drop().table(CertEvents::Table).to_owned())
             .await?;
         manager
-            .drop_table(Table::drop().table(Certificates::Table).to_owned())
+            .drop_table(Table::drop().table(Domains::Table).to_owned())
             .await?;
         manager
-            .drop_table(Table::drop().table(Domains::Table).to_owned())
+            .drop_table(Table::drop().table(Certificates::Table).to_owned())
             .await?;
         manager
             .drop_table(Table::drop().table(Service::Table).to_owned())

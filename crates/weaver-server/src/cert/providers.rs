@@ -13,6 +13,12 @@ pub struct AcmeProviderInfo {
     /// OFF-190 issues a single `[<root>, *.<root>]` order, so a provider that
     /// cannot issue wildcards is unusable as a primary or fallback.
     pub wildcard_capable: bool,
+    /// The CA's CAA issuer domain, if known.
+    ///
+    /// The authoritative responder publishes `issue`/`issuewild` CAA records
+    /// for this identifier so issuance is restricted to the configured CA.
+    /// `None` means we cannot name the CA (e.g. `custom`) and no CAA is served.
+    pub caa_identifier: Option<&'static str>,
     pub quota: &'static str,
     pub guidance: &'static str,
 }
@@ -24,6 +30,7 @@ pub const PROVIDERS: &[AcmeProviderInfo] = &[
         directory: "https://acme-v02.api.letsencrypt.org/directory",
         eab_required: false,
         wildcard_capable: true,
+        caa_identifier: Some("letsencrypt.org"),
         quota: "50 new certs / week / registered domain (renewals exempt); 300 orders / 3 h; free increase via https://isrg.formstack.com/forms/rate_limit_adjustment_request",
         guidance: "—",
     },
@@ -32,6 +39,7 @@ pub const PROVIDERS: &[AcmeProviderInfo] = &[
         directory: "https://acme-staging-v02.api.letsencrypt.org/directory",
         eab_required: false,
         wildcard_capable: true,
+        caa_identifier: Some("letsencrypt.org"),
         quota: "very high, untrusted certs",
         guidance: "—",
     },
@@ -40,6 +48,7 @@ pub const PROVIDERS: &[AcmeProviderInfo] = &[
         directory: "https://dv.acme-v02.api.pki.goog/directory",
         eab_required: true,
         wildcard_capable: true,
+        caa_identifier: Some("pki.goog"),
         quota: "very high, adjustable in GCP",
         guidance: "GCP project → enable Public Certificate Authority API → gcloud publicca external-account-keys create → keyId + b64MacKey. Key must be used within 7 days of creation. Docs: https://cloud.google.com/certificate-manager/docs/public-ca-tutorial",
     },
@@ -48,6 +57,7 @@ pub const PROVIDERS: &[AcmeProviderInfo] = &[
         directory: "https://acme.zerossl.com/v2/DV90",
         eab_required: true,
         wildcard_capable: true,
+        caa_identifier: Some("sectigo.com"),
         quota: "unlimited 90-day",
         guidance: "free account → Developer → EAB Credentials for ACME Clients. Docs: https://zerossl.com/documentation/acme/",
     },
@@ -57,6 +67,7 @@ pub const PROVIDERS: &[AcmeProviderInfo] = &[
         eab_required: false,
         // Buypass does not offer wildcard DNS-01; excluded from OFF-190.
         wildcard_capable: false,
+        caa_identifier: Some("buypass.com"),
         quota: "20 / week / domain, 180-day certs",
         guidance: "—",
     },
@@ -65,6 +76,7 @@ pub const PROVIDERS: &[AcmeProviderInfo] = &[
         directory: "any URL",
         eab_required: false,
         wildcard_capable: true,
+        caa_identifier: None,
         quota: "—",
         guidance: "Pebble, step-ca, internal CAs; optional acme_root_ca_pem to trust the directory endpoint",
     },
@@ -74,6 +86,21 @@ pub const PROVIDERS: &[AcmeProviderInfo] = &[
 pub fn find_provider(id: &str) -> Option<&'static AcmeProviderInfo> {
     let lower = id.to_ascii_lowercase();
     PROVIDERS.iter().find(|p| p.id.eq_ignore_ascii_case(&lower))
+}
+
+/// Returns the CAA issuer domains for the configured provider and its
+/// fallbacks, deduplicated. Empty means "unknown" — serve no CAA rather than a
+/// restrictive one, since an empty `issuewild` forbids wildcard issuance.
+pub fn caa_identifiers(provider: &str, fallbacks: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    for id in std::iter::once(provider).chain(fallbacks.iter().map(String::as_str)) {
+        if let Some(domain) = find_provider(id).and_then(|p| p.caa_identifier)
+            && !out.iter().any(|d| d == domain)
+        {
+            out.push(domain.to_string());
+        }
+    }
+    out
 }
 
 /// Whether the provider can issue the wildcard certificate OFF-190 requires.

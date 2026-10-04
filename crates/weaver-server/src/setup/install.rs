@@ -112,7 +112,7 @@ pub async fn execute_install(
         println!("  {} Creating system group '{}'...", "•".blue(), plan.user);
         let _ = Command::new("groupadd")
             .args(["--system", &plan.user])
-            .status();
+            .output();
         changed = true;
     }
 
@@ -130,14 +130,15 @@ pub async fn execute_install(
         }
         useradd_cmd.arg(&plan.user);
 
-        let status = useradd_cmd
-            .status()
+        let output = useradd_cmd
+            .output()
             .map_err(|e| format!("failed to execute useradd: {e}"))?;
 
-        if !status.success() {
+        if !output.status.success() {
             return Err(format!(
-                "useradd failed with exit code: {:?}",
-                status.code()
+                "useradd failed with exit code {:?}: {}",
+                output.status.code(),
+                String::from_utf8_lossy(&output.stderr).trim()
             ));
         }
         changed = true;
@@ -221,8 +222,8 @@ pub async fn execute_install(
     // 4. Temporarily stop service if running to apply database changes
     let service_was_active = Command::new("systemctl")
         .args(["is-active", "--quiet", "weaver-server.service"])
-        .status()
-        .map(|s| s.success())
+        .output()
+        .map(|out| out.status.success())
         .unwrap_or(false);
 
     if service_was_active {
@@ -232,7 +233,7 @@ pub async fn execute_install(
         );
         let _ = Command::new("systemctl")
             .args(["stop", "weaver-server.service"])
-            .status();
+            .output();
     }
 
     // 5. Open SQLite store and persist configuration
@@ -271,6 +272,7 @@ pub async fn execute_install(
 
     let config = Config {
         root_domain: gathered.root_domain.clone(),
+        admin_domain: gathered.admin_domain.clone(),
         admin_email: gathered.admin_email.clone(),
         acme_provider: gathered.acme_provider.clone(),
         listen_http: "[::]:80".parse().unwrap(),
@@ -349,27 +351,33 @@ pub async fn execute_install(
         fs::write(service_path, &service_content)
             .map_err(|e| format!("failed to write service unit: {e}"))?;
 
-        let _ = Command::new("systemctl").arg("daemon-reload").status();
+        let _ = Command::new("systemctl").arg("daemon-reload").output();
         changed = true;
         println!("  {} Systemd units written and reloaded", "✓".green());
     } else {
         println!("  {} Systemd units already up to date", "•".dim());
     }
 
-    // 7. Enable and start units
+    // 7. Enable and start units. `--quiet` suppresses systemctl's
+    //    "Created symlink ..." chatter; `output()` keeps even that off stdout
+    //    and is surfaced only if the command fails.
     println!("  {} Enabling and starting systemd services...", "•".blue());
-    let status = Command::new("systemctl")
+    let output = Command::new("systemctl")
         .args([
             "enable",
             "--now",
+            "--quiet",
             "weaver-server.socket",
             "weaver-server.service",
         ])
-        .status()
+        .output()
         .map_err(|e| format!("failed to enable and start services: {e}"))?;
 
-    if !status.success() {
-        return Err("failed to start weaver-server services".into());
+    if !output.status.success() {
+        return Err(format!(
+            "failed to start weaver-server services: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
     }
 
     println!("  {} Sockets and services activated", "✓".green());

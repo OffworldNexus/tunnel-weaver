@@ -236,6 +236,7 @@ async fn spawn_test_relay(root_domain: &str) -> TestRelay {
 
     let config = Arc::new(Config {
         root_domain: root_domain.to_string(),
+        admin_domain: "relay-admin.test".to_string(),
         admin_email: "admin@weaver.test".to_string(),
         acme_provider: "letsencrypt-staging".to_string(),
         listen_http: SocketAddr::from(([127, 0, 0, 1], 0)),
@@ -2068,6 +2069,7 @@ async fn test_client_leaving_during_cert_issuance_does_not_leave_hostname_active
     let store = Arc::new(Store::open(temp_db.path()).await.unwrap());
     let config = Arc::new(Config {
         root_domain: root.to_string(),
+        admin_domain: "relay-admin.test".to_string(),
         admin_email: "admin@weaver.test".to_string(),
         acme_provider: "custom".to_string(),
         listen_http: SocketAddr::from(([127, 0, 0, 1], 0)),

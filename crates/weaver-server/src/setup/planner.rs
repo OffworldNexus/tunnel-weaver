@@ -83,6 +83,8 @@ pub struct SystemProbe {
     pub supported_arch: bool,
     /// Target root domain being installed.
     pub target_domain: String,
+    /// The relay's own (admin) hostname, kept outside the tunnel delegation.
+    pub admin_domain: String,
     /// Optional existing installation details.
     pub existing_install: Option<ExistingInstall>,
     /// Resolved IP addresses for the apex domain `<root>`.
@@ -183,6 +185,10 @@ pub enum PlanAbort {
     /// `systemd-resolved`'s stub listener occupies the port our DNS socket needs.
     #[error("systemd-resolved conflicts with the relay DNS socket: {0}")]
     ResolverStubConflict(String),
+
+    /// The admin and tunnel domains are nested unsafely.
+    #[error("unsafe admin/tunnel domain split: {0}")]
+    UnsafeDomainSplit(String),
 }
 
 /// Concrete execution plan approved by the planner.
@@ -190,6 +196,8 @@ pub enum PlanAbort {
 pub struct Plan {
     /// Approved root domain.
     pub root_domain: String,
+    /// The relay's own (admin) hostname, issued its own HTTP-01 certificate.
+    pub admin_domain: String,
     /// Database path to open and configure.
     pub db_path: String,
     /// System service user.
@@ -219,6 +227,14 @@ pub fn plan_setup(probe: &SystemProbe) -> Result<Plan, PlanAbort> {
     // 2. Preflight: CPU architecture
     if !probe.supported_arch {
         return Err(PlanAbort::UnsupportedArchitecture);
+    }
+
+    // 2b. Preflight: the admin domain must not fall inside the delegated tunnel
+    //     zone, or the tunnel delegation would control the admin DNS.
+    if let Some(issue) =
+        crate::config::domain_split_issue(&probe.admin_domain, &probe.target_domain)
+    {
+        return Err(PlanAbort::UnsafeDomainSplit(issue));
     }
 
     // 3. Existing installation domain check
@@ -319,6 +335,7 @@ pub fn plan_setup(probe: &SystemProbe) -> Result<Plan, PlanAbort> {
 
     Ok(Plan {
         root_domain: probe.target_domain.clone(),
+        admin_domain: probe.admin_domain.clone(),
         db_path: probe.db_path.clone(),
         user: probe.user.clone(),
         prefix: probe.prefix.clone(),

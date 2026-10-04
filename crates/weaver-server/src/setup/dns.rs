@@ -29,25 +29,20 @@ const QUERY_TIMEOUT: Duration = Duration::from_secs(3);
 /// Total attempts per query (the first try plus retries).
 const QUERY_ATTEMPTS: usize = 3;
 
-/// Output of a DNS probe verification.
+/// Result of resolving the delegated zone through the public recursives.
+///
+/// Distinguishes the apex from a freshly generated one-label probe name so a
+/// half-propagated delegation (apex answers, wildcard does not, or vice versa)
+/// is caught.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DnsProbeResult {
+pub struct ZoneProbe {
     /// Resolved IP addresses for `<root>`.
     pub root_ips: Vec<IpAddr>,
     /// Ephemeral probe subdomain queried (e.g. `probe-<random>.<root>`).
     pub probe_domain: String,
     /// Resolved IP addresses for `probe-<random>.<root>`.
     pub probe_ips: Vec<IpAddr>,
-    /// NS targets returned for `<root>` by the public resolvers, normalized.
-    ///
-    /// A correctly delegated relay zone lists itself as its own nameserver, so
-    /// this should contain `<root>`.
-    pub ns_targets: Vec<String>,
-    /// Whether `<root>` is self-delegated (at least one NS target equals the
-    /// apex). A parked or parent-held zone fails this and must halt setup.
-    pub delegation_ok: bool,
-    /// Whether every public resolver returned the apex set for the probe
-    /// subdomain. Split-horizon or partially-propagated delegations fail.
+    /// Whether every public resolver returned the same set for the probe name.
     pub resolvers_ok: bool,
 }
 
@@ -205,26 +200,36 @@ async fn resolve_both(resolver: IpAddr, qname: &str) -> Result<Vec<IpAddr>, Stri
     Ok(ips)
 }
 
-/// Performs the complete explicit DNS probe check for `root_domain`.
-///
-/// Returns `Err` only when the question could not be answered at all (every
-/// public resolver timed out or failed transport). Semantic problems — a
-/// non-self delegation, an apex with no A/AAAA, or resolvers that disagree —
-/// are reported through the boolean flags so the planner can explain them.
-pub async fn probe_dns(root_domain: &str) -> Result<DnsProbeResult, String> {
+/// Checks that `<root>` is self-delegated: the parent's `NS <root>` must list
+/// `<root>` itself. This reads only the parent zone, so it works before the
+/// relay's own responder is running — which is what lets `setup` bring DNS up
+/// first and verify delegation second.
+pub async fn probe_delegation(root_domain: &str) -> Result<(Vec<String>, bool), String> {
     let root = normalize_name(root_domain);
     let resolvers: Vec<IpAddr> = PUBLIC_RESOLVERS
         .iter()
         .filter_map(|s| s.parse::<IpAddr>().ok())
         .collect();
 
-    // 1. NS self-delegation through the public resolvers.
     let mut ns_targets = Vec::new();
     let mut ns_failures = Vec::new();
     for resolver in &resolvers {
         match query_resolver(*resolver, &root, RecordType::NS).await {
-            Ok(msg) => ns_targets.extend(collect_ns_targets(&msg)),
-            Err(err) => ns_failures.push(err),
+            Ok(msg) => {
+                let found = collect_ns_targets(&msg);
+                tracing::debug!(
+                    resolver = %resolver,
+                    answers = msg.answers.len(),
+                    authorities = msg.authorities.len(),
+                    ?found,
+                    "delegation probe: NS reply"
+                );
+                ns_targets.extend(found);
+            }
+            Err(err) => {
+                tracing::warn!(resolver = %resolver, error = %err, "delegation probe: NS query failed");
+                ns_failures.push(err);
+            }
         }
     }
     ns_targets.sort();
@@ -237,38 +242,117 @@ pub async fn probe_dns(root_domain: &str) -> Result<DnsProbeResult, String> {
             ns_failures.join("; ")
         ));
     }
-    if !delegation_ok {
+    Ok((ns_targets, delegation_ok))
+}
+
+/// Reads the delegation for `<root>` straight from its parent's authoritative
+/// servers.
+///
+/// Unlike [`probe_delegation`], this does not ask a recursive resolver to walk
+/// into the child zone, so it returns the truth even when the child (the relay)
+/// is not answering DNS yet — or is already delegated but broken. It is what
+/// lets `setup` tell "the operator has not added the NS record" apart from
+/// "the responder is not up yet", without depending on resolver caches.
+///
+/// `expected_ns` is the relay's admin hostname: OFF-198 delegates the tunnel
+/// zone to the admin name, which is always resolvable because it lives outside
+/// the delegation.
+pub async fn probe_registrar_delegation(
+    root_domain: &str,
+    expected_ns: &str,
+) -> Result<(Vec<String>, bool), String> {
+    let root = normalize_name(root_domain);
+    let expected = normalize_name(expected_ns);
+    let labels: Vec<&str> = root.split('.').collect();
+    if labels.len() < 2 {
         return Err(format!(
-            "delegation mismatch for '{root}': expected NS target '{root}', found [{}]",
-            ns_targets.join(", ")
+            "'{root}' has no parent zone to read a delegation from"
+        ));
+    }
+    let parent = labels[1..].join(".");
+    let resolvers: Vec<IpAddr> = PUBLIC_RESOLVERS
+        .iter()
+        .filter_map(|s| s.parse::<IpAddr>().ok())
+        .collect();
+
+    // 1. Find the parent's authoritative name servers through the recursives.
+    let mut parent_ns = Vec::new();
+    for resolver in &resolvers {
+        if let Ok(msg) = query_resolver(*resolver, &parent, RecordType::NS).await {
+            parent_ns.extend(collect_ns_targets(&msg));
+        }
+    }
+    parent_ns.sort();
+    parent_ns.dedup();
+    if parent_ns.is_empty() {
+        return Err(format!(
+            "could not discover the name servers for parent zone '{parent}'"
         ));
     }
 
-    // 2. Apex A/AAAA through the public resolvers (union of both families).
-    let mut root_ips = Vec::new();
-    let mut apex_answered = false;
-    let mut apex_failures = Vec::new();
-    for resolver in &resolvers {
-        match resolve_both(*resolver, &root).await {
-            Ok(ips) => {
-                apex_answered = true;
-                root_ips.extend(ips);
+    // 2. Resolve one address per parent NS and query it directly for the
+    //    child's NS record. The parent answers authoritatively even while the
+    //    child is down.
+    let mut targets = Vec::new();
+    for ns in &parent_ns {
+        let mut ips = Vec::new();
+        for resolver in &resolvers {
+            if let Ok(found) = resolve_both(*resolver, ns).await
+                && !found.is_empty()
+            {
+                ips = found;
+                break;
             }
-            Err(err) => apex_failures.push(err),
+        }
+        for ip in ips {
+            if let Ok(msg) = query_resolver(ip, &root, RecordType::NS).await {
+                targets.extend(collect_ns_targets(&msg));
+            }
+        }
+    }
+    targets.sort();
+    targets.dedup();
+    // The tunnel zone is delegated to the relay's own admin hostname, which is
+    // what the parent's `NS <root>` records must point at.
+    let delegation_ok = delegation_matches(&targets, &expected);
+    Ok((targets, delegation_ok))
+}
+
+/// True when the parent's `NS <root>` targets include `expected_ns`.
+///
+/// OFF-198 delegates the tunnel zone to the relay's *admin* hostname (which
+/// lives outside the delegation and is therefore always resolvable), not to the
+/// apex itself. Comparison is case-insensitive with any trailing dot ignored.
+pub fn delegation_matches(targets: &[String], expected_ns: &str) -> bool {
+    let expected = normalize_name(expected_ns);
+    targets
+        .iter()
+        .any(|target| normalize_name(target) == expected)
+}
+
+/// Resolves the apex and a fresh probe name through the public recursives.
+///
+/// This needs the relay's authoritative responder to be up (and the delegation
+/// to point at it), so call it *after* the DNS socket is started.
+pub async fn probe_zone(root_domain: &str) -> ZoneProbe {
+    let root = normalize_name(root_domain);
+    let resolvers: Vec<IpAddr> = PUBLIC_RESOLVERS
+        .iter()
+        .filter_map(|s| s.parse::<IpAddr>().ok())
+        .collect();
+
+    // Apex A/AAAA through the public resolvers (union of both families).
+    let mut root_ips = Vec::new();
+    for resolver in &resolvers {
+        if let Ok(ips) = resolve_both(*resolver, &root).await {
+            root_ips.extend(ips);
         }
     }
     root_ips.sort();
     root_ips.dedup();
 
-    if root_ips.is_empty() && !apex_answered {
-        return Err(format!(
-            "apex lookup for '{root}' failed through every public resolver; expected the relay's public A/AAAA: {}",
-            apex_failures.join("; ")
-        ));
-    }
-
-    // 3. Fresh probe subdomain through EACH resolver; every resolver must
-    //    return exactly the apex set.
+    // Fresh probe subdomain through EACH resolver; every resolver should return
+    // exactly the apex set.
     let probe_domain = format!("probe-{}.{}", generate_random_hex(6), root);
     let mut probe_ips = Vec::new();
     let mut resolvers_ok = true;
@@ -280,9 +364,7 @@ pub async fn probe_dns(root_domain: &str) -> Result<DnsProbeResult, String> {
                 }
                 probe_ips.extend(ips);
             }
-            Err(_) => {
-                resolvers_ok = false;
-            }
+            Err(_) => resolvers_ok = false,
         }
     }
     probe_ips.sort();
@@ -291,14 +373,76 @@ pub async fn probe_dns(root_domain: &str) -> Result<DnsProbeResult, String> {
         resolvers_ok = false;
     }
 
-    Ok(DnsProbeResult {
+    ZoneProbe {
         root_ips,
         probe_domain,
         probe_ips,
-        ns_targets,
-        delegation_ok,
         resolvers_ok,
-    })
+    }
+}
+
+/// Resolves `name` A and AAAA through every public recursive and returns the
+/// deduplicated, public-only address set.
+///
+/// Used by the setup/doctor preflight to report what the admin hostname
+/// currently points at before any host modification.
+pub async fn resolve_public(name: &str) -> Vec<IpAddr> {
+    let qname = normalize_name(name);
+    let resolvers: Vec<IpAddr> = PUBLIC_RESOLVERS
+        .iter()
+        .filter_map(|s| s.parse::<IpAddr>().ok())
+        .collect();
+    let mut ips = Vec::new();
+    for resolver in &resolvers {
+        if let Ok(found) = resolve_both(*resolver, &qname).await {
+            ips.extend(found);
+        }
+    }
+    ips.retain(super::planner::is_public_ip);
+    ips.sort();
+    ips.dedup();
+    ips
+}
+
+/// Returns the host's own global egress addresses (IPv4 and IPv6), public only.
+///
+/// Connecting a UDP socket sends no packet; it only selects the route's source
+/// address, which is the address inbound traffic would need to reach.
+pub fn host_egress_ips() -> Vec<IpAddr> {
+    let mut ips = Vec::new();
+    for (bind, target) in [
+        ("0.0.0.0:0", "1.1.1.1:53"),
+        ("[::]:0", "[2606:4700:4700::1111]:53"),
+    ] {
+        if let Ok(socket) = std::net::UdpSocket::bind(bind)
+            && socket.connect(target).is_ok()
+            && let Ok(addr) = socket.local_addr()
+        {
+            ips.push(addr.ip());
+        }
+    }
+    ips.retain(super::planner::is_public_ip);
+    ips.sort();
+    ips.dedup();
+    ips
+}
+
+/// Determines the relay's own public addresses for the socket unit and the
+/// authoritative A/AAAA answers.
+///
+/// Prefers what the admin domain currently resolves to (the operator points
+/// `A`/`AAAA <admin>` at the relay in the same visit as the `NS` delegation),
+/// then unions in the host's global egress addresses. The egress fallback is
+/// what makes a re-run after the delegation already exists work even if the
+/// admin record is briefly unreadable. Non-public addresses are dropped; behind
+/// NAT the operator overrides with `--relay-ip`.
+pub async fn detect_relay_ips(admin_domain: &str) -> Vec<IpAddr> {
+    let mut ips = resolve_public(admin_domain).await;
+    ips.extend(host_egress_ips());
+    ips.retain(super::planner::is_public_ip);
+    ips.sort();
+    ips.dedup();
+    ips
 }
 
 #[cfg(test)]
@@ -318,5 +462,18 @@ mod tests {
     #[test]
     fn normalize_strips_trailing_dot_and_lowercases() {
         assert_eq!(normalize_name("Example.COM."), "example.com");
+    }
+
+    #[test]
+    fn delegation_target_is_the_admin_hostname() {
+        // OFF-198: the tunnel zone is delegated to the relay's admin hostname,
+        // not to the apex itself.
+        let targets = vec![
+            "relay.example.net.".to_string(),
+            "ns2.example.net".to_string(),
+        ];
+        assert!(delegation_matches(&targets, "relay.example.net"));
+        assert!(delegation_matches(&targets, "Relay.Example.NET."));
+        assert!(!delegation_matches(&targets, "tunnel.example.com"));
     }
 }

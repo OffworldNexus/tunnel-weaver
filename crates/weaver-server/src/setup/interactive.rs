@@ -3,18 +3,20 @@
 //! Collects and validates domain names, admin email, ACME provider configuration,
 //! and displays a structured plan before executing installation.
 
-use std::io::{IsTerminal, Write, stdin, stdout};
+use std::fmt;
 use std::path::PathBuf;
 
 use comfy_table::modifiers::UTF8_ROUND_CORNERS;
 use comfy_table::presets::UTF8_FULL;
 use comfy_table::{Attribute, Cell, Color, ContentArrangement, Table};
 use crossterm::style::Stylize;
+use inquire::{Confirm, InquireError, Password, Select, Text};
 
 /// Configuration values gathered interactively or via CLI arguments.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GatheredConfig {
     pub root_domain: String,
+    pub admin_domain: String,
     pub admin_email: String,
     pub acme_provider: String,
     pub acme_directory: Option<String>,
@@ -25,6 +27,9 @@ pub struct GatheredConfig {
     pub user: String,
     pub prefix: PathBuf,
     pub skip_reachability_check: bool,
+    /// Operator-supplied public IPs, forwarded across the `sudo` re-exec so a
+    /// NAT deployment keeps its explicit `--relay-ip` values.
+    pub relay_ips: Vec<std::net::IpAddr>,
 }
 
 /// Validates whether a domain name is a structurally valid Fully Qualified Domain Name (FQDN).
@@ -68,74 +73,59 @@ pub fn validate_email(email: &str) -> bool {
     true
 }
 
-/// Prompts the user on stdout and reads a line from stdin.
-pub fn prompt_line(prompt: &str, default: Option<&str>) -> std::io::Result<String> {
-    if let Some(def) = default {
-        print!(
-            "  {} {prompt} [{}]: ",
-            "❯".bold().cyan(),
-            def.bold().white()
-        );
-    } else {
-        print!("  {} {prompt}: ", "❯".bold().cyan());
+/// Converts an [`InquireError`] into the `std::io::Error` that this module's
+/// API exposes, so callers keep their existing `Result` shape.
+///
+/// `inquire` reports a non-TTY input device as [`InquireError::NotTTY`], which
+/// lets `prompt_line` fail with an `io::Error` on a pipe instead of panicking.
+fn inquire_err(err: InquireError) -> std::io::Error {
+    match err {
+        InquireError::IO(err) => err,
+        InquireError::OperationCanceled | InquireError::OperationInterrupted => {
+            std::io::Error::new(std::io::ErrorKind::Interrupted, err)
+        }
+        other => std::io::Error::other(other),
     }
-    stdout().flush()?;
+}
 
-    let mut line = String::new();
-    stdin().read_line(&mut line)?;
-    let trimmed = line.trim();
-    if trimmed.is_empty()
-        && let Some(def) = default
-    {
-        return Ok(def.to_string());
+/// Prompts the user with an `inquire` [`Text`] prompt and returns the trimmed
+/// answer.
+///
+/// A `default` is pre-filled as the initial value, so pressing Enter accepts it;
+/// clearing the field first yields the empty string. Because `Text` handles the
+/// arrow keys and line editing, no raw-mode handling is needed here.
+pub fn prompt_line(prompt: &str, default: Option<&str>) -> std::io::Result<String> {
+    let mut text = Text::new(prompt);
+    if let Some(def) = default {
+        text = text.with_initial_value(def);
     }
-    Ok(trimmed.to_string())
+    text.prompt()
+        .map(|input| input.trim().to_string())
+        .map_err(inquire_err)
 }
 
 /// Reads masked input for sensitive values (such as EAB HMAC keys).
+///
+/// Uses `inquire`'s hidden-display [`Password`] prompt. Confirmation is
+/// disabled to preserve the previous single-entry semantics.
 pub fn read_masked_input(prompt: &str) -> std::io::Result<String> {
-    print!("  {} {prompt}: ", "❯".bold().cyan());
-    stdout().flush()?;
+    Password::new(prompt)
+        .without_confirmation()
+        .prompt()
+        .map_err(inquire_err)
+}
 
-    if !stdin().is_terminal() {
-        let mut line = String::new();
-        stdin().read_line(&mut line)?;
-        return Ok(line.trim_end_matches(['\r', '\n']).to_string());
+/// One selectable ACME provider; `Display` supplies the visible label so the
+/// `Select` list reads like the old numbered menu without the numbering.
+struct ProviderOption {
+    id: &'static str,
+    label: &'static str,
+}
+
+impl fmt::Display for ProviderOption {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.label)
     }
-
-    use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers, read};
-
-    crossterm::terminal::enable_raw_mode()?;
-    let mut input = String::new();
-    loop {
-        if let Ok(Event::Key(KeyEvent {
-            code, modifiers, ..
-        })) = read()
-        {
-            match code {
-                KeyCode::Enter => break,
-                KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => {
-                    let _ = crossterm::terminal::disable_raw_mode();
-                    println!();
-                    std::process::exit(130);
-                }
-                KeyCode::Char(c) => {
-                    input.push(c);
-                    print!("*");
-                    stdout().flush()?;
-                }
-                KeyCode::Backspace if !input.is_empty() => {
-                    input.pop();
-                    print!("\x08 \x08");
-                    stdout().flush()?;
-                }
-                _ => {}
-            }
-        }
-    }
-    crossterm::terminal::disable_raw_mode()?;
-    println!();
-    Ok(input)
 }
 
 /// Displays the interactive ACME provider selection menu with a compact auto-formatted table.
@@ -221,25 +211,192 @@ pub fn prompt_provider_choice() -> std::io::Result<(String, Option<String>)> {
 
     println!("{table}\n");
 
-    loop {
-        let choice = prompt_line("Select provider", Some("1"))?;
-        match choice.trim() {
-            "1" | "letsencrypt" => return Ok(("letsencrypt".into(), None)),
-            "2" | "google" => return Ok(("google".into(), None)),
-            "3" | "zerossl" => return Ok(("zerossl".into(), None)),
-            "4" | "buypass" => return Ok(("buypass".into(), None)),
-            "5" | "custom" => {
-                let url = prompt_line("ACME directory URL", None)?;
-                return Ok(("custom".into(), Some(url)));
-            }
-            _ => {
+    let providers = vec![
+        ProviderOption {
+            id: "letsencrypt",
+            label: "Let's Encrypt (default)",
+        },
+        ProviderOption {
+            id: "google",
+            label: "Google Trust Services",
+        },
+        ProviderOption {
+            id: "zerossl",
+            label: "ZeroSSL",
+        },
+        ProviderOption {
+            id: "buypass",
+            label: "Buypass",
+        },
+        ProviderOption {
+            id: "custom",
+            label: "Custom ACME",
+        },
+    ];
+
+    let choice = Select::new("Select an ACME provider:", providers)
+        .prompt()
+        .map_err(inquire_err)?;
+
+    if choice.id == "custom" {
+        let url = prompt_line("ACME directory URL", None)?;
+        return Ok(("custom".into(), Some(url)));
+    }
+    Ok((choice.id.into(), None))
+}
+
+/// Current terminal width in columns, falling back to the conventional 80 when
+/// stdout is not attached to a terminal.
+fn terminal_width() -> usize {
+    crossterm::terminal::size()
+        .map(|(cols, _)| cols as usize)
+        .unwrap_or(80)
+}
+
+/// Greedy ASCII word wrap: packs words into lines of at most `width` columns.
+///
+/// A word longer than `width` is kept intact on its own line rather than split
+/// mid-word. Blank input yields no lines.
+pub fn wrap_text(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    for word in text.split_whitespace() {
+        if current.is_empty() {
+            current.push_str(word);
+        } else if current.len() + 1 + word.len() <= width {
+            current.push(' ');
+            current.push_str(word);
+        } else {
+            lines.push(std::mem::take(&mut current));
+            current.push_str(word);
+        }
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    lines
+}
+
+/// Prints `text` to stdout, wrapped to the current terminal width and prefixed
+/// by `indent` on every line.
+///
+/// Wrapping happens after the indent is subtracted, so continuation lines are
+/// hanging-indented under the first and nothing hard-wraps mid-sentence.
+pub fn print_wrapped(indent: &str, text: &str) {
+    let width = terminal_width()
+        .saturating_sub(indent.chars().count())
+        .max(1);
+    for line in wrap_text(text, width) {
+        println!("{indent}{line}");
+    }
+}
+
+/// Like [`print_wrapped`], but styles a leading `label` and hangs continuation
+/// lines under the text that follows it. Used for the domain explanations so
+/// the coloured label stays put while the sentence wraps.
+fn print_labeled_wrapped(indent: &str, label: &str, rest: &str) {
+    let prefix_width = indent.chars().count() + label.chars().count() + 1;
+    let width = terminal_width().saturating_sub(prefix_width).max(1);
+    let lines = wrap_text(rest, width);
+    if lines.is_empty() {
+        println!("{indent}{}", label.bold().green());
+        return;
+    }
+    for (index, line) in lines.iter().enumerate() {
+        if index == 0 {
+            println!("{indent}{} {line}", label.bold().green());
+        } else {
+            println!("{}{line}", " ".repeat(prefix_width));
+        }
+    }
+}
+
+/// Prints the Step 1 preamble explaining the two domains and the DNS records
+/// the operator must create before setup can proceed.
+///
+/// Setup is mechanical, so there are no choices here; the text exists purely to
+/// make the two prompts self-explanatory and to state the expected delegation
+/// up front, before any host modification.
+pub fn print_domain_step_intro() {
+    println!(
+        "\n{} {} {}",
+        "Weaver Server Setup".bold().cyan(),
+        "—".dark_grey(),
+        "Host & Relay Deployment".white()
+    );
+    print_wrapped(
+        "  ",
+        "Configure your host to run a public Tunnel Weaver relay.",
+    );
+    println!();
+    println!("{}", "Step 1: Two domains".bold().white());
+    println!();
+    print_wrapped(
+        "  ",
+        "You need two domains. If they are not set up yet, open the DNS provider for any \
+         domain you own — you only go there once, to add the two records below.",
+    );
+    println!();
+    print_labeled_wrapped(
+        "  ",
+        "Tunnel domain:",
+        "all future tunnels will be subdomains of this one, so pick a dedicated name.",
+    );
+    println!(
+        "    e.g. for {} → {}",
+        "bar.foo".cyan(),
+        "tunnel.bar.foo".cyan()
+    );
+    println!();
+    print_labeled_wrapped(
+        "  ",
+        "Admin domain:",
+        "the relay's own address; the admin console runs here.",
+    );
+    println!(
+        "    e.g. for {} → {}",
+        "bar.foo".cyan(),
+        "relay.bar.foo".cyan()
+    );
+    println!();
+    print_wrapped("  ", "So now, pick for your own domain:");
+    let records = [
+        ("relay.<your-domain>", "A/AAAA", "-> this VM's public IP(s)"),
+        (
+            "tunnel.<your-domain>",
+            "NS",
+            "-> relay.<your-domain> (yes, the NS points at the domain defined above)",
+        ),
+    ];
+    let name_width = records.iter().map(|(n, _, _)| n.len()).max().unwrap_or(0);
+    let kind_width = records.iter().map(|(_, k, _)| k.len()).max().unwrap_or(0);
+    // Column where the `-> target` text begins; continuation lines hang there so
+    // the two `name kind ->` columns stay aligned even when the NS parenthetical
+    // wraps on a narrow terminal.
+    let target_col = 4 + name_width + 2 + kind_width + 2;
+    let width = terminal_width();
+    for (name, kind, target) in records {
+        let target_width = width.saturating_sub(target_col).max(1);
+        for (index, line) in wrap_text(target, target_width).iter().enumerate() {
+            if index == 0 {
                 println!(
-                    "  {} Invalid selection. Please enter 1, 2, 3, 4, or 5.",
-                    "✗".red().bold()
+                    "    {}  {}  {}",
+                    format!("{name:<name_width$}").cyan(),
+                    format!("{kind:<kind_width$}").yellow(),
+                    line.as_str().white()
                 );
+            } else {
+                println!("{}{}", " ".repeat(target_col), line.as_str().white());
             }
         }
     }
+    println!();
+    print_wrapped(
+        "  ",
+        "Setup verifies these before changing anything on this host.",
+    );
+    println!();
 }
 
 /// Displays the structured plan and asks for user confirmation.
@@ -250,8 +407,13 @@ pub fn display_plan_and_confirm(config: &GatheredConfig, is_headless: bool) -> b
     println!("{}", "Domain & ACME".bold().white());
     println!(
         "  {:<18} {}",
-        "Root Domain:".dark_grey(),
+        "Tunnel Domain:".dark_grey(),
         config.root_domain.as_str().bold().green()
+    );
+    println!(
+        "  {:<18} {}",
+        "Admin Domain:".dark_grey(),
+        config.admin_domain.as_str().bold().green()
     );
     println!(
         "  {:<18} {}",
@@ -306,11 +468,46 @@ pub fn display_plan_and_confirm(config: &GatheredConfig, is_headless: bool) -> b
         return true;
     }
 
-    match prompt_line("Proceed with installation? [y/N]", Some("n")) {
-        Ok(ans) => {
-            let lower = ans.to_ascii_lowercase();
-            lower == "y" || lower == "yes"
-        }
-        Err(_) => false,
+    // `Confirm` defaults to "no", so an accidental Enter cancels rather than
+    // installing; a cancel/IO error is also treated as "no".
+    Confirm::new("Proceed with installation?")
+        .with_default(false)
+        .prompt()
+        .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::wrap_text;
+
+    #[test]
+    fn wrap_text_short_input_is_a_single_line() {
+        assert_eq!(
+            wrap_text("host and relay", 80),
+            vec!["host and relay".to_string()]
+        );
+    }
+
+    #[test]
+    fn wrap_text_breaks_when_a_word_would_exceed_the_exact_width() {
+        // "ab cd" is exactly five columns; "ef" must start a new line.
+        assert_eq!(
+            wrap_text("ab cd ef", 5),
+            vec!["ab cd".to_string(), "ef".to_string()]
+        );
+    }
+
+    #[test]
+    fn wrap_text_keeps_a_long_word_on_its_own_line() {
+        assert_eq!(
+            wrap_text("supercalifragilistic", 4),
+            vec!["supercalifragilistic".to_string()]
+        );
+    }
+
+    #[test]
+    fn wrap_text_empty_input_yields_no_lines() {
+        assert!(wrap_text("", 80).is_empty());
+        assert!(wrap_text("   ", 80).is_empty());
     }
 }

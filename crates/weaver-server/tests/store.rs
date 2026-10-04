@@ -22,6 +22,7 @@ where
 fn sample_config() -> Config {
     Config {
         root_domain: "example.com".into(),
+        admin_domain: "relay-admin.test".into(),
         admin_email: "admin@example.com".into(),
         acme_provider: "letsencrypt".into(),
         listen_http: "0.0.0.0:80".parse::<SocketAddr>().unwrap(),
@@ -105,15 +106,15 @@ async fn test_store_open_runs_migrations_and_is_idempotent() {
         )
         .await;
         assert_eq!(count, 12);
-        assert_eq!(store.schema_version().await.expect("schema_version"), 3);
+        assert_eq!(store.schema_version().await.expect("schema_version"), 1);
     }
 
     // Re-open existing database: should succeed and not re-apply migrations
     {
         let store = Store::open(&db_path).await.expect("re-open failed");
         let migration_count: i64 = scalar(&store, "SELECT count(*) FROM seaql_migrations").await;
-        assert_eq!(migration_count, 3);
-        assert_eq!(store.schema_version().await.expect("schema_version"), 3);
+        assert_eq!(migration_count, 1);
+        assert_eq!(store.schema_version().await.expect("schema_version"), 1);
     }
 }
 
@@ -246,6 +247,59 @@ async fn test_config_validation_rules() {
         }
         res => panic!("Expected ValidationFailed, got: {res:?}"),
     }
+
+    // OFF-198 foot-gun: an admin domain nested under the delegated tunnel zone
+    // would hand the relay's own DNS to the zone the relay is meant to control.
+    let nested_admin_config = Config {
+        admin_domain: "relay.example.com".into(),
+        ..sample_config()
+    };
+    store
+        .save_config(&nested_admin_config)
+        .await
+        .expect("save succeeded");
+    match Config::load(&store).await {
+        Err(ConfigError::ValidationFailed(issues)) => {
+            assert!(
+                issues.iter().any(|i| i.contains("subdomain")),
+                "expected subdomain rejection, got: {issues:?}"
+            );
+        }
+        res => panic!("Expected ValidationFailed, got: {res:?}"),
+    }
+
+    // Same name for both is equally unsafe.
+    let same_name_config = Config {
+        admin_domain: "example.com".into(),
+        ..sample_config()
+    };
+    store
+        .save_config(&same_name_config)
+        .await
+        .expect("save succeeded");
+    match Config::load(&store).await {
+        Err(ConfigError::ValidationFailed(issues)) => {
+            assert!(issues.iter().any(|i| i.contains("must differ")));
+        }
+        res => panic!("Expected ValidationFailed, got: {res:?}"),
+    }
+
+    // The reverse nesting (tunnel under admin) is safe and must load.
+    let tunnel_under_admin = Config {
+        root_domain: "tunnels.relay.example.net".into(),
+        admin_domain: "relay.example.net".into(),
+        acme_provider: "letsencrypt".into(),
+        admin_email: "admin@example.com".into(),
+        ..sample_config()
+    };
+    store
+        .save_config(&tunnel_under_admin)
+        .await
+        .expect("save succeeded");
+    assert!(
+        Config::load(&store).await.is_ok(),
+        "tunnel under admin must be allowed"
+    );
 }
 
 #[tokio::test]
@@ -256,6 +310,7 @@ async fn test_set_config_mutates_single_key() {
 
     for (k, v) in [
         ("root_domain", "tunnel.nexus.com"),
+        ("admin_domain", "\"relay.nexus.com\""),
         ("admin_email", "ops@nexus.com"),
         ("acme_provider", "letsencrypt"),
         ("listen_http", "\"127.0.0.1:8080\""),
@@ -380,6 +435,8 @@ async fn test_certificate_and_event_round_trip() {
         issuer: None,
         directory: "https://acme.test/dir".into(),
         obtained_at: 100,
+        validation: "dns-01".to_string(),
+        wildcard: true,
     };
     store
         .save_certificate("host.example.com", cert.clone())
@@ -394,6 +451,8 @@ async fn test_certificate_and_event_round_trip() {
         .expect("present");
     assert_eq!(rec.name, "host.example.com");
     assert_eq!(rec.not_after, 200);
+    assert_eq!(rec.validation, "dns-01");
+    assert!(rec.wildcard);
 
     // Saving under the same name upserts in place: one global row per name.
     store
@@ -446,6 +505,8 @@ async fn test_certificate_and_event_round_trip() {
     assert_eq!(full.len(), 1);
     assert_eq!(full[0].cert_pem, "CERT");
     assert_eq!(full[0].key_pem, "KEY");
+    assert_eq!(full[0].validation, "dns-01");
+    assert!(full[0].wildcard);
 
     // Events, newest first
     store
@@ -469,6 +530,79 @@ async fn test_certificate_and_event_round_trip() {
         .expect("latest")
         .expect("present");
     assert_eq!(latest.at, 20);
+}
+
+#[tokio::test]
+async fn test_challenge_kinds_are_isolated_and_validation_round_trips() {
+    let store = Store::connect("sqlite::memory:").await.expect("connect");
+
+    // DNS-01 TXT rows and HTTP-01 token rows live in the same table but never
+    // leak into each other's reads.
+    store
+        .publish_challenge("_acme-challenge.example.com", "digest-a", 1)
+        .await
+        .unwrap();
+    store
+        .publish_http01("token-1", "key-auth-1", 1)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        store
+            .get_challenges("_acme-challenge.example.com")
+            .await
+            .unwrap(),
+        vec!["digest-a".to_string()]
+    );
+    // The TXT reader must not return a key authorization even if a token row
+    // happens to share the queried name.
+    assert!(store.get_challenges("token-1").await.unwrap().is_empty());
+    assert_eq!(
+        store.get_http01("token-1").await.unwrap().as_deref(),
+        Some("key-auth-1")
+    );
+
+    // HTTP-01 rows are removed by token, DNS-01 by (name, value).
+    store.remove_http01("token-1").await.unwrap();
+    assert!(store.get_http01("token-1").await.unwrap().is_none());
+    store
+        .remove_challenge("_acme-challenge.example.com", "digest-a")
+        .await
+        .unwrap();
+    assert!(
+        store
+            .get_challenges("_acme-challenge.example.com")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    // `validation` and `wildcard` round-trip both mechanisms.
+    for (name, mechanism, wildcard) in [
+        ("example.com", "dns-01", true),
+        ("relay.example.net", "http-01", false),
+    ] {
+        store
+            .save_certificate(
+                name,
+                weaver_server::store::NewCertificate {
+                    cert_pem: format!("CERT-{name}"),
+                    key_pem: "KEY".into(),
+                    not_before: 1,
+                    not_after: 2,
+                    issuer: None,
+                    directory: "https://acme.test/dir".into(),
+                    obtained_at: 1,
+                    validation: mechanism.to_string(),
+                    wildcard,
+                },
+            )
+            .await
+            .unwrap();
+        let rec = store.get_certificate(name).await.unwrap().unwrap();
+        assert_eq!(rec.validation, mechanism);
+        assert_eq!(rec.wildcard, wildcard);
+    }
 }
 
 #[tokio::test]
@@ -501,6 +635,8 @@ async fn test_multiple_certificates_distinct_names() {
         issuer: Some(issuer.into()),
         directory: "dir".into(),
         obtained_at: 1_000,
+        validation: "dns-01".to_string(),
+        wildcard: false,
     };
 
     store
@@ -570,6 +706,8 @@ async fn test_deleting_certificate_clears_domain_reference() {
         issuer: None,
         directory: "dir".into(),
         obtained_at: 1_000,
+        validation: "dns-01".to_string(),
+        wildcard: false,
     };
     let saved = store
         .save_certificate("cascade.example.com", cert)
@@ -760,10 +898,10 @@ async fn test_migration_usage_round_trips() {
     let db_path = temp.path().join("migrate.db");
     let store = Store::open(&db_path).await.expect("open");
 
-    // Roll every migration back, then re-apply. `m0003` adds a column to
-    // `domains` and has no data-preserving inverse, so a partial rollback that
-    // leaves the column behind cannot be re-applied; a full rebuild can.
-    weaver_server::Migrator::down(store.db(), Some(3))
+    // Roll the single migration back, then re-apply. `m0001` creates the
+    // `usage` table along with every other table, so a full rebuild is what
+    // proves `down`/`up` are symmetric.
+    weaver_server::Migrator::down(store.db(), Some(1))
         .await
         .expect("down");
     let usage_tables: i64 = scalar(

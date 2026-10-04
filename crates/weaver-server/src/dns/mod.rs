@@ -3,7 +3,8 @@
 //! Answers A/AAAA/NS/CAA/SOA and DNS-01 TXT queries for `<root>` and any single
 //! label directly beneath it. It is generative — no zone files, no second
 //! binary — reading relay addresses from config and TXT values from the live
-//! challenge registry in the `Store`.
+//! challenge registry in the `Store`. The zone's NS and SOA MNAME point at the
+//! relay's own admin domain, which lives outside the delegated tunnel zone.
 //!
 //! Design points (OFF-190):
 //! - **No recursion, ever.** `RA=0`; out-of-zone names get `REFUSED` because we
@@ -36,6 +37,13 @@ pub const STATIC_TTL: u32 = 3600;
 /// asked before publication does not cache the old answer through validation.
 pub const CHALLENGE_TTL: u32 = 30;
 
+/// TTL for CAA records, in seconds.
+///
+/// Deliberately shorter than the other static records: CAs cache the CAA tree
+/// for its TTL, so a mistaken or stale CAA (e.g. one that forbids wildcards)
+/// blocks issuance for that whole window. 60s keeps mistakes cheap to correct.
+pub const CAA_TTL: u32 = 60;
+
 /// Negative-cache TTL, mirrored into the SOA MINIMUM. Kept short because a
 /// resolver that cached NODATA for `_acme-challenge.<root>` would break DCV.
 pub const NEGATIVE_TTL: u32 = 30;
@@ -49,8 +57,14 @@ const _ACME_PREFIX: &str = "_acme-challenge";
 pub struct DnsResponder {
     root_domain: String,
     root_name: Name,
+    /// The name server target for the zone's NS and SOA MNAME records: the
+    /// relay's own stable (admin) hostname, which lives outside the delegation.
+    admin_name: Name,
     relay_ips: Vec<IpAddr>,
     soa: SOA,
+    /// CA issuer domains for the `issue`/`issuewild` CAA records. Empty means
+    /// we cannot name the CA, so no CAA is served (permissive).
+    caa_issuers: Vec<String>,
     store: Arc<Store>,
 }
 
@@ -58,6 +72,7 @@ impl std::fmt::Debug for DnsResponder {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DnsResponder")
             .field("root_domain", &self.root_domain)
+            .field("admin_name", &self.admin_name)
             .field("relay_ips", &self.relay_ips)
             .finish()
     }
@@ -68,10 +83,15 @@ impl DnsResponder {
     pub fn new(config: &Config, store: Arc<Store>) -> Self {
         let root_domain = config.root_domain.to_ascii_lowercase();
         let root_name = Name::from_str(&format!("{root_domain}.")).expect("root domain is a Name");
-        // The zone is self-delegated: the apex is its own primary nameserver.
+        // The zone is delegated to the relay, whose own stable hostname is the
+        // admin domain; NS and SOA advertise that name, never the apex (an
+        // apex self-reference is not resolvable once delegated).
+        let admin_domain = config.admin_domain.to_ascii_lowercase();
+        let admin_name =
+            Name::from_str(&format!("{admin_domain}.")).expect("admin domain is a Name");
         let soa = SOA::new(
-            root_name.clone(),
-            root_name.clone(),
+            admin_name.clone(),
+            admin_name.clone(),
             1,
             7200,
             3600,
@@ -81,8 +101,13 @@ impl DnsResponder {
         Self {
             root_domain,
             root_name,
+            admin_name,
             relay_ips: config.relay_ips.clone(),
             soa,
+            caa_issuers: crate::cert::providers::caa_identifiers(
+                &config.acme_provider,
+                &config.acme_fallback_providers,
+            ),
             store,
         }
     }
@@ -142,6 +167,9 @@ impl DnsResponder {
         resp.metadata = Metadata::response_from_request(&req.metadata);
         resp.metadata.authoritative = true;
         resp.metadata.recursion_available = false;
+        // RFC 1035 §4.1.1: the response must echo the question section. Without
+        // it resolvers treat the reply as malformed and fall back to SERVFAIL.
+        resp.queries = req.queries.clone();
 
         // EDNS: minimal but present. Echo an OPT with our small buffer; fail
         // BADVERS for an unknown version (RFC 6891). Options are ignored.
@@ -252,15 +280,36 @@ impl DnsResponder {
                 resp.add_answer(Record::from_rdata(
                     self.root_name.clone(),
                     STATIC_TTL,
-                    RData::NS(NS(self.root_name.clone())),
+                    RData::NS(NS(self.admin_name.clone())),
                 ));
             }
             RecordType::CAA if qname == self.root_domain => {
-                resp.add_answer(Record::from_rdata(
-                    self.root_name.clone(),
-                    STATIC_TTL,
-                    RData::CAA(CAA::new_issuewild(false, None, Vec::new())),
-                ));
+                // Authorise the configured CA(s) for both ordinary and wildcard
+                // issuance. An empty `issuewild` would *forbid* wildcards, so if
+                // the CA is unknown we serve no CAA at all (NODATA).
+                if self.caa_issuers.is_empty() {
+                    resp.add_authority(self.soa_record());
+                } else {
+                    for issuer in &self.caa_issuers {
+                        // Parse *without* a trailing dot: hickory's `CAA`
+                        // encoder appends the name via `to_ascii()`, and a
+                        // trailing dot ("letsencrypt.org.") does not match the
+                        // CA's issuer identifier, so issuance is refused.
+                        let Ok(name) = Name::from_str(issuer) else {
+                            continue;
+                        };
+                        resp.add_answer(Record::from_rdata(
+                            self.root_name.clone(),
+                            CAA_TTL,
+                            RData::CAA(CAA::new_issue(false, Some(name.clone()), Vec::new())),
+                        ));
+                        resp.add_answer(Record::from_rdata(
+                            self.root_name.clone(),
+                            CAA_TTL,
+                            RData::CAA(CAA::new_issuewild(false, Some(name), Vec::new())),
+                        ));
+                    }
+                }
             }
             _ => {
                 // NODATA: NOERROR, no answers, SOA for negative caching.
@@ -388,10 +437,13 @@ mod tests {
     use hickory_proto::op::Query;
 
     async fn responder(relay_ips: Vec<IpAddr>) -> Arc<DnsResponder> {
-        let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path().join("test.db")).await.unwrap();
+        // Keep the temp directory alive for the whole test: `TempDir` drops on
+        // scope exit and would unlink the SQLite file under the open connection.
+        let dir = tempfile::tempdir().unwrap().keep();
+        let store = Store::open(dir.join("test.db")).await.unwrap();
         let config = Config {
             root_domain: "example.com".into(),
+            admin_domain: "relay-admin.test".into(),
             admin_email: "ops@example.com".into(),
             acme_provider: "letsencrypt".into(),
             listen_http: "0.0.0.0:80".parse().unwrap(),
@@ -428,6 +480,9 @@ mod tests {
             assert_eq!(resp.response_code, ResponseCode::NoError);
             assert_eq!(resp.answers.len(), 1, "name {name}");
             assert!(resp.metadata.authoritative);
+            // RFC 1035: the response must echo the question section, or
+            // resolvers treat it as malformed and return SERVFAIL.
+            assert_eq!(resp.queries.len(), 1, "question echoed for {name}");
         }
     }
 
@@ -534,5 +589,47 @@ mod tests {
         msg.set_edns(edns);
         let resp = r.answer(&msg).await.unwrap();
         assert_eq!(resp.response_code, ResponseCode::BADVERS);
+    }
+
+    #[tokio::test]
+    async fn caa_authorises_configured_ca() {
+        // The responder is built with `acme_provider = letsencrypt`, so it must
+        // publish `issue`/`issuewild` for letsencrypt.org. An empty value would
+        // forbid wildcard issuance and break the ACME order.
+        let r = responder(vec!["203.0.113.7".parse().unwrap()]).await;
+        let resp = r
+            .answer(&query(
+                "example.com",
+                RecordType::CAA,
+                hickory_proto::rr::DNSClass::IN,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.answers.len(), 2);
+        let records: Vec<(&str, String)> = resp
+            .answers
+            .iter()
+            .filter_map(|record| match &record.data {
+                RData::CAA(caa) => Some((
+                    caa.tag.as_str(),
+                    String::from_utf8_lossy(&caa.value).into_owned(),
+                )),
+                _ => None,
+            })
+            .collect();
+        // The CAA value must be the bare issuer domain with no trailing dot:
+        // Let's Encrypt rejects `letsencrypt.org.`.
+        assert!(
+            records
+                .iter()
+                .any(|(tag, value)| *tag == "issue" && value == "letsencrypt.org"),
+            "CAA issue must name the CA without a trailing dot: {records:?}"
+        );
+        assert!(
+            records
+                .iter()
+                .any(|(tag, value)| *tag == "issuewild" && value == "letsencrypt.org"),
+            "CAA issuewild must name the CA without a trailing dot: {records:?}"
+        );
     }
 }

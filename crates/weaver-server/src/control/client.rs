@@ -1,5 +1,5 @@
 use std::path::Path;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use comfy_table::modifiers::UTF8_ROUND_CORNERS;
 use comfy_table::presets::UTF8_FULL;
@@ -45,6 +45,18 @@ async fn connect_control_socket(socket_path: &Path) -> Result<UnixStream, i32> {
             }
         },
     }
+}
+
+/// Returns whether the relay is listening on the control socket.
+///
+/// `doctor` uses this to choose its context without printing connection
+/// diagnostics: when the socket answers, the daemon composes the report; when
+/// it does not, the command falls back to the in-process preflight.
+pub async fn control_socket_available(socket_path: &Path) -> bool {
+    tokio::time::timeout(Duration::from_millis(250), UnixStream::connect(socket_path))
+        .await
+        .map(|result| result.is_ok())
+        .unwrap_or(false)
 }
 
 /// Creates a preconfigured `comfy-table` with rounded UTF-8 borders and dynamic layout.
@@ -264,6 +276,13 @@ pub async fn client_status(socket_path: &Path, json: bool) -> i32 {
         "Root Domain:".dark_grey(),
         resp.root_domain.bold()
     );
+    if !resp.admin_domain.is_empty() {
+        println!(
+            "  {:<14} {}",
+            "Admin Domain:".dark_grey(),
+            resp.admin_domain.bold()
+        );
+    }
     println!("  {:<14} {}", "HTTP:".dark_grey(), resp.listeners.http);
     println!("  {:<14} {}", "HTTPS:".dark_grey(), resp.listeners.https);
     if !resp.control_socket.is_empty() {
@@ -386,7 +405,13 @@ pub async fn client_cert_status(
             Cell::new("NAME")
                 .add_attribute(Attribute::Bold)
                 .fg(Color::Cyan),
+            Cell::new("KIND")
+                .add_attribute(Attribute::Bold)
+                .fg(Color::Cyan),
             Cell::new("STATE")
+                .add_attribute(Attribute::Bold)
+                .fg(Color::Cyan),
+            Cell::new("VALIDATION")
                 .add_attribute(Attribute::Bold)
                 .fg(Color::Cyan),
             Cell::new("DAYS-LEFT")
@@ -412,6 +437,16 @@ pub async fn client_cert_status(
             };
 
             let state_cell = styled_state_cell(&cert.state);
+
+            let kind_cell = if cert.wildcard {
+                Cell::new("wildcard").fg(Color::Cyan)
+            } else {
+                Cell::new("single").fg(Color::DarkGrey)
+            };
+            let validation_cell = match cert.validation.as_deref() {
+                Some(mech) => Cell::new(mech),
+                None => Cell::new("-").fg(Color::DarkGrey),
+            };
 
             let (days_str, days_color) = match cert.not_after {
                 Some(ts) => {
@@ -450,7 +485,9 @@ pub async fn client_cert_status(
             }
             row.extend(vec![
                 name_cell,
+                kind_cell,
                 state_cell,
+                validation_cell,
                 days_cell,
                 active_cell,
                 age_cell,
@@ -502,6 +539,18 @@ pub async fn client_cert_status(
         table.add_row(vec![
             Cell::new("State").fg(Color::DarkCyan),
             styled_state_cell(resp.state.label()),
+        ]);
+        table.add_row(vec![
+            Cell::new("Kind").fg(Color::DarkCyan),
+            if resp.wildcard {
+                Cell::new("wildcard").fg(Color::Cyan)
+            } else {
+                Cell::new("single").fg(Color::DarkGrey)
+            },
+        ]);
+        table.add_row(vec![
+            Cell::new("Validation").fg(Color::DarkCyan),
+            Cell::new(resp.validation.as_deref().unwrap_or("-")),
         ]);
         table.add_row(vec![
             Cell::new("Active").fg(Color::DarkCyan),
@@ -819,6 +868,48 @@ pub async fn client_cert_order(socket_path: &Path, json: bool) -> i32 {
 
     println!("{} Wildcard certificate order queued", "✓".green().bold());
     0
+}
+
+/// Triggers both managed certificate orders without echoing the raw response.
+///
+/// `setup` calls this before its own `cert.wait` calls: the wizard prints its
+/// own clean confirmation instead of the control client's JSON envelope.
+pub async fn client_cert_order_quiet(socket_path: &Path) -> i32 {
+    let req = ControlRequest {
+        v: 1,
+        cmd: "cert.order".to_string(),
+        name: None,
+        limit: None,
+        timeout_s: None,
+        all: None,
+        force: Some(true),
+        path: None,
+        no_only_best: None,
+        person: None,
+        service: None,
+        since: None,
+        until: None,
+    };
+
+    let line = match send_request_and_read_line(socket_path, &req).await {
+        Ok(l) => l,
+        Err(code) => return code,
+    };
+
+    let trimmed = line.trim();
+    match serde_json::from_str::<serde_json::Value>(trimmed) {
+        Ok(val) if val.get("ok") != Some(&serde_json::Value::Bool(false)) => 0,
+        Ok(val) => {
+            if let Some(err) = val.get("error").and_then(|e| e.as_str()) {
+                eprintln!("{} {err}", "✗ Error:".red().bold());
+            }
+            1
+        }
+        Err(_) => {
+            eprintln!("{} {trimmed}", "✗ Error:".red().bold());
+            1
+        }
+    }
 }
 
 /// Executes the `weaver-server cert renew [NAME | --all] [--force] [--wait]` CLI command.
@@ -1158,6 +1249,59 @@ fn format_ratio(visitor: i64, tunnel: i64) -> String {
         return "-".to_string();
     }
     format!("{:.1}×", visitor.max(0) as f64 / tunnel as f64)
+}
+
+/// Executes the `weaver-server doctor` command against the running relay.
+///
+/// The daemon owns ports 80/443/53, so it composes the report itself and sends
+/// it back; this prints the rendered checklist (or pretty JSON) and returns
+/// nonzero when any check failed.
+pub async fn client_doctor(socket_path: &Path, json: bool) -> i32 {
+    let req = ControlRequest {
+        v: 1,
+        cmd: "doctor".to_string(),
+        name: None,
+        limit: None,
+        timeout_s: None,
+        all: None,
+        force: None,
+        path: None,
+        no_only_best: None,
+        person: None,
+        service: None,
+        since: None,
+        until: None,
+    };
+
+    let line = match send_request_and_read_line(socket_path, &req).await {
+        Ok(l) => l,
+        Err(code) => return code,
+    };
+
+    let trimmed = line.trim();
+    let report: crate::setup::doctor::DoctorReport = match serde_json::from_str(trimmed) {
+        Ok(report) => report,
+        Err(_) => {
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed) {
+                let err = val.get("error").and_then(|e| e.as_str()).unwrap_or(trimmed);
+                eprintln!("{} {err}", "✗ Error:".red().bold());
+            } else {
+                eprintln!("{} {trimmed}", "✗ Error:".red().bold());
+            }
+            return 1;
+        }
+    };
+
+    if json {
+        match serde_json::to_string_pretty(&report.to_json()) {
+            Ok(rendered) => println!("{rendered}"),
+            Err(_) => return 1,
+        }
+    } else {
+        println!("{}", report.render());
+    }
+
+    if report.ok() { 0 } else { 1 }
 }
 
 #[cfg(test)]

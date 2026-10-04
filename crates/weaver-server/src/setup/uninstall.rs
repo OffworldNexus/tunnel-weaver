@@ -89,10 +89,11 @@ pub fn execute_uninstall(opts: &UninstallOptions) -> Result<(), String> {
         .args([
             "disable",
             "--now",
+            "--quiet",
             "weaver-server.service",
             "weaver-server.socket",
         ])
-        .status();
+        .output();
 
     // 3. Remove unit files
     let service_unit = Path::new("/etc/systemd/system/weaver-server.service");
@@ -105,7 +106,7 @@ pub fn execute_uninstall(opts: &UninstallOptions) -> Result<(), String> {
         let _ = fs::remove_file(socket_unit);
     }
 
-    let _ = Command::new("systemctl").arg("daemon-reload").status();
+    let _ = Command::new("systemctl").arg("daemon-reload").output();
     println!("  {} Systemd units removed", "✓".green());
 
     // 4. Remove installed binary

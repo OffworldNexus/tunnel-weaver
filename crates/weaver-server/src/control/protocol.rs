@@ -4,12 +4,12 @@ use crate::cert::CertState;
 
 /// Envelope for client requests sent across the control socket.
 ///
-/// All requests require `v: 1` and one of the eight valid command verbs.
+/// All requests require `v: 1` and one of the nine valid command verbs.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ControlRequest {
     /// Protocol version envelope; must be 1.
     pub v: u32,
-    /// Command verb ("status", "cert.status", "cert.wait", "cert.order", "cert.renew", "usage", "backup", "shutdown").
+    /// Command verb ("status", "cert.status", "cert.wait", "cert.order", "cert.renew", "usage", "backup", "doctor", "shutdown").
     pub cmd: String,
     /// Target domain or hostname for certificate operations.
     #[serde(default)]
@@ -90,6 +90,10 @@ pub struct StatusResponse {
     pub uptime: u64,
     pub pid: u32,
     pub root_domain: String,
+    /// The relay's own hostname, served by the admin interface and covered by
+    /// its own HTTP-01 certificate.
+    #[serde(default)]
+    pub admin_domain: String,
     pub listeners: ListenersInfo,
     pub root_cert: String,
     pub cert_counts: CertCounts,
@@ -99,6 +103,13 @@ pub struct StatusResponse {
     #[serde(default)]
     pub control_socket: String,
 }
+
+/// Response payload for the `doctor` verb.
+///
+/// The report is carried verbatim so the shared check model (`setup::doctor`)
+/// stays out of this module; the control layer only transports and validates
+/// the envelope.
+pub type DoctorResponse = crate::setup::doctor::DoctorReport;
 
 /// Historical certificate lifecycle event record.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -119,6 +130,13 @@ pub struct CertSummary {
     pub last_event: Option<CertEventSummary>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cert_id: Option<i32>,
+    /// ACME validation mechanism of the stored row (`dns-01`/`http-01`), absent
+    /// when no certificate has been issued for the name yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub validation: Option<String>,
+    /// Whether the stored certificate carries a wildcard SAN.
+    #[serde(default)]
+    pub wildcard: bool,
 }
 
 /// Response payload for `cert.status` without a hostname.
@@ -143,6 +161,12 @@ pub struct CertDetailResponse {
     pub cert_events: Vec<CertEventSummary>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cert_id: Option<i32>,
+    /// ACME validation mechanism of the stored row (`dns-01`/`http-01`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub validation: Option<String>,
+    /// Whether the stored certificate carries a wildcard SAN.
+    #[serde(default)]
+    pub wildcard: bool,
 }
 
 /// Individual streamed event for `cert.wait`.

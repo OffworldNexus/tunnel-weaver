@@ -15,6 +15,9 @@ use super::protocol::{
 use crate::cert::{CertManager, CertState};
 use crate::config::Config;
 use crate::metering::MeteringManager;
+use crate::setup::doctor::{
+    DoctorCheck, DoctorReport, ReportInputs, SelfConnectReachability, assemble_report,
+};
 use crate::store::Store;
 
 /// Binds the UNIX domain control socket listener, creates parent directories,
@@ -150,6 +153,114 @@ pub async fn run_control_server(
     .await
 }
 
+/// Composes the live doctor report from the running daemon's own facts.
+///
+/// The daemon owns 80/443/53, so it verifies reachability with
+/// [`SelfConnectReachability`] rather than binding. The shared
+/// [`assemble_report`] fixes the checklist and port handling; this function
+/// only gathers the facts the daemon has and adds the certificate-health
+/// checks the in-process context cannot.
+async fn build_doctor_report(
+    config: &Config,
+    store: &Store,
+    cert_manager: &CertManager,
+) -> DoctorReport {
+    let root = config.root_domain.to_ascii_lowercase();
+    let admin = config.admin_domain.to_ascii_lowercase();
+
+    let mut relay_ips = config.relay_ips.clone();
+    relay_ips.sort();
+    relay_ips.dedup();
+
+    // Public-DNS re-verification is the pre-install context's job; the daemon
+    // reports the public addresses and delegation target persisted at setup,
+    // then proves them live with the self-connect probe.
+    let admin_resolved = relay_ips.clone();
+    let ns_targets = vec![admin.clone()];
+    let extra_checks = certificate_health_checks(config, store, cert_manager).await;
+    let reachability = SelfConnectReachability::new(admin.clone(), root.clone());
+
+    assemble_report(
+        ReportInputs {
+            root_domain: root,
+            admin_domain: admin,
+            relay_ips,
+            admin_resolved,
+            ns_targets,
+            delegation_error: None,
+            extra_checks,
+            skip_reachability: false,
+        },
+        &reachability,
+    )
+    .await
+}
+
+/// One checklist item per managed certificate (the tunnel wildcard and the
+/// admin host) reporting name, validation mechanism, wildcard/single kind, and
+/// lifecycle state.
+async fn certificate_health_checks(
+    config: &Config,
+    store: &Store,
+    cert_manager: &CertManager,
+) -> Vec<DoctorCheck> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs() as i64)
+        .unwrap_or(0);
+
+    let names = [
+        config.root_domain.to_ascii_lowercase(),
+        config.admin_domain.to_ascii_lowercase(),
+    ];
+
+    let mut checks = Vec::with_capacity(names.len());
+    for name in names {
+        let record = store.get_certificate(&name).await.ok().flatten();
+        let (validation, kind) = match &record {
+            Some(row) => (
+                row.validation.clone(),
+                if row.wildcard { "wildcard" } else { "single" },
+            ),
+            None => ("unknown".to_string(), "single"),
+        };
+
+        let (ok, state) = match cert_manager.status(&name) {
+            CertState::Issued { not_after } | CertState::Renewing { not_after } => {
+                let remaining = not_after - now;
+                if remaining <= 0 {
+                    (false, "expired".to_string())
+                } else {
+                    let days = remaining / 86_400;
+                    if days < 14 {
+                        (true, format!("expiring ({days}d left)"))
+                    } else {
+                        (true, format!("issued ({days}d left)"))
+                    }
+                }
+            }
+            CertState::Failed { error, .. } => (false, format!("failed: {error}")),
+            CertState::Ordering => (false, "ordering".to_string()),
+            CertState::Pending => (false, "pending".to_string()),
+        };
+
+        let remediation = (!ok).then(|| {
+            format!(
+                "Renew or re-order '{name}': run `weaver-server cert renew {name} --force` and \
+                 check ACME reachability."
+            )
+        });
+
+        checks.push(DoctorCheck {
+            title: format!("Certificate {name}"),
+            ok,
+            detail: format!("{state} • {validation} • {kind}"),
+            remediation,
+        });
+    }
+    checks
+}
+
 /// Handles a single control socket connection: reads one JSON request, dispatches it, and writes response.
 async fn handle_connection(
     mut stream: UnixStream,
@@ -210,7 +321,7 @@ async fn handle_connection(
         }
     };
 
-    // 3. Strict 7-verb dispatcher check
+    // 3. Strict dispatcher check: every verb the control surface accepts.
     const ALLOWED_VERBS: &[&str] = &[
         "status",
         "cert.status",
@@ -219,6 +330,7 @@ async fn handle_connection(
         "cert.renew",
         "usage",
         "backup",
+        "doctor",
         "shutdown",
     ];
 
@@ -249,6 +361,7 @@ async fn handle_connection(
             let uptime = start_time.elapsed().as_secs();
             let pid = std::process::id();
             let root_domain = config.root_domain.clone();
+            let admin_domain = config.admin_domain.clone();
             let listeners = ListenersInfo {
                 http: config.listen_http.to_string(),
                 https: config.listen_https.to_string(),
@@ -272,6 +385,7 @@ async fn handle_connection(
                 uptime,
                 pid,
                 root_domain,
+                admin_domain,
                 listeners,
                 root_cert,
                 cert_counts,
@@ -345,6 +459,8 @@ async fn handle_connection(
                                 active,
                                 last_event,
                                 cert_id,
+                                validation: cert_rec.map(|c| c.validation.clone()),
+                                wildcard: cert_rec.is_some_and(|c| c.wildcard),
                             });
                         }
                         list
@@ -378,6 +494,8 @@ async fn handle_connection(
                                     active,
                                     last_event,
                                     cert_id: Some(r.id),
+                                    validation: Some(r.validation.clone()),
+                                    wildcard: r.wildcard,
                                 });
                             }
                         }
@@ -394,6 +512,8 @@ async fn handle_connection(
                                 active,
                                 last_event: None,
                                 cert_id: None,
+                                validation: None,
+                                wildcard: false,
                             });
                             seen_domains.insert(root_domain.clone());
                         }
@@ -423,6 +543,8 @@ async fn handle_connection(
                                     active,
                                     last_event,
                                     cert_id: Some(r.id),
+                                    validation: Some(r.validation.clone()),
+                                    wildcard: r.wildcard,
                                 });
                             }
                         }
@@ -441,6 +563,8 @@ async fn handle_connection(
                                     active,
                                     last_event: None,
                                     cert_id: None,
+                                    validation: None,
+                                    wildcard: false,
                                 });
                             }
                         }
@@ -517,6 +641,8 @@ async fn handle_connection(
                     // the wildcard row has no per-name activity timestamp.
                     let last_active_at = None;
                     let cert_id = cert_rec.as_ref().map(|r| r.id);
+                    let validation = cert_rec.as_ref().map(|r| r.validation.clone());
+                    let wildcard = cert_rec.as_ref().is_some_and(|r| r.wildcard);
 
                     let resp = CertDetailResponse {
                         ok: true,
@@ -530,6 +656,8 @@ async fn handle_connection(
                         last_active_at,
                         cert_events,
                         cert_id,
+                        validation,
+                        wildcard,
                     };
                     let mut data = serde_json::to_vec(&resp)?;
                     data.push(b'\n');
@@ -651,18 +779,12 @@ async fn handle_connection(
             }
         }
         "cert.order" => {
-            // Setup triggers this once, forcing the wildcard order before it
+            // Setup triggers this once, forcing both managed orders before it
             // waits on `cert.wait`. Force bypasses backoff so a fresh install
-            // is never held by a stale failure counter.
-            let root_domain = config.root_domain.to_ascii_lowercase();
-            match cert_manager.renew_hostname(&root_domain, true).await {
-                Ok(()) => {
-                    let resp = RenewResponse {
-                        ok: true,
-                        renewed: vec![root_domain],
-                        status: "queued".to_string(),
-                        skipped_inactive: Vec::new(),
-                    };
+            // is never held by a stale failure counter. Both are queued: the
+            // tunnel wildcard (DNS-01) and the admin certificate (HTTP-01).
+            match cert_manager.renew_all(true).await {
+                Ok(resp) => {
                     let mut data = serde_json::to_vec(&resp)?;
                     data.push(b'\n');
                     writer.write_all(&data).await?;
@@ -815,6 +937,15 @@ async fn handle_connection(
                     writer.flush().await?;
                 }
             }
+        }
+        "doctor" => {
+            // The daemon owns 80/443/53, so it self-connects instead of
+            // binding; certificate health comes from the store + manager.
+            let report = build_doctor_report(&config, &store, &cert_manager).await;
+            let mut data = serde_json::to_vec(&report)?;
+            data.push(b'\n');
+            writer.write_all(&data).await?;
+            writer.flush().await?;
         }
         "shutdown" => {
             let resp = ShutdownResponse {

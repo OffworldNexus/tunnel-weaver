@@ -1,8 +1,10 @@
 //! Cleartext HTTP edge server.
 //!
-//! Listens on HTTP (port 80) and redirects all cleartext requests to HTTPS
-//! via HTTP 308 Permanent Redirect, preserving host, port, and query string.
-//! ACME validation is DNS-01 only, so there is no challenge interception here.
+//! Listens on HTTP (port 80). ACME HTTP-01 validation requests under
+//! `/.well-known/acme-challenge/` are answered from the store (used for the
+//! relay's own admin certificate); every other cleartext request is redirected
+//! to HTTPS via HTTP 308 Permanent Redirect, preserving host, port, and query
+//! string. The tunnel wildcard uses DNS-01, so it does not touch this path.
 
 use std::convert::Infallible;
 use std::sync::Arc;
@@ -19,6 +21,10 @@ use tokio_util::task::TaskTracker;
 use tracing::{debug, info, trace};
 
 use crate::edge::host::{HostError, request_host};
+use crate::store::Store;
+
+/// Path prefix ACME HTTP-01 validation requests use.
+const ACME_CHALLENGE_PREFIX: &str = "/.well-known/acme-challenge/";
 
 /// Shared state for HTTP edge service.
 #[derive(Clone, Default)]
@@ -27,6 +33,11 @@ pub struct HttpEdgeConfig {
     pub root_domain: String,
     /// Port of the HTTPS listener to redirect to.
     pub https_port: u16,
+    /// State store holding live HTTP-01 key authorizations, if any.
+    ///
+    /// `None` in tests that only exercise the redirect; the challenge path then
+    /// always returns 404 rather than panicking.
+    pub store: Option<Arc<Store>>,
 }
 
 impl std::fmt::Debug for HttpEdgeConfig {
@@ -38,11 +49,19 @@ impl std::fmt::Debug for HttpEdgeConfig {
     }
 }
 
-/// Handles incoming cleartext HTTP requests, redirecting them to HTTPS.
+/// Handles incoming cleartext HTTP requests: ACME HTTP-01 challenges are served
+/// from the store on port 80; everything else is redirected to HTTPS.
 pub async fn handle_http_redirect(
     req: Request<hyper::body::Incoming>,
     config: Arc<HttpEdgeConfig>,
 ) -> Result<Response<Full<Bytes>>, Infallible> {
+    // ACME HTTP-01 validation is plaintext and must be answered before the
+    // redirect: the CA will not follow a 3xx to https for a challenge. The path
+    // is fixed by RFC 8555 §8.3; the token is the final segment.
+    if let Some(token) = req.uri().path().strip_prefix(ACME_CHALLENGE_PREFIX) {
+        return Ok(handle_http01_challenge(token, &config).await);
+    }
+
     // RFC 9112 §3.2: no routing — not even a redirect — on a missing,
     // duplicated or malformed `Host`. HTTP/1.0 without `Host` is the one
     // legitimate hostless shape; it is redirected to the root domain.
@@ -83,6 +102,35 @@ pub async fn handle_http_redirect(
         .unwrap();
 
     Ok(response)
+}
+
+/// Answers an ACME HTTP-01 challenge request.
+///
+/// The token is looked up in the store; a live key authorization is returned as
+/// `text/plain` with status 200, anything else is 404. This intentionally does
+/// not echo whether the miss was an unknown token or no store — both are the
+/// same to a validator.
+async fn handle_http01_challenge(token: &str, config: &HttpEdgeConfig) -> Response<Full<Bytes>> {
+    let key_auth = match &config.store {
+        Some(store) if !token.is_empty() => store.get_http01(token).await.ok().flatten(),
+        _ => None,
+    };
+
+    match key_auth {
+        Some(value) => {
+            trace!(token, "Serving ACME HTTP-01 key authorization");
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(http::header::CONTENT_TYPE, "text/plain")
+                .body(Full::new(Bytes::from(value)))
+                .unwrap()
+        }
+        None => Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .header(http::header::CONTENT_TYPE, "text/plain; charset=utf-8")
+            .body(Full::new(Bytes::from("404 Not Found: unknown challenge\n")))
+            .unwrap(),
+    }
 }
 
 /// Helper to extract host without port.
@@ -139,11 +187,13 @@ pub async fn run_http_server(
     listener: TcpListener,
     root_domain: String,
     https_port: u16,
+    store: Arc<Store>,
     shutdown_token: CancellationToken,
 ) {
     let edge_config = Arc::new(HttpEdgeConfig {
         root_domain,
         https_port,
+        store: Some(store),
     });
     let auto_builder = Builder::new(TokioExecutor::new());
     let tracker = TaskTracker::new();

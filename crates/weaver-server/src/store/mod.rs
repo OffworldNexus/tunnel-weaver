@@ -320,8 +320,8 @@ impl Store {
 
     /// Inserts or replaces the certificate stored under `name`.
     ///
-    /// In the wildcard model a certificate is global and keyed by its own name
-    /// (the zone apex); a renewal swaps the material in place rather than
+    /// A certificate is global and keyed by its own name (the tunnel apex or
+    /// the admin domain); a renewal swaps the material in place rather than
     /// appending a row, so at most one row per name exists.
     pub async fn save_certificate(
         &self,
@@ -338,6 +338,8 @@ impl Store {
             issuer: Set(cert.issuer),
             directory: Set(cert.directory),
             obtained_at: Set(cert.obtained_at),
+            validation: Set(cert.validation),
+            wildcard: Set(cert.wildcard),
             ..Default::default()
         };
         certificate::Entity::insert(active)
@@ -351,6 +353,8 @@ impl Store {
                         certificate::Column::Issuer,
                         certificate::Column::Directory,
                         certificate::Column::ObtainedAt,
+                        certificate::Column::Validation,
+                        certificate::Column::Wildcard,
                     ])
                     .to_owned(),
             )
@@ -465,9 +469,9 @@ impl Store {
         Ok(())
     }
 
-    // ----- ACME challenge registry (DNS-01, multi-value) -----
+    // ----- ACME challenge registry (DNS-01 TXT + HTTP-01 tokens) -----
 
-    /// Publishes one TXT value for `name`, ignoring duplicates.
+    /// Publishes one DNS-01 TXT value for `name`, ignoring duplicates.
     ///
     /// A DNS-01 challenge name maps to a *set* of values: the apex and the
     /// wildcard authorisations of a single order share
@@ -483,6 +487,7 @@ impl Store {
             name: Set(lower),
             value: Set(value.to_string()),
             created_at: Set(at),
+            kind: Set("dns-01".to_string()),
             ..Default::default()
         };
         challenge::Entity::insert(active)
@@ -496,36 +501,90 @@ impl Store {
         Ok(())
     }
 
-    /// Removes one TXT value for `name`.
+    /// Removes one DNS-01 TXT value for `name`.
     pub async fn remove_challenge(&self, name: &str, value: &str) -> Result<(), StoreError> {
         let lower = name.to_ascii_lowercase();
         challenge::Entity::delete_many()
             .filter(challenge::Column::Name.eq(lower))
             .filter(challenge::Column::Value.eq(value))
+            .filter(challenge::Column::Kind.eq("dns-01"))
             .exec(&self.db)
             .await?;
         Ok(())
     }
 
-    /// Removes every TXT value for `name`.
+    /// Removes every DNS-01 TXT value for `name`.
     pub async fn clear_challenges(&self, name: &str) -> Result<(), StoreError> {
         let lower = name.to_ascii_lowercase();
         challenge::Entity::delete_many()
             .filter(challenge::Column::Name.eq(lower))
+            .filter(challenge::Column::Kind.eq("dns-01"))
             .exec(&self.db)
             .await?;
         Ok(())
     }
 
-    /// Returns the current TXT values for `name`, oldest first.
+    /// Returns the current DNS-01 TXT values for `name`, oldest first.
+    ///
+    /// HTTP-01 token rows are never returned, whatever they are named, so the
+    /// authoritative responder cannot leak a key authorization as TXT.
     pub async fn get_challenges(&self, name: &str) -> Result<Vec<String>, StoreError> {
         let lower = name.to_ascii_lowercase();
         let rows = challenge::Entity::find()
             .filter(challenge::Column::Name.eq(lower))
+            .filter(challenge::Column::Kind.eq("dns-01"))
             .order_by_asc(challenge::Column::Id)
             .all(&self.db)
             .await?;
         Ok(rows.into_iter().map(|r| r.value).collect())
+    }
+
+    /// Publishes the HTTP-01 key authorization for an ACME token.
+    ///
+    /// The token is a case-sensitive path segment, so unlike DNS names it is
+    /// stored verbatim. Any previous row for the same token is removed first so
+    /// a re-published challenge never serves a stale key authorization.
+    pub async fn publish_http01(
+        &self,
+        token: &str,
+        key_auth: &str,
+        at: i64,
+    ) -> Result<(), StoreError> {
+        challenge::Entity::delete_many()
+            .filter(challenge::Column::Name.eq(token))
+            .filter(challenge::Column::Kind.eq("http-01"))
+            .exec(&self.db)
+            .await?;
+        let active = challenge::ActiveModel {
+            name: Set(token.to_string()),
+            value: Set(key_auth.to_string()),
+            created_at: Set(at),
+            kind: Set("http-01".to_string()),
+            ..Default::default()
+        };
+        active.insert(&self.db).await?;
+        Ok(())
+    }
+
+    /// Returns the HTTP-01 key authorization for `token`, if one is published.
+    pub async fn get_http01(&self, token: &str) -> Result<Option<String>, StoreError> {
+        let row = challenge::Entity::find()
+            .filter(challenge::Column::Name.eq(token))
+            .filter(challenge::Column::Kind.eq("http-01"))
+            .order_by_desc(challenge::Column::Id)
+            .one(&self.db)
+            .await?;
+        Ok(row.map(|r| r.value))
+    }
+
+    /// Removes the HTTP-01 key authorization for `token`.
+    pub async fn remove_http01(&self, token: &str) -> Result<(), StoreError> {
+        challenge::Entity::delete_many()
+            .filter(challenge::Column::Name.eq(token))
+            .filter(challenge::Column::Kind.eq("http-01"))
+            .exec(&self.db)
+            .await?;
+        Ok(())
     }
 
     /// Sets or clears `last_active_at` for a domain.
@@ -901,6 +960,11 @@ pub struct NewCertificate {
     pub issuer: Option<String>,
     pub directory: String,
     pub obtained_at: i64,
+    /// ACME validation mechanism that produced this certificate
+    /// (`dns-01`/`http-01`).
+    pub validation: String,
+    /// Whether the certificate carries a wildcard SAN (`*.<root>`).
+    pub wildcard: bool,
 }
 
 /// Maps a certificate model into a `CertRecord`.
@@ -913,6 +977,8 @@ fn to_cert_record(cert: certificate::Model) -> CertRecord {
         issuer: cert.issuer,
         directory: cert.directory,
         obtained_at: cert.obtained_at,
+        validation: cert.validation,
+        wildcard: cert.wildcard,
     }
 }
 
@@ -927,6 +993,8 @@ fn to_full_cert_record(cert: certificate::Model) -> FullCertRecord {
         issuer: cert.issuer,
         directory: cert.directory,
         obtained_at: cert.obtained_at,
+        validation: cert.validation,
+        wildcard: cert.wildcard,
     }
 }
 
@@ -940,6 +1008,10 @@ pub struct CertRecord {
     pub issuer: Option<String>,
     pub directory: String,
     pub obtained_at: i64,
+    /// ACME validation mechanism that produced this row (`dns-01`/`http-01`).
+    pub validation: String,
+    /// Whether the certificate carries a wildcard SAN (`*.<root>`).
+    pub wildcard: bool,
 }
 
 /// Full certificate record with PEM material, used for startup cache hydration.
@@ -954,6 +1026,10 @@ pub struct FullCertRecord {
     pub issuer: Option<String>,
     pub directory: String,
     pub obtained_at: i64,
+    /// ACME validation mechanism that produced this row (`dns-01`/`http-01`).
+    pub validation: String,
+    /// Whether the certificate carries a wildcard SAN (`*.<root>`).
+    pub wildcard: bool,
 }
 
 /// Certificate event database record.

@@ -65,6 +65,9 @@ socket2 = "0.6"
 libc = "0.2"
 comfy-table = "7.1"
 crossterm = "0.29"
+# Line-editable prompts for `weaver-server setup`. Uses the same `crossterm`
+# backend as the rest of the CLI, so no second terminal crate is pulled in.
+inquire = "0.9"
 jiff = { version = "0.2", default-features = false, features = ["std", "tz-system"] }
 futures-util = "0.3"
 tokio-tungstenite = { version = "0.26", default-features = false, features = ["handshake"] }

@@ -60,8 +60,16 @@ pub async fn wait_for_systemd_active() -> Result<(), String> {
     Err("weaver-server systemd units did not become active".into())
 }
 
-/// Waits for certificate issuance via control socket and tests HTTPS endpoint.
-pub async fn verify_setup(root_domain: &str, socket_path: &Path) -> Result<(), String> {
+/// Waits for certificate issuance via control socket and tests HTTPS endpoints.
+///
+/// Both managed certificates are verified: the tunnel wildcard (DNS-01, also
+/// exercised through a random one-label name) and the admin certificate
+/// (HTTP-01). `setup_complete` is only persisted once both pass.
+pub async fn verify_setup(
+    root_domain: &str,
+    admin_domain: &str,
+    socket_path: &Path,
+) -> Result<(), String> {
     println!("\n{}", "Verifying deployment...".bold().cyan());
 
     // 1. Check systemd service is active
@@ -135,6 +143,80 @@ pub async fn verify_setup(root_domain: &str, socket_path: &Path) -> Result<(), S
         Err(_) => {
             println!(
                 "\r  {} curl command not found, skipping local HTTPS check",
+                "•".dim()
+            );
+        }
+    }
+
+    // 3b. Admin certificate: wait for the HTTP-01 order and probe its endpoint.
+    println!(
+        "  {} Waiting for admin certificate issuance for '{}' (timeout: 300s)...",
+        "•".blue(),
+        admin_domain.bold().cyan()
+    );
+    let admin_wait = client_cert_wait(
+        socket_path,
+        Some(admin_domain.to_string()),
+        Some(300),
+        false,
+    )
+    .await;
+    if admin_wait != 0 {
+        print_failure_guidance();
+        return Err(format!(
+            "certificate issuance failed or timed out for admin host '{admin_domain}'"
+        ));
+    }
+
+    print!(
+        "  {} Testing HTTPS GET https://{}/...",
+        "•".blue(),
+        admin_domain
+    );
+    let admin_url = format!("https://{admin_domain}/");
+    let admin_res = Command::new("curl")
+        .args([
+            "--fail",
+            "--silent",
+            "--show-error",
+            "-o",
+            "/dev/null",
+            "-w",
+            "%{http_code}",
+            &admin_url,
+        ])
+        .output();
+    match admin_res {
+        Ok(out) if out.status.success() => {
+            let status_code = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            println!(
+                "\r  {} Admin HTTPS GET https://{}/ succeeded (HTTP {})",
+                "✓".green(),
+                admin_domain,
+                status_code.bold()
+            );
+        }
+        Ok(out) => {
+            let err_msg = String::from_utf8_lossy(&out.stderr);
+            // A trust failure is tolerated (staging/Pebble); any other failure
+            // means the admin certificate or its HTTP-01 path is broken.
+            if err_msg.contains("certificate") || err_msg.contains("SSL") || err_msg.contains("TLS")
+            {
+                println!(
+                    "\r  {} Admin HTTPS endpoint reached; certificate verification failed against system roots (expected for staging/Pebble environments)",
+                    "•".yellow()
+                );
+            } else {
+                print_failure_guidance();
+                return Err(format!(
+                    "admin HTTPS GET https://{admin_domain}/ failed: {}",
+                    err_msg.trim()
+                ));
+            }
+        }
+        Err(_) => {
+            println!(
+                "\r  {} curl command not found, skipping admin HTTPS check",
                 "•".dim()
             );
         }
