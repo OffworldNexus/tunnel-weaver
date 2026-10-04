@@ -16,7 +16,7 @@ use tokio::sync::broadcast;
 use tracing::{debug, warn};
 
 use super::dns::generate_random_hex;
-use super::planner::PortReachability;
+use super::planner::{Port, PortReachability};
 
 /// Scans `/proc/net/tcp{,6}` and `/proc/net/udp{,6}` for socket inodes bound
 /// to the given port.
@@ -327,15 +327,13 @@ async fn probe_udp_ip_port(ip: IpAddr, port: u16, challenge: &str) -> Result<(),
 ///
 /// Port 53 is exercised over both TCP and UDP because the authoritative DNS
 /// responder serves both; either failing marks the port unreachable.
-pub async fn verify_reachability(
-    public_ips: &[IpAddr],
-) -> (PortReachability, PortReachability, PortReachability) {
+pub async fn verify_reachability(public_ips: &[IpAddr]) -> [PortReachability; 3] {
     if public_ips.is_empty() {
-        return (
+        return [
             PortReachability::Failed("no public IPs provided".into()),
             PortReachability::Failed("no public IPs provided".into()),
             PortReachability::Failed("no public IPs provided".into()),
-        );
+        ];
     }
 
     let token = generate_random_hex(16);
@@ -448,7 +446,15 @@ pub async fn verify_reachability(
         let _ = task.await;
     }
 
-    (port_80_result, port_443_result, port_53_result)
+    let mut results = [
+        PortReachability::Failed("not probed".into()),
+        PortReachability::Failed("not probed".into()),
+        PortReachability::Failed("not probed".into()),
+    ];
+    results[Port::Http.index()] = port_80_result;
+    results[Port::Https.index()] = port_443_result;
+    results[Port::Dns.index()] = port_53_result;
+    results
 }
 
 /// Probes one TCP port across every public IP with the challenge handshake.

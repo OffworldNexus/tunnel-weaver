@@ -32,7 +32,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 
 use super::dns;
-use super::planner::PortReachability;
+use super::planner::{Port, PortReachability};
 use super::reachability;
 use crate::zone::normalize_domain;
 
@@ -53,6 +53,10 @@ pub struct DoctorCheck {
     pub detail: String,
     /// What the operator should change when `ok` is false.
     pub remediation: Option<String>,
+    /// Structured verdict for port checks, so the planner never has to parse
+    /// the human `detail` to recover it. `None` for non-port checks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<PortReachability>,
 }
 
 /// Aggregated result of every preflight check.
@@ -122,7 +126,7 @@ impl DoctorReport {
         for check in &self.checks {
             let (marker, detail) = if !check.ok {
                 ("✗".red().bold(), check.detail.as_str().red())
-            } else if check.detail.starts_with("skipped") {
+            } else if check.status == Some(PortReachability::Skipped) {
                 ("•".blue(), check.detail.as_str().dark_grey())
             } else {
                 ("✓".green().bold(), check.detail.as_str().white())
@@ -216,12 +220,12 @@ pub struct BindReachability;
 #[async_trait]
 impl Reachability for BindReachability {
     async fn check(&self, ips: &[IpAddr]) -> Vec<DoctorCheck> {
-        let (port_80, port_443, port_53) = reachability::verify_reachability(ips).await;
-        vec![
-            bind_port_check("Port 80", &port_80, "TCP 80"),
-            bind_port_check("Port 443", &port_443, "TCP 443"),
-            bind_port_check("Port 53", &port_53, "TCP+UDP 53"),
-        ]
+        let results = reachability::verify_reachability(ips).await;
+        Port::ALL
+            .iter()
+            .zip(results)
+            .map(|(port, status)| bind_port_check(*port, &status))
+            .collect()
     }
 }
 
@@ -229,19 +233,23 @@ impl Reachability for BindReachability {
 ///
 /// Port 53 gets extra guidance when `systemd-resolved`'s stub listener is the
 /// cause, which is the most common bind failure on a fresh host.
-fn bind_port_check(title: &str, status: &PortReachability, description: &str) -> DoctorCheck {
+fn bind_port_check(port: Port, status: &PortReachability) -> DoctorCheck {
+    let title = port.title();
+    let description = port.transport();
     match status {
         PortReachability::ReachedSelf => DoctorCheck {
-            title: title.to_string(),
+            title,
             ok: true,
             detail: format!("inbound {description} reaches this host"),
             remediation: None,
+            status: Some(status.clone()),
         },
         PortReachability::Skipped => DoctorCheck {
-            title: title.to_string(),
+            title,
             ok: true,
             detail: "skipped via --skip-reachability-check".to_string(),
             remediation: None,
+            status: Some(status.clone()),
         },
         PortReachability::Failed(reason) => {
             let mut detail = reason.clone();
@@ -249,8 +257,8 @@ fn bind_port_check(title: &str, status: &PortReachability, description: &str) ->
                 "Forward {description} to this host and allow it through the host firewall, \
                  then re-run."
             );
-            if title == "Port 53"
-                && let Some((pid, comm)) = reachability::find_occupying_process(53)
+            if port == Port::Dns
+                && let Some((pid, comm)) = reachability::find_occupying_process(port.number())
                 && comm.to_ascii_lowercase().contains("systemd-resolve")
             {
                 detail.push_str(&format!(" (port 53 held by '{comm}', PID {pid})"));
@@ -261,10 +269,11 @@ fn bind_port_check(title: &str, status: &PortReachability, description: &str) ->
                 );
             }
             DoctorCheck {
-                title: title.to_string(),
+                title,
                 ok: false,
                 detail,
                 remediation: Some(remediation),
+                status: Some(status.clone()),
             }
         }
     }
@@ -296,11 +305,22 @@ impl SelfConnectReachability {
     /// Produces the three port checks, allowing tests to substitute the ports
     /// for locally bound listeners (80/443/53 cannot be bound unprivileged).
     async fn checks_with_ports(&self, ips: &[IpAddr], ports: [u16; 3]) -> Vec<DoctorCheck> {
-        vec![
-            self.tcp_port_check("Port 80", ips, ports[0], true).await,
-            self.tcp_port_check("Port 443", ips, ports[1], false).await,
-            self.dns_port_check("Port 53", ips, ports[2]).await,
-        ]
+        let mut checks = Vec::with_capacity(Port::ALL.len());
+        for port in Port::ALL {
+            let check = match port {
+                Port::Http => {
+                    self.tcp_port_check(port, ips, ports[port.index()], true)
+                        .await
+                }
+                Port::Https => {
+                    self.tcp_port_check(port, ips, ports[port.index()], false)
+                        .await
+                }
+                Port::Dns => self.dns_port_check(port, ips, ports[port.index()]).await,
+            };
+            checks.push(check);
+        }
+        checks
     }
 
     /// TCP-connects to `port` on every IP. On port 80 it also sends a minimal
@@ -308,18 +328,18 @@ impl SelfConnectReachability {
     /// connect itself is the probe.
     async fn tcp_port_check(
         &self,
-        title: &str,
+        port: Port,
         ips: &[IpAddr],
-        port: u16,
+        number: u16,
         send_http: bool,
     ) -> DoctorCheck {
         if ips.is_empty() {
-            return unreachable_port(title, "no public relay addresses to probe", None);
+            return unreachable_port(port, "no public relay addresses to probe");
         }
         let mut results = Vec::with_capacity(ips.len());
         let mut all_ok = true;
         for &ip in ips {
-            match self.probe_tcp(ip, port, send_http).await {
+            match self.probe_tcp(ip, number, send_http).await {
                 Ok(()) => results.push(format!("{ip}: reachable")),
                 Err(err) => {
                     all_ok = false;
@@ -329,23 +349,28 @@ impl SelfConnectReachability {
         }
         let remediation = (!all_ok).then(|| {
             format!(
-                "Check that TCP {port} is forwarded to this relay and not blocked by the host \
+                "Check that TCP {number} is forwarded to this relay and not blocked by the host \
                  firewall, then re-run `weaver-server doctor`."
             )
         });
-        port_check(title, all_ok, results, remediation)
+        let status = if all_ok {
+            PortReachability::ReachedSelf
+        } else {
+            PortReachability::Failed(results.join("; "))
+        };
+        port_check(port, status, results, remediation)
     }
 
     /// Sends a DNS `A` query for the tunnel apex to `port` on every IP and
     /// requires a response datagram.
-    async fn dns_port_check(&self, title: &str, ips: &[IpAddr], port: u16) -> DoctorCheck {
+    async fn dns_port_check(&self, port: Port, ips: &[IpAddr], number: u16) -> DoctorCheck {
         if ips.is_empty() {
-            return unreachable_port(title, "no public relay addresses to probe", None);
+            return unreachable_port(port, "no public relay addresses to probe");
         }
         let mut results = Vec::with_capacity(ips.len());
         let mut all_ok = true;
         for &ip in ips {
-            match self.probe_dns(ip, port).await {
+            match self.probe_dns(ip, number).await {
                 Ok(()) => results.push(format!("{ip}: reachable")),
                 Err(err) => {
                     all_ok = false;
@@ -358,7 +383,12 @@ impl SelfConnectReachability {
              responder is running, then re-run `weaver-server doctor`."
                 .to_string()
         });
-        port_check(title, all_ok, results, remediation)
+        let status = if all_ok {
+            PortReachability::ReachedSelf
+        } else {
+            PortReachability::Failed(results.join("; "))
+        };
+        port_check(port, status, results, remediation)
     }
 
     /// One timed TCP connect, with an optional HTTP request on success.
@@ -422,36 +452,43 @@ impl SelfConnectReachability {
 #[async_trait]
 impl Reachability for SelfConnectReachability {
     async fn check(&self, ips: &[IpAddr]) -> Vec<DoctorCheck> {
-        self.checks_with_ports(ips, [80, 443, 53]).await
+        let ports = [
+            Port::Http.number(),
+            Port::Https.number(),
+            Port::Dns.number(),
+        ];
+        self.checks_with_ports(ips, ports).await
     }
 }
 
-/// Builds a per-port check from per-address result lines.
+/// Builds a per-port check from per-address result lines and its verdict.
 fn port_check(
-    title: &str,
-    ok: bool,
+    port: Port,
+    status: PortReachability,
     mut results: Vec<String>,
     remediation: Option<String>,
 ) -> DoctorCheck {
     results.sort();
     DoctorCheck {
-        title: title.to_string(),
-        ok,
+        title: port.title(),
+        ok: matches!(status, PortReachability::ReachedSelf),
         detail: results.join("; "),
         remediation,
+        status: Some(status),
     }
 }
 
 /// A port check for the case where there is no address to probe at all.
-fn unreachable_port(title: &str, detail: &str, remediation: Option<String>) -> DoctorCheck {
+fn unreachable_port(port: Port, detail: &str) -> DoctorCheck {
     DoctorCheck {
-        title: title.to_string(),
+        title: port.title(),
         ok: false,
         detail: detail.to_string(),
-        remediation: Some(remediation.unwrap_or_else(|| {
+        remediation: Some(
             "Point the admin A/AAAA at this relay or pass --relay-ip <ADDR>, then re-run."
-                .to_string()
-        })),
+                .to_string(),
+        ),
+        status: Some(PortReachability::Failed(detail.to_string())),
     }
 }
 
@@ -486,6 +523,7 @@ pub async fn assemble_report(
                 &inputs.root_domain,
                 &inputs.relay_ips,
             )),
+            status: None,
         }),
         None => checks.push(delegation_check(
             &inputs.admin_domain,
@@ -497,16 +535,13 @@ pub async fn assemble_report(
     checks.extend(inputs.extra_checks);
 
     if inputs.skip_reachability {
-        checks.extend(
-            ["Port 80", "Port 443", "Port 53"]
-                .iter()
-                .map(|title| DoctorCheck {
-                    title: (*title).to_string(),
-                    ok: true,
-                    detail: "skipped via --skip-reachability-check".to_string(),
-                    remediation: None,
-                }),
-        );
+        checks.extend(Port::ALL.iter().map(|port| DoctorCheck {
+            title: port.title(),
+            ok: true,
+            detail: "skipped via --skip-reachability-check".to_string(),
+            remediation: None,
+            status: Some(PortReachability::Skipped),
+        }));
     } else {
         checks.extend(reachability.check(&inputs.relay_ips).await);
     }
@@ -568,18 +603,22 @@ pub async fn run_in_process(
     .await
 }
 
-/// Recovers the planner's [`PortReachability`] verdict for `port` from the
+/// Reads the planner's [`PortReachability`] verdict for `port` from the
 /// report's per-port check.
 ///
-/// `setup` still feeds the pure planner, which predates the shared report; this
-/// keeps the report free of duplicate port fields while letting the planner
-/// consume it unchanged.
-pub fn port_status(report: &DoctorReport, port: u16) -> PortReachability {
-    let title = format!("Port {port}");
+/// The verdict is carried structurally on the check (`status`), not recovered
+/// from its human `detail`, so rephrasing a rendered message cannot change the
+/// planner's decision.
+pub fn port_status(report: &DoctorReport, port: Port) -> PortReachability {
+    let title = port.title();
     match report.checks.iter().find(|check| check.title == title) {
-        Some(check) if check.detail.starts_with("skipped") => PortReachability::Skipped,
-        Some(check) if check.ok => PortReachability::ReachedSelf,
-        Some(check) => PortReachability::Failed(check.detail.clone()),
+        Some(check) => check.status.clone().unwrap_or_else(|| {
+            if check.ok {
+                PortReachability::ReachedSelf
+            } else {
+                PortReachability::Failed(check.detail.clone())
+            }
+        }),
         None => PortReachability::Failed(format!("no '{title}' check in report")),
     }
 }
@@ -598,6 +637,7 @@ pub fn domain_split_check(admin_domain: &str, root_domain: &str) -> DoctorCheck 
                 "admin domain '{admin_domain}' is outside the delegated tunnel zone '{root_domain}'"
             ),
             remediation: None,
+            status: None,
         },
         Some(issue) => DoctorCheck {
             title: "Domain split".to_string(),
@@ -608,6 +648,7 @@ pub fn domain_split_check(admin_domain: &str, root_domain: &str) -> DoctorCheck 
                  e.g. relay.example.net for tunnel example.com."
                     .to_string(),
             ),
+            status: None,
         },
     }
 }
@@ -642,6 +683,7 @@ pub fn delegation_check(
             ok: true,
             detail: format!("parent zone delegates '{root_domain}' to '{admin_domain}'"),
             remediation: None,
+            status: None,
         };
     }
     let found = if ns_targets.is_empty() {
@@ -654,6 +696,7 @@ pub fn delegation_check(
         ok: false,
         detail: format!("'{root_domain}' is not delegated to '{admin_domain}' (found: {found})"),
         remediation: Some(delegation_records(admin_domain, root_domain, &[])),
+        status: None,
     }
 }
 
@@ -691,6 +734,7 @@ pub fn admin_addresses_check(
                 "Point A/AAAA {admin_domain} at this relay's public address, or pass \
                  --relay-ip <ADDR>."
             )),
+            status: None,
         };
     }
 
@@ -702,6 +746,7 @@ pub fn admin_addresses_check(
             remediation: Some(format!(
                 "Point A/AAAA {admin_domain} at {relay_list} so HTTP-01 can reach this relay."
             )),
+            status: None,
         };
     }
 
@@ -714,6 +759,7 @@ pub fn admin_addresses_check(
                  addresses [{relay_list}]"
             ),
             remediation: None,
+            status: None,
         };
     }
 
@@ -724,6 +770,7 @@ pub fn admin_addresses_check(
             "'{admin_domain}' resolves to [{admin_list}]; relay addresses are [{relay_list}]"
         ),
         remediation: None,
+        status: None,
     }
 }
 
@@ -738,6 +785,7 @@ mod tests {
             ok,
             detail: String::new(),
             remediation: None,
+            status: None,
         }
     }
 
@@ -806,6 +854,7 @@ mod tests {
                     ok: false,
                     detail: "missing".into(),
                     remediation: Some("add it".into()),
+                    status: None,
                 },
                 check("Port 53", true),
             ],
@@ -853,43 +902,52 @@ mod tests {
                     ok: false,
                     detail: "connection refused".into(),
                     remediation: None,
+                    status: Some(PortReachability::Failed("connection refused".into())),
                 },
                 DoctorCheck {
                     title: "Port 53".to_string(),
                     ok: true,
                     detail: "skipped via --skip-reachability-check".into(),
                     remediation: None,
+                    status: Some(PortReachability::Skipped),
                 },
             ],
         };
-        assert_eq!(port_status(&report, 80), PortReachability::ReachedSelf);
         assert_eq!(
-            port_status(&report, 443),
+            port_status(&report, Port::Http),
+            PortReachability::ReachedSelf
+        );
+        assert_eq!(
+            port_status(&report, Port::Https),
             PortReachability::Failed("connection refused".into())
         );
-        assert_eq!(port_status(&report, 53), PortReachability::Skipped);
+        assert_eq!(port_status(&report, Port::Dns), PortReachability::Skipped);
         // A report that never probed a port reports a failure, not a panic.
         report.checks.clear();
         assert!(matches!(
-            port_status(&report, 80),
+            port_status(&report, Port::Http),
             PortReachability::Failed(_)
         ));
     }
 
     #[test]
     fn bind_port_check_marks_failures_with_remediation() {
-        let ok = bind_port_check("Port 80", &PortReachability::ReachedSelf, "TCP 80");
+        let ok = bind_port_check(Port::Http, &PortReachability::ReachedSelf);
         assert!(ok.ok);
         assert!(ok.remediation.is_none());
+        assert_eq!(ok.status, Some(PortReachability::ReachedSelf));
 
         let failed = bind_port_check(
-            "Port 443",
+            Port::Https,
             &PortReachability::Failed("connection timed out".into()),
-            "TCP 443",
         );
         assert!(!failed.ok);
         assert!(failed.detail.contains("connection timed out"));
         assert!(failed.remediation.is_some());
+        assert_eq!(
+            failed.status,
+            Some(PortReachability::Failed("connection timed out".into()))
+        );
     }
 
     #[tokio::test]

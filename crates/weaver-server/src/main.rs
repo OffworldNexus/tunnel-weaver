@@ -1127,9 +1127,18 @@ async fn handle_setup(args: SetupArgs, db_path: PathBuf) {
         .iter()
         .find(|check| check.title == "Delegation")
         .is_some_and(|check| check.ok);
-    let port_80 = weaver_server::setup::doctor::port_status(&report, 80);
-    let port_443 = weaver_server::setup::doctor::port_status(&report, 443);
-    let port_53 = weaver_server::setup::doctor::port_status(&report, 53);
+    let port_80 = weaver_server::setup::doctor::port_status(
+        &report,
+        weaver_server::setup::planner::Port::Http,
+    );
+    let port_443 = weaver_server::setup::doctor::port_status(
+        &report,
+        weaver_server::setup::planner::Port::Https,
+    );
+    let port_53 = weaver_server::setup::doctor::port_status(
+        &report,
+        weaver_server::setup::planner::Port::Dns,
+    );
 
     // A `systemd-resolved` stub already holding a port-53 socket is the most
     // common reason the DNS bind fails; surface it as a first-class abort with

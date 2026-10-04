@@ -63,8 +63,64 @@ pub struct ExistingInstall {
     pub root_domain: String,
 }
 
+/// The network ports the relay must own and prove reachable.
+///
+/// A named type instead of positional fields or `"Port 80"` strings, so the
+/// planner, the doctor probe and the CLI all agree on the set and its order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Port {
+    /// Cleartext HTTP, also the ACME HTTP-01 path.
+    Http = 80,
+    /// TLS HTTPS.
+    Https = 443,
+    /// Authoritative DNS, TCP and UDP.
+    Dns = 53,
+}
+
+impl Port {
+    /// Every required port, in checklist order.
+    pub const ALL: [Port; 3] = [Port::Http, Port::Https, Port::Dns];
+
+    /// The port number.
+    pub fn number(self) -> u16 {
+        self as u16
+    }
+
+    /// Position of this port in [`Port::ALL`].
+    pub fn index(self) -> usize {
+        match self {
+            Port::Http => 0,
+            Port::Https => 1,
+            Port::Dns => 2,
+        }
+    }
+
+    /// Checklist title, e.g. `"Port 80"`.
+    pub fn title(self) -> String {
+        format!("Port {}", self.number())
+    }
+
+    /// Human description of the transport the probe exercises.
+    pub fn transport(self) -> &'static str {
+        match self {
+            Port::Http => "TCP 80",
+            Port::Https => "TCP 443",
+            Port::Dns => "TCP+UDP 53",
+        }
+    }
+
+    /// The planner's abort for this port being unreachable.
+    fn unreachable(self, reason: String) -> PlanAbort {
+        match self {
+            Port::Http => PlanAbort::Port80NotReachable(reason),
+            Port::Https => PlanAbort::Port443NotReachable(reason),
+            Port::Dns => PlanAbort::Port53NotReachable(reason),
+        }
+    }
+}
+
 /// Reachability probe result for a specific port.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum PortReachability {
     /// Outbound connection to resolved public IP successfully routed back to our listener and solved the challenge.
     ReachedSelf,
@@ -122,6 +178,17 @@ pub struct SystemProbe {
     pub acme_provider: String,
     /// Whether External Account Binding (EAB) credentials will be registered.
     pub has_eab: bool,
+}
+
+impl SystemProbe {
+    /// The required ports paired with their probe verdicts, in checklist order.
+    fn ports(&self) -> [(Port, &PortReachability); 3] {
+        [
+            (Port::Http, &self.port_80),
+            (Port::Https, &self.port_443),
+            (Port::Dns, &self.port_53),
+        ]
+    }
 }
 
 /// Fatal condition detected during planning that halts setup.
@@ -296,39 +363,15 @@ pub fn plan_setup(probe: &SystemProbe) -> Result<Plan, PlanAbort> {
 
     // 9. Reachability checks: 80, 443, and 53 are mandatory unless skipped
     if !probe.skip_reachability_check {
-        match &probe.port_80 {
-            PortReachability::ReachedSelf => {}
-            PortReachability::Failed(reason) => {
-                return Err(PlanAbort::Port80NotReachable(reason.clone()));
-            }
-            PortReachability::Skipped => {
-                return Err(PlanAbort::Port80NotReachable(
-                    "reachability was not performed".into(),
-                ));
-            }
-        }
-
-        match &probe.port_443 {
-            PortReachability::ReachedSelf => {}
-            PortReachability::Failed(reason) => {
-                return Err(PlanAbort::Port443NotReachable(reason.clone()));
-            }
-            PortReachability::Skipped => {
-                return Err(PlanAbort::Port443NotReachable(
-                    "reachability was not performed".into(),
-                ));
-            }
-        }
-
-        match &probe.port_53 {
-            PortReachability::ReachedSelf => {}
-            PortReachability::Failed(reason) => {
-                return Err(PlanAbort::Port53NotReachable(reason.clone()));
-            }
-            PortReachability::Skipped => {
-                return Err(PlanAbort::Port53NotReachable(
-                    "reachability was not performed".into(),
-                ));
+        for (port, verdict) in probe.ports() {
+            match verdict {
+                PortReachability::ReachedSelf => {}
+                PortReachability::Failed(reason) => {
+                    return Err(port.unreachable(reason.clone()));
+                }
+                PortReachability::Skipped => {
+                    return Err(port.unreachable("reachability was not performed".into()));
+                }
             }
         }
     }

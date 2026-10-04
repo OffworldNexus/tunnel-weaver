@@ -256,6 +256,7 @@ async fn certificate_health_checks(
             ok,
             detail: format!("{state} • {validation} • {kind}"),
             remediation,
+            status: None,
         });
     }
     checks
