@@ -465,133 +465,37 @@ async fn main() {
                 .db
                 .unwrap_or_else(|| PathBuf::from("/var/lib/weaver/weaver.db"));
 
-            let mut acme_provider = args.acme_provider;
-            let acme_directory = args.acme_directory;
-            if acme_directory.is_some() && acme_provider == "letsencrypt" {
-                acme_provider = "custom".into();
-            }
-
-            let eab_hmac = match (args.acme_eab_hmac, args.acme_eab_hmac_file) {
-                (Some(h), _) => Some(h),
-                (None, Some(path)) => match std::fs::read_to_string(&path) {
-                    Ok(c) => Some(c.trim().to_string()),
-                    Err(err) => {
-                        eprintln!(
-                            "Error: Failed to read EAB HMAC file at {}: {err}",
-                            path.display()
-                        );
-                        std::process::exit(2);
-                    }
+            let gathered = gather_acme_config(
+                AcmeConfigInputs {
+                    root_domain: args.root_domain,
+                    admin_domain: args.admin_domain,
+                    email: args.email,
+                    acme_provider: args.acme_provider,
+                    acme_directory: args.acme_directory,
+                    acme_eab_kid: args.acme_eab_kid,
+                    acme_eab_hmac: args.acme_eab_hmac,
+                    acme_eab_hmac_file: args.acme_eab_hmac_file,
+                    acme_root_ca: args.acme_root_ca,
+                    headless: args.headless,
+                    // `configure` is never re-exec'd for elevation, so there is
+                    // no pre-supplied prompt-values path.
+                    no_prompt_values: false,
                 },
-                (None, None) => None,
-            };
-
-            let (root_domain, admin_domain, admin_email) = if args.headless {
-                let Some(rd) = args.root_domain else {
-                    eprintln!("Error: Missing required option --root-domain in headless mode");
-                    std::process::exit(2);
-                };
-                let Some(ad) = args.admin_domain else {
-                    eprintln!("Error: Missing required option --admin-domain in headless mode");
-                    std::process::exit(2);
-                };
-                let Some(email) = args.email else {
-                    eprintln!("Error: Missing required option --email in headless mode");
-                    std::process::exit(2);
-                };
-                if !weaver_server::setup::interactive::validate_fqdn(&rd) {
-                    eprintln!("Error: Invalid root domain '{rd}'. Must be a valid FQDN.");
-                    std::process::exit(2);
-                }
-                if !weaver_server::setup::interactive::validate_fqdn(&ad) {
-                    eprintln!("Error: Invalid admin domain '{ad}'. Must be a valid FQDN.");
-                    std::process::exit(2);
-                }
-                if let Some(issue) = weaver_server::config::domain_split_issue(&ad, &rd) {
-                    eprintln!("Error: {issue}");
-                    std::process::exit(2);
-                }
-                if !weaver_server::setup::interactive::validate_email(&email) {
-                    eprintln!("Error: Invalid email '{email}'.");
-                    std::process::exit(2);
-                }
-                let prov_info = weaver_server::cert::providers::find_provider(&acme_provider);
-                if prov_info.is_some_and(|p| p.eab_required)
-                    && (args.acme_eab_kid.is_none() || eab_hmac.is_none())
-                {
-                    eprintln!(
-                        "Error: Provider '{acme_provider}' requires both EAB KID and EAB HMAC in headless mode"
-                    );
-                    std::process::exit(2);
-                }
-                (rd, ad, email)
-            } else {
-                let rd = match args.root_domain {
-                    Some(d) => {
-                        if !weaver_server::setup::interactive::validate_fqdn(&d) {
-                            eprintln!("Error: Invalid root domain '{d}'. Must be a valid FQDN.");
-                            std::process::exit(2);
-                        }
-                        d
-                    }
-                    None => loop {
-                        let input =
-                            weaver_server::setup::interactive::prompt_line("Root domain", None)
-                                .unwrap_or_default();
-                        if weaver_server::setup::interactive::validate_fqdn(&input) {
-                            break input;
-                        }
-                        println!(
-                            "Invalid root domain. Please provide a valid FQDN (e.g. example.com)."
-                        );
-                    },
-                };
-                let ad = match args.admin_domain {
-                    Some(d) => {
-                        if !weaver_server::setup::interactive::validate_fqdn(&d) {
-                            eprintln!("Error: Invalid admin domain '{d}'. Must be a valid FQDN.");
-                            std::process::exit(2);
-                        }
-                        d
-                    }
-                    None => loop {
-                        let input = weaver_server::setup::interactive::prompt_line(
-                            "Admin domain (the relay's own hostname)",
-                            None,
-                        )
-                        .unwrap_or_default();
-                        if weaver_server::setup::interactive::validate_fqdn(&input) {
-                            break input;
-                        }
-                        println!(
-                            "Invalid admin domain. Please provide a valid FQDN (e.g. relay.example.net)."
-                        );
-                    },
-                };
-                if let Some(issue) = weaver_server::config::domain_split_issue(&ad, &rd) {
-                    eprintln!("Error: {issue}");
-                    std::process::exit(2);
-                }
-                let email = match args.email {
-                    Some(e) => {
-                        if !weaver_server::setup::interactive::validate_email(&e) {
-                            eprintln!("Error: Invalid email '{e}'.");
-                            std::process::exit(2);
-                        }
-                        e
-                    }
-                    None => loop {
-                        let input =
-                            weaver_server::setup::interactive::prompt_line("Admin email", None)
-                                .unwrap_or_default();
-                        if weaver_server::setup::interactive::validate_email(&input) {
-                            break input;
-                        }
-                        println!("Invalid email. Please provide a valid email address.");
-                    },
-                };
-                (rd, ad, email)
-            };
+                GatherOptions {
+                    print_intro: false,
+                    offer_provider_choice: false,
+                },
+            );
+            let GatheredAcme {
+                root_domain,
+                admin_domain,
+                admin_email,
+                acme_provider,
+                acme_directory,
+                acme_eab_kid,
+                acme_eab_hmac,
+                acme_root_ca,
+            } = gathered;
 
             let store = Store::open(&db_path).await.unwrap_or_else(|err| {
                 eprintln!("Failed to open database at {}: {err}", db_path.display());
@@ -609,7 +513,7 @@ async fn main() {
                 .map(|cfg| cfg.relay_ips)
                 .unwrap_or_default();
 
-            let root_ca_pem = match args.acme_root_ca {
+            let root_ca_pem = match acme_root_ca {
                 Some(path) => match std::fs::read_to_string(&path) {
                     Ok(content) => Some(content),
                     Err(err) => {
@@ -629,8 +533,8 @@ async fn main() {
                 listen_https: args.listen_https,
                 control_socket: args.control_socket,
                 acme_directory,
-                acme_eab_kid: args.acme_eab_kid,
-                acme_eab_hmac: eab_hmac,
+                acme_eab_kid,
+                acme_eab_hmac,
                 acme_root_ca_pem: root_ca_pem,
                 acme_fallback_providers: Vec::new(),
                 usage_flush_interval_secs: args.usage_flush_interval,
@@ -830,15 +734,61 @@ fn resolve_usage_window(
     Ok((since_secs, until_secs))
 }
 
-async fn handle_setup(args: SetupArgs, db_path: PathBuf) {
-    let mut acme_provider = args.acme_provider;
-    let mut acme_directory = args.acme_directory;
-    if acme_directory.is_some() && acme_provider == "letsencrypt" {
-        acme_provider = "custom".into();
+/// ACME and domain inputs shared by `setup` and `configure`.
+struct AcmeConfigInputs {
+    root_domain: Option<String>,
+    admin_domain: Option<String>,
+    email: Option<String>,
+    acme_provider: String,
+    acme_directory: Option<String>,
+    acme_eab_kid: Option<String>,
+    acme_eab_hmac: Option<String>,
+    acme_eab_hmac_file: Option<PathBuf>,
+    acme_root_ca: Option<PathBuf>,
+    headless: bool,
+    no_prompt_values: bool,
+}
+
+/// Presentation choices that differ between `setup` and `configure`.
+#[derive(Clone, Copy)]
+struct GatherOptions {
+    /// Print the two-domain setup preamble before prompting.
+    print_intro: bool,
+    /// Offer the interactive ACME provider menu when no provider was chosen.
+    offer_provider_choice: bool,
+}
+
+/// The gathered, validated ACME/domain configuration.
+struct GatheredAcme {
+    root_domain: String,
+    admin_domain: String,
+    admin_email: String,
+    acme_provider: String,
+    acme_directory: Option<String>,
+    acme_eab_kid: Option<String>,
+    acme_eab_hmac: Option<String>,
+    /// Path to a custom root CA PEM, if one was supplied.
+    acme_root_ca: Option<PathBuf>,
+}
+
+/// Gathers and validates the domain and ACME settings for `setup` and `configure`.
+///
+/// Both commands ask for the same fields with the same validation; only the
+/// preamble and the optional provider menu differ, which `options` selects.
+/// Invalid input exits the process with code 2, matching the commands'
+/// existing behaviour.
+fn gather_acme_config(mut inputs: AcmeConfigInputs, options: GatherOptions) -> GatheredAcme {
+    use weaver_server::setup::interactive;
+
+    // A custom directory implies the `custom` provider.
+    if inputs.acme_directory.is_some() && inputs.acme_provider == "letsencrypt" {
+        inputs.acme_provider = "custom".into();
     }
 
-    let mut eab_kid = args.acme_eab_kid;
-    let mut eab_hmac = match (args.acme_eab_hmac, args.acme_eab_hmac_file) {
+    let mut eab_hmac = match (
+        inputs.acme_eab_hmac.take(),
+        inputs.acme_eab_hmac_file.take(),
+    ) {
         (Some(h), _) => Some(h),
         (None, Some(path)) => match std::fs::read_to_string(&path) {
             Ok(c) => Some(c.trim().to_string()),
@@ -853,35 +803,39 @@ async fn handle_setup(args: SetupArgs, db_path: PathBuf) {
         (None, None) => None,
     };
 
-    let mut root_ca_path = args.acme_root_ca;
+    let mut acme_provider = inputs.acme_provider;
+    let mut acme_directory = inputs.acme_directory;
+    let mut eab_kid = inputs.acme_eab_kid;
+    let mut root_ca = inputs.acme_root_ca;
 
-    // 1. Gather configuration
-    let (root_domain, admin_domain, admin_email) = if args.no_prompt_values {
+    let (root_domain, admin_domain, admin_email) = if inputs.no_prompt_values {
         (
-            args.root_domain
+            inputs
+                .root_domain
                 .expect("root_domain missing with --no-prompt-values"),
-            args.admin_domain
+            inputs
+                .admin_domain
                 .expect("admin_domain missing with --no-prompt-values"),
-            args.email.expect("email missing with --no-prompt-values"),
+            inputs.email.expect("email missing with --no-prompt-values"),
         )
-    } else if args.headless {
-        let Some(rd) = args.root_domain else {
+    } else if inputs.headless {
+        let Some(rd) = inputs.root_domain else {
             eprintln!("Error: Missing required option --root-domain in headless mode");
             std::process::exit(2);
         };
-        let Some(ad) = args.admin_domain else {
+        let Some(ad) = inputs.admin_domain else {
             eprintln!("Error: Missing required option --admin-domain in headless mode");
             std::process::exit(2);
         };
-        let Some(email) = args.email else {
+        let Some(email) = inputs.email else {
             eprintln!("Error: Missing required option --email in headless mode");
             std::process::exit(2);
         };
-        if !weaver_server::setup::interactive::validate_fqdn(&rd) {
+        if !interactive::validate_fqdn(&rd) {
             eprintln!("Error: Invalid root domain '{rd}'. Must be a valid FQDN.");
             std::process::exit(2);
         }
-        if !weaver_server::setup::interactive::validate_fqdn(&ad) {
+        if !interactive::validate_fqdn(&ad) {
             eprintln!("Error: Invalid admin domain '{ad}'. Must be a valid FQDN.");
             std::process::exit(2);
         }
@@ -889,36 +843,37 @@ async fn handle_setup(args: SetupArgs, db_path: PathBuf) {
             eprintln!("Error: {issue}");
             std::process::exit(2);
         }
-        if !weaver_server::setup::interactive::validate_email(&email) {
+        if !interactive::validate_email(&email) {
             eprintln!("Error: Invalid email '{email}'.");
             std::process::exit(2);
         }
         let prov_info = weaver_server::cert::providers::find_provider(&acme_provider);
         if prov_info.is_some_and(|p| p.eab_required) && (eab_kid.is_none() || eab_hmac.is_none()) {
             eprintln!(
-                "Error: Provider '{acme_provider}' requires both --acme-eab-kid and --acme-eab-hmac in headless mode"
+                "Error: Provider '{acme_provider}' requires both EAB KID and EAB HMAC \
+                 (--acme-eab-kid / --acme-eab-hmac) in headless mode"
             );
             std::process::exit(2);
         }
         (rd, ad, email)
     } else {
-        weaver_server::setup::interactive::print_domain_step_intro();
+        if options.print_intro {
+            interactive::print_domain_step_intro();
+        }
 
-        let rd = match args.root_domain {
+        let rd = match inputs.root_domain {
             Some(d) => {
-                if !weaver_server::setup::interactive::validate_fqdn(&d) {
+                if !interactive::validate_fqdn(&d) {
                     eprintln!("Error: Invalid root domain '{d}'. Must be a valid FQDN.");
                     std::process::exit(2);
                 }
                 d
             }
             None => loop {
-                let input = weaver_server::setup::interactive::prompt_line(
-                    "Tunnel domain (delegated to this relay)",
-                    None,
-                )
-                .unwrap_or_default();
-                if weaver_server::setup::interactive::validate_fqdn(&input) {
+                let input =
+                    interactive::prompt_line("Tunnel domain (delegated to this relay)", None)
+                        .unwrap_or_default();
+                if interactive::validate_fqdn(&input) {
                     break input;
                 }
                 println!(
@@ -928,21 +883,21 @@ async fn handle_setup(args: SetupArgs, db_path: PathBuf) {
             },
         };
 
-        let ad = match args.admin_domain {
+        let ad = match inputs.admin_domain {
             Some(d) => {
-                if !weaver_server::setup::interactive::validate_fqdn(&d) {
+                if !interactive::validate_fqdn(&d) {
                     eprintln!("Error: Invalid admin domain '{d}'. Must be a valid FQDN.");
                     std::process::exit(2);
                 }
                 d
             }
             None => loop {
-                let input = weaver_server::setup::interactive::prompt_line(
+                let input = interactive::prompt_line(
                     "Admin domain (the relay's own hostname, outside the tunnel zone)",
                     None,
                 )
                 .unwrap_or_default();
-                if weaver_server::setup::interactive::validate_fqdn(&input) {
+                if interactive::validate_fqdn(&input) {
                     break input;
                 }
                 println!(
@@ -960,72 +915,106 @@ async fn handle_setup(args: SetupArgs, db_path: PathBuf) {
             std::process::exit(2);
         }
 
-        let email = match args.email {
+        let email = match inputs.email {
             Some(e) => {
-                if !weaver_server::setup::interactive::validate_email(&e) {
+                if !interactive::validate_email(&e) {
                     eprintln!("Error: Invalid email '{e}'.");
                     std::process::exit(2);
                 }
                 e
             }
             None => loop {
-                let input = weaver_server::setup::interactive::prompt_line("Admin email", None)
-                    .unwrap_or_default();
-                if weaver_server::setup::interactive::validate_email(&input) {
+                let input = interactive::prompt_line("Admin email", None).unwrap_or_default();
+                if interactive::validate_email(&input) {
                     break input;
                 }
                 println!("{} Invalid email address.", "✗".red().bold());
             },
         };
 
-        if eab_kid.is_none() && acme_directory.is_none() && acme_provider == "letsencrypt" {
-            let (chosen_prov, custom_dir) =
-                weaver_server::setup::interactive::prompt_provider_choice().unwrap();
+        if options.offer_provider_choice
+            && eab_kid.is_none()
+            && acme_directory.is_none()
+            && acme_provider == "letsencrypt"
+        {
+            let (chosen_prov, custom_dir) = interactive::prompt_provider_choice().unwrap();
             acme_provider = chosen_prov;
             if let Some(dir) = custom_dir {
                 acme_directory = Some(dir);
             }
             let prov_info = weaver_server::cert::providers::find_provider(&acme_provider);
             if prov_info.is_some_and(|p| p.eab_required) {
-                let kid = weaver_server::setup::interactive::prompt_line(
-                    "EAB Key Identifier (KID)",
-                    None,
-                )
-                .unwrap();
-                let hmac =
-                    weaver_server::setup::interactive::read_masked_input("EAB HMAC Key").unwrap();
+                let kid = interactive::prompt_line("EAB Key Identifier (KID)", None).unwrap();
+                let hmac = interactive::read_masked_input("EAB HMAC Key").unwrap();
                 eab_kid = Some(kid);
                 eab_hmac = Some(hmac);
             } else if acme_provider == "custom" {
-                let need_eab = weaver_server::setup::interactive::prompt_line(
-                    "Does this directory require EAB? [y/N]",
-                    Some("n"),
-                )
-                .unwrap_or_default();
+                let need_eab =
+                    interactive::prompt_line("Does this directory require EAB? [y/N]", Some("n"))
+                        .unwrap_or_default();
                 if need_eab.eq_ignore_ascii_case("y") || need_eab.eq_ignore_ascii_case("yes") {
-                    let kid = weaver_server::setup::interactive::prompt_line(
-                        "EAB Key Identifier (KID)",
-                        None,
-                    )
-                    .unwrap();
-                    let hmac = weaver_server::setup::interactive::read_masked_input("EAB HMAC Key")
-                        .unwrap();
+                    let kid = interactive::prompt_line("EAB Key Identifier (KID)", None).unwrap();
+                    let hmac = interactive::read_masked_input("EAB HMAC Key").unwrap();
                     eab_kid = Some(kid);
                     eab_hmac = Some(hmac);
                 }
-                let ca_path_str = weaver_server::setup::interactive::prompt_line(
+                let ca_path_str = interactive::prompt_line(
                     "Custom Root CA PEM path (optional, press enter to skip)",
                     None,
                 )
                 .unwrap_or_default();
                 if !ca_path_str.is_empty() {
-                    root_ca_path = Some(PathBuf::from(ca_path_str));
+                    root_ca = Some(PathBuf::from(ca_path_str));
                 }
             }
         }
 
         (rd, ad, email)
     };
+
+    GatheredAcme {
+        root_domain,
+        admin_domain,
+        admin_email,
+        acme_provider,
+        acme_directory,
+        acme_eab_kid: eab_kid,
+        acme_eab_hmac: eab_hmac,
+        acme_root_ca: root_ca,
+    }
+}
+
+async fn handle_setup(args: SetupArgs, db_path: PathBuf) {
+    // 1. Gather configuration (shared with `configure`).
+    let gathered_acme = gather_acme_config(
+        AcmeConfigInputs {
+            root_domain: args.root_domain,
+            admin_domain: args.admin_domain,
+            email: args.email,
+            acme_provider: args.acme_provider,
+            acme_directory: args.acme_directory,
+            acme_eab_kid: args.acme_eab_kid,
+            acme_eab_hmac: args.acme_eab_hmac,
+            acme_eab_hmac_file: args.acme_eab_hmac_file,
+            acme_root_ca: args.acme_root_ca,
+            headless: args.headless,
+            no_prompt_values: args.no_prompt_values,
+        },
+        GatherOptions {
+            print_intro: true,
+            offer_provider_choice: true,
+        },
+    );
+    let GatheredAcme {
+        root_domain,
+        admin_domain,
+        admin_email,
+        acme_provider,
+        acme_directory,
+        acme_eab_kid: eab_kid,
+        acme_eab_hmac: eab_hmac,
+        acme_root_ca: root_ca_path,
+    } = gathered_acme;
 
     let gathered = weaver_server::setup::interactive::GatheredConfig {
         root_domain: root_domain.clone(),
