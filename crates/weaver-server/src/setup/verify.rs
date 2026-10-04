@@ -14,6 +14,56 @@ use crossterm::style::Stylize;
 use crate::control::client::client_cert_wait;
 use crate::setup::dns::generate_random_hex;
 
+/// Outcome of one `curl` HTTPS probe.
+enum HttpsProbe {
+    /// curl exited zero; carries the HTTP status code.
+    Succeeded(String),
+    /// The system trust store rejected the certificate (typical for
+    /// staging/Pebble CAs).
+    TrustFailure(String),
+    /// Any other failure, with curl's message.
+    Failed(String),
+    /// curl is not installed.
+    Unavailable,
+}
+
+/// Runs `curl` against `url` and classifies the result.
+///
+/// `fail_on_http_error` adds `--fail`, so a non-2xx status counts as a failure
+/// (used for the root and admin endpoints). The wildcard probe omits it because
+/// any HTTP response, even a 404, proves the wildcard certificate completed the
+/// handshake. A TLS trust failure is separated from other errors so callers can
+/// tolerate it in staging/Pebble environments.
+fn https_probe(url: &str, fail_on_http_error: bool) -> HttpsProbe {
+    let mut args = vec![
+        "--silent",
+        "--show-error",
+        "-o",
+        "/dev/null",
+        "-w",
+        "%{http_code}",
+    ];
+    if fail_on_http_error {
+        args.insert(0, "--fail");
+    }
+    args.push(url);
+
+    match Command::new("curl").args(&args).output() {
+        Ok(out) if out.status.success() => {
+            HttpsProbe::Succeeded(String::from_utf8_lossy(&out.stdout).trim().to_string())
+        }
+        Ok(out) => {
+            let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            if err.contains("certificate") || err.contains("SSL") || err.contains("TLS") {
+                HttpsProbe::TrustFailure(err)
+            } else {
+                HttpsProbe::Failed(err)
+            }
+        }
+        Err(_) => HttpsProbe::Unavailable,
+    }
+}
+
 /// Prints diagnostic instructions on failure.
 pub fn print_failure_guidance() {
     println!("\n{}", "Troubleshooting:".bold().red());
@@ -101,51 +151,24 @@ pub async fn verify_setup(
         "•".blue(),
         root_domain
     );
-    let url = format!("https://{root_domain}/");
-    let curl_res = Command::new("curl")
-        .args([
-            "--fail",
-            "--silent",
-            "--show-error",
-            "-o",
-            "/dev/null",
-            "-w",
-            "%{http_code}",
-            &url,
-        ])
-        .output();
-
-    match curl_res {
-        Ok(out) if out.status.success() => {
-            let status_code = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            println!(
-                "\r  {} HTTPS GET https://{}/ succeeded (HTTP {})",
-                "✓".green(),
-                root_domain,
-                status_code.bold()
-            );
+    match https_probe(&format!("https://{root_domain}/"), true) {
+        HttpsProbe::Succeeded(status_code) => println!(
+            "\r  {} HTTPS GET https://{}/ succeeded (HTTP {})",
+            "✓".green(),
+            root_domain,
+            status_code.bold()
+        ),
+        HttpsProbe::TrustFailure(_) => println!(
+            "\r  {} HTTPS endpoint reached; certificate verification failed against system roots (expected for staging/Pebble environments)",
+            "•".yellow()
+        ),
+        HttpsProbe::Failed(err_msg) => {
+            println!("\r  {} HTTPS request warning: {}", "•".yellow(), err_msg)
         }
-        Ok(out) => {
-            let err_msg = String::from_utf8_lossy(&out.stderr);
-            if err_msg.contains("certificate") || err_msg.contains("SSL") {
-                println!(
-                    "\r  {} HTTPS endpoint reached; certificate verification failed against system roots (expected for staging/Pebble environments)",
-                    "•".yellow()
-                );
-            } else {
-                println!(
-                    "\r  {} HTTPS request warning: {}",
-                    "•".yellow(),
-                    err_msg.trim()
-                );
-            }
-        }
-        Err(_) => {
-            println!(
-                "\r  {} curl command not found, skipping local HTTPS check",
-                "•".dim()
-            );
-        }
+        HttpsProbe::Unavailable => println!(
+            "\r  {} curl command not found, skipping local HTTPS check",
+            "•".dim()
+        ),
     }
 
     // 3b. Admin certificate: wait for the HTTP-01 order and probe its endpoint.
@@ -173,53 +196,29 @@ pub async fn verify_setup(
         "•".blue(),
         admin_domain
     );
-    let admin_url = format!("https://{admin_domain}/");
-    let admin_res = Command::new("curl")
-        .args([
-            "--fail",
-            "--silent",
-            "--show-error",
-            "-o",
-            "/dev/null",
-            "-w",
-            "%{http_code}",
-            &admin_url,
-        ])
-        .output();
-    match admin_res {
-        Ok(out) if out.status.success() => {
-            let status_code = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            println!(
-                "\r  {} Admin HTTPS GET https://{}/ succeeded (HTTP {})",
-                "✓".green(),
-                admin_domain,
-                status_code.bold()
-            );
-        }
-        Ok(out) => {
-            let err_msg = String::from_utf8_lossy(&out.stderr);
+    match https_probe(&format!("https://{admin_domain}/"), true) {
+        HttpsProbe::Succeeded(status_code) => println!(
+            "\r  {} Admin HTTPS GET https://{}/ succeeded (HTTP {})",
+            "✓".green(),
+            admin_domain,
+            status_code.bold()
+        ),
+        HttpsProbe::TrustFailure(_) => println!(
+            "\r  {} Admin HTTPS endpoint reached; certificate verification failed against system roots (expected for staging/Pebble environments)",
+            "•".yellow()
+        ),
+        HttpsProbe::Failed(err_msg) => {
             // A trust failure is tolerated (staging/Pebble); any other failure
             // means the admin certificate or its HTTP-01 path is broken.
-            if err_msg.contains("certificate") || err_msg.contains("SSL") || err_msg.contains("TLS")
-            {
-                println!(
-                    "\r  {} Admin HTTPS endpoint reached; certificate verification failed against system roots (expected for staging/Pebble environments)",
-                    "•".yellow()
-                );
-            } else {
-                print_failure_guidance();
-                return Err(format!(
-                    "admin HTTPS GET https://{admin_domain}/ failed: {}",
-                    err_msg.trim()
-                ));
-            }
+            print_failure_guidance();
+            return Err(format!(
+                "admin HTTPS GET https://{admin_domain}/ failed: {err_msg}"
+            ));
         }
-        Err(_) => {
-            println!(
-                "\r  {} curl command not found, skipping admin HTTPS check",
-                "•".dim()
-            );
-        }
+        HttpsProbe::Unavailable => println!(
+            "\r  {} curl command not found, skipping admin HTTPS check",
+            "•".dim()
+        ),
     }
 
     // 4. Wildcard coverage: a random single-label name must complete a TLS
@@ -232,53 +231,29 @@ pub async fn verify_setup(
         "•".blue(),
         sample_url.trim_start_matches("https://")
     );
-    let wildcard_res = Command::new("curl")
-        .args([
-            "--silent",
-            "--show-error",
-            "-o",
-            "/dev/null",
-            "-w",
-            "%{http_code}",
-            &sample_url,
-        ])
-        .output();
-
-    match wildcard_res {
-        Ok(out) if out.status.success() => {
-            let status_code = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            println!(
-                "\r  {} Wildcard HTTPS GET for '{}' succeeded (HTTP {})",
-                "✓".green(),
-                sample_name,
-                status_code.bold()
-            );
-        }
-        Ok(out) => {
-            let err_msg = String::from_utf8_lossy(&out.stderr);
-            if err_msg.contains("certificate") || err_msg.contains("SSL") || err_msg.contains("TLS")
-            {
-                println!(
-                    "\r  {} Wildcard certificate problem for '{}': {}",
-                    "✗".red().bold(),
-                    sample_name,
-                    err_msg.trim()
-                );
-            } else {
-                println!(
-                    "\r  {} Wildcard HTTPS request warning for '{}': {}",
-                    "•".yellow(),
-                    sample_name,
-                    err_msg.trim()
-                );
-            }
-        }
-        Err(_) => {
-            println!(
-                "\r  {} curl command not found, skipping wildcard HTTPS check",
-                "•".dim()
-            );
-        }
+    match https_probe(&sample_url, false) {
+        HttpsProbe::Succeeded(status_code) => println!(
+            "\r  {} Wildcard HTTPS GET for '{}' succeeded (HTTP {})",
+            "✓".green(),
+            sample_name,
+            status_code.bold()
+        ),
+        HttpsProbe::TrustFailure(err_msg) => println!(
+            "\r  {} Wildcard certificate problem for '{}': {}",
+            "✗".red().bold(),
+            sample_name,
+            err_msg
+        ),
+        HttpsProbe::Failed(err_msg) => println!(
+            "\r  {} Wildcard HTTPS request warning for '{}': {}",
+            "•".yellow(),
+            sample_name,
+            err_msg
+        ),
+        HttpsProbe::Unavailable => println!(
+            "\r  {} curl command not found, skipping wildcard HTTPS check",
+            "•".dim()
+        ),
     }
 
     // 5. Closing summary
