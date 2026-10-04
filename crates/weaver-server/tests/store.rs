@@ -21,7 +21,8 @@ where
 
 fn sample_config() -> Config {
     Config {
-        root_domain: "example.com".into(),
+        tunnel_domain: "example.com".into(),
+        admin_domain: "relay-admin.test".into(),
         admin_email: "admin@example.com".into(),
         acme_provider: "letsencrypt".into(),
         listen_http: "0.0.0.0:80".parse::<SocketAddr>().unwrap(),
@@ -33,6 +34,8 @@ fn sample_config() -> Config {
         acme_root_ca_pem: None,
         acme_fallback_providers: vec!["letsencrypt-staging".into()],
         usage_flush_interval_secs: 60,
+        relay_ips: Vec::new(),
+        setup_complete: false,
     }
 }
 
@@ -99,19 +102,19 @@ async fn test_store_open_runs_migrations_and_is_idempotent() {
         let store = Store::open(&db_path).await.expect("open failed");
         let count: i64 = scalar(
             &store,
-            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN ('config', 'acme_account', 'domains', 'certificates', 'cert_events', 'seaql_migrations', 'person', 'machine', 'machine_key', 'service', 'usage')",
+            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN ('config', 'acme_account', 'domains', 'certificates', 'cert_events', 'seaql_migrations', 'person', 'machine', 'machine_key', 'service', 'usage', 'challenge')",
         )
         .await;
-        assert_eq!(count, 11);
-        assert_eq!(store.schema_version().await.expect("schema_version"), 2);
+        assert_eq!(count, 12);
+        assert_eq!(store.schema_version().await.expect("schema_version"), 1);
     }
 
     // Re-open existing database: should succeed and not re-apply migrations
     {
         let store = Store::open(&db_path).await.expect("re-open failed");
         let migration_count: i64 = scalar(&store, "SELECT count(*) FROM seaql_migrations").await;
-        assert_eq!(migration_count, 2);
-        assert_eq!(store.schema_version().await.expect("schema_version"), 2);
+        assert_eq!(migration_count, 1);
+        assert_eq!(store.schema_version().await.expect("schema_version"), 1);
     }
 }
 
@@ -148,7 +151,7 @@ async fn test_config_load_on_unconfigured_db_lists_missing_keys() {
 
     match Config::load(&store).await {
         Err(ConfigError::MissingKeys(keys)) => {
-            assert!(keys.contains(&"root_domain".to_string()));
+            assert!(keys.contains(&"tunnel_domain".to_string()));
             assert!(keys.contains(&"admin_email".to_string()));
             assert!(keys.contains(&"acme_provider".to_string()));
             assert!(keys.contains(&"listen_http".to_string()));
@@ -244,6 +247,59 @@ async fn test_config_validation_rules() {
         }
         res => panic!("Expected ValidationFailed, got: {res:?}"),
     }
+
+    // OFF-198 foot-gun: an admin domain nested under the delegated tunnel zone
+    // would hand the relay's own DNS to the zone the relay is meant to control.
+    let nested_admin_config = Config {
+        admin_domain: "relay.example.com".into(),
+        ..sample_config()
+    };
+    store
+        .save_config(&nested_admin_config)
+        .await
+        .expect("save succeeded");
+    match Config::load(&store).await {
+        Err(ConfigError::ValidationFailed(issues)) => {
+            assert!(
+                issues.iter().any(|i| i.contains("subdomain")),
+                "expected subdomain rejection, got: {issues:?}"
+            );
+        }
+        res => panic!("Expected ValidationFailed, got: {res:?}"),
+    }
+
+    // Same name for both is equally unsafe.
+    let same_name_config = Config {
+        admin_domain: "example.com".into(),
+        ..sample_config()
+    };
+    store
+        .save_config(&same_name_config)
+        .await
+        .expect("save succeeded");
+    match Config::load(&store).await {
+        Err(ConfigError::ValidationFailed(issues)) => {
+            assert!(issues.iter().any(|i| i.contains("must differ")));
+        }
+        res => panic!("Expected ValidationFailed, got: {res:?}"),
+    }
+
+    // The reverse nesting (tunnel under admin) is safe and must load.
+    let tunnel_under_admin = Config {
+        tunnel_domain: "tunnels.relay.example.net".into(),
+        admin_domain: "relay.example.net".into(),
+        acme_provider: "letsencrypt".into(),
+        admin_email: "admin@example.com".into(),
+        ..sample_config()
+    };
+    store
+        .save_config(&tunnel_under_admin)
+        .await
+        .expect("save succeeded");
+    assert!(
+        Config::load(&store).await.is_ok(),
+        "tunnel under admin must be allowed"
+    );
 }
 
 #[tokio::test]
@@ -253,7 +309,8 @@ async fn test_set_config_mutates_single_key() {
     let store = Store::open(&db_path).await.expect("open failed");
 
     for (k, v) in [
-        ("root_domain", "tunnel.nexus.com"),
+        ("tunnel_domain", "tunnel.nexus.com"),
+        ("admin_domain", "\"relay.nexus.com\""),
         ("admin_email", "ops@nexus.com"),
         ("acme_provider", "letsencrypt"),
         ("listen_http", "\"127.0.0.1:8080\""),
@@ -264,7 +321,7 @@ async fn test_set_config_mutates_single_key() {
     }
 
     let loaded = store.load_config().await.expect("load_config failed");
-    assert_eq!(loaded.root_domain, "tunnel.nexus.com");
+    assert_eq!(loaded.tunnel_domain, "tunnel.nexus.com");
     assert_eq!(loaded.admin_email, "ops@nexus.com");
     assert_eq!(loaded.acme_provider, "letsencrypt");
     assert_eq!(
@@ -281,7 +338,7 @@ async fn test_backup_creates_openable_database() {
 
     let store = Store::open(&original_db).await.expect("open failed");
     let config = Config {
-        root_domain: "backup.nexus.com".into(),
+        tunnel_domain: "backup.nexus.com".into(),
         ..sample_config()
     };
     store.save_config(&config).await.expect("save failed");
@@ -343,16 +400,16 @@ async fn test_auth_persistence_and_identity_resolution() {
     assert!(resolver.identity(&unknown_key).await.is_none());
     assert!(resolver.public_key(&unknown_key).await.is_none());
 
-    // A declared service attaches to the machine and links its hostname.
+    // A declared service attaches to the machine and links its flat hostname.
     let svc = store
-        .register_declared_service(&alice_key, "api.workstation.alice.example.com", "API")
+        .register_declared_service(&alice_key, "alice-workstation-api.example.com", "API")
         .await
         .expect("register service");
     assert_eq!(svc.name, "api");
     assert_eq!(svc.machine_id, desktop.id);
 
     let domain = store
-        .get_domain("api.workstation.alice.example.com")
+        .get_domain("alice-workstation-api.example.com")
         .await
         .expect("get domain")
         .expect("domain present");
@@ -378,7 +435,7 @@ async fn test_certificate_and_event_round_trip() {
         issuer: None,
         directory: "https://acme.test/dir".into(),
         obtained_at: 100,
-        active_at: Some(100),
+        validation: "dns-01".to_string(),
     };
     store
         .save_certificate("host.example.com", cert.clone())
@@ -393,9 +450,9 @@ async fn test_certificate_and_event_round_trip() {
         .expect("present");
     assert_eq!(rec.name, "host.example.com");
     assert_eq!(rec.not_after, 200);
-    assert_eq!(rec.last_active_at, Some(100));
+    assert_eq!(rec.validation, "dns-01");
 
-    // Saving another certificate inserts a new certificate row linked to the same domain
+    // Saving under the same name upserts in place: one global row per name.
     store
         .save_certificate(
             "host.example.com",
@@ -407,8 +464,7 @@ async fn test_certificate_and_event_round_trip() {
         .await
         .expect("save 2");
 
-    // only_best = true returns 1 (the best one, not_after = 300)
-    assert_eq!(store.list_certificates(true).await.expect("list").len(), 1);
+    assert_eq!(store.list_certificates().await.expect("list").len(), 1);
     assert_eq!(
         store
             .get_certificate("host.example.com")
@@ -418,9 +474,6 @@ async fn test_certificate_and_event_round_trip() {
             .not_after,
         300
     );
-
-    // only_best = false returns both certificates
-    assert_eq!(store.list_certificates(false).await.expect("list").len(), 2);
 
     // Lookup by certificate PK ID
     let best_cert = store
@@ -443,20 +496,12 @@ async fn test_certificate_and_event_round_trip() {
         .unwrap();
     assert_eq!(rec_by_id_str.id, best_cert.id);
 
-    // Active flag
-    store
-        .set_cert_active("host.example.com", None)
-        .await
-        .expect("set inactive");
-    assert_eq!(
-        store
-            .get_certificate("host.example.com")
-            .await
-            .unwrap()
-            .unwrap()
-            .last_active_at,
-        None
-    );
+    // The full record carries PEM material for cache hydration.
+    let full = store.list_certificates_full().await.unwrap();
+    assert_eq!(full.len(), 1);
+    assert_eq!(full[0].cert_pem, "CERT");
+    assert_eq!(full[0].key_pem, "KEY");
+    assert_eq!(full[0].validation, "dns-01");
 
     // Events, newest first
     store
@@ -483,6 +528,74 @@ async fn test_certificate_and_event_round_trip() {
 }
 
 #[tokio::test]
+async fn test_challenge_kinds_are_isolated_and_validation_round_trips() {
+    let store = Store::connect("sqlite::memory:").await.expect("connect");
+
+    // DNS-01 TXT rows and HTTP-01 token rows live in the same table but never
+    // leak into each other's reads.
+    store
+        .publish_challenge("_acme-challenge.example.com", "digest-a", None, 1)
+        .await
+        .unwrap();
+    store
+        .publish_http01("token-1", "key-auth-1", None, 1)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        store
+            .get_challenges("_acme-challenge.example.com")
+            .await
+            .unwrap(),
+        vec!["digest-a".to_string()]
+    );
+    // The TXT reader must not return a key authorization even if a token row
+    // happens to share the queried name.
+    assert!(store.get_challenges("token-1").await.unwrap().is_empty());
+    assert_eq!(
+        store.get_http01("token-1").await.unwrap().as_deref(),
+        Some("key-auth-1")
+    );
+
+    // HTTP-01 rows are removed by token, DNS-01 by (name, value).
+    store.remove_http01("token-1").await.unwrap();
+    assert!(store.get_http01("token-1").await.unwrap().is_none());
+    store
+        .remove_challenge("_acme-challenge.example.com", "digest-a")
+        .await
+        .unwrap();
+    assert!(
+        store
+            .get_challenges("_acme-challenge.example.com")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    // `validation` round-trips both mechanisms.
+    for (name, mechanism) in [("example.com", "dns-01"), ("relay.example.net", "http-01")] {
+        store
+            .save_certificate(
+                name,
+                weaver_server::store::NewCertificate {
+                    cert_pem: format!("CERT-{name}"),
+                    key_pem: "KEY".into(),
+                    not_before: 1,
+                    not_after: 2,
+                    issuer: None,
+                    directory: "https://acme.test/dir".into(),
+                    obtained_at: 1,
+                    validation: mechanism.to_string(),
+                },
+            )
+            .await
+            .unwrap();
+        let rec = store.get_certificate(name).await.unwrap().unwrap();
+        assert_eq!(rec.validation, mechanism);
+    }
+}
+
+#[tokio::test]
 async fn test_acme_account_round_trip() {
     let store = Store::connect("sqlite::memory:").await.expect("connect");
     assert!(store.get_acme_account("d").await.unwrap().is_none());
@@ -501,86 +614,74 @@ async fn test_acme_account_round_trip() {
 }
 
 #[tokio::test]
-async fn test_multiple_certificates_and_best_resolution() {
+async fn test_multiple_certificates_distinct_names() {
     let store = Store::connect("sqlite::memory:").await.expect("connect");
 
-    let cert_1 = weaver_server::store::NewCertificate {
-        cert_pem: "PEM1".into(),
-        key_pem: "KEY1".into(),
+    let cert = |pem: &str, issuer: &str, not_after: i64| weaver_server::store::NewCertificate {
+        cert_pem: pem.into(),
+        key_pem: format!("KEY-{pem}"),
         not_before: 1_000,
-        not_after: 2_000,
-        issuer: Some("Issuer 1".into()),
-        directory: "dir1".into(),
+        not_after,
+        issuer: Some(issuer.into()),
+        directory: "dir".into(),
         obtained_at: 1_000,
-        active_at: Some(1_000),
-    };
-    let cert_2 = weaver_server::store::NewCertificate {
-        cert_pem: "PEM2".into(),
-        key_pem: "KEY2".into(),
-        not_before: 1_500,
-        not_after: 3_000, // Furthest expiration
-        issuer: Some("Issuer 2".into()),
-        directory: "dir2".into(),
-        obtained_at: 1_500,
-        active_at: Some(1_500),
-    };
-    let cert_3 = weaver_server::store::NewCertificate {
-        cert_pem: "PEM3".into(),
-        key_pem: "KEY3".into(),
-        not_before: 500,
-        not_after: 1_200,
-        issuer: Some("Issuer 3".into()),
-        directory: "dir3".into(),
-        obtained_at: 500,
-        active_at: Some(500),
+        validation: "dns-01".to_string(),
     };
 
     store
-        .save_certificate("multi.example.com", cert_1)
+        .save_certificate("a.example.com", cert("PEM1", "Issuer 1", 2_000))
         .await
         .unwrap();
     store
-        .save_certificate("multi.example.com", cert_2)
+        .save_certificate("b.example.com", cert("PEM2", "Issuer 2", 3_000))
         .await
         .unwrap();
     store
-        .save_certificate("multi.example.com", cert_3)
+        .save_certificate("c.example.com", cert("PEM3", "Issuer 3", 1_200))
         .await
         .unwrap();
 
-    // Verify count in SQL
-    let count = store
-        .count_certificates_for_domain("multi.example.com")
+    // Certificates are global and keyed by name: three distinct rows.
+    assert_eq!(store.list_certificates().await.unwrap().len(), 3);
+    assert_eq!(store.list_certificates_full().await.unwrap().len(), 3);
+
+    let names: Vec<String> = store
+        .list_certificates()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|c| c.name)
+        .collect();
+    assert_eq!(
+        names,
+        vec!["a.example.com", "b.example.com", "c.example.com"]
+    );
+
+    // Re-saving one name upserts that row and leaves the others untouched.
+    store
+        .save_certificate("b.example.com", cert("PEM2B", "Issuer 2B", 4_000))
         .await
         .unwrap();
-    assert_eq!(count, 3);
-
-    // Verify best certificate resolution chooses cert_2 (furthest not_after = 3000)
-    let best = store
-        .get_certificate("multi.example.com")
+    assert_eq!(store.list_certificates().await.unwrap().len(), 3);
+    let b = store
+        .get_certificate("b.example.com")
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(best.not_after, 3_000);
-    assert_eq!(best.issuer.as_deref(), Some("Issuer 2"));
-
-    // Verify list_certificates(true) returns only the single best certificate
-    let list_best = store.list_certificates(true).await.unwrap();
-    assert_eq!(list_best.len(), 1);
-    assert_eq!(list_best[0].not_after, 3_000);
-
-    // Verify list_certificates(false) returns all 3 certificates
-    let list_all = store.list_certificates(false).await.unwrap();
-    assert_eq!(list_all.len(), 3);
-
-    // Verify list_best_certificates_full returns only 1 full record with PEMs
-    let full_best = store.list_best_certificates_full().await.unwrap();
-    assert_eq!(full_best.len(), 1);
-    assert_eq!(full_best[0].cert_pem, "PEM2");
+    assert_eq!(b.not_after, 4_000);
+    assert_eq!(b.issuer.as_deref(), Some("Issuer 2B"));
+    let full_b = store
+        .list_certificates_full()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|c| c.name == "b.example.com")
+        .unwrap();
+    assert_eq!(full_b.cert_pem, "PEM2B");
 }
 
 #[tokio::test]
-async fn test_cascade_delete_domain() {
+async fn test_domain_and_certificate_lifecycles_are_independent() {
     use sea_orm::EntityTrait;
     let store = Store::connect("sqlite::memory:").await.expect("connect");
 
@@ -592,38 +693,172 @@ async fn test_cascade_delete_domain() {
         issuer: None,
         directory: "dir".into(),
         obtained_at: 1_000,
-        active_at: None,
+        validation: "dns-01".to_string(),
     };
-    store
+    let saved = store
         .save_certificate("cascade.example.com", cert)
         .await
         .unwrap();
-    assert_eq!(
-        store
-            .count_certificates_for_domain("cascade.example.com")
-            .await
-            .unwrap(),
-        1
-    );
 
+    // A materialized domain is independent of the certificate table.
     let domain = store
-        .get_domain("cascade.example.com")
+        .get_or_create_domain("cascade.example.com", None)
         .await
-        .unwrap()
         .unwrap();
-    // Delete parent domain directly via entity
+
+    // Certificates are global: deleting a domain must not delete them.
     weaver_server::store::entity::domain::Entity::delete_by_id(domain.id)
         .exec(store.db())
         .await
         .unwrap();
+    assert!(
+        store
+            .get_certificate("cascade.example.com")
+            .await
+            .unwrap()
+            .is_some(),
+        "deleting a domain must leave the global certificate alone"
+    );
 
-    // Associated certificates should be cascaded and deleted
-    let certs_count: i64 = scalar(
-        &store,
-        "SELECT count(*) FROM certificates WHERE domain_id = 999 OR domain_id NOT IN (SELECT id FROM domains)",
-    )
-    .await;
-    assert_eq!(certs_count, 0);
+    // Deleting the certificate leaves the domain alone: the covering
+    // certificate is resolved at run time, not by a foreign key.
+    let recreated = store
+        .get_or_create_domain("cascade.example.com", None)
+        .await
+        .unwrap();
+    weaver_server::store::entity::certificate::Entity::delete_by_id(saved.id)
+        .exec(store.db())
+        .await
+        .unwrap();
+    let after = store
+        .get_domain("cascade.example.com")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(after.id, recreated.id);
+}
+
+#[tokio::test]
+async fn test_naming_rules_reject_invalid_names() {
+    use weaver_mux::KeyId;
+
+    let store = Store::connect("sqlite::memory:").await.expect("connect");
+
+    for bad in ["", "has-dash", "under_score", "Upper!", &"a".repeat(16)] {
+        assert!(
+            matches!(
+                store.create_person(bad).await,
+                Err(StoreError::InvalidName(_))
+            ),
+            "person {bad:?} must be rejected"
+        );
+    }
+
+    let alice = store.create_person("alice").await.unwrap();
+    for bad in ["", "has-dash", "under_score", "Upper!", &"a".repeat(16)] {
+        assert!(
+            matches!(
+                store.create_machine(alice.id, bad).await,
+                Err(StoreError::InvalidName(_))
+            ),
+            "machine {bad:?} must be rejected"
+        );
+    }
+
+    let laptop = store.create_machine(alice.id, "laptop").await.unwrap();
+    // Service names allow dashes between alphanumeric runs but not leading,
+    // trailing, doubled, or non-alphanumeric characters.
+    for bad in [
+        "",
+        "-web",
+        "web-",
+        "a--b",
+        "a.b",
+        "web/api",
+        &"a".repeat(32),
+    ] {
+        assert!(
+            matches!(
+                store.get_or_create_service(laptop.id, bad).await,
+                Err(StoreError::InvalidName(_))
+            ),
+            "service {bad:?} must be rejected"
+        );
+    }
+
+    // Valid names still work and are lowercased.
+    let svc = store
+        .get_or_create_service(laptop.id, "My-Web")
+        .await
+        .unwrap();
+    assert_eq!(svc.name, "my-web");
+
+    // A declared service is keyed by the flat hostname and validated at the
+    // store boundary too (an invalid service never reaches persistence).
+    let key = KeyId::Ed25519([0x33; 32]);
+    store.add_machine_key(laptop.id, &key).await.unwrap();
+    assert!(matches!(
+        store
+            .register_declared_service(&key, "alice-laptop-x.example.com", "a--b")
+            .await,
+        Err(StoreError::InvalidName(_))
+    ));
+}
+
+#[tokio::test]
+async fn test_recompute_domain_names_after_machine_rename() {
+    use sea_orm::sea_query::Expr;
+    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+    use weaver_mux::KeyId;
+
+    let store = Store::connect("sqlite::memory:").await.expect("connect");
+    let alice = store.create_person("alice").await.unwrap();
+    let laptop = store.create_machine(alice.id, "laptop").await.unwrap();
+    let key = KeyId::Ed25519([0x44; 32]);
+    store.add_machine_key(laptop.id, &key).await.unwrap();
+
+    store
+        .register_declared_service(&key, "alice-laptop-web.example.com", "web")
+        .await
+        .unwrap();
+    assert!(
+        store
+            .get_domain("alice-laptop-web.example.com")
+            .await
+            .unwrap()
+            .is_some()
+    );
+
+    // Rename the machine directly (there is no public rename API yet) and let
+    // the sweep rewrite the derived `domains.name`.
+    weaver_server::store::entity::machine::Entity::update_many()
+        .col_expr(
+            weaver_server::store::entity::machine::Column::Name,
+            Expr::value("desktop"),
+        )
+        .filter(weaver_server::store::entity::machine::Column::Id.eq(laptop.id))
+        .exec(store.db())
+        .await
+        .unwrap();
+
+    store.recompute_domain_names("example.com").await.unwrap();
+
+    assert!(
+        store
+            .get_domain("alice-desktop-web.example.com")
+            .await
+            .unwrap()
+            .is_some(),
+        "the materialized name must follow the renamed machine"
+    );
+    assert!(
+        store
+            .get_domain("alice-laptop-web.example.com")
+            .await
+            .unwrap()
+            .is_none(),
+        "the stale name must be gone"
+    );
 }
 
 #[tokio::test]
@@ -634,7 +869,9 @@ async fn test_migration_usage_round_trips() {
     let db_path = temp.path().join("migrate.db");
     let store = Store::open(&db_path).await.expect("open");
 
-    // Roll back just the usage migration, then re-apply it.
+    // Roll the single migration back, then re-apply. `m0001` creates the
+    // `usage` table along with every other table, so a full rebuild is what
+    // proves `down`/`up` are symmetric.
     weaver_server::Migrator::down(store.db(), Some(1))
         .await
         .expect("down");

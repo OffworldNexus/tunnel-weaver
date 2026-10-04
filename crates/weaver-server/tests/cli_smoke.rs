@@ -104,8 +104,10 @@ fn test_weaver_server_configure_command() {
         .arg("--db")
         .arg(&db_path)
         .arg("configure")
-        .arg("--root-domain")
+        .arg("--tunnel-domain")
         .arg("test.example.com")
+        .arg("--admin-domain")
+        .arg("relay.example.net")
         .arg("--admin-email")
         .arg("admin@example.com")
         .arg("--listen-http")
@@ -127,7 +129,7 @@ fn test_weaver_server_configure_command() {
         store.close().await.unwrap();
         cfg
     });
-    assert_eq!(config.root_domain, "test.example.com");
+    assert_eq!(config.tunnel_domain, "test.example.com");
     assert_eq!(config.admin_email, "admin@example.com");
     assert_eq!(config.acme_provider, "letsencrypt");
     assert_eq!(
@@ -146,8 +148,10 @@ fn test_weaver_server_configure_command() {
         .arg(&db_path)
         .arg("configure")
         .arg("--headless")
-        .arg("--root-domain")
+        .arg("--tunnel-domain")
         .arg("headless.example.com")
+        .arg("--admin-domain")
+        .arg("relay.example.net")
         .arg("--email")
         .arg("headless@example.com")
         .output()
@@ -158,15 +162,15 @@ fn test_weaver_server_configure_command() {
         let store = Store::open(&db_path).await.unwrap();
         store.load_config().await.unwrap()
     });
-    assert_eq!(config2.root_domain, "headless.example.com");
+    assert_eq!(config2.tunnel_domain, "headless.example.com");
     assert_eq!(config2.admin_email, "headless@example.com");
     assert_eq!(config2.acme_provider, "letsencrypt");
 }
 
 // OFF-73: Missing required options in headless mode — invoking setup --headless or
-// configure --headless without --root-domain or --email terminates immediately with exit code 2 naming the missing option.
+// configure --headless without --tunnel-domain or --email terminates immediately with exit code 2 naming the missing option.
 #[test]
-fn test_setup_headless_missing_root_domain_exits_2() {
+fn test_setup_headless_missing_tunnel_domain_exits_2() {
     let bin_path = env!("CARGO_BIN_EXE_weaver-server");
 
     let output = Command::new(bin_path)
@@ -180,8 +184,8 @@ fn test_setup_headless_missing_root_domain_exits_2() {
     assert_eq!(output.status.code(), Some(2));
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("--root-domain"),
-        "Expected error message naming --root-domain, got: {stderr}"
+        stderr.contains("--tunnel-domain"),
+        "Expected error message naming --tunnel-domain, got: {stderr}"
     );
 }
 
@@ -192,8 +196,10 @@ fn test_setup_headless_missing_email_exits_2() {
     let output = Command::new(bin_path)
         .arg("setup")
         .arg("--headless")
-        .arg("--root-domain")
+        .arg("--tunnel-domain")
         .arg("example.com")
+        .arg("--admin-domain")
+        .arg("relay.example.net")
         .output()
         .expect("failed to execute setup");
 
@@ -206,7 +212,7 @@ fn test_setup_headless_missing_email_exits_2() {
 }
 
 #[test]
-fn test_configure_headless_missing_root_domain_exits_2() {
+fn test_configure_headless_missing_tunnel_domain_exits_2() {
     let bin_path = env!("CARGO_BIN_EXE_weaver-server");
 
     let output = Command::new(bin_path)
@@ -220,8 +226,8 @@ fn test_configure_headless_missing_root_domain_exits_2() {
     assert_eq!(output.status.code(), Some(2));
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("--root-domain"),
-        "Expected error message naming --root-domain, got: {stderr}"
+        stderr.contains("--tunnel-domain"),
+        "Expected error message naming --tunnel-domain, got: {stderr}"
     );
 }
 
@@ -232,8 +238,10 @@ fn test_configure_headless_missing_email_exits_2() {
     let output = Command::new(bin_path)
         .arg("configure")
         .arg("--headless")
-        .arg("--root-domain")
+        .arg("--tunnel-domain")
         .arg("example.com")
+        .arg("--admin-domain")
+        .arg("relay.example.net")
         .output()
         .expect("failed to execute configure");
 
@@ -267,8 +275,10 @@ fn test_setup_headless_sudo_password_required_exits_2_no_hang() {
         .env("SUDO_ASKPASS", "/bin/false")
         .arg("setup")
         .arg("--headless")
-        .arg("--root-domain")
+        .arg("--tunnel-domain")
         .arg("example.com")
+        .arg("--admin-domain")
+        .arg("relay.example.net")
         .arg("--email")
         .arg("admin@example.com")
         .output()
@@ -318,8 +328,10 @@ fn test_headless_eab_provider_without_credentials_exits_2() {
     let output = Command::new(bin_path)
         .arg("configure")
         .arg("--headless")
-        .arg("--root-domain")
+        .arg("--tunnel-domain")
         .arg("example.com")
+        .arg("--admin-domain")
+        .arg("relay.example.net")
         .arg("--email")
         .arg("admin@example.com")
         .arg("--acme-provider")
@@ -338,8 +350,10 @@ fn test_headless_eab_provider_without_credentials_exits_2() {
     let output = Command::new(bin_path)
         .arg("setup")
         .arg("--headless")
-        .arg("--root-domain")
+        .arg("--tunnel-domain")
         .arg("example.com")
+        .arg("--admin-domain")
+        .arg("relay.example.net")
         .arg("--email")
         .arg("admin@example.com")
         .arg("--acme-provider")
@@ -418,6 +432,42 @@ fn test_usage_cli_parsing_and_socket_errors() {
 }
 
 #[test]
+fn test_doctor_help_and_missing_domains() {
+    let bin_path = env!("CARGO_BIN_EXE_weaver-server");
+
+    // `doctor` is listed and documents its flags.
+    let output = Command::new(bin_path)
+        .arg("doctor")
+        .arg("--help")
+        .output()
+        .expect("failed to execute doctor --help");
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("--tunnel-domain"));
+    assert!(stdout.contains("--admin-domain"));
+    assert!(stdout.contains("--relay-ip"));
+    assert!(stdout.contains("--skip-reachability-check"));
+    assert!(stdout.contains("--json"));
+
+    // With no domains and no installed config, it fails fast with exit 2 and
+    // names the missing options rather than touching the network.
+    let dir = tempdir().unwrap();
+    let missing_db = dir.path().join("absent.db");
+    let output = Command::new(bin_path)
+        .arg("--db")
+        .arg(&missing_db)
+        .arg("doctor")
+        .output()
+        .expect("failed to execute doctor");
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--tunnel-domain") && stderr.contains("--admin-domain"),
+        "Expected missing-option error, got: {stderr}"
+    );
+}
+
+#[test]
 fn test_configure_usage_flush_interval_round_trips() {
     let dir = tempdir().unwrap();
     let db_path = dir.path().join("flushinterval.db");
@@ -428,8 +478,10 @@ fn test_configure_usage_flush_interval_round_trips() {
         .arg(&db_path)
         .arg("configure")
         .arg("--headless")
-        .arg("--root-domain")
+        .arg("--tunnel-domain")
         .arg("flush.example.com")
+        .arg("--admin-domain")
+        .arg("relay.example.net")
         .arg("--email")
         .arg("admin@example.com")
         .arg("--usage-flush-interval")

@@ -1,6 +1,6 @@
 //! Throwaway listener and self-reachability verification probes.
 //!
-//! Binds temporary listeners on target ports (80 and 443), connects back
+//! Binds temporary listeners on target ports (80, 443, and 53), connects back
 //! via resolved public IP addresses, and validates a random challenge token
 //! to ensure incoming public traffic lands on this machine.
 
@@ -11,20 +11,34 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::broadcast;
 use tracing::{debug, warn};
 
 use super::dns::generate_random_hex;
-use super::planner::PortReachability;
+use super::planner::{Port, PortReachability};
 
-/// Scans `/proc/net/tcp` and `/proc/net/tcp6` for socket inodes listening on the given port.
+/// Scans `/proc/net/tcp{,6}` and `/proc/net/udp{,6}` for socket inodes bound
+/// to the given port.
+///
+/// TCP listening sockets are in state `0A` (LISTEN); an unconnected UDP socket
+/// is in state `07`. Scanning both catches the `systemd-resolved` stub, which
+/// holds `127.0.0.53:53` over UDP as well as TCP.
 #[cfg(target_os = "linux")]
 fn find_listening_inodes(port: u16) -> HashSet<u64> {
     let mut inodes = HashSet::new();
     let port_hex = format!("{port:04X}");
 
-    for path in &["/proc/net/tcp", "/proc/net/tcp6"] {
+    // (proc path, socket state) pairs. `0A` = TCP_LISTEN, `07` = UDP
+    // unconnected/socket.
+    let sources = [
+        ("/proc/net/tcp", "0A"),
+        ("/proc/net/tcp6", "0A"),
+        ("/proc/net/udp", "07"),
+        ("/proc/net/udp6", "07"),
+    ];
+
+    for (path, expected_state) in sources {
         if let Ok(content) = std::fs::read_to_string(path) {
             for line in content.lines().skip(1) {
                 let fields: Vec<&str> = line.split_whitespace().collect();
@@ -33,8 +47,7 @@ fn find_listening_inodes(port: u16) -> HashSet<u64> {
                     let state = fields[3];
                     let inode_str = fields[9];
 
-                    // State 0A is TCP_LISTEN
-                    if state == "0A"
+                    if state == expected_state
                         && local_addr.ends_with(&format!(":{port_hex}"))
                         && let Ok(inode) = inode_str.parse::<u64>()
                     {
@@ -134,6 +147,35 @@ fn bind_port_listener(port: u16) -> Result<TcpListener, String> {
         .map_err(|e| format!("failed to register tokio listener: {e}"))
 }
 
+/// Binds a TCP listener on an explicit address (no wildcard), used for port 53
+/// so the probe mirrors production and does not collide with the resolved stub.
+fn bind_explicit_listener(ip: IpAddr, port: u16) -> Result<TcpListener, String> {
+    use socket2::{Domain, Protocol, Socket, Type};
+
+    let addr = SocketAddr::new(ip, port);
+    let domain = if ip.is_ipv6() {
+        Domain::IPV6
+    } else {
+        Domain::IPV4
+    };
+    let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))
+        .map_err(|e| format!("failed to create socket: {e}"))?;
+    let _ = socket.set_reuse_address(true);
+    let _ = socket.set_nonblocking(true);
+    if ip.is_ipv6() {
+        let _ = socket.set_only_v6(false);
+    }
+    socket
+        .bind(&addr.into())
+        .map_err(|e| format!("cannot bind {addr}: {e}"))?;
+    socket
+        .listen(128)
+        .map_err(|e| format!("failed to listen on {addr}: {e}"))?;
+    let std_listener: std::net::TcpListener = socket.into();
+    TcpListener::from_std(std_listener)
+        .map_err(|e| format!("failed to register tokio listener: {e}"))
+}
+
 /// Runs an ephemeral challenge-response responder on the given listener.
 async fn run_challenge_responder(
     listener: TcpListener,
@@ -210,83 +252,219 @@ async fn probe_ip_port(ip: IpAddr, port: u16, challenge: &str) -> Result<(), Str
     }
 }
 
-/// Performs the complete self-reachability check for port 80 and port 443 across all resolved public IPs.
-pub async fn verify_reachability(public_ips: &[IpAddr]) -> (PortReachability, PortReachability) {
+/// Tests whether a UDP datagram sent to `ip`:`port` lands back on a throwaway
+/// socket bound to that explicit public address, proving the relay's DNS
+/// datagram port is open. The socket binds the relay address directly (never a
+/// wildcard), mirroring production and avoiding the `systemd-resolved` stub on
+/// `127.0.0.53`.
+async fn probe_udp_ip_port(ip: IpAddr, port: u16, challenge: &str) -> Result<(), String> {
+    let bind = SocketAddr::new(ip, port);
+    let responder = match UdpSocket::bind(bind).await {
+        Ok(socket) => socket,
+        Err(e) => {
+            if let Some((pid, comm)) = find_occupying_process(port) {
+                return Err(format!(
+                    "could not bind UDP {bind} (occupied by PID {pid} '{comm}'): {e}"
+                ));
+            }
+            return Err(format!("could not bind UDP {bind}: {e}"));
+        }
+    };
+
+    let prober_bind = if ip.is_ipv6() { "[::]:0" } else { "0.0.0.0:0" };
+    let prober = UdpSocket::bind(prober_bind)
+        .await
+        .map_err(|e| format!("could not bind UDP probe socket: {e}"))?;
+    prober
+        .connect(bind)
+        .await
+        .map_err(|e| format!("could not connect UDP probe socket to {bind}: {e}"))?;
+
+    let probe_payload = format!("WEAVER-PROBE-UDP {challenge}");
+    prober
+        .send(probe_payload.as_bytes())
+        .await
+        .map_err(|e| format!("failed to send UDP challenge to {bind}: {e}"))?;
+
+    // The responder receives the datagram (routed back via the public address)
+    // and answers the source.
+    let mut buf = [0u8; 512];
+    let recv = tokio::time::timeout(Duration::from_secs(5), responder.recv_from(&mut buf));
+    let (n, peer) = match recv.await {
+        Ok(Ok(v)) => v,
+        Ok(Err(e)) => return Err(format!("UDP challenge receive on {bind} failed: {e}")),
+        Err(_) => return Err(format!("timed out waiting for UDP challenge on {bind}")),
+    };
+    if !String::from_utf8_lossy(&buf[..n]).contains(challenge) {
+        return Err(format!("unexpected UDP payload received on {bind}"));
+    }
+
+    let confirm = format!("WEAVER-CONFIRM-UDP {challenge}");
+    responder
+        .send_to(confirm.as_bytes(), peer)
+        .await
+        .map_err(|e| format!("failed to send UDP confirmation from {bind}: {e}"))?;
+
+    let mut reply = [0u8; 512];
+    let read = tokio::time::timeout(Duration::from_secs(5), prober.recv(&mut reply));
+    let rn = match read.await {
+        Ok(Ok(n)) => n,
+        Ok(Err(e)) => return Err(format!("failed to read UDP confirmation: {e}")),
+        Err(_) => {
+            return Err(format!(
+                "timed out waiting for UDP confirmation from {bind}"
+            ));
+        }
+    };
+    if !String::from_utf8_lossy(&reply[..rn]).contains(&confirm) {
+        return Err(format!("UDP confirmation received on {bind} did not match"));
+    }
+    Ok(())
+}
+
+/// Performs the complete self-reachability check for ports 80, 443, and 53
+/// across all resolved public IPs.
+///
+/// Port 53 is exercised over both TCP and UDP because the authoritative DNS
+/// responder serves both; either failing marks the port unreachable.
+pub async fn verify_reachability(public_ips: &[IpAddr]) -> [PortReachability; 3] {
     if public_ips.is_empty() {
-        return (
+        return [
             PortReachability::Failed("no public IPs provided".into()),
             PortReachability::Failed("no public IPs provided".into()),
-        );
+            PortReachability::Failed("no public IPs provided".into()),
+        ];
     }
 
     let token = generate_random_hex(16);
     let challenge = Arc::new(format!("weaver-reachability-{token}"));
+    let udp_challenge = format!("weaver-reachability-udp-{token}");
 
-    // 1. Setup port 80 listener
+    // 1. Bind each TCP listener independently so a failure on one port does not
+    //    hide the state of the others.
     let listener_80 = match bind_port_listener(80) {
-        Ok(l) => l,
+        Ok(l) => Some(l),
         Err(e) => {
-            return (
-                PortReachability::Failed(format!("failed to bind port 80: {e}")),
-                PortReachability::Failed("skipped due to port 80 bind failure".into()),
-            );
+            warn!(error = %e, "Failed to bind port 80 for reachability probe");
+            None
         }
     };
-
-    // 2. Setup port 443 listener
     let listener_443 = match bind_port_listener(443) {
-        Ok(l) => l,
+        Ok(l) => Some(l),
         Err(e) => {
-            return (
-                PortReachability::Failed("skipped due to port 443 bind failure".into()),
-                PortReachability::Failed(format!("failed to bind port 443: {e}")),
-            );
+            warn!(error = %e, "Failed to bind port 443 for reachability probe");
+            None
         }
+    };
+    let listener_53 = {
+        // Port 53 must be bound on the explicit relay addresses, never a
+        // wildcard: `[::]:53`/`0.0.0.0:53` collides with the systemd-resolved
+        // stub on `127.0.0.53:53`, the exact failure OFF-190 avoids. We
+        // therefore bind one listener per public IP.
+        let mut listeners = Vec::new();
+        for &ip in public_ips {
+            match bind_explicit_listener(ip, 53) {
+                Ok(l) => listeners.push(l),
+                Err(e) => {
+                    warn!(%ip, error = %e, "Failed to bind TCP port 53 for reachability probe");
+                }
+            }
+        }
+        listeners
     };
 
     let (shutdown_tx, _) = broadcast::channel(1);
 
-    let responder_80_task = tokio::spawn(run_challenge_responder(
-        listener_80,
-        Arc::clone(&challenge),
-        shutdown_tx.subscribe(),
-    ));
-
-    let responder_443_task = tokio::spawn(run_challenge_responder(
-        listener_443,
-        Arc::clone(&challenge),
-        shutdown_tx.subscribe(),
-    ));
+    let responder_80_task = listener_80.map(|l| {
+        tokio::spawn(run_challenge_responder(
+            l,
+            Arc::clone(&challenge),
+            shutdown_tx.subscribe(),
+        ))
+    });
+    let responder_443_task = listener_443.map(|l| {
+        tokio::spawn(run_challenge_responder(
+            l,
+            Arc::clone(&challenge),
+            shutdown_tx.subscribe(),
+        ))
+    });
+    let responder_53_tasks: Vec<_> = listener_53
+        .into_iter()
+        .map(|l| {
+            tokio::spawn(run_challenge_responder(
+                l,
+                Arc::clone(&challenge),
+                shutdown_tx.subscribe(),
+            ))
+        })
+        .collect();
 
     // Allow responders to start listening
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    // Test port 80 for every resolved IP
-    let mut port_80_result = PortReachability::ReachedSelf;
-    for &ip in public_ips {
-        if let Err(e) = probe_ip_port(ip, 80, &challenge).await {
-            warn!(ip = %ip, error = %e, "Port 80 reachability verification failed");
-            port_80_result = PortReachability::Failed(e);
-            break;
-        }
-        debug!(ip = %ip, "Port 80 self-reachability verified");
-    }
+    // 2. Test each port for every resolved IP.
+    let port_80_result = if responder_80_task.is_some() {
+        probe_tcp_all(public_ips, 80, &challenge).await
+    } else {
+        PortReachability::Failed("failed to bind port 80".into())
+    };
 
-    // Test port 443 for every resolved IP
-    let mut port_443_result = PortReachability::ReachedSelf;
-    for &ip in public_ips {
-        if let Err(e) = probe_ip_port(ip, 443, &challenge).await {
-            warn!(ip = %ip, error = %e, "Port 443 reachability verification failed");
-            port_443_result = PortReachability::Failed(e);
-            break;
+    let port_443_result = if responder_443_task.is_some() {
+        probe_tcp_all(public_ips, 443, &challenge).await
+    } else {
+        PortReachability::Failed("failed to bind port 443".into())
+    };
+
+    let mut port_53_result = if responder_53_tasks.is_empty() {
+        PortReachability::Failed("failed to bind TCP port 53 on the relay addresses".into())
+    } else {
+        probe_tcp_all(public_ips, 53, &challenge).await
+    };
+
+    // 3. UDP 53: every public IP must accept a datagram on the DNS port.
+    if matches!(port_53_result, PortReachability::ReachedSelf) {
+        for &ip in public_ips {
+            if let Err(e) = probe_udp_ip_port(ip, 53, &udp_challenge).await {
+                warn!(ip = %ip, error = %e, "Port 53 UDP reachability verification failed");
+                port_53_result = PortReachability::Failed(format!("UDP: {e}"));
+                break;
+            }
+            debug!(ip = %ip, "Port 53 UDP self-reachability verified");
         }
-        debug!(ip = %ip, "Port 443 self-reachability verified");
     }
 
     // Stop responders and wait for tasks to finish
     let _ = shutdown_tx.send(());
-    let _ = responder_80_task.await;
-    let _ = responder_443_task.await;
+    if let Some(task) = responder_80_task {
+        let _ = task.await;
+    }
+    if let Some(task) = responder_443_task {
+        let _ = task.await;
+    }
+    for task in responder_53_tasks {
+        let _ = task.await;
+    }
 
-    (port_80_result, port_443_result)
+    let mut results = [
+        PortReachability::Failed("not probed".into()),
+        PortReachability::Failed("not probed".into()),
+        PortReachability::Failed("not probed".into()),
+    ];
+    results[Port::Http.index()] = port_80_result;
+    results[Port::Https.index()] = port_443_result;
+    results[Port::Dns.index()] = port_53_result;
+    results
+}
+
+/// Probes one TCP port across every public IP with the challenge handshake.
+async fn probe_tcp_all(public_ips: &[IpAddr], port: u16, challenge: &str) -> PortReachability {
+    for &ip in public_ips {
+        if let Err(e) = probe_ip_port(ip, port, challenge).await {
+            warn!(ip = %ip, port, error = %e, "TCP self-reachability verification failed");
+            return PortReachability::Failed(e);
+        }
+        debug!(ip = %ip, port, "TCP self-reachability verified");
+    }
+    PortReachability::ReachedSelf
 }

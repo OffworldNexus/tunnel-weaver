@@ -1,5 +1,5 @@
 use std::path::Path;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use comfy_table::modifiers::UTF8_ROUND_CORNERS;
 use comfy_table::presets::UTF8_FULL;
@@ -45,6 +45,18 @@ async fn connect_control_socket(socket_path: &Path) -> Result<UnixStream, i32> {
             }
         },
     }
+}
+
+/// Returns whether the relay is listening on the control socket.
+///
+/// `doctor` uses this to choose its context without printing connection
+/// diagnostics: when the socket answers, the daemon composes the report; when
+/// it does not, the command falls back to the in-process preflight.
+pub async fn control_socket_available(socket_path: &Path) -> bool {
+    tokio::time::timeout(Duration::from_millis(250), UnixStream::connect(socket_path))
+        .await
+        .map(|result| result.is_ok())
+        .unwrap_or(false)
 }
 
 /// Creates a preconfigured `comfy-table` with rounded UTF-8 borders and dynamic layout.
@@ -111,6 +123,37 @@ async fn send_request_and_read_line(
     }
 
     Ok(line)
+}
+
+/// Prints the raw response line when `json` was requested and returns the exit
+/// code the envelope implies, or `None` when a typed renderer should run.
+///
+/// Every `client_*` command shares this: `--json` prints the server's line
+/// verbatim and exits nonzero only when the envelope says `ok:false`.
+fn json_short_circuit(line: &str, json: bool) -> Option<i32> {
+    if !json {
+        return None;
+    }
+    println!("{line}");
+    match serde_json::from_str::<serde_json::Value>(line) {
+        Ok(val) if val.get("ok") == Some(&serde_json::Value::Bool(false)) => Some(1),
+        Ok(_) => Some(0),
+        Err(_) => Some(1),
+    }
+}
+
+/// Reports a response that could not be parsed as the expected typed payload.
+///
+/// Prints the `error` field of a JSON error envelope, or the raw line, and
+/// returns the standard failure exit code.
+fn response_error(line: &str) -> i32 {
+    if let Ok(val) = serde_json::from_str::<serde_json::Value>(line) {
+        let err = val.get("error").and_then(|e| e.as_str()).unwrap_or(line);
+        eprintln!("{} {err}", "✗ Error:".red().bold());
+    } else {
+        eprintln!("{} {line}", "✗ Error:".red().bold());
+    }
+    1
 }
 
 /// Helper to format byte count into a decimal SI representation.
@@ -187,19 +230,7 @@ fn styled_state_cell(state: &str) -> Cell {
 /// Executes the `weaver-server status` CLI command.
 pub async fn client_status(socket_path: &Path, json: bool) -> i32 {
     let req = ControlRequest {
-        v: 1,
-        cmd: "status".to_string(),
-        name: None,
-        limit: None,
-        timeout_s: None,
-        all: None,
-        force: None,
-        path: None,
-        no_only_best: None,
-        person: None,
-        service: None,
-        since: None,
-        until: None,
+        ..ControlRequest::new("status")
     };
 
     let line = match send_request_and_read_line(socket_path, &req).await {
@@ -208,29 +239,13 @@ pub async fn client_status(socket_path: &Path, json: bool) -> i32 {
     };
 
     let trimmed = line.trim();
-    if json {
-        println!("{trimmed}");
-        let val: serde_json::Value = match serde_json::from_str(trimmed) {
-            Ok(v) => v,
-            Err(_) => return 1,
-        };
-        if val.get("ok") == Some(&serde_json::Value::Bool(false)) {
-            return 1;
-        }
-        return 0;
+    if let Some(code) = json_short_circuit(trimmed, json) {
+        return code;
     }
 
     let resp: StatusResponse = match serde_json::from_str(trimmed) {
         Ok(r) => r,
-        Err(_) => {
-            if let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed) {
-                let err = val.get("error").and_then(|e| e.as_str()).unwrap_or(trimmed);
-                eprintln!("{} {err}", "✗ Error:".red().bold());
-            } else {
-                eprintln!("{} {trimmed}", "✗ Error:".red().bold());
-            }
-            return 1;
-        }
+        Err(_) => return response_error(trimmed),
     };
 
     if !resp.ok {
@@ -262,8 +277,15 @@ pub async fn client_status(socket_path: &Path, json: bool) -> i32 {
     println!(
         "  {:<14} {}",
         "Root Domain:".dark_grey(),
-        resp.root_domain.bold()
+        resp.tunnel_domain.bold()
     );
+    if !resp.admin_domain.is_empty() {
+        println!(
+            "  {:<14} {}",
+            "Admin Domain:".dark_grey(),
+            resp.admin_domain.bold()
+        );
+    }
     println!("  {:<14} {}", "HTTP:".dark_grey(), resp.listeners.http);
     println!("  {:<14} {}", "HTTPS:".dark_grey(), resp.listeners.https);
     if !resp.control_socket.is_empty() {
@@ -312,19 +334,10 @@ pub async fn client_cert_status(
 ) -> i32 {
     let has_name = name.is_some();
     let req = ControlRequest {
-        v: 1,
-        cmd: "cert.status".to_string(),
         name,
         limit,
-        timeout_s: None,
-        all: None,
-        force: None,
-        path: None,
         no_only_best: if no_only_best { Some(true) } else { None },
-        person: None,
-        service: None,
-        since: None,
-        until: None,
+        ..ControlRequest::new("cert.status")
     };
 
     let line = match send_request_and_read_line(socket_path, &req).await {
@@ -333,16 +346,8 @@ pub async fn client_cert_status(
     };
 
     let trimmed = line.trim();
-    if json {
-        println!("{trimmed}");
-        let val: serde_json::Value = match serde_json::from_str(trimmed) {
-            Ok(v) => v,
-            Err(_) => return 1,
-        };
-        if val.get("ok") == Some(&serde_json::Value::Bool(false)) {
-            return 1;
-        }
-        return 0;
+    if let Some(code) = json_short_circuit(trimmed, json) {
+        return code;
     }
 
     let now = SystemTime::now()
@@ -354,15 +359,7 @@ pub async fn client_cert_status(
         // Table view
         let resp: CertListResponse = match serde_json::from_str(trimmed) {
             Ok(r) => r,
-            Err(_) => {
-                if let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed) {
-                    let err = val.get("error").and_then(|e| e.as_str()).unwrap_or(trimmed);
-                    eprintln!("{} {err}", "✗ Error:".red().bold());
-                } else {
-                    eprintln!("{} {trimmed}", "✗ Error:".red().bold());
-                }
-                return 1;
-            }
+            Err(_) => return response_error(trimmed),
         };
 
         if !resp.ok {
@@ -389,6 +386,9 @@ pub async fn client_cert_status(
             Cell::new("STATE")
                 .add_attribute(Attribute::Bold)
                 .fg(Color::Cyan),
+            Cell::new("VALIDATION")
+                .add_attribute(Attribute::Bold)
+                .fg(Color::Cyan),
             Cell::new("DAYS-LEFT")
                 .add_attribute(Attribute::Bold)
                 .fg(Color::Cyan),
@@ -412,6 +412,11 @@ pub async fn client_cert_status(
             };
 
             let state_cell = styled_state_cell(&cert.state);
+
+            let validation_cell = match cert.validation.as_deref() {
+                Some(mech) => Cell::new(mech),
+                None => Cell::new("-").fg(Color::DarkGrey),
+            };
 
             let (days_str, days_color) = match cert.not_after {
                 Some(ts) => {
@@ -451,6 +456,7 @@ pub async fn client_cert_status(
             row.extend(vec![
                 name_cell,
                 state_cell,
+                validation_cell,
                 days_cell,
                 active_cell,
                 age_cell,
@@ -470,15 +476,7 @@ pub async fn client_cert_status(
         // Detail view
         let resp: CertDetailResponse = match serde_json::from_str(trimmed) {
             Ok(r) => r,
-            Err(_) => {
-                if let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed) {
-                    let err = val.get("error").and_then(|e| e.as_str()).unwrap_or(trimmed);
-                    eprintln!("{} {err}", "✗ Error:".red().bold());
-                } else {
-                    eprintln!("{} {trimmed}", "✗ Error:".red().bold());
-                }
-                return 1;
-            }
+            Err(_) => return response_error(trimmed),
         };
 
         if !resp.ok {
@@ -502,6 +500,10 @@ pub async fn client_cert_status(
         table.add_row(vec![
             Cell::new("State").fg(Color::DarkCyan),
             styled_state_cell(resp.state.label()),
+        ]);
+        table.add_row(vec![
+            Cell::new("Validation").fg(Color::DarkCyan),
+            Cell::new(resp.validation.as_deref().unwrap_or("-")),
         ]);
         table.add_row(vec![
             Cell::new("Active").fg(Color::DarkCyan),
@@ -614,19 +616,9 @@ pub async fn client_cert_wait(
     json: bool,
 ) -> i32 {
     let req = ControlRequest {
-        v: 1,
-        cmd: "cert.wait".to_string(),
         name,
-        limit: None,
         timeout_s,
-        all: None,
-        force: None,
-        path: None,
-        no_only_best: None,
-        person: None,
-        service: None,
-        since: None,
-        until: None,
+        ..ControlRequest::new("cert.wait")
     };
 
     let mut stream = match connect_control_socket(socket_path).await {
@@ -759,6 +751,72 @@ pub async fn client_cert_wait(
     exit_code
 }
 
+/// Triggers a forced wildcard certificate order via the `cert.order` control command.
+///
+/// Setup calls this after the systemd units start and before `cert.wait`, so
+/// the first boot does not depend on the daemon's auto-order (which is gated on
+/// `setup_complete`).
+pub async fn client_cert_order(socket_path: &Path, json: bool) -> i32 {
+    let req = ControlRequest {
+        force: Some(true),
+        ..ControlRequest::new("cert.order")
+    };
+
+    let line = match send_request_and_read_line(socket_path, &req).await {
+        Ok(l) => l,
+        Err(code) => return code,
+    };
+
+    let trimmed = line.trim();
+    if let Some(code) = json_short_circuit(trimmed, json) {
+        return code;
+    }
+
+    let resp: RenewResponse = match serde_json::from_str(trimmed) {
+        Ok(r) => r,
+        Err(_) => return response_error(trimmed),
+    };
+
+    if !resp.ok {
+        eprintln!("{} Wildcard order rejected", "✗ Error:".red().bold());
+        return 1;
+    }
+
+    println!("{} Wildcard certificate order queued", "✓".green().bold());
+    0
+}
+
+/// Triggers both managed certificate orders without echoing the raw response.
+///
+/// `setup` calls this before its own `cert.wait` calls: the wizard prints its
+/// own clean confirmation instead of the control client's JSON envelope.
+pub async fn client_cert_order_quiet(socket_path: &Path) -> i32 {
+    let req = ControlRequest {
+        force: Some(true),
+        ..ControlRequest::new("cert.order")
+    };
+
+    let line = match send_request_and_read_line(socket_path, &req).await {
+        Ok(l) => l,
+        Err(code) => return code,
+    };
+
+    let trimmed = line.trim();
+    match serde_json::from_str::<serde_json::Value>(trimmed) {
+        Ok(val) if val.get("ok") != Some(&serde_json::Value::Bool(false)) => 0,
+        Ok(val) => {
+            if let Some(err) = val.get("error").and_then(|e| e.as_str()) {
+                eprintln!("{} {err}", "✗ Error:".red().bold());
+            }
+            1
+        }
+        Err(_) => {
+            eprintln!("{} {trimmed}", "✗ Error:".red().bold());
+            1
+        }
+    }
+}
+
 /// Executes the `weaver-server cert renew [NAME | --all] [--force] [--wait]` CLI command.
 pub async fn client_cert_renew(
     socket_path: &Path,
@@ -769,19 +827,10 @@ pub async fn client_cert_renew(
     json: bool,
 ) -> i32 {
     let req = ControlRequest {
-        v: 1,
-        cmd: "cert.renew".to_string(),
         name,
-        limit: None,
-        timeout_s: None,
         all: if all { Some(true) } else { None },
         force: if force { Some(true) } else { None },
-        path: None,
-        no_only_best: None,
-        person: None,
-        service: None,
-        since: None,
-        until: None,
+        ..ControlRequest::new("cert.renew")
     };
 
     let line = match send_request_and_read_line(socket_path, &req).await {
@@ -815,15 +864,7 @@ pub async fn client_cert_renew(
 
     let resp: RenewResponse = match serde_json::from_str(trimmed) {
         Ok(r) => r,
-        Err(_) => {
-            if let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed) {
-                let err = val.get("error").and_then(|e| e.as_str()).unwrap_or(trimmed);
-                eprintln!("{} {err}", "✗ Error:".red().bold());
-            } else {
-                eprintln!("{} {trimmed}", "✗ Error:".red().bold());
-            }
-            return 1;
-        }
+        Err(_) => return response_error(trimmed),
     };
 
     if !resp.ok {
@@ -866,19 +907,8 @@ pub async fn client_cert_renew(
 /// Executes the `weaver-server backup <PATH>` CLI command.
 pub async fn client_backup(socket_path: &Path, path: String, json: bool) -> i32 {
     let req = ControlRequest {
-        v: 1,
-        cmd: "backup".to_string(),
-        name: None,
-        limit: None,
-        timeout_s: None,
-        all: None,
-        force: None,
         path: Some(path),
-        no_only_best: None,
-        person: None,
-        service: None,
-        since: None,
-        until: None,
+        ..ControlRequest::new("backup")
     };
 
     let line = match send_request_and_read_line(socket_path, &req).await {
@@ -887,29 +917,13 @@ pub async fn client_backup(socket_path: &Path, path: String, json: bool) -> i32 
     };
 
     let trimmed = line.trim();
-    if json {
-        println!("{trimmed}");
-        let val: serde_json::Value = match serde_json::from_str(trimmed) {
-            Ok(v) => v,
-            Err(_) => return 1,
-        };
-        if val.get("ok") == Some(&serde_json::Value::Bool(false)) {
-            return 1;
-        }
-        return 0;
+    if let Some(code) = json_short_circuit(trimmed, json) {
+        return code;
     }
 
     let resp: BackupResponse = match serde_json::from_str(trimmed) {
         Ok(r) => r,
-        Err(_) => {
-            if let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed) {
-                let err = val.get("error").and_then(|e| e.as_str()).unwrap_or(trimmed);
-                eprintln!("{} {err}", "✗ Error:".red().bold());
-            } else {
-                eprintln!("{} {trimmed}", "✗ Error:".red().bold());
-            }
-            return 1;
-        }
+        Err(_) => return response_error(trimmed),
     };
 
     if !resp.ok {
@@ -931,19 +945,7 @@ pub async fn client_backup(socket_path: &Path, path: String, json: bool) -> i32 
 /// Executes the `weaver-server shutdown` CLI command.
 pub async fn client_shutdown(socket_path: &Path, json: bool) -> i32 {
     let req = ControlRequest {
-        v: 1,
-        cmd: "shutdown".to_string(),
-        name: None,
-        limit: None,
-        timeout_s: None,
-        all: None,
-        force: None,
-        path: None,
-        no_only_best: None,
-        person: None,
-        service: None,
-        since: None,
-        until: None,
+        ..ControlRequest::new("shutdown")
     };
 
     let line = match send_request_and_read_line(socket_path, &req).await {
@@ -952,16 +954,8 @@ pub async fn client_shutdown(socket_path: &Path, json: bool) -> i32 {
     };
 
     let trimmed = line.trim();
-    if json {
-        println!("{trimmed}");
-        let val: serde_json::Value = match serde_json::from_str(trimmed) {
-            Ok(v) => v,
-            Err(_) => return 1,
-        };
-        if val.get("ok") == Some(&serde_json::Value::Bool(false)) {
-            return 1;
-        }
-        return 0;
+    if let Some(code) = json_short_circuit(trimmed, json) {
+        return code;
     }
 
     println!("{} Server shutdown initiated", "✓".yellow().bold());
@@ -987,19 +981,11 @@ pub async fn client_usage(
     json: bool,
 ) -> i32 {
     let req = ControlRequest {
-        v: 1,
-        cmd: "usage".to_string(),
-        name: None,
-        limit: None,
-        timeout_s: None,
-        all: None,
-        force: None,
-        path: None,
-        no_only_best: None,
         person,
         service,
         since: Some(since),
         until: Some(until),
+        ..ControlRequest::new("usage")
     };
 
     let line = match send_request_and_read_line(socket_path, &req).await {
@@ -1008,29 +994,13 @@ pub async fn client_usage(
     };
 
     let trimmed = line.trim();
-    if json {
-        println!("{trimmed}");
-        let val: serde_json::Value = match serde_json::from_str(trimmed) {
-            Ok(v) => v,
-            Err(_) => return 1,
-        };
-        if val.get("ok") == Some(&serde_json::Value::Bool(false)) {
-            return 1;
-        }
-        return 0;
+    if let Some(code) = json_short_circuit(trimmed, json) {
+        return code;
     }
 
     let resp: UsageResponse = match serde_json::from_str(trimmed) {
         Ok(r) => r,
-        Err(_) => {
-            if let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed) {
-                let err = val.get("error").and_then(|e| e.as_str()).unwrap_or(trimmed);
-                eprintln!("{} {err}", "✗ Error:".red().bold());
-            } else {
-                eprintln!("{} {trimmed}", "✗ Error:".red().bold());
-            }
-            return 1;
-        }
+        Err(_) => return response_error(trimmed),
     };
 
     if !resp.ok {
@@ -1096,6 +1066,39 @@ fn format_ratio(visitor: i64, tunnel: i64) -> String {
         return "-".to_string();
     }
     format!("{:.1}×", visitor.max(0) as f64 / tunnel as f64)
+}
+
+/// Executes the `weaver-server doctor` command against the running relay.
+///
+/// The daemon owns ports 80/443/53, so it composes the report itself and sends
+/// it back; this prints the rendered checklist (or pretty JSON) and returns
+/// nonzero when any check failed.
+pub async fn client_doctor(socket_path: &Path, json: bool) -> i32 {
+    let req = ControlRequest {
+        ..ControlRequest::new("doctor")
+    };
+
+    let line = match send_request_and_read_line(socket_path, &req).await {
+        Ok(l) => l,
+        Err(code) => return code,
+    };
+
+    let trimmed = line.trim();
+    let report: crate::setup::doctor::DoctorReport = match serde_json::from_str(trimmed) {
+        Ok(report) => report,
+        Err(_) => return response_error(trimmed),
+    };
+
+    if json {
+        match serde_json::to_string_pretty(&report.to_json()) {
+            Ok(rendered) => println!("{rendered}"),
+            Err(_) => return 1,
+        }
+    } else {
+        println!("{}", report.render());
+    }
+
+    if report.ok() { 0 } else { 1 }
 }
 
 #[cfg(test)]

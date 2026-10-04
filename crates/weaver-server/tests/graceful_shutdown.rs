@@ -14,7 +14,8 @@ fn create_valid_test_config(
     control_socket: std::path::PathBuf,
 ) -> Config {
     Config {
-        root_domain: "weaver.test".to_string(),
+        tunnel_domain: "weaver.test".to_string(),
+        admin_domain: "relay-admin.test".to_string(),
         admin_email: "admin@weaver.test".to_string(),
         acme_provider: "letsencrypt-staging".to_string(),
         listen_http: SocketAddr::from(([127, 0, 0, 1], http_port)),
@@ -26,6 +27,8 @@ fn create_valid_test_config(
         acme_root_ca_pem: None,
         acme_fallback_providers: Vec::new(),
         usage_flush_interval_secs: 60,
+        relay_ips: Vec::new(),
+        setup_complete: false,
     }
 }
 

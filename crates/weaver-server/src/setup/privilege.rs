@@ -65,12 +65,17 @@ pub fn ensure_root_or_elevate(config: &GatheredConfig, is_headless: bool) {
     cmd.arg(current_exe);
     cmd.arg("setup");
 
-    cmd.arg("--root-domain").arg(&config.root_domain);
+    cmd.arg("--tunnel-domain").arg(&config.tunnel_domain);
+    cmd.arg("--admin-domain").arg(&config.admin_domain);
     cmd.arg("--email").arg(&config.admin_email);
     cmd.arg("--acme-provider").arg(&config.acme_provider);
     cmd.arg("--db").arg(&config.db_path);
     cmd.arg("--user").arg(&config.user);
     cmd.arg("--prefix").arg(&config.prefix);
+
+    for ip in &config.relay_ips {
+        cmd.arg("--relay-ip").arg(ip.to_string());
+    }
 
     if let Some(dir) = &config.acme_directory {
         cmd.arg("--acme-directory").arg(dir);

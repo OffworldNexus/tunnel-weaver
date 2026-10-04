@@ -1,4 +1,13 @@
-//! `certificates` table: issued TLS certificates linked to a parent domain.
+//! `certificates` table: issued TLS certificates.
+//!
+//! One row per certificate, keyed by its own `name`. In the OFF-198 model there
+//! are two long-lived rows — the `[<root>, *.<root>]` tunnel wildcard held
+//! under the zone apex, and the single-name admin certificate held under the
+//! admin domain — but the table itself does not hard-code that cardinality so
+//! a future per-name path could return without a schema change.
+//!
+//! `validation` records the ACME mechanism (`dns-01` vs `http-01`) so renewal
+//! can be dispatched per row without re-deriving it from the name.
 
 use sea_orm::entity::prelude::*;
 
@@ -7,7 +16,8 @@ use sea_orm::entity::prelude::*;
 pub struct Model {
     #[sea_orm(primary_key)]
     pub id: i32,
-    pub domain_id: i32,
+    #[sea_orm(unique)]
+    pub name: String,
     pub cert_pem: String,
     pub key_pem: String,
     pub not_before: i64,
@@ -15,24 +25,12 @@ pub struct Model {
     pub issuer: Option<String>,
     pub directory: String,
     pub obtained_at: i64,
+    /// ACME validation mechanism that produced this row: `dns-01` for the
+    /// tunnel wildcard, `http-01` for the relay's admin certificate.
+    pub validation: String,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
-pub enum Relation {
-    #[sea_orm(
-        belongs_to = "super::domain::Entity",
-        from = "Column::DomainId",
-        to = "super::domain::Column::Id",
-        on_update = "Cascade",
-        on_delete = "Cascade"
-    )]
-    Domain,
-}
-
-impl Related<super::domain::Entity> for Entity {
-    fn to() -> RelationDef {
-        Relation::Domain.def()
-    }
-}
+pub enum Relation {}
 
 impl ActiveModelBehavior for ActiveModel {}

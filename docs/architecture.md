@@ -462,7 +462,7 @@ flowchart LR
     Rej["Rejected{code}"] --> f1["failure = rejected"]
     Rd["Readable(id)"] --> which{"control?"}
     which -- yes --> ctl["decode ControlReply → print 'svc url → target'<br/>Refused → record failure, others keep running"]
-    which -- no --> start["resolve service from authority<br/>(first DNS label; no Registered race)<br/>spawn run_exchange; insert Exchange"]
+    which -- no --> start["resolve service from authority<br/>(flat label, split at first two dashes; no Registered race)<br/>spawn run_exchange; insert Exchange"]
     start --> drain["drain_stream: decode BodyFrame → req_body_tx<br/>pause + resume on full (backpressure)"]
     Wr["Writable{id}"] --> pump["pump_out: flush encoded head/frames on credit"]
     out["run_exchange: pool.acquire → hyper h1/h2 →<br/>send head(s) + BodyFrame::Chunk/Trailers + End"] --> pump

@@ -15,6 +15,14 @@ use crate::store::Store;
 use crate::tunnel::identity::{IdentityResolver, derive_hostname};
 use crate::tunnel::proxy::ProxyRequest;
 
+/// Current Unix time, for `last_active_at` stamps.
+fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
+}
+
 /// Route information for a registered tunnel service.
 #[derive(Clone)]
 pub struct TunnelRoute {
@@ -38,33 +46,38 @@ struct ActiveConnection {
 
 /// Registry managing active tunnel connections and registered services.
 pub struct TunnelRegistry {
-    root_domain: String,
+    tunnel_domain: String,
     cert_manager: Arc<CertManager>,
     identities: Arc<dyn IdentityResolver>,
     store: Store,
     metering: Arc<MeteringManager>,
     routes: RwLock<HashMap<String, TunnelRoute>>,
     connections: Mutex<HashMap<KeyId, ActiveConnection>>,
+    /// Hostnames with a live route (and the admin host once visited). Owned by
+    /// the registry, which is the component that knows what is live; mirrored
+    /// to `domains.last_active_at` for persistence.
+    active_hosts: RwLock<HashSet<String>>,
     next_conn_id: AtomicU64,
 }
 
 impl TunnelRegistry {
     /// Creates a new in-memory registry tied to the given root domain and certificate manager.
     pub fn new(
-        root_domain: String,
+        tunnel_domain: String,
         cert_manager: Arc<CertManager>,
         identities: Arc<dyn IdentityResolver>,
         store: Store,
         metering: Arc<MeteringManager>,
     ) -> Self {
         Self {
-            root_domain,
+            tunnel_domain,
             cert_manager,
             identities,
             store,
             metering,
             routes: RwLock::new(HashMap::new()),
             connections: Mutex::new(HashMap::new()),
+            active_hosts: RwLock::new(HashSet::new()),
             next_conn_id: AtomicU64::new(1),
         }
     }
@@ -72,6 +85,35 @@ impl TunnelRegistry {
     /// Access to the underlying state store.
     pub fn store(&self) -> Store {
         self.store.clone()
+    }
+
+    /// Marks a hostname active or inactive, mirroring to `domains.last_active_at`.
+    ///
+    /// The tunnel registry owns domain activity — it is the component that knows
+    /// which hostnames are live. The certificate manager and the control surface
+    /// only read the flag back.
+    pub fn set_active(&self, name: &str, active: bool) {
+        let lower = name.to_ascii_lowercase();
+        if active {
+            self.active_hosts.write().unwrap().insert(lower.clone());
+        } else {
+            self.active_hosts.write().unwrap().remove(&lower);
+        }
+        let store = self.store.clone();
+        let active_at = active.then(now_unix);
+        tokio::spawn(async move {
+            if let Err(err) = store.set_domain_active(&lower, active_at).await {
+                tracing::warn!(hostname = %lower, error = %err, "Failed to persist domain active flag");
+            }
+        });
+    }
+
+    /// Whether `name` currently has a live route.
+    pub fn is_active(&self, name: &str) -> bool {
+        self.active_hosts
+            .read()
+            .unwrap()
+            .contains(&name.to_ascii_lowercase())
     }
 
     /// The metering manager routes and the relay report traffic to.
@@ -104,7 +146,7 @@ impl TunnelRegistry {
                 if let Some(route) = routes.remove(&hostname) {
                     self.metering.unregister_service(route.service_id);
                 }
-                self.cert_manager.set_active(&hostname, false);
+                self.set_active(&hostname, false);
                 info!(%hostname, "Evicted service from superseded connection");
             }
         }
@@ -124,7 +166,7 @@ impl TunnelRegistry {
                 if let Some(route) = routes.remove(&hostname) {
                     self.metering.unregister_service(route.service_id);
                 }
-                self.cert_manager.set_active(&hostname, false);
+                self.set_active(&hostname, false);
                 info!(%hostname, "Unregistered service on connection close");
             }
         }
@@ -151,7 +193,7 @@ impl TunnelRegistry {
             return Err(RefusalCode::Unauthorized);
         };
 
-        let host_lower = derive_hostname(service, &identity, &self.root_domain);
+        let host_lower = derive_hostname(service, &identity, &self.tunnel_domain);
 
         // Refuse duplicates before touching the database: a rejected
         // registration must not leave `service`/`domain` rows behind.
@@ -193,6 +235,11 @@ impl TunnelRegistry {
         }
         self.metering.register_service(persisted.id);
 
+        // The route exists, so the hostname is active for the whole (bounded)
+        // certificate wait. The post-order recompute below corrects it if the
+        // tunnel leaves while the order is in flight.
+        self.set_active(&host_lower, true);
+
         {
             let mut conns = self.connections.lock().unwrap();
             if let Some(conn) = conns.get_mut(&key_id)
@@ -202,14 +249,10 @@ impl TunnelRegistry {
             }
         }
 
-        // Trigger certificate issuance. `ensure` marks the hostname active
-        // before it awaits the ACME order; the order can take long enough
-        // for the client to have gone away meanwhile, in which case
-        // `unregister_*` already removed the route and deactivated the
-        // hostname. The active flag must follow the *route*, so it is
-        // reconciled against the table after the await rather than set
-        // unconditionally — otherwise a departed tunnel leaves an orphaned
-        // hostname that the renewal loop keeps re-issuing forever.
+        // Trigger certificate issuance. The wildcard covers every hostname, so
+        // `ensure` resolves to the apex and waits (bounded) for it to be valid.
+        // The covering certificate is resolved at run time by the certificate
+        // registry; the domain is not linked to a certificate row.
         let _ = self.cert_manager.ensure(&host_lower).await;
         let still_routed = {
             // Held across `set_active` so an unregister cannot slip in
@@ -219,7 +262,7 @@ impl TunnelRegistry {
             let routed = routes
                 .get(&host_lower)
                 .is_some_and(|route| route.key_id == key_id);
-            self.cert_manager.set_active(&host_lower, routed);
+            self.set_active(&host_lower, routed);
             routed
         };
         if still_routed {
@@ -241,7 +284,7 @@ impl TunnelRegistry {
             let service_id = route.service_id;
             routes.remove(&lower);
             self.metering.unregister_service(service_id);
-            self.cert_manager.set_active(&lower, false);
+            self.set_active(&lower, false);
             info!(hostname = %lower, "Tunnel service unregistered");
 
             let mut conns = self.connections.lock().unwrap();
@@ -257,9 +300,21 @@ impl TunnelRegistry {
         Arc::clone(&self.identities)
     }
 
-    pub fn lookup(&self, hostname: &str) -> Option<TunnelRoute> {
+    /// Resolves an incoming `Host` to its live tunnel.
+    ///
+    /// The materialized `domains` table is the source of truth for
+    /// `hostname -> service_id` (the "one join" of OFF-190); the in-memory map
+    /// only supplies the process-local `proxy_tx` channel, which cannot be a DB
+    /// row. A domain with no live route, or a route whose `service_id` does not
+    /// match the database, resolves to `None`.
+    pub async fn resolve(&self, hostname: &str) -> Option<TunnelRoute> {
         let lower = hostname.to_ascii_lowercase();
+        let domain = self.store.get_domain(&lower).await.ok().flatten()?;
+        let service_id = domain.service_id?;
         let routes = self.routes.read().unwrap();
-        routes.get(&lower).cloned()
+        routes
+            .get(&lower)
+            .filter(|route| route.service_id == service_id)
+            .cloned()
     }
 }

@@ -40,9 +40,9 @@ type RelayHandle = Handle<RelayHandler>;
 pub fn spawn_tunnel_connection(
     ws_stream: WebSocketStream<TokioIo<hyper::upgrade::Upgraded>>,
     registry: Arc<TunnelRegistry>,
-    root_domain: String,
+    tunnel_domain: String,
 ) {
-    tokio::spawn(run_tunnel_connection(ws_stream, registry, root_domain));
+    tokio::spawn(run_tunnel_connection(ws_stream, registry, tunnel_domain));
 }
 
 /// How often the mux asks the `IdentityResolver` whether the connected
@@ -52,10 +52,10 @@ const REVERIFY_INTERVAL: Duration = Duration::from_secs(60);
 async fn run_tunnel_connection(
     ws_stream: WebSocketStream<TokioIo<hyper::upgrade::Upgraded>>,
     registry: Arc<TunnelRegistry>,
-    root_domain: String,
+    tunnel_domain: String,
 ) {
     let verifier = Box::new(ResolverVerifier(registry.identities()));
-    let mut cfg = Config::server(verifier, root_domain, Box::new(SystemRng));
+    let mut cfg = Config::server(verifier, tunnel_domain, Box::new(SystemRng));
     if let weaver_mux::Role::Server {
         reverify_interval, ..
     } = &mut cfg.role

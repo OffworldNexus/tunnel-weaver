@@ -21,7 +21,7 @@ use tokio_util::sync::CancellationToken;
 use weave::{ServiceSpec, StartOptions, Target};
 use weaver_proto::control::RefusalCode;
 use weaver_server::cert::resolver::CertResolver;
-use weaver_server::cert::{CertManager, ChallengeRegistry, SystemClock};
+use weaver_server::cert::{CertManager, SystemClock};
 use weaver_server::config::Config;
 use weaver_server::edge::https::run_https_server_with_registry;
 use weaver_server::store::Store;
@@ -216,7 +216,7 @@ fn create_client_tls_config(alpn: Vec<Vec<u8>>) -> Arc<ClientConfig> {
 #[allow(dead_code)]
 struct TestRelay {
     addr: SocketAddr,
-    root_domain: String,
+    tunnel_domain: String,
     registry: Arc<TunnelRegistry>,
     cert_manager: Arc<CertManager>,
     store: Arc<Store>,
@@ -227,7 +227,7 @@ struct TestRelay {
     _temp_ca: NamedTempFile,
 }
 
-async fn spawn_test_relay(root_domain: &str) -> TestRelay {
+async fn spawn_test_relay(tunnel_domain: &str) -> TestRelay {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
 
@@ -235,7 +235,8 @@ async fn spawn_test_relay(root_domain: &str) -> TestRelay {
     let store = Arc::new(Store::open(temp_db.path()).await.unwrap());
 
     let config = Arc::new(Config {
-        root_domain: root_domain.to_string(),
+        tunnel_domain: tunnel_domain.to_string(),
+        admin_domain: "relay-admin.test".to_string(),
         admin_email: "admin@weaver.test".to_string(),
         acme_provider: "letsencrypt-staging".to_string(),
         listen_http: SocketAddr::from(([127, 0, 0, 1], 0)),
@@ -247,30 +248,26 @@ async fn spawn_test_relay(root_domain: &str) -> TestRelay {
         acme_root_ca_pem: None,
         acme_fallback_providers: Vec::new(),
         usage_flush_interval_secs: 60,
+        relay_ips: Vec::new(),
+        setup_complete: false,
     });
 
-    let challenge_registry = Arc::new(ChallengeRegistry::new());
-    let resolver = Arc::new(CertResolver::new(
-        root_domain.to_string(),
-        Arc::clone(&challenge_registry),
-    ));
+    let resolver = Arc::new(CertResolver::new(tunnel_domain));
 
     let cert_manager = CertManager::new(
         Arc::clone(&config),
         Arc::clone(&store),
         Arc::clone(&resolver),
-        Arc::clone(&challenge_registry),
         Arc::new(SystemClock),
-        false,
     );
 
-    // Generate self-signed cert for server
+    // Generate the single self-signed wildcard `[<root>, *.<root>]` the edge
+    // presents, plus the loopback names the test client uses directly.
     let (server_tls, cert_pem) = {
         let key_pair = rcgen::KeyPair::generate().unwrap();
         let params = rcgen::CertificateParams::new(vec![
-            root_domain.to_string(),
-            format!("*.{}", root_domain),
-            format!("*.laptop.poc.{}", root_domain),
+            tunnel_domain.to_string(),
+            format!("*.{}", tunnel_domain),
             "127.0.0.1".to_string(),
             "localhost".to_string(),
         ])
@@ -303,7 +300,7 @@ async fn spawn_test_relay(root_domain: &str) -> TestRelay {
         std::time::Duration::from_secs(60),
     ));
     let registry = Arc::new(TunnelRegistry::new(
-        root_domain.to_string(),
+        tunnel_domain.to_string(),
         Arc::clone(&cert_manager),
         resolver,
         store.as_ref().clone(),
@@ -312,7 +309,7 @@ async fn spawn_test_relay(root_domain: &str) -> TestRelay {
 
     let shutdown_token = CancellationToken::new();
     let s_tok = shutdown_token.clone();
-    let root = root_domain.to_string();
+    let root = tunnel_domain.to_string();
     let reg_clone = Arc::clone(&registry);
 
     tokio::spawn(async move {
@@ -322,7 +319,7 @@ async fn spawn_test_relay(root_domain: &str) -> TestRelay {
 
     TestRelay {
         addr,
-        root_domain: root_domain.to_string(),
+        tunnel_domain: tunnel_domain.to_string(),
         registry,
         cert_manager,
         store,
@@ -354,7 +351,7 @@ async fn test_tunnel_registration_and_http1_http2_proxying() {
     let expected_hostname = derive_hostname("web", &poc_identity(), root);
     let mut registered = false;
     for _ in 0..50 {
-        if relay.registry.lookup(&expected_hostname).is_some() {
+        if relay.registry.resolve(&expected_hostname).await.is_some() {
             registered = true;
             break;
         }
@@ -363,7 +360,7 @@ async fn test_tunnel_registration_and_http1_http2_proxying() {
     assert!(registered, "Service should register within 5 seconds");
 
     // Verify cert_manager active status
-    assert!(relay.cert_manager.is_active(&expected_hostname));
+    assert!(relay.registry.is_active(&expected_hostname));
 
     // 3. Visitor request over HTTP/1.1
     let client_tls_h1 = create_client_tls_config(vec![b"http/1.1".to_vec()]);
@@ -512,14 +509,14 @@ async fn test_tunnel_registration_and_http1_http2_proxying() {
     // Wait up to 1 second for route to be removed from registry
     let mut unreg = false;
     for _ in 0..10 {
-        if relay.registry.lookup(&expected_hostname).is_none() {
+        if relay.registry.resolve(&expected_hostname).await.is_none() {
             unreg = true;
             break;
         }
         sleep(Duration::from_millis(100)).await;
     }
     assert!(unreg, "Route should be removed within 1 second");
-    assert!(!relay.cert_manager.is_active(&expected_hostname));
+    assert!(!relay.registry.is_active(&expected_hostname));
 
     // Send another request and expect 404
     let tcp3 = TcpStream::connect(relay.addr).await.unwrap();
@@ -566,27 +563,27 @@ async fn test_control_stream_is_the_registration_lease() {
     let hostname = derive_hostname("web", &poc_identity(), root);
     let mut registered = false;
     for _ in 0..50 {
-        if relay.registry.lookup(&hostname).is_some() {
+        if relay.registry.resolve(&hostname).await.is_some() {
             registered = true;
             break;
         }
         sleep(Duration::from_millis(100)).await;
     }
     assert!(registered, "service should register");
-    assert!(relay.cert_manager.is_active(&hostname));
+    assert!(relay.registry.is_active(&hostname));
 
     // Drop the lease; the connection stays open.
     release.cancel();
     let mut released = false;
     for _ in 0..20 {
-        if relay.registry.lookup(&hostname).is_none() {
+        if relay.registry.resolve(&hostname).await.is_none() {
             released = true;
             break;
         }
         sleep(Duration::from_millis(100)).await;
     }
     assert!(released, "finishing the control stream must unregister");
-    assert!(!relay.cert_manager.is_active(&hostname));
+    assert!(!relay.registry.is_active(&hostname));
     assert!(
         !client_task.is_finished(),
         "connection must survive the lease release"
@@ -618,7 +615,7 @@ async fn test_tunnel_supersession() {
     let expected_hostname = derive_hostname("web", &poc_identity(), root);
     let mut reg1 = false;
     for _ in 0..50 {
-        if relay.registry.lookup(&expected_hostname).is_some() {
+        if relay.registry.resolve(&expected_hostname).await.is_some() {
             reg1 = true;
             break;
         }
@@ -647,7 +644,7 @@ async fn test_tunnel_supersession() {
     // Verify instance 2 is now registered and serving
     let mut reg2 = false;
     for _ in 0..50 {
-        if relay.registry.lookup(&expected_hostname).is_some() {
+        if relay.registry.resolve(&expected_hostname).await.is_some() {
             reg2 = true;
             break;
         }
@@ -719,7 +716,7 @@ async fn test_two_services_on_one_connection() {
     for host in [&host_a, &host_b] {
         let mut ok = false;
         for _ in 0..50 {
-            if relay.registry.lookup(host).is_some() {
+            if relay.registry.resolve(host).await.is_some() {
                 ok = true;
                 break;
             }
@@ -826,7 +823,7 @@ async fn test_websocket_upgrade_h1_and_h2_extended_connect() {
     let host = derive_hostname("ws", &poc_identity(), root);
     let mut ok = false;
     for _ in 0..50 {
-        if relay.registry.lookup(&host).is_some() {
+        if relay.registry.resolve(&host).await.is_some() {
             ok = true;
             break;
         }
@@ -1052,7 +1049,7 @@ async fn test_websocket_abrupt_origin_close_reaches_visitor() {
 
     let host = derive_hostname("ws", &poc_identity(), root);
     for _ in 0..50 {
-        if relay.registry.lookup(&host).is_some() {
+        if relay.registry.resolve(&host).await.is_some() {
             break;
         }
         sleep(Duration::from_millis(100)).await;
@@ -1147,7 +1144,7 @@ async fn test_websocket_origin_initiated_close_reaches_visitor() {
 
     let host = derive_hostname("ws", &poc_identity(), root);
     for _ in 0..50 {
-        if relay.registry.lookup(&host).is_some() {
+        if relay.registry.resolve(&host).await.is_some() {
             break;
         }
         sleep(Duration::from_millis(100)).await;
@@ -1229,7 +1226,7 @@ async fn test_origin_down_502s_only_that_service() {
     for host in [&host_down, &host_up] {
         let mut ok = false;
         for _ in 0..50 {
-            if relay.registry.lookup(host).is_some() {
+            if relay.registry.resolve(host).await.is_some() {
                 ok = true;
                 break;
             }
@@ -1655,7 +1652,7 @@ async fn test_translation_matrix_h1_and_h2() {
     let host = derive_hostname("m", &poc_identity(), root);
     let mut ok = false;
     for _ in 0..50 {
-        if relay.registry.lookup(&host).is_some() {
+        if relay.registry.resolve(&host).await.is_some() {
             ok = true;
             break;
         }
@@ -1872,7 +1869,7 @@ async fn test_h2_split_cookie_fields_reach_the_origin_joined() {
     let host = derive_hostname("m", &poc_identity(), root);
     let mut routed = false;
     for _ in 0..50 {
-        if relay.registry.lookup(&host).is_some() {
+        if relay.registry.resolve(&host).await.is_some() {
             routed = true;
             break;
         }
@@ -2006,7 +2003,7 @@ async fn assert_connection_close_closes(origin: TestOrigin) {
 
     let hostname = derive_hostname("web", &poc_identity(), root);
     for _ in 0..50 {
-        if relay.registry.lookup(&hostname).is_some() {
+        if relay.registry.resolve(&hostname).await.is_some() {
             break;
         }
         sleep(Duration::from_millis(100)).await;
@@ -2071,7 +2068,8 @@ async fn test_client_leaving_during_cert_issuance_does_not_leave_hostname_active
     let temp_db = NamedTempFile::new().unwrap();
     let store = Arc::new(Store::open(temp_db.path()).await.unwrap());
     let config = Arc::new(Config {
-        root_domain: root.to_string(),
+        tunnel_domain: root.to_string(),
+        admin_domain: "relay-admin.test".to_string(),
         admin_email: "admin@weaver.test".to_string(),
         acme_provider: "custom".to_string(),
         listen_http: SocketAddr::from(([127, 0, 0, 1], 0)),
@@ -2083,19 +2081,15 @@ async fn test_client_leaving_during_cert_issuance_does_not_leave_hostname_active
         acme_root_ca_pem: None,
         acme_fallback_providers: Vec::new(),
         usage_flush_interval_secs: 60,
+        relay_ips: Vec::new(),
+        setup_complete: false,
     });
-    let challenge_registry = Arc::new(ChallengeRegistry::new());
-    let resolver = Arc::new(CertResolver::new(
-        root.to_string(),
-        Arc::clone(&challenge_registry),
-    ));
+    let resolver = Arc::new(CertResolver::new(root));
     let cert_manager = CertManager::new(
         Arc::clone(&config),
         Arc::clone(&store),
         resolver,
-        challenge_registry,
         Arc::new(SystemClock),
-        false,
     );
     let identity_resolver = Arc::new(StoreIdentityResolver::new(store.as_ref().clone()));
     let registry = Arc::new(TunnelRegistry::new(
@@ -2127,14 +2121,14 @@ async fn test_client_leaving_during_cert_issuance_does_not_leave_hostname_active
     };
     let mut routed = false;
     for _ in 0..50 {
-        if registry.lookup(&hostname).is_some() {
+        if registry.resolve(&hostname).await.is_some() {
             routed = true;
             break;
         }
         sleep(Duration::from_millis(20)).await;
     }
     assert!(routed, "route must appear before the order completes");
-    assert!(cert_manager.is_active(&hostname));
+    assert!(registry.is_active(&hostname));
     // Give the order a real chance to finish early if the stall were not
     // holding: it must still be in flight.
     sleep(Duration::from_millis(300)).await;
@@ -2142,8 +2136,8 @@ async fn test_client_leaving_during_cert_issuance_does_not_leave_hostname_active
 
     // The client goes away mid-order.
     registry.unregister_connection(key, conn_id);
-    assert!(registry.lookup(&hostname).is_none());
-    assert!(!cert_manager.is_active(&hostname));
+    assert!(registry.resolve(&hostname).await.is_none());
+    assert!(!registry.is_active(&hostname));
 
     // Let the order finish (by failing: the stalled socket is dropped).
     stall_task.abort();
@@ -2154,9 +2148,9 @@ async fn test_client_leaving_during_cert_issuance_does_not_leave_hostname_active
     assert!(result.is_ok(), "registration itself reports the hostname");
 
     // The whole point: nothing resurrected the departed tunnel's hostname.
-    assert!(registry.lookup(&hostname).is_none());
+    assert!(registry.resolve(&hostname).await.is_none());
     assert!(
-        !cert_manager.is_active(&hostname),
+        !registry.is_active(&hostname),
         "a hostname whose tunnel left during issuance must not be active"
     );
 }
@@ -2193,7 +2187,7 @@ async fn test_store_backed_auth_and_service_domain_persistence() {
     let expected_hostname = derive_hostname("myservice", &poc_identity(), root);
     let mut registered = false;
     for _ in 0..50 {
-        if relay.registry.lookup(&expected_hostname).is_some() {
+        if relay.registry.resolve(&expected_hostname).await.is_some() {
             registered = true;
             break;
         }
@@ -2259,7 +2253,7 @@ async fn test_metering_attributes_traffic_per_service() {
     for host in [&web_host, &api_host] {
         let mut registered = false;
         for _ in 0..50 {
-            if relay.registry.lookup(host).is_some() {
+            if relay.registry.resolve(host).await.is_some() {
                 registered = true;
                 break;
             }

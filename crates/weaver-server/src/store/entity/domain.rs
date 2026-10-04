@@ -1,7 +1,10 @@
-//! `domains` table: registered hostnames/domains and their activity tracking.
+//! `domains` table: materialized flat service hostnames.
 //!
-//! `last_active_at` is `NULL` for hostnames no tunnel currently serves; the
-//! renewal loop skips those so unused certificates are allowed to lapse.
+//! Each row's `name` is the full `<person>-<machine>-<service>.<root>` label
+//! derived from entity names, so an incoming `Host` resolves to its service in
+//! one join. The certificate covering a name is resolved at run time by the
+//! certificate registry (`cert::ManagedCerts`), not stored as a foreign key: a
+//! domain does not own its certificate, it is merely covered by one.
 
 use sea_orm::entity::prelude::*;
 
@@ -18,8 +21,6 @@ pub struct Model {
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
 pub enum Relation {
-    #[sea_orm(has_many = "super::certificate::Entity")]
-    Certificates,
     #[sea_orm(
         belongs_to = "super::service::Entity",
         from = "Column::ServiceId",
@@ -27,12 +28,6 @@ pub enum Relation {
         on_delete = "SetNull"
     )]
     Service,
-}
-
-impl Related<super::certificate::Entity> for Entity {
-    fn to() -> RelationDef {
-        Relation::Certificates.def()
-    }
 }
 
 impl Related<super::service::Entity> for Entity {

@@ -30,7 +30,17 @@ pub enum ConfigError {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Config {
     /// Base domain for routed public tunnels (e.g. "example.com").
-    pub root_domain: String,
+    ///
+    /// This is the *delegated* zone: the parent delegates it in full to the
+    /// relay, which then owns every name beneath it.
+    pub tunnel_domain: String,
+    /// The relay's own stable hostname (e.g. "relay.example.net").
+    ///
+    /// Kept outside the tunnel delegation so the relay's own DNS, control
+    /// endpoint, and admin certificate are never controlled by the delegated
+    /// zone. Setup detects `relay_ips` from its A/AAAA records and serves the
+    /// authoritative NS/SOA under this name.
+    pub admin_domain: String,
     /// Administrator contact email for ACME registration.
     pub admin_email: String,
     /// ACME directory provider (e.g. "letsencrypt", "letsencrypt-staging", "google", "zerossl", "buypass", "custom").
@@ -61,11 +71,56 @@ pub struct Config {
     /// metering existed keep loading.
     #[serde(default = "default_usage_flush_interval")]
     pub usage_flush_interval_secs: u64,
+    /// The relay's own public IPv4/IPv6 addresses.
+    ///
+    /// Auto-filled at `setup` from the apex `A`/`AAAA` records it resolves,
+    /// then operator-editable (required behind NAT). These drive the
+    /// reachability probes, the authoritative DNS A/AAAA answers, and the
+    /// explicit address the DNS socket unit binds — never a wildcard, which
+    /// would collide with the `systemd-resolved` stub on `127.0.0.53:53`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub relay_ips: Vec<std::net::IpAddr>,
+    /// Whether `setup` has completed at least once.
+    ///
+    /// The daemon auto-orders the wildcard at startup, but on a fresh install
+    /// the delegation and port-53 checks must pass first. `setup` leaves this
+    /// false until those checks succeed and it has triggered the order, so the
+    /// first boot does not race an unreachable zone.
+    #[serde(default)]
+    pub setup_complete: bool,
 }
 
 /// Default usage flush interval, in seconds.
 fn default_usage_flush_interval() -> u64 {
     60
+}
+
+/// Checks the admin/tunnel domain split and returns a reason when it is unsafe.
+///
+/// The tunnel domain is delegated in full to this relay, so an admin domain
+/// *under* the tunnel zone would put the relay's own DNS — and therefore the
+/// admin certificate's HTTP-01 DCV and the authoritative NS records — under the
+/// delegated zone's control. The reverse nesting (tunnel under admin) is safe
+/// and allowed. Both names are compared case-insensitively with any trailing
+/// dot ignored.
+///
+/// Returns `None` when the pair is acceptable. Callers are expected to have
+/// already rejected empty names, but an empty input is reported here too.
+pub fn domain_split_issue(admin_domain: &str, tunnel_domain: &str) -> Option<String> {
+    let admin = crate::store::names::normalize_domain(admin_domain);
+    let root = crate::store::names::normalize_domain(tunnel_domain);
+    if admin.is_empty() || root.is_empty() {
+        return Some("admin_domain and tunnel_domain must both be non-empty".into());
+    }
+    if admin == root {
+        return Some("admin_domain and tunnel_domain must differ".into());
+    }
+    if admin.ends_with(&format!(".{root}")) {
+        return Some(format!(
+            "admin_domain '{admin}' must not be a subdomain of the tunnel domain '{root}'"
+        ));
+    }
+    None
 }
 
 impl Config {
@@ -78,7 +133,8 @@ impl Config {
 
         let Some(json_str) = raw_json else {
             return Err(ConfigError::MissingKeys(vec![
-                "root_domain".into(),
+                "tunnel_domain".into(),
+                "admin_domain".into(),
                 "admin_email".into(),
                 "acme_provider".into(),
                 "listen_http".into(),
@@ -95,7 +151,8 @@ impl Config {
         })?;
 
         let required_keys = [
-            "root_domain",
+            "tunnel_domain",
+            "admin_domain",
             "admin_email",
             "acme_provider",
             "listen_http",
@@ -119,8 +176,19 @@ impl Config {
 
         // Semantic validation
         let mut validation_issues = Vec::new();
-        if config.root_domain.trim().is_empty() {
-            validation_issues.push("root_domain must not be empty".into());
+        if config.tunnel_domain.trim().is_empty() {
+            validation_issues.push("tunnel_domain must not be empty".into());
+        }
+        if config.admin_domain.trim().is_empty() {
+            validation_issues.push("admin_domain must not be empty".into());
+        }
+        // Only compare the pair once both are present; the empty checks above
+        // already reported the missing side.
+        if !config.tunnel_domain.trim().is_empty()
+            && !config.admin_domain.trim().is_empty()
+            && let Some(issue) = domain_split_issue(&config.admin_domain, &config.tunnel_domain)
+        {
+            validation_issues.push(issue);
         }
 
         let email = config.admin_email.trim();

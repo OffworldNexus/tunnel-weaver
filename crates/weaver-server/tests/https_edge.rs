@@ -66,14 +66,14 @@ fn create_test_client_config(alpn: Vec<Vec<u8>>) -> Arc<ClientConfig> {
     Arc::new(config)
 }
 
-async fn spawn_test_https_server(root_domain: &str) -> (std::net::SocketAddr, CancellationToken) {
+async fn spawn_test_https_server(tunnel_domain: &str) -> (std::net::SocketAddr, CancellationToken) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let server_tls = create_self_signed_server_config(root_domain).unwrap();
+    let server_tls = create_self_signed_server_config(tunnel_domain).unwrap();
     let shutdown_token = CancellationToken::new();
 
     let token_clone = shutdown_token.clone();
-    let root = root_domain.to_string();
+    let root = tunnel_domain.to_string();
     tokio::spawn(async move {
         run_https_server(listener, server_tls, root, None, token_clone).await;
     });
@@ -84,15 +84,15 @@ async fn spawn_test_https_server(root_domain: &str) -> (std::net::SocketAddr, Ca
 // OFF-70: Security rule — enforce strict HTTPS serving and hardened security headers
 // (CSP, X-Frame-Options, X-Content-Type-Options, Referrer-Policy) on root domain responses.
 #[tokio::test]
-async fn test_https_root_domain_endpoints() {
-    let root_domain = "weaver.test";
-    let (addr, shutdown_token) = spawn_test_https_server(root_domain).await;
+async fn test_https_tunnel_domain_endpoints() {
+    let tunnel_domain = "weaver.test";
+    let (addr, shutdown_token) = spawn_test_https_server(tunnel_domain).await;
     let client_config = create_test_client_config(vec![b"http/1.1".to_vec()]);
     let connector = TlsConnector::from(client_config);
 
-    // 1. GET / on root_domain -> 200 with welcome HTML and security headers
+    // 1. GET / on tunnel_domain -> 200 with welcome HTML and security headers
     let tcp = TcpStream::connect(addr).await.unwrap();
-    let server_name = ServerName::try_from(root_domain).unwrap().to_owned();
+    let server_name = ServerName::try_from(tunnel_domain).unwrap().to_owned();
     let mut tls = connector.connect(server_name, tcp).await.unwrap();
 
     tls.write_all(b"GET / HTTP/1.1\r\nHost: weaver.test\r\nConnection: close\r\n\r\n")
@@ -112,9 +112,9 @@ async fn test_https_root_domain_endpoints() {
     assert!(resp.contains("<style>"));
     assert!(resp.contains("<svg"));
 
-    // 2. GET /healthz on root_domain -> 200 with "ok"
+    // 2. GET /healthz on tunnel_domain -> 200 with "ok"
     let tcp = TcpStream::connect(addr).await.unwrap();
-    let server_name = ServerName::try_from(root_domain).unwrap().to_owned();
+    let server_name = ServerName::try_from(tunnel_domain).unwrap().to_owned();
     let mut tls = connector.connect(server_name, tcp).await.unwrap();
 
     tls.write_all(b"GET /healthz HTTP/1.1\r\nHost: weaver.test\r\nConnection: close\r\n\r\n")
@@ -126,9 +126,9 @@ async fn test_https_root_domain_endpoints() {
     assert!(resp.starts_with("HTTP/1.1 200 OK"));
     assert!(resp.contains("ok"));
 
-    // 3. GET /unmapped on root_domain -> 404
+    // 3. GET /unmapped on tunnel_domain -> 404
     let tcp = TcpStream::connect(addr).await.unwrap();
-    let server_name = ServerName::try_from(root_domain).unwrap().to_owned();
+    let server_name = ServerName::try_from(tunnel_domain).unwrap().to_owned();
     let mut tls = connector.connect(server_name, tcp).await.unwrap();
 
     tls.write_all(b"GET /unmapped HTTP/1.1\r\nHost: weaver.test\r\nConnection: close\r\n\r\n")
@@ -147,8 +147,8 @@ async fn test_https_root_domain_endpoints() {
 // rather than leaking internal routing details or serving the root domain.
 #[tokio::test]
 async fn test_https_subdomain_branded_404() {
-    let root_domain = "weaver.test";
-    let (addr, shutdown_token) = spawn_test_https_server(root_domain).await;
+    let tunnel_domain = "weaver.test";
+    let (addr, shutdown_token) = spawn_test_https_server(tunnel_domain).await;
     let client_config = create_test_client_config(vec![b"http/1.1".to_vec()]);
     let connector = TlsConnector::from(client_config);
 
@@ -178,8 +178,8 @@ async fn test_https_subdomain_branded_404() {
 // unrecognized domains, or IP literals over HTTPS with status 421 Misdirected Request.
 #[tokio::test]
 async fn test_https_421_misdirected_requests() {
-    let root_domain = "weaver.test";
-    let (addr, shutdown_token) = spawn_test_https_server(root_domain).await;
+    let tunnel_domain = "weaver.test";
+    let (addr, shutdown_token) = spawn_test_https_server(tunnel_domain).await;
     let client_config = create_test_client_config(vec![b"http/1.1".to_vec()]);
     let connector = TlsConnector::from(client_config);
 
@@ -230,8 +230,8 @@ async fn test_https_421_misdirected_requests() {
 // 421, which is for a well-formed host the edge does not serve).
 #[tokio::test]
 async fn test_https_400_missing_duplicate_or_invalid_host() {
-    let root_domain = "weaver.test";
-    let (addr, shutdown_token) = spawn_test_https_server(root_domain).await;
+    let tunnel_domain = "weaver.test";
+    let (addr, shutdown_token) = spawn_test_https_server(tunnel_domain).await;
     let client_config = create_test_client_config(vec![b"http/1.1".to_vec()]);
     let connector = TlsConnector::from(client_config);
 
@@ -262,7 +262,7 @@ async fn test_https_400_missing_duplicate_or_invalid_host() {
 
     for (label, raw) in cases {
         let tcp = TcpStream::connect(addr).await.unwrap();
-        let server_name = ServerName::try_from(root_domain).unwrap().to_owned();
+        let server_name = ServerName::try_from(tunnel_domain).unwrap().to_owned();
         let mut tls = connector.connect(server_name, tcp).await.unwrap();
         tls.write_all(raw).await.unwrap();
         let mut resp = String::new();
@@ -285,13 +285,13 @@ async fn test_https_400_missing_duplicate_or_invalid_host() {
 // `:authority` is malformed (400); one that agrees is fine.
 #[tokio::test]
 async fn test_https_h2_host_authority_mismatch_is_400() {
-    let root_domain = "weaver.test";
-    let (addr, shutdown_token) = spawn_test_https_server(root_domain).await;
+    let tunnel_domain = "weaver.test";
+    let (addr, shutdown_token) = spawn_test_https_server(tunnel_domain).await;
     let client_config = create_test_client_config(vec![b"h2".to_vec()]);
     let connector = TlsConnector::from(client_config);
 
     let tcp = TcpStream::connect(addr).await.unwrap();
-    let server_name = ServerName::try_from(root_domain).unwrap().to_owned();
+    let server_name = ServerName::try_from(tunnel_domain).unwrap().to_owned();
     let tls = connector.connect(server_name, tcp).await.unwrap();
     let (mut sender, conn) = hyper::client::conn::http2::Builder::new(TokioExecutor::new())
         .handshake(TokioIo::new(tls))
@@ -303,7 +303,7 @@ async fn test_https_h2_host_authority_mismatch_is_400() {
 
     let req = Request::builder()
         .method(Method::GET)
-        .uri(format!("https://{root_domain}/healthz"))
+        .uri(format!("https://{tunnel_domain}/healthz"))
         .header(http::header::HOST, "other.weaver.test")
         .body(http_body_util::Empty::<Bytes>::new())
         .unwrap();
@@ -312,7 +312,7 @@ async fn test_https_h2_host_authority_mismatch_is_400() {
 
     let req = Request::builder()
         .method(Method::GET)
-        .uri(format!("https://{root_domain}/healthz"))
+        .uri(format!("https://{tunnel_domain}/healthz"))
         .header(http::header::HOST, "WEAVER.test:443")
         .body(http_body_util::Empty::<Bytes>::new())
         .unwrap();
@@ -324,15 +324,15 @@ async fn test_https_h2_host_authority_mismatch_is_400() {
 
 #[tokio::test]
 async fn test_https_http2_alpn_and_request() {
-    let root_domain = "weaver.test";
-    let (addr, shutdown_token) = spawn_test_https_server(root_domain).await;
+    let tunnel_domain = "weaver.test";
+    let (addr, shutdown_token) = spawn_test_https_server(tunnel_domain).await;
 
     // Connect negotiating h2
     let client_config = create_test_client_config(vec![b"h2".to_vec()]);
     let connector = TlsConnector::from(client_config);
 
     let tcp = TcpStream::connect(addr).await.unwrap();
-    let server_name = ServerName::try_from(root_domain).unwrap().to_owned();
+    let server_name = ServerName::try_from(tunnel_domain).unwrap().to_owned();
     let tls = connector.connect(server_name, tcp).await.unwrap();
 
     // Verify ALPN protocol negotiated is h2
@@ -352,8 +352,8 @@ async fn test_https_http2_alpn_and_request() {
 
     let req = Request::builder()
         .method(Method::GET)
-        .uri(format!("https://{root_domain}/"))
-        .header(http::header::HOST, root_domain)
+        .uri(format!("https://{tunnel_domain}/"))
+        .header(http::header::HOST, tunnel_domain)
         .body(http_body_util::Empty::<Bytes>::new())
         .unwrap();
 

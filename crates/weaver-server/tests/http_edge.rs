@@ -1,17 +1,36 @@
+use std::sync::Arc;
+
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_util::sync::CancellationToken;
+use weaver_server::cert::solver::Http01Solver;
 use weaver_server::edge::http::run_http_server;
+use weaver_server::store::Store;
+
+/// A throwaway store for the redirect tests. The challenge path is not
+/// exercised here, so an empty registry is enough.
+async fn test_store() -> Arc<Store> {
+    let dir = tempfile::tempdir().unwrap().keep();
+    Arc::new(Store::open(dir.join("test.db")).await.unwrap())
+}
 
 #[tokio::test]
 async fn test_http_308_redirect_preserves_host_and_path() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let shutdown_token = CancellationToken::new();
+    let store = test_store().await;
 
     let token_clone = shutdown_token.clone();
     let server_task = tokio::spawn(async move {
-        run_http_server(listener, "example.com".to_string(), 8443, None, token_clone).await;
+        run_http_server(
+            listener,
+            "example.com".to_string(),
+            8443,
+            vec![Arc::new(Http01Solver::new(store))],
+            token_clone,
+        )
+        .await;
     });
 
     // Case 1: Standard host, non-443 HTTPS port -> appends :8443
@@ -40,7 +59,7 @@ async fn test_http_308_redirect_preserves_host_and_path() {
     assert!(resp.starts_with("HTTP/1.1 308"));
     assert!(resp.contains("location: https://example.com:8443/api/v1"));
 
-    // Case 3: Loopback / IP literal host -> rewrites to root_domain:8443
+    // Case 3: Loopback / IP literal host -> rewrites to tunnel_domain:8443
     let mut stream = TcpStream::connect(addr).await.unwrap();
     stream
         .write_all(b"GET /status HTTP/1.1\r\nHost: 127.0.0.1:8080\r\nConnection: close\r\n\r\n")
@@ -52,7 +71,7 @@ async fn test_http_308_redirect_preserves_host_and_path() {
     assert!(resp.starts_with("HTTP/1.1 308"));
     assert!(resp.contains("location: https://example.com:8443/status"));
 
-    // Case 4: localhost -> rewrites to root_domain:8443
+    // Case 4: localhost -> rewrites to tunnel_domain:8443
     let mut stream = TcpStream::connect(addr).await.unwrap();
     stream
         .write_all(b"GET / HTTP/1.1\r\nHost: localhost:8080\r\nConnection: close\r\n\r\n")
@@ -73,10 +92,18 @@ async fn test_http_308_redirect_standard_https_port_443() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let shutdown_token = CancellationToken::new();
+    let store = test_store().await;
 
     let token_clone = shutdown_token.clone();
     let server_task = tokio::spawn(async move {
-        run_http_server(listener, "weaver.test".to_string(), 443, None, token_clone).await;
+        run_http_server(
+            listener,
+            "weaver.test".to_string(),
+            443,
+            vec![Arc::new(Http01Solver::new(store))],
+            token_clone,
+        )
+        .await;
     });
 
     let mut stream = TcpStream::connect(addr).await.unwrap();
@@ -102,10 +129,18 @@ async fn test_http_400_on_bad_host_but_http10_without_host_redirects() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let shutdown_token = CancellationToken::new();
+    let store = test_store().await;
 
     let token_clone = shutdown_token.clone();
     let server_task = tokio::spawn(async move {
-        run_http_server(listener, "weaver.test".to_string(), 443, None, token_clone).await;
+        run_http_server(
+            listener,
+            "weaver.test".to_string(),
+            443,
+            vec![Arc::new(Http01Solver::new(store))],
+            token_clone,
+        )
+        .await;
     });
 
     let bad: &[(&str, &[u8])] = &[
@@ -137,6 +172,66 @@ async fn test_http_400_on_bad_host_but_http10_without_host_redirects() {
     stream.read_to_string(&mut resp).await.unwrap();
     assert!(resp.starts_with("HTTP/1.0 308"), "got {resp:?}");
     assert!(resp.contains("location: https://weaver.test/x"));
+
+    shutdown_token.cancel();
+    server_task.await.unwrap();
+}
+
+#[tokio::test]
+async fn test_http01_challenge_served_on_port_80() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let shutdown_token = CancellationToken::new();
+    let store = test_store().await;
+    store
+        .publish_http01("tok-abc", "key-auth-abc", None, 0)
+        .await
+        .unwrap();
+
+    let store_for_server = Arc::clone(&store);
+    let token_clone = shutdown_token.clone();
+    let server_task = tokio::spawn(async move {
+        run_http_server(
+            listener,
+            "example.com".to_string(),
+            443,
+            vec![Arc::new(Http01Solver::new(store_for_server))],
+            token_clone,
+        )
+        .await;
+    });
+
+    // A live token returns 200 with the raw key authorization.
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    stream
+        .write_all(
+            b"GET /.well-known/acme-challenge/tok-abc HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+        )
+        .await
+        .unwrap();
+    let mut resp = String::new();
+    stream.read_to_string(&mut resp).await.unwrap();
+    assert!(resp.starts_with("HTTP/1.1 200"), "got {resp:?}");
+    assert!(
+        resp.ends_with("key-auth-abc"),
+        "body missing key auth: {resp:?}"
+    );
+
+    // An unknown token is a 404, never a redirect.
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    stream
+        .write_all(
+            b"GET /.well-known/acme-challenge/unknown HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+        )
+        .await
+        .unwrap();
+    let mut resp = String::new();
+    stream.read_to_string(&mut resp).await.unwrap();
+    assert!(resp.starts_with("HTTP/1.1 404"), "got {resp:?}");
+    assert!(
+        !resp.contains("location:"),
+        "challenge miss must not redirect"
+    );
 
     shutdown_token.cancel();
     server_task.await.unwrap();

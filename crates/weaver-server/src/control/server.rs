@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
@@ -15,6 +15,9 @@ use super::protocol::{
 use crate::cert::{CertManager, CertState};
 use crate::config::Config;
 use crate::metering::MeteringManager;
+use crate::setup::doctor::{
+    DoctorCheck, DoctorReport, ReportInputs, SelfConnectReachability, assemble_report,
+};
 use crate::store::Store;
 
 /// Binds the UNIX domain control socket listener, creates parent directories,
@@ -150,6 +153,147 @@ pub async fn run_control_server(
     .await
 }
 
+/// Composes the live doctor report from the running daemon's own facts.
+///
+/// The daemon owns 80/443/53, so it verifies reachability with
+/// [`SelfConnectReachability`] rather than binding. The shared
+/// [`assemble_report`] fixes the checklist and port handling; this function
+/// only gathers the facts the daemon has and adds the certificate-health
+/// checks the in-process context cannot.
+async fn build_doctor_report(
+    config: &Config,
+    store: &Store,
+    cert_manager: &CertManager,
+) -> DoctorReport {
+    let root = config.tunnel_domain.to_ascii_lowercase();
+    let admin = config.admin_domain.to_ascii_lowercase();
+
+    let mut relay_ips = config.relay_ips.clone();
+    relay_ips.sort();
+    relay_ips.dedup();
+
+    // Public-DNS re-verification is the pre-install context's job; the daemon
+    // reports the public addresses and delegation target persisted at setup,
+    // then proves them live with the self-connect probe.
+    let admin_resolved = relay_ips.clone();
+    let ns_targets = vec![admin.clone()];
+    let extra_checks = certificate_health_checks(config, store, cert_manager).await;
+    let reachability = SelfConnectReachability::new(admin.clone(), root.clone());
+
+    assemble_report(
+        ReportInputs {
+            tunnel_domain: root,
+            admin_domain: admin,
+            relay_ips,
+            admin_resolved,
+            ns_targets,
+            delegation_error: None,
+            extra_checks,
+            skip_reachability: false,
+        },
+        &reachability,
+    )
+    .await
+}
+
+/// One checklist item per managed certificate (the tunnel wildcard and the
+/// admin host) reporting name, validation mechanism, wildcard/single kind, and
+/// lifecycle state.
+async fn certificate_health_checks(
+    config: &Config,
+    store: &Store,
+    cert_manager: &CertManager,
+) -> Vec<DoctorCheck> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs() as i64)
+        .unwrap_or(0);
+
+    let managed = crate::cert::managed::ManagedCerts::from_config(config);
+    let mut checks = Vec::with_capacity(managed.all().len());
+    for cert in managed.all() {
+        let name = cert.name.clone();
+        let kind = if cert.wildcard() {
+            "wildcard"
+        } else {
+            "single"
+        };
+        let record = store.get_certificate(&name).await.ok().flatten();
+        let validation = record
+            .as_ref()
+            .map(|row| row.validation.clone())
+            .unwrap_or_else(|| "unknown".to_string());
+
+        let (ok, state) = match cert_manager.status(&name) {
+            CertState::Issued { not_after } | CertState::Renewing { not_after } => {
+                let remaining = not_after - now;
+                if remaining <= 0 {
+                    (false, "expired".to_string())
+                } else {
+                    let days = remaining / 86_400;
+                    if days < 14 {
+                        (true, format!("expiring ({days}d left)"))
+                    } else {
+                        (true, format!("issued ({days}d left)"))
+                    }
+                }
+            }
+            CertState::Failed { error, .. } => (false, format!("failed: {error}")),
+            CertState::Ordering => (false, "ordering".to_string()),
+            CertState::Pending => (false, "pending".to_string()),
+        };
+
+        let remediation = (!ok).then(|| {
+            format!(
+                "Renew or re-order '{name}': run `weaver-server cert renew {name} --force` and \
+                 check ACME reachability."
+            )
+        });
+
+        checks.push(DoctorCheck {
+            title: format!("Certificate {name}"),
+            ok,
+            detail: format!("{state} • {validation} • {kind}"),
+            remediation,
+            status: None,
+        });
+    }
+    checks
+}
+
+/// Serializes `resp` and writes it as a single newline-terminated JSON line.
+///
+/// The control protocol is one response line per request; every branch of
+/// [`handle_connection`] used to spell out the serialize/push/write/flush
+/// sequence by hand.
+async fn reply<W, T>(
+    writer: &mut W,
+    resp: &T,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+where
+    W: tokio::io::AsyncWriteExt + Unpin,
+    T: serde::Serialize,
+{
+    let mut data = serde_json::to_vec(resp)?;
+    data.push(b'\n');
+    writer.write_all(&data).await?;
+    writer.flush().await?;
+    Ok(())
+}
+
+/// Whether a materialized domain is currently active (`last_active_at` set).
+///
+/// Activity lives on the domain row, not on a certificate: the tunnel registry
+/// owns the flag and the control surface reads it back.
+async fn is_active(store: &Store, name: &str) -> bool {
+    store
+        .get_domain(name)
+        .await
+        .ok()
+        .flatten()
+        .is_some_and(|d| d.last_active_at.is_some())
+}
+
 /// Handles a single control socket connection: reads one JSON request, dispatches it, and writes response.
 async fn handle_connection(
     mut stream: UnixStream,
@@ -179,10 +323,7 @@ async fn handle_connection(
         Ok(v) => v,
         Err(_) => {
             let resp = ErrorResponse::new("Malformed JSON request");
-            let mut data = serde_json::to_vec(&resp)?;
-            data.push(b'\n');
-            writer.write_all(&data).await?;
-            writer.flush().await?;
+            reply(&mut writer, &resp).await?;
             return Ok(());
         }
     };
@@ -191,10 +332,7 @@ async fn handle_connection(
     let v = val.get("v").and_then(|v| v.as_u64());
     if v != Some(1) {
         let resp = ErrorResponse::new("Unsupported protocol version: expected 1");
-        let mut data = serde_json::to_vec(&resp)?;
-        data.push(b'\n');
-        writer.write_all(&data).await?;
-        writer.flush().await?;
+        reply(&mut writer, &resp).await?;
         return Ok(());
     }
 
@@ -202,31 +340,27 @@ async fn handle_connection(
         Some(c) => c,
         None => {
             let resp = ErrorResponse::new("Missing or invalid 'cmd' field");
-            let mut data = serde_json::to_vec(&resp)?;
-            data.push(b'\n');
-            writer.write_all(&data).await?;
-            writer.flush().await?;
+            reply(&mut writer, &resp).await?;
             return Ok(());
         }
     };
 
-    // 3. Strict 7-verb dispatcher check
+    // 3. Strict dispatcher check: every verb the control surface accepts.
     const ALLOWED_VERBS: &[&str] = &[
         "status",
         "cert.status",
         "cert.wait",
+        "cert.order",
         "cert.renew",
         "usage",
         "backup",
+        "doctor",
         "shutdown",
     ];
 
     if !ALLOWED_VERBS.contains(&cmd) {
         let resp = ErrorResponse::new(format!("Unknown command '{cmd}'"));
-        let mut data = serde_json::to_vec(&resp)?;
-        data.push(b'\n');
-        writer.write_all(&data).await?;
-        writer.flush().await?;
+        reply(&mut writer, &resp).await?;
         return Ok(());
     }
 
@@ -234,10 +368,7 @@ async fn handle_connection(
         Ok(r) => r,
         Err(err) => {
             let resp = ErrorResponse::new(format!("Invalid request format: {err}"));
-            let mut data = serde_json::to_vec(&resp)?;
-            data.push(b'\n');
-            writer.write_all(&data).await?;
-            writer.flush().await?;
+            reply(&mut writer, &resp).await?;
             return Ok(());
         }
     };
@@ -247,13 +378,14 @@ async fn handle_connection(
         "status" => {
             let uptime = start_time.elapsed().as_secs();
             let pid = std::process::id();
-            let root_domain = config.root_domain.clone();
+            let tunnel_domain = config.tunnel_domain.clone();
+            let admin_domain = config.admin_domain.clone();
             let listeners = ListenersInfo {
                 http: config.listen_http.to_string(),
                 https: config.listen_https.to_string(),
             };
             let root_cert = cert_manager.root_cert_status().to_string();
-            let cert_counts = cert_manager.cert_counts().await;
+            let cert_counts = cert_manager.cert_counts();
             let db_path = store
                 .path()
                 .map(|p| p.display().to_string())
@@ -270,7 +402,8 @@ async fn handle_connection(
                 version: env!("CARGO_PKG_VERSION").to_string(),
                 uptime,
                 pid,
-                root_domain,
+                tunnel_domain,
+                admin_domain,
                 listeners,
                 root_cert,
                 cert_counts,
@@ -280,25 +413,22 @@ async fn handle_connection(
                 control_socket: config.control_socket.display().to_string(),
             };
 
-            let mut data = serde_json::to_vec(&resp)?;
-            data.push(b'\n');
-            writer.write_all(&data).await?;
-            writer.flush().await?;
+            reply(&mut writer, &resp).await?;
         }
         "cert.status" => {
-            let root_domain = config.root_domain.to_ascii_lowercase();
+            let tunnel_domain = config.tunnel_domain.to_ascii_lowercase();
             match req.name {
                 None => {
                     let no_only_best = req.no_only_best.unwrap_or(false);
 
                     let summaries = if !no_only_best {
-                        // Summary list: only the best certificate per domain
+                        // Summary list: one certificate row per managed name.
                         let mut domain_names = std::collections::BTreeSet::new();
-                        domain_names.insert(root_domain.clone());
+                        domain_names.insert(tunnel_domain.clone());
 
-                        let best_records = store.list_certificates(true).await.unwrap_or_default();
+                        let records = store.list_certificates().await.unwrap_or_default();
                         let mut records_map = std::collections::HashMap::new();
-                        for r in best_records {
+                        for r in records {
                             let lower = r.name.to_ascii_lowercase();
                             domain_names.insert(lower.clone());
                             records_map.insert(lower, r);
@@ -309,9 +439,9 @@ async fn handle_connection(
 
                         // Order root first, then remaining alphabetically
                         let mut ordered_names = Vec::with_capacity(domain_names.len());
-                        ordered_names.push(root_domain.clone());
+                        ordered_names.push(tunnel_domain.clone());
                         for n in domain_names {
-                            if n != root_domain {
+                            if n != tunnel_domain {
                                 ordered_names.push(n);
                             }
                         }
@@ -323,7 +453,7 @@ async fn handle_connection(
                             let not_after = cert_rec
                                 .map(|c| c.not_after)
                                 .or_else(|| cert_manager.status(&name).not_after());
-                            let active = cert_manager.is_active(&name);
+                            let active = is_active(&store, &name).await;
                             let cert_id = cert_rec.map(|c| c.id);
                             let last_event = store
                                 .get_latest_cert_event(&name)
@@ -344,23 +474,24 @@ async fn handle_connection(
                                 active,
                                 last_event,
                                 cert_id,
+                                validation: cert_rec.map(|c| c.validation.clone()),
                             });
                         }
                         list
                     } else {
                         // Full list: all certificates for each domain
-                        let all_records = store.list_certificates(false).await.unwrap_or_default();
+                        let all_records = store.list_certificates().await.unwrap_or_default();
                         let mut list = Vec::new();
                         let mut seen_domains = std::collections::HashSet::new();
 
-                        // First partition: root domain certificates (best root first)
+                        // First partition: the root domain's certificate row
                         for r in &all_records {
-                            if r.name.eq_ignore_ascii_case(&root_domain) {
-                                seen_domains.insert(root_domain.clone());
-                                let state = cert_manager.status(&root_domain).label().to_string();
-                                let active = cert_manager.is_active(&root_domain);
+                            if r.name.eq_ignore_ascii_case(&tunnel_domain) {
+                                seen_domains.insert(tunnel_domain.clone());
+                                let state = cert_manager.status(&tunnel_domain).label().to_string();
+                                let active = is_active(&store, &tunnel_domain).await;
                                 let last_event = store
-                                    .get_latest_cert_event(&root_domain)
+                                    .get_latest_cert_event(&tunnel_domain)
                                     .await
                                     .ok()
                                     .flatten()
@@ -371,39 +502,41 @@ async fn handle_connection(
                                         detail: e.detail,
                                     });
                                 list.push(CertSummary {
-                                    name: root_domain.clone(),
+                                    name: tunnel_domain.clone(),
                                     state,
                                     not_after: Some(r.not_after),
                                     active,
                                     last_event,
                                     cert_id: Some(r.id),
+                                    validation: Some(r.validation.clone()),
                                 });
                             }
                         }
 
                         // If root had no certificates yet, add placeholder row
-                        if !seen_domains.contains(&root_domain) {
-                            let state = cert_manager.status(&root_domain).label().to_string();
-                            let not_after = cert_manager.status(&root_domain).not_after();
-                            let active = cert_manager.is_active(&root_domain);
+                        if !seen_domains.contains(&tunnel_domain) {
+                            let state = cert_manager.status(&tunnel_domain).label().to_string();
+                            let not_after = cert_manager.status(&tunnel_domain).not_after();
+                            let active = is_active(&store, &tunnel_domain).await;
                             list.push(CertSummary {
-                                name: root_domain.clone(),
+                                name: tunnel_domain.clone(),
                                 state,
                                 not_after,
                                 active,
                                 last_event: None,
                                 cert_id: None,
+                                validation: None,
                             });
-                            seen_domains.insert(root_domain.clone());
+                            seen_domains.insert(tunnel_domain.clone());
                         }
 
                         // Second partition: non-root certificates
                         for r in &all_records {
                             let lower = r.name.to_ascii_lowercase();
-                            if lower != root_domain {
+                            if lower != tunnel_domain {
                                 seen_domains.insert(lower.clone());
                                 let state = cert_manager.status(&lower).label().to_string();
-                                let active = cert_manager.is_active(&lower);
+                                let active = is_active(&store, &lower).await;
                                 let last_event = store
                                     .get_latest_cert_event(&lower)
                                     .await
@@ -422,6 +555,7 @@ async fn handle_connection(
                                     active,
                                     last_event,
                                     cert_id: Some(r.id),
+                                    validation: Some(r.validation.clone()),
                                 });
                             }
                         }
@@ -432,7 +566,7 @@ async fn handle_connection(
                             if seen_domains.insert(lower.clone()) {
                                 let state = cert_manager.status(&lower).label().to_string();
                                 let not_after = cert_manager.status(&lower).not_after();
-                                let active = cert_manager.is_active(&lower);
+                                let active = is_active(&store, &lower).await;
                                 list.push(CertSummary {
                                     name: lower,
                                     state,
@@ -440,6 +574,7 @@ async fn handle_connection(
                                     active,
                                     last_event: None,
                                     cert_id: None,
+                                    validation: None,
                                 });
                             }
                         }
@@ -450,17 +585,14 @@ async fn handle_connection(
                         ok: true,
                         certificates: summaries,
                     };
-                    let mut data = serde_json::to_vec(&resp)?;
-                    data.push(b'\n');
-                    writer.write_all(&data).await?;
-                    writer.flush().await?;
+                    reply(&mut writer, &resp).await?;
                 }
                 Some(name) => {
                     let cert_rec = if let Ok(cert_id) = name.parse::<i32>() {
                         store.get_certificate_by_id(cert_id).await.ok().flatten()
                     } else {
                         let target = if name == "root" {
-                            root_domain.clone()
+                            tunnel_domain.clone()
                         } else {
                             name.to_ascii_lowercase()
                         };
@@ -470,19 +602,16 @@ async fn handle_connection(
                     let target = if let Some(ref r) = cert_rec {
                         r.name.clone()
                     } else if name == "root" {
-                        root_domain.clone()
+                        tunnel_domain.clone()
                     } else {
                         name.to_ascii_lowercase()
                     };
 
                     let in_states = cert_manager.list_states().contains_key(&target);
 
-                    if target != root_domain && cert_rec.is_none() && !in_states {
+                    if target != tunnel_domain && cert_rec.is_none() && !in_states {
                         let resp = ErrorResponse::new(format!("Certificate '{name}' not found"));
-                        let mut data = serde_json::to_vec(&resp)?;
-                        data.push(b'\n');
-                        writer.write_all(&data).await?;
-                        writer.flush().await?;
+                        reply(&mut writer, &resp).await?;
                         return Ok(());
                     }
 
@@ -511,9 +640,12 @@ async fn handle_connection(
                         .as_ref()
                         .map(|r| r.directory.clone())
                         .unwrap_or_else(|| config.acme_provider.clone());
-                    let active = cert_manager.is_active(&target);
-                    let last_active_at = cert_rec.as_ref().and_then(|r| r.last_active_at);
+                    let active = is_active(&store, &target).await;
+                    // Activity now lives on the domain, not the certificate;
+                    // the wildcard row has no per-name activity timestamp.
+                    let last_active_at = None;
                     let cert_id = cert_rec.as_ref().map(|r| r.id);
+                    let validation = cert_rec.as_ref().map(|r| r.validation.clone());
 
                     let resp = CertDetailResponse {
                         ok: true,
@@ -527,23 +659,21 @@ async fn handle_connection(
                         last_active_at,
                         cert_events,
                         cert_id,
+                        validation,
                     };
-                    let mut data = serde_json::to_vec(&resp)?;
-                    data.push(b'\n');
-                    writer.write_all(&data).await?;
-                    writer.flush().await?;
+                    reply(&mut writer, &resp).await?;
                 }
             }
         }
         "cert.wait" => {
-            let root_domain = config.root_domain.to_ascii_lowercase();
+            let tunnel_domain = config.tunnel_domain.to_ascii_lowercase();
             let target = match req.name.as_deref() {
-                Some("root") | None => root_domain.clone(),
+                Some("root") | None => tunnel_domain.clone(),
                 Some(n) => n.to_ascii_lowercase(),
             };
 
             // Verify requested hostname is in the certificate store
-            let is_root = target == root_domain;
+            let is_root = target == tunnel_domain;
             let exists = is_root
                 || cert_manager.list_states().contains_key(&target)
                 || store
@@ -556,10 +686,7 @@ async fn handle_connection(
                 let resp = ErrorResponse::new(format!(
                     "Hostname '{target}' not found in certificate store"
                 ));
-                let mut data = serde_json::to_vec(&resp)?;
-                data.push(b'\n');
-                writer.write_all(&data).await?;
-                writer.flush().await?;
+                reply(&mut writer, &resp).await?;
                 return Ok(());
             }
 
@@ -579,10 +706,7 @@ async fn handle_connection(
                     _ => None,
                 },
             };
-            let mut data = serde_json::to_vec(&init_event)?;
-            data.push(b'\n');
-            writer.write_all(&data).await?;
-            writer.flush().await?;
+            reply(&mut writer, &init_event).await?;
 
             // If initial state is already terminal, finish immediately
             if matches!(
@@ -598,10 +722,7 @@ async fn handle_connection(
                 if elapsed >= timeout_dur {
                     let resp =
                         ErrorResponse::new("Timed out waiting for certificate state transition");
-                    let mut data = serde_json::to_vec(&resp)?;
-                    data.push(b'\n');
-                    writer.write_all(&data).await?;
-                    writer.flush().await?;
+                    reply(&mut writer, &resp).await?;
                     break;
                 }
 
@@ -619,10 +740,7 @@ async fn handle_connection(
                                     _ => None,
                                 },
                             };
-                            let mut data = serde_json::to_vec(&event)?;
-                            data.push(b'\n');
-                            writer.write_all(&data).await?;
-                            writer.flush().await?;
+                            reply(&mut writer, &event).await?;
 
                             if matches!(state, CertState::Issued { .. } | CertState::Failed { .. })
                             {
@@ -638,12 +756,24 @@ async fn handle_connection(
                         let resp = ErrorResponse::new(
                             "Timed out waiting for certificate state transition",
                         );
-                        let mut data = serde_json::to_vec(&resp)?;
-                        data.push(b'\n');
-                        writer.write_all(&data).await?;
-                        writer.flush().await?;
+                        reply(&mut writer, &resp).await?;
                         break;
                     }
+                }
+            }
+        }
+        "cert.order" => {
+            // Setup triggers this once, forcing both managed orders before it
+            // waits on `cert.wait`. Force bypasses backoff so a fresh install
+            // is never held by a stale failure counter. Both are queued: the
+            // tunnel wildcard (DNS-01) and the admin certificate (HTTP-01).
+            match cert_manager.renew_all(true).await {
+                Ok(resp) => {
+                    reply(&mut writer, &resp).await?;
+                }
+                Err(err) => {
+                    let resp = ErrorResponse::new(err.to_string());
+                    reply(&mut writer, &resp).await?;
                 }
             }
         }
@@ -652,23 +782,17 @@ async fn handle_connection(
             if req.all == Some(true) {
                 match cert_manager.renew_all(force).await {
                     Ok(resp) => {
-                        let mut data = serde_json::to_vec(&resp)?;
-                        data.push(b'\n');
-                        writer.write_all(&data).await?;
-                        writer.flush().await?;
+                        reply(&mut writer, &resp).await?;
                     }
                     Err(err) => {
                         let resp = ErrorResponse::new(err.to_string());
-                        let mut data = serde_json::to_vec(&resp)?;
-                        data.push(b'\n');
-                        writer.write_all(&data).await?;
-                        writer.flush().await?;
+                        reply(&mut writer, &resp).await?;
                     }
                 }
             } else {
-                let root_domain = config.root_domain.to_ascii_lowercase();
+                let tunnel_domain = config.tunnel_domain.to_ascii_lowercase();
                 let target = match req.name.as_deref() {
-                    Some("root") | None => root_domain.clone(),
+                    Some("root") | None => tunnel_domain.clone(),
                     Some(n) => n.to_ascii_lowercase(),
                 };
 
@@ -680,17 +804,11 @@ async fn handle_connection(
                             status: "queued".to_string(),
                             skipped_inactive: Vec::new(),
                         };
-                        let mut data = serde_json::to_vec(&resp)?;
-                        data.push(b'\n');
-                        writer.write_all(&data).await?;
-                        writer.flush().await?;
+                        reply(&mut writer, &resp).await?;
                     }
                     Err(err) => {
                         let resp = ErrorResponse::new(err.to_string());
-                        let mut data = serde_json::to_vec(&resp)?;
-                        data.push(b'\n');
-                        writer.write_all(&data).await?;
-                        writer.flush().await?;
+                        reply(&mut writer, &resp).await?;
                     }
                 }
             }
@@ -701,10 +819,7 @@ async fn handle_connection(
             let until_secs = req.until.unwrap_or(i64::MAX);
             if since_secs >= until_secs {
                 let resp = ErrorResponse::new("'since' must be before 'until'");
-                let mut data = serde_json::to_vec(&resp)?;
-                data.push(b'\n');
-                writer.write_all(&data).await?;
-                writer.flush().await?;
+                reply(&mut writer, &resp).await?;
                 return Ok(());
             }
             match metering
@@ -734,17 +849,11 @@ async fn handle_connection(
                         })
                         .collect();
                     let resp = UsageResponse { ok: true, services };
-                    let mut data = serde_json::to_vec(&resp)?;
-                    data.push(b'\n');
-                    writer.write_all(&data).await?;
-                    writer.flush().await?;
+                    reply(&mut writer, &resp).await?;
                 }
                 Err(err) => {
                     let resp = ErrorResponse::new(format!("Usage query failed: {err}"));
-                    let mut data = serde_json::to_vec(&resp)?;
-                    data.push(b'\n');
-                    writer.write_all(&data).await?;
-                    writer.flush().await?;
+                    reply(&mut writer, &resp).await?;
                 }
             }
         }
@@ -753,10 +862,7 @@ async fn handle_connection(
                 Some(p) => p,
                 None => {
                     let resp = ErrorResponse::new("Missing target backup path");
-                    let mut data = serde_json::to_vec(&resp)?;
-                    data.push(b'\n');
-                    writer.write_all(&data).await?;
-                    writer.flush().await?;
+                    reply(&mut writer, &resp).await?;
                     return Ok(());
                 }
             };
@@ -772,29 +878,26 @@ async fn handle_connection(
                         path: path_str,
                         size,
                     };
-                    let mut data = serde_json::to_vec(&resp)?;
-                    data.push(b'\n');
-                    writer.write_all(&data).await?;
-                    writer.flush().await?;
+                    reply(&mut writer, &resp).await?;
                 }
                 Err(err) => {
                     let resp = ErrorResponse::new(format!("Backup failed: {err}"));
-                    let mut data = serde_json::to_vec(&resp)?;
-                    data.push(b'\n');
-                    writer.write_all(&data).await?;
-                    writer.flush().await?;
+                    reply(&mut writer, &resp).await?;
                 }
             }
+        }
+        "doctor" => {
+            // The daemon owns 80/443/53, so it self-connects instead of
+            // binding; certificate health comes from the store + manager.
+            let report = build_doctor_report(&config, &store, &cert_manager).await;
+            reply(&mut writer, &report).await?;
         }
         "shutdown" => {
             let resp = ShutdownResponse {
                 ok: true,
                 message: "Server shutting down".to_string(),
             };
-            let mut data = serde_json::to_vec(&resp)?;
-            data.push(b'\n');
-            writer.write_all(&data).await?;
-            writer.flush().await?;
+            reply(&mut writer, &resp).await?;
 
             info!("Control socket received shutdown command, triggering graceful daemon stop");
             shutdown_token.cancel();

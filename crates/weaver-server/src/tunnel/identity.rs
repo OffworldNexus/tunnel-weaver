@@ -94,14 +94,12 @@ impl IdentityResolver for StoreIdentityResolver {
 }
 
 /// Derives the fully-qualified tunnel hostname:
-/// `<service>.<machine>.<person>.<root>`, lowercased.
+/// `<person>-<machine>-<service>.<root>`, lowercased.
+///
+/// The service name may contain dashes; person and machine may not, so the
+/// label splits unambiguously at its first two dashes.
 pub fn derive_hostname(service: &str, identity: &Identity, root: &str) -> String {
-    format!(
-        "{}.{}.{}.{root}",
-        service.to_ascii_lowercase(),
-        identity.machine.to_ascii_lowercase(),
-        identity.person.to_ascii_lowercase()
-    )
+    crate::store::names::flat_hostname(&identity.person, &identity.machine, service, root)
 }
 
 #[cfg(test)]
@@ -116,7 +114,7 @@ mod tests {
         };
         assert_eq!(
             derive_hostname("Web", &id, "example.com"),
-            "web.laptop.poc.example.com"
+            "poc-laptop-web.example.com"
         );
     }
 }

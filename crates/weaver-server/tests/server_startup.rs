@@ -17,7 +17,8 @@ fn create_valid_test_config(http_port: u16, https_port: u16) -> Config {
         id
     ));
     Config {
-        root_domain: "weaver.test".to_string(),
+        tunnel_domain: "weaver.test".to_string(),
+        admin_domain: "relay-admin.test".to_string(),
         admin_email: "admin@weaver.test".to_string(),
         acme_provider: "letsencrypt-staging".to_string(),
         listen_http: SocketAddr::from(([127, 0, 0, 1], http_port)),
@@ -29,6 +30,8 @@ fn create_valid_test_config(http_port: u16, https_port: u16) -> Config {
         acme_root_ca_pem: None,
         acme_fallback_providers: Vec::new(),
         usage_flush_interval_secs: 60,
+        relay_ips: Vec::new(),
+        setup_complete: false,
     }
 }
 
@@ -67,7 +70,7 @@ fn test_startup_unconfigured_db_exits_78() {
     assert_eq!(output.status.code(), Some(78));
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("Configuration missing required keys"));
-    assert!(stderr.contains("root_domain"));
+    assert!(stderr.contains("tunnel_domain"));
     assert!(stderr.contains("admin_email"));
     assert!(stderr.contains("listen_http"));
     assert!(stderr.contains("listen_https"));
@@ -152,7 +155,10 @@ fn test_startup_listen_fds_invalid_count_exits_1() {
 
     assert_eq!(output.status.code(), Some(1));
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("Expected exactly 2 sockets in LISTEN_FDS"));
+    assert!(
+        stderr.contains("Expected at least 2 inherited sockets"),
+        "got: {stderr}"
+    );
 }
 
 #[test]

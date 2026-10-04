@@ -15,7 +15,8 @@ fn create_valid_test_config(
     control_socket: std::path::PathBuf,
 ) -> Config {
     Config {
-        root_domain: "weaver.test".to_string(),
+        tunnel_domain: "weaver.test".to_string(),
+        admin_domain: "relay-admin.test".to_string(),
         admin_email: "admin@weaver.test".to_string(),
         acme_provider: "letsencrypt-staging".to_string(),
         listen_http: SocketAddr::from(([127, 0, 0, 1], http_port)),
@@ -27,6 +28,8 @@ fn create_valid_test_config(
         acme_root_ca_pem: None,
         acme_fallback_providers: Vec::new(),
         usage_flush_interval_secs: 60,
+        relay_ips: Vec::new(),
+        setup_complete: false,
     }
 }
 
@@ -146,30 +149,22 @@ async fn test_control_socket_daemon_suite() {
     let config = create_valid_test_config(http_port, https_port, control_sock_path.clone());
     store.save_config(&config).await.unwrap();
 
-    // Generate valid self-signed certificates using rcgen
-    let root_rcgen = rcgen::generate_simple_self_signed(vec!["weaver.test".to_string()]).unwrap();
+    // Generate the single wildcard certificate `[weaver.test, *.weaver.test]`.
+    let root_rcgen = rcgen::generate_simple_self_signed(vec![
+        "weaver.test".to_string(),
+        "*.weaver.test".to_string(),
+    ])
+    .unwrap();
     let root_cert_pem = root_rcgen.cert.pem();
     let root_key_pem = root_rcgen.signing_key.serialize_pem();
 
-    let tunnel_rcgen =
-        rcgen::generate_simple_self_signed(vec!["tunnel-active.weaver.test".to_string()]).unwrap();
-    let tunnel_cert_pem = tunnel_rcgen.cert.pem();
-    let tunnel_key_pem = tunnel_rcgen.signing_key.serialize_pem();
-
-    let inactive_rcgen =
-        rcgen::generate_simple_self_signed(vec!["tunnel-inactive.weaver.test".to_string()])
-            .unwrap();
-    let inactive_cert_pem = inactive_rcgen.cert.pem();
-    let inactive_key_pem = inactive_rcgen.signing_key.serialize_pem();
-
-    // Seed certificates table with root domain, an active tunnel, and an inactive tunnel
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs() as i64;
 
-    let seed_cert = |cert_pem: &str, key_pem: &str, days: i64, active: bool| {
-        weaver_server::store::NewCertificate {
+    let seed_cert =
+        |cert_pem: &str, key_pem: &str, days: i64| weaver_server::store::NewCertificate {
             cert_pem: cert_pem.to_string(),
             key_pem: key_pem.to_string(),
             not_before: now - 3600,
@@ -177,37 +172,16 @@ async fn test_control_socket_daemon_suite() {
             issuer: Some("Test Issuer".to_string()),
             directory: "letsencrypt-staging".to_string(),
             obtained_at: now - 3600,
-            active_at: active.then_some(now - 3600),
-        }
-    };
-    // Seed an older certificate for root domain (30 days left)
+            validation: "dns-01".to_string(),
+        };
+    // Seed an older wildcard (30 days left), then upsert the newer one (90
+    // days left): one global row keyed by the apex name.
     store
-        .save_certificate(
-            "weaver.test",
-            seed_cert(&root_cert_pem, &root_key_pem, 30, true),
-        )
-        .await
-        .unwrap();
-    // Seed the best/newer certificate for root domain (90 days left)
-    store
-        .save_certificate(
-            "weaver.test",
-            seed_cert(&root_cert_pem, &root_key_pem, 90, true),
-        )
+        .save_certificate("weaver.test", seed_cert(&root_cert_pem, &root_key_pem, 30))
         .await
         .unwrap();
     store
-        .save_certificate(
-            "tunnel-active.weaver.test",
-            seed_cert(&tunnel_cert_pem, &tunnel_key_pem, 60, true),
-        )
-        .await
-        .unwrap();
-    store
-        .save_certificate(
-            "tunnel-inactive.weaver.test",
-            seed_cert(&inactive_cert_pem, &inactive_key_pem, 30, false),
-        )
+        .save_certificate("weaver.test", seed_cert(&root_cert_pem, &root_key_pem, 90))
         .await
         .unwrap();
     // Cert events
@@ -217,15 +191,6 @@ async fn test_control_socket_daemon_suite() {
             now - 3600,
             "issued",
             Some("Certificate successfully issued"),
-        )
-        .await
-        .unwrap();
-    store
-        .record_cert_event(
-            "tunnel-active.weaver.test",
-            now - 3600,
-            "issued",
-            Some("Issued for tunnel"),
         )
         .await
         .unwrap();
@@ -324,12 +289,15 @@ async fn test_control_socket_daemon_suite() {
         assert_eq!(output.status.code(), Some(0));
         let val: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
         assert_eq!(val["ok"], true);
-        assert_eq!(val["root_domain"], "weaver.test");
-        assert_eq!(val["schema_version"], 2);
-        assert_eq!(val["cert_counts"]["issued"], 2); // root + active
-        assert_eq!(val["cert_counts"]["inactive"], 1); // inactive
-        assert_eq!(val["cert_counts"]["ordering"], 0);
+        assert_eq!(val["tunnel_domain"], "weaver.test");
+        assert_eq!(val["admin_domain"], "relay-admin.test");
+        assert_eq!(val["schema_version"], 1);
+        // The seeded tunnel wildcard reports issued; the admin certificate has
+        // no stored row and is still pending, so it counts as ordering.
+        assert_eq!(val["cert_counts"]["issued"], 1);
+        assert_eq!(val["cert_counts"]["ordering"], 1);
         assert_eq!(val["cert_counts"]["failed"], 0);
+        assert_eq!(val["cert_counts"]["inactive"], 0);
     }
 
     // --- Test CLI: status human-readable ---
@@ -345,7 +313,9 @@ async fn test_control_socket_daemon_suite() {
         let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(stdout.contains("Weaver Server Status"));
         assert!(stdout.contains("Root Domain"));
+        assert!(stdout.contains("Admin Domain"));
         assert!(stdout.contains("weaver.test"));
+        assert!(stdout.contains("relay-admin.test"));
         assert!(stdout.contains("issued"));
         assert!(stdout.contains("inactive"));
     }
@@ -365,16 +335,12 @@ async fn test_control_socket_daemon_suite() {
         let val: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
         assert_eq!(val["ok"], true);
         let certs = val["certificates"].as_array().unwrap();
-        // Default only shows the best certificate per domain (3 domains)
-        assert_eq!(certs.len(), 3);
+        // Two managed certificates: the tunnel wildcard and the admin host.
+        assert_eq!(certs.len(), 2);
         // Root domain is strictly first!
         assert_eq!(certs[0]["name"], "weaver.test");
-        assert_eq!(certs[0]["active"], true);
         assert!(certs[0]["cert_id"].as_i64().is_some());
-        // Remaining names sorted alphabetically
-        assert_eq!(certs[1]["name"], "tunnel-active.weaver.test");
-        assert_eq!(certs[2]["name"], "tunnel-inactive.weaver.test");
-        assert_eq!(certs[2]["active"], false);
+        assert_eq!(certs[1]["name"], "relay-admin.test");
     }
 
     // --- Test CLI: cert status --no-only-best (shows all certs and CERT-ID) ---
@@ -393,13 +359,10 @@ async fn test_control_socket_daemon_suite() {
         let val: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
         assert_eq!(val["ok"], true);
         let certs = val["certificates"].as_array().unwrap();
-        // Shows all 4 certificates (2 for weaver.test, 1 active tunnel, 1 inactive tunnel)
-        assert_eq!(certs.len(), 4);
+        // Global certificates have no per-domain ranking: still two rows.
+        assert_eq!(certs.len(), 2);
         assert_eq!(certs[0]["name"], "weaver.test");
-        assert_eq!(certs[1]["name"], "weaver.test");
         assert!(certs[0]["cert_id"].as_i64().is_some());
-        assert!(certs[1]["cert_id"].as_i64().is_some());
-        assert_ne!(certs[0]["cert_id"], certs[1]["cert_id"]);
     }
 
     // --- Test CLI: cert status human-readable table with highlighted root ---
@@ -418,10 +381,9 @@ async fn test_control_socket_daemon_suite() {
         assert!(!stdout.contains("CERT-ID")); // CERT-ID column omitted by default
         assert!(stdout.contains("weaver.test"));
         assert!(stdout.contains("★")); // Highlighted root!
-        assert!(stdout.contains("tunnel-active.weaver.test"));
     }
 
-    // --- Test CLI: cert status --no-only-best table has CERT-ID and single ★ on best root cert ---
+    // --- Test CLI: cert status --no-only-best table has CERT-ID and ★ on the apex ---
     {
         let output = Command::new(bin_path)
             .arg("--socket")
@@ -436,10 +398,8 @@ async fn test_control_socket_daemon_suite() {
         let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(stdout.contains("CERT-ID"));
         assert!(stdout.contains("NAME"));
-        // Best root certificate has star marker
+        // The single global certificate is the highlighted apex row.
         assert!(stdout.contains("★ weaver.test"));
-        // Secondary root certificate has space indent without star
-        assert!(stdout.contains("  weaver.test"));
     }
 
     // --- Test CLI: cert status detail view ---
@@ -530,7 +490,7 @@ async fn test_control_socket_daemon_suite() {
         assert_eq!(val["renewed"][0], "weaver.test");
     }
 
-    // --- Test CLI: cert renew --all skips inactive ---
+    // --- Test CLI: cert renew --all has nothing to skip now ---
     {
         let output = Command::new(bin_path)
             .arg("--socket")
@@ -547,19 +507,25 @@ async fn test_control_socket_daemon_suite() {
         assert_eq!(val["ok"], true);
         let renewed = val["renewed"].as_array().unwrap();
         let skipped = val["skipped_inactive"].as_array().unwrap();
-        assert!(renewed.iter().any(|n| n == "weaver.test"));
-        assert!(renewed.iter().any(|n| n == "tunnel-active.weaver.test"));
-        assert!(skipped.iter().any(|n| n == "tunnel-inactive.weaver.test"));
+        // Both managed certificates are queued; admin sorts first.
+        assert_eq!(
+            renewed,
+            &vec![
+                serde_json::Value::from("relay-admin.test"),
+                serde_json::Value::from("weaver.test"),
+            ]
+        );
+        assert!(skipped.is_empty());
     }
 
-    // --- Test CLI: cert renew explicit inactive hostname is permitted ---
+    // --- Test CLI: cert renew for an explicit hostname maps to the wildcard ---
     {
         let output = Command::new(bin_path)
             .arg("--socket")
             .arg(&control_sock_path)
             .arg("cert")
             .arg("renew")
-            .arg("tunnel-inactive.weaver.test")
+            .arg("poc-laptop-web.weaver.test")
             .arg("--json")
             .output()
             .unwrap();
@@ -567,7 +533,7 @@ async fn test_control_socket_daemon_suite() {
         assert_eq!(output.status.code(), Some(0));
         let val: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
         assert_eq!(val["ok"], true);
-        assert_eq!(val["renewed"][0], "tunnel-inactive.weaver.test");
+        assert_eq!(val["renewed"][0], "poc-laptop-web.weaver.test");
     }
 
     // --- Test CLI: backup command ---
@@ -615,9 +581,7 @@ async fn test_cert_wait_streaming_failed_exit_4_and_renew_rate_limit() {
     use std::sync::Arc;
     use std::time::Instant;
     use tokio_util::sync::CancellationToken;
-    use weaver_server::cert::{
-        CertManager, CertResolver, CertState, ChallengeRegistry, SystemClock,
-    };
+    use weaver_server::cert::{CertManager, CertResolver, CertState, SystemClock};
 
     let dir = tempdir().unwrap();
     let db_path = dir.path().join("test.db");
@@ -625,7 +589,8 @@ async fn test_cert_wait_streaming_failed_exit_4_and_renew_rate_limit() {
 
     let store = Arc::new(Store::open(&db_path).await.unwrap());
     let config = Arc::new(Config {
-        root_domain: "weaver.test".to_string(),
+        tunnel_domain: "weaver.test".to_string(),
+        admin_domain: "relay-admin.test".to_string(),
         admin_email: "admin@weaver.test".to_string(),
         acme_provider: "letsencrypt-staging".to_string(),
         listen_http: "[::]:80".parse().unwrap(),
@@ -637,22 +602,18 @@ async fn test_cert_wait_streaming_failed_exit_4_and_renew_rate_limit() {
         acme_root_ca_pem: None,
         acme_fallback_providers: Vec::new(),
         usage_flush_interval_secs: 60,
+        relay_ips: Vec::new(),
+        setup_complete: false,
     });
     store.save_config(&config).await.unwrap();
 
-    let challenge_registry = Arc::new(ChallengeRegistry::new());
-    let resolver = Arc::new(CertResolver::new(
-        config.root_domain.clone(),
-        Arc::clone(&challenge_registry),
-    ));
+    let resolver = Arc::new(CertResolver::new(config.tunnel_domain.clone()));
 
     let cert_manager = CertManager::new(
         Arc::clone(&config),
         Arc::clone(&store),
         Arc::clone(&resolver),
-        Arc::clone(&challenge_registry),
         Arc::new(SystemClock),
-        true,
     );
 
     // Track a test hostname in Ordering state
@@ -724,6 +685,16 @@ async fn test_cert_wait_streaming_failed_exit_4_and_renew_rate_limit() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("Issuance failed: ACME Challenge validation failed"));
 
+    // Renewal now acts on the apex (the wildcard is the only certificate), so
+    // mark the apex failed with a future retry to exercise the rate limit.
+    cert_manager.set_state(
+        "weaver.test",
+        CertState::Failed {
+            error: "ACME Challenge validation failed".to_string(),
+            next_retry: now + 3600,
+        },
+    );
+
     // Now test cert renew without --force -> must fail with rate limit error (exit 1)
     let sock = control_sock_path.clone();
     let output = tokio::task::spawn_blocking(move || {
@@ -794,7 +765,7 @@ async fn test_usage_control_verb_and_cli() {
     use std::sync::Arc;
     use std::time::Instant;
     use tokio_util::sync::CancellationToken;
-    use weaver_server::cert::{CertManager, CertResolver, ChallengeRegistry, SystemClock};
+    use weaver_server::cert::{CertManager, CertResolver, SystemClock};
     use weaver_server::metering::MeteringManager;
 
     let dir = tempdir().unwrap();
@@ -805,18 +776,12 @@ async fn test_usage_control_verb_and_cli() {
     let config = Arc::new(create_valid_test_config(0, 0, control_sock_path.clone()));
     store.save_config(&config).await.unwrap();
 
-    let challenge_registry = Arc::new(ChallengeRegistry::new());
-    let resolver = Arc::new(CertResolver::new(
-        config.root_domain.clone(),
-        Arc::clone(&challenge_registry),
-    ));
+    let resolver = Arc::new(CertResolver::new(config.tunnel_domain.clone()));
     let cert_manager = CertManager::new(
         Arc::clone(&config),
         Arc::clone(&store),
         resolver,
-        challenge_registry,
         Arc::new(SystemClock),
-        true,
     );
 
     // Seed one service and drive the manager's own loop so open time accrues.
@@ -984,5 +949,284 @@ async fn test_usage_control_verb_and_cli() {
     );
 
     meter_task.abort();
+    shutdown_token.cancel();
+}
+
+// 7. status reports both domains; cert.status carries validation + wildcard.
+#[tokio::test]
+async fn test_status_and_cert_status_report_admin_and_cert_metadata() {
+    use std::sync::Arc;
+    use std::time::Instant;
+    use tokio_util::sync::CancellationToken;
+    use weaver_server::cert::{CertManager, CertResolver, SystemClock};
+
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("meta.db");
+    let control_sock_path = dir.path().join("control.sock");
+
+    let store = Arc::new(Store::open(&db_path).await.unwrap());
+    let config = Arc::new(create_valid_test_config(0, 0, control_sock_path.clone()));
+    store.save_config(&config).await.unwrap();
+
+    let now = now_secs();
+    store
+        .save_certificate(
+            "weaver.test",
+            weaver_server::store::NewCertificate {
+                cert_pem: "WILDCARD-CERT".into(),
+                key_pem: "WILDCARD-KEY".into(),
+                not_before: now - 60,
+                not_after: now + 86_400,
+                issuer: None,
+                directory: "letsencrypt-staging".into(),
+                obtained_at: now - 60,
+                validation: "dns-01".into(),
+            },
+        )
+        .await
+        .unwrap();
+    store
+        .save_certificate(
+            "relay-admin.test",
+            weaver_server::store::NewCertificate {
+                cert_pem: "ADMIN-CERT".into(),
+                key_pem: "ADMIN-KEY".into(),
+                not_before: now - 60,
+                not_after: now + 86_400,
+                issuer: None,
+                directory: "letsencrypt-staging".into(),
+                obtained_at: now - 60,
+                validation: "http-01".into(),
+            },
+        )
+        .await
+        .unwrap();
+
+    let resolver = Arc::new(CertResolver::new(config.tunnel_domain.clone()));
+    let cert_manager = CertManager::new(
+        Arc::clone(&config),
+        Arc::clone(&store),
+        resolver,
+        Arc::new(SystemClock),
+    );
+
+    let shutdown_token = CancellationToken::new();
+    let listener =
+        weaver_server::control::server::bind_control_listener(&control_sock_path).unwrap();
+    let srv_token = shutdown_token.clone();
+    let srv_sock = control_sock_path.clone();
+    let srv_cfg = Arc::clone(&config);
+    let srv_store = Arc::clone(&store);
+    let srv_mgr = Arc::clone(&cert_manager);
+    let srv_metering = Arc::new(weaver_server::metering::MeteringManager::new(
+        store.as_ref().clone(),
+        Duration::from_secs(60),
+    ));
+    tokio::spawn(async move {
+        let _ = weaver_server::control::server::run_control_server_with_listener(
+            listener,
+            srv_sock,
+            srv_cfg,
+            srv_store,
+            srv_mgr,
+            srv_metering,
+            Instant::now(),
+            srv_token,
+        )
+        .await;
+    });
+
+    // `status` names both managed domains.
+    let status = control_roundtrip(
+        &control_sock_path,
+        serde_json::json!({"v": 1, "cmd": "status"}),
+    )
+    .await;
+    assert_eq!(status["tunnel_domain"], "weaver.test");
+    assert_eq!(status["admin_domain"], "relay-admin.test");
+
+    // `cert.status` list carries validation + wildcard for both rows.
+    let list = control_roundtrip(
+        &control_sock_path,
+        serde_json::json!({"v": 1, "cmd": "cert.status"}),
+    )
+    .await;
+    let certs = list["certificates"].as_array().unwrap();
+    let root = certs
+        .iter()
+        .find(|c| c["name"] == "weaver.test")
+        .expect("tunnel row");
+    assert_eq!(root["validation"], "dns-01");
+    let admin = certs
+        .iter()
+        .find(|c| c["name"] == "relay-admin.test")
+        .expect("admin row");
+    assert_eq!(admin["validation"], "http-01");
+
+    // Detail view for the admin name reports its mechanism and kind.
+    let detail = control_roundtrip(
+        &control_sock_path,
+        serde_json::json!({"v": 1, "cmd": "cert.status", "name": "relay-admin.test"}),
+    )
+    .await;
+    assert_eq!(detail["ok"], true);
+    assert_eq!(detail["validation"], "http-01");
+
+    shutdown_token.cancel();
+}
+
+// 8. `doctor` round-trips a full report over the socket and through the CLI.
+#[tokio::test]
+async fn test_doctor_control_verb_and_cli() {
+    use std::sync::Arc;
+    use std::time::Instant;
+    use tokio_util::sync::CancellationToken;
+    use weaver_server::cert::{CertManager, CertResolver, SystemClock};
+
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("doctor.db");
+    let control_sock_path = dir.path().join("control.sock");
+
+    let store = Arc::new(Store::open(&db_path).await.unwrap());
+    let config = Arc::new(create_valid_test_config(0, 0, control_sock_path.clone()));
+    store.save_config(&config).await.unwrap();
+
+    // Seed the tunnel wildcard so the daemon's certificate-health check has a
+    // real record to describe.
+    let now = now_secs();
+    store
+        .save_certificate(
+            "weaver.test",
+            weaver_server::store::NewCertificate {
+                cert_pem: "WILDCARD-CERT".into(),
+                key_pem: "WILDCARD-KEY".into(),
+                not_before: now - 60,
+                not_after: now + 86_400,
+                issuer: None,
+                directory: "letsencrypt-staging".into(),
+                obtained_at: now - 60,
+                validation: "dns-01".into(),
+            },
+        )
+        .await
+        .unwrap();
+
+    let resolver = Arc::new(CertResolver::new(config.tunnel_domain.clone()));
+    let cert_manager = CertManager::new(
+        Arc::clone(&config),
+        Arc::clone(&store),
+        resolver,
+        Arc::new(SystemClock),
+    );
+
+    let shutdown_token = CancellationToken::new();
+    let listener =
+        weaver_server::control::server::bind_control_listener(&control_sock_path).unwrap();
+    let srv_token = shutdown_token.clone();
+    let srv_sock = control_sock_path.clone();
+    let srv_cfg = Arc::clone(&config);
+    let srv_store = Arc::clone(&store);
+    let srv_mgr = Arc::clone(&cert_manager);
+    let srv_metering = Arc::new(weaver_server::metering::MeteringManager::new(
+        store.as_ref().clone(),
+        Duration::from_secs(60),
+    ));
+    tokio::spawn(async move {
+        let _ = weaver_server::control::server::run_control_server_with_listener(
+            listener,
+            srv_sock,
+            srv_cfg,
+            srv_store,
+            srv_mgr,
+            srv_metering,
+            Instant::now(),
+            srv_token,
+        )
+        .await;
+    });
+
+    // Raw verb: the response is the serialized report, with per-port checks as
+    // ordinary checklist items and a certificate check per managed name.
+    let report = control_roundtrip(
+        &control_sock_path,
+        serde_json::json!({"v": 1, "cmd": "doctor"}),
+    )
+    .await;
+    assert_eq!(report["tunnel_domain"], "weaver.test");
+    assert_eq!(report["admin_domain"], "relay-admin.test");
+    let titles: Vec<&str> = report["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["title"].as_str().unwrap())
+        .collect();
+    for expected in [
+        "Domain split",
+        "Admin addresses",
+        "Delegation",
+        "Certificate weaver.test",
+        "Certificate relay-admin.test",
+        "Port 80",
+        "Port 443",
+        "Port 53",
+    ] {
+        assert!(titles.contains(&expected), "missing check: {expected}");
+    }
+    // The seeded wildcard reports its mechanism and kind.
+    let root_cert = report["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["title"] == "Certificate weaver.test")
+        .unwrap();
+    assert!(root_cert["detail"].as_str().unwrap().contains("dns-01"));
+    assert!(root_cert["detail"].as_str().unwrap().contains("wildcard"));
+    // No relay IPs are stored, so the port checks fail.
+    let port_80 = report["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["title"] == "Port 80")
+        .unwrap();
+    assert_eq!(port_80["ok"], false);
+
+    // CLI path: it detects the live relay and prints the report, exiting
+    // nonzero because the port checks cannot pass without stored relay IPs.
+    // Run the blocking child on a separate thread so the in-process server
+    // task keeps making progress on the async runtime.
+    let cli_sock = control_sock_path.clone();
+    let output = tokio::task::spawn_blocking(move || {
+        Command::new(env!("CARGO_BIN_EXE_weaver-server"))
+            .arg("--socket")
+            .arg(&cli_sock)
+            .arg("doctor")
+            .arg("--json")
+            .output()
+            .unwrap()
+    })
+    .await
+    .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let val: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(val["ok"], false);
+    assert_eq!(val["tunnel_domain"], "weaver.test");
+
+    // Human path prints the rendered checklist.
+    let cli_sock = control_sock_path.clone();
+    let output = tokio::task::spawn_blocking(move || {
+        Command::new(env!("CARGO_BIN_EXE_weaver-server"))
+            .arg("--socket")
+            .arg(&cli_sock)
+            .arg("doctor")
+            .output()
+            .unwrap()
+    })
+    .await
+    .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Weaver Server Doctor"));
+    assert!(stdout.contains("Port 80"));
+
     shutdown_token.cancel();
 }

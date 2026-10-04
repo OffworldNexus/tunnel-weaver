@@ -1,6 +1,7 @@
 pub mod cert;
 pub mod config;
 pub mod control;
+pub mod dns;
 pub mod edge;
 pub mod metering;
 pub mod notify;

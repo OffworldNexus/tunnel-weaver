@@ -60,11 +60,67 @@ pub fn is_public_ip(ip: &IpAddr) -> bool {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExistingInstall {
     /// Currently configured root domain in the existing installation.
-    pub root_domain: String,
+    pub tunnel_domain: String,
+}
+
+/// The network ports the relay must own and prove reachable.
+///
+/// A named type instead of positional fields or `"Port 80"` strings, so the
+/// planner, the doctor probe and the CLI all agree on the set and its order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Port {
+    /// Cleartext HTTP, also the ACME HTTP-01 path.
+    Http = 80,
+    /// TLS HTTPS.
+    Https = 443,
+    /// Authoritative DNS, TCP and UDP.
+    Dns = 53,
+}
+
+impl Port {
+    /// Every required port, in checklist order.
+    pub const ALL: [Port; 3] = [Port::Http, Port::Https, Port::Dns];
+
+    /// The port number.
+    pub fn number(self) -> u16 {
+        self as u16
+    }
+
+    /// Position of this port in [`Port::ALL`].
+    pub fn index(self) -> usize {
+        match self {
+            Port::Http => 0,
+            Port::Https => 1,
+            Port::Dns => 2,
+        }
+    }
+
+    /// Checklist title, e.g. `"Port 80"`.
+    pub fn title(self) -> String {
+        format!("Port {}", self.number())
+    }
+
+    /// Human description of the transport the probe exercises.
+    pub fn transport(self) -> &'static str {
+        match self {
+            Port::Http => "TCP 80",
+            Port::Https => "TCP 443",
+            Port::Dns => "TCP+UDP 53",
+        }
+    }
+
+    /// The planner's abort for this port being unreachable.
+    fn unreachable(self, reason: String) -> PlanAbort {
+        match self {
+            Port::Http => PlanAbort::Port80NotReachable(reason),
+            Port::Https => PlanAbort::Port443NotReachable(reason),
+            Port::Dns => PlanAbort::Port53NotReachable(reason),
+        }
+    }
 }
 
 /// Reachability probe result for a specific port.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum PortReachability {
     /// Outbound connection to resolved public IP successfully routed back to our listener and solved the challenge.
     ReachedSelf,
@@ -83,16 +139,29 @@ pub struct SystemProbe {
     pub supported_arch: bool,
     /// Target root domain being installed.
     pub target_domain: String,
+    /// The relay's own (admin) hostname, kept outside the tunnel delegation.
+    pub admin_domain: String,
     /// Optional existing installation details.
     pub existing_install: Option<ExistingInstall>,
     /// Resolved IP addresses for the apex domain `<root>`.
     pub root_ips: Vec<IpAddr>,
     /// Resolved IP addresses for the random probe subdomain `probe-<random>.<root>`.
     pub probe_ips: Vec<IpAddr>,
+    /// NS targets observed for `<root>` through the public resolvers.
+    pub ns_targets: Vec<String>,
+    /// Whether `<root>` is self-delegated (the apex is its own nameserver).
+    pub delegation_ok: bool,
+    /// Whether every public resolver returned the apex set for the probe name.
+    pub resolvers_ok: bool,
     /// Reachability probe status on port 80.
     pub port_80: PortReachability,
     /// Reachability probe status on port 443.
     pub port_443: PortReachability,
+    /// Reachability probe status on port 53 (authoritative DNS, TCP and UDP).
+    pub port_53: PortReachability,
+    /// Human-readable description of a `systemd-resolved` stub conflict on
+    /// port 53, when detected.
+    pub resolver_stub_conflict: Option<String>,
     /// Whether setup was invoked in non-interactive headless mode.
     pub is_headless: bool,
     /// Whether the user confirmed changing an existing installed domain.
@@ -109,6 +178,17 @@ pub struct SystemProbe {
     pub acme_provider: String,
     /// Whether External Account Binding (EAB) credentials will be registered.
     pub has_eab: bool,
+}
+
+impl SystemProbe {
+    /// The required ports paired with their probe verdicts, in checklist order.
+    fn ports(&self) -> [(Port, &PortReachability); 3] {
+        [
+            (Port::Http, &self.port_80),
+            (Port::Https, &self.port_443),
+            (Port::Dns, &self.port_53),
+        ]
+    }
 }
 
 /// Fatal condition detected during planning that halts setup.
@@ -147,13 +227,44 @@ pub enum PlanAbort {
     /// Inbound traffic on port 443 failed to reach our own listener.
     #[error("port 443 reachability check failed: {0}")]
     Port443NotReachable(String),
+
+    /// Inbound DNS traffic on port 53 failed to reach the relay's own listeners.
+    #[error("port 53 reachability check failed: {0}")]
+    Port53NotReachable(String),
+
+    /// The apex domain resolved to zero A/AAAA records.
+    #[error("apex domain '{0}' has no A or AAAA records")]
+    ApexMissing(String),
+
+    /// Resolvers disagree about the apex: the probe name did not match.
+    #[error("apex mismatch: expected {expected:?}, but the probe subdomain resolved to {found:?}")]
+    ApexMismatch {
+        /// Addresses the apex resolved to.
+        expected: Vec<IpAddr>,
+        /// Addresses the ephemeral probe subdomain resolved to.
+        found: Vec<IpAddr>,
+    },
+
+    /// The delegated zone could not be resolved consistently through public DNS.
+    #[error("DNS delegation probe failed: {0}")]
+    ProbeResolutionFailed(String),
+
+    /// `systemd-resolved`'s stub listener occupies the port our DNS socket needs.
+    #[error("systemd-resolved conflicts with the relay DNS socket: {0}")]
+    ResolverStubConflict(String),
+
+    /// The admin and tunnel domains are nested unsafely.
+    #[error("unsafe admin/tunnel domain split: {0}")]
+    UnsafeDomainSplit(String),
 }
 
 /// Concrete execution plan approved by the planner.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Plan {
     /// Approved root domain.
-    pub root_domain: String,
+    pub tunnel_domain: String,
+    /// The relay's own (admin) hostname, issued its own HTTP-01 certificate.
+    pub admin_domain: String,
     /// Database path to open and configure.
     pub db_path: String,
     /// System service user.
@@ -168,6 +279,9 @@ pub struct Plan {
     pub is_upgrade: bool,
     /// Whether connect-back reachability checks were bypassed.
     pub reachability_skipped: bool,
+    /// The relay's own public IPs, resolved from the apex. Persisted to config
+    /// and used to render the explicit DNS socket unit bindings.
+    pub relay_ips: Vec<IpAddr>,
 }
 
 /// Evaluates a system probe and produces an execution plan or an abort error.
@@ -182,27 +296,55 @@ pub fn plan_setup(probe: &SystemProbe) -> Result<Plan, PlanAbort> {
         return Err(PlanAbort::UnsupportedArchitecture);
     }
 
+    // 2b. Preflight: the admin domain must not fall inside the delegated tunnel
+    //     zone, or the tunnel delegation would control the admin DNS.
+    if let Some(issue) =
+        crate::config::domain_split_issue(&probe.admin_domain, &probe.target_domain)
+    {
+        return Err(PlanAbort::UnsafeDomainSplit(issue));
+    }
+
     // 3. Existing installation domain check
     let mut is_upgrade = false;
     if let Some(existing) = &probe.existing_install {
         is_upgrade = true;
-        if existing.root_domain != probe.target_domain
+        if existing.tunnel_domain != probe.target_domain
             && !probe.is_headless
             && !probe.confirmed_domain_change
         {
             return Err(PlanAbort::DomainMismatch {
-                existing: existing.root_domain.clone(),
+                existing: existing.tunnel_domain.clone(),
                 target: probe.target_domain.clone(),
             });
         }
     }
 
-    // 4. DNS check: non-empty
-    if probe.root_ips.is_empty() {
-        return Err(PlanAbort::DnsEmpty(probe.target_domain.clone()));
+    // 4. DNS delegation: the zone must be self-delegated through public DNS.
+    if let Some(conflict) = &probe.resolver_stub_conflict {
+        return Err(PlanAbort::ResolverStubConflict(conflict.clone()));
+    }
+    if !probe.delegation_ok {
+        return Err(PlanAbort::ProbeResolutionFailed(format!(
+            "'{}' is not self-delegated; NS targets found: [{}]",
+            probe.target_domain,
+            probe.ns_targets.join(", ")
+        )));
     }
 
-    // 5. DNS check: root and probe IPs must match
+    // 5. DNS check: apex must resolve.
+    if probe.root_ips.is_empty() {
+        return Err(PlanAbort::ApexMissing(probe.target_domain.clone()));
+    }
+
+    // 6. DNS check: every resolver must agree with the apex on the probe name.
+    if !probe.resolvers_ok {
+        return Err(PlanAbort::ApexMismatch {
+            expected: probe.root_ips.clone(),
+            found: probe.probe_ips.clone(),
+        });
+    }
+
+    // 7. DNS check: root and probe IPs must match
     let root_set: BTreeSet<IpAddr> = probe.root_ips.iter().copied().collect();
     let probe_set: BTreeSet<IpAddr> = probe.probe_ips.iter().copied().collect();
     if root_set != probe_set {
@@ -212,42 +354,31 @@ pub fn plan_setup(probe: &SystemProbe) -> Result<Plan, PlanAbort> {
         });
     }
 
-    // 6. DNS check: every resolved IP must be public
+    // 8. DNS check: every resolved IP must be public
     for ip in &root_set {
         if !is_public_ip(ip) {
             return Err(PlanAbort::NonPublicIp(*ip));
         }
     }
 
-    // 7. Reachability checks: both 80 and 443 are mandatory unless skipped
+    // 9. Reachability checks: 80, 443, and 53 are mandatory unless skipped
     if !probe.skip_reachability_check {
-        match &probe.port_80 {
-            PortReachability::ReachedSelf => {}
-            PortReachability::Failed(reason) => {
-                return Err(PlanAbort::Port80NotReachable(reason.clone()));
-            }
-            PortReachability::Skipped => {
-                return Err(PlanAbort::Port80NotReachable(
-                    "reachability was not performed".into(),
-                ));
-            }
-        }
-
-        match &probe.port_443 {
-            PortReachability::ReachedSelf => {}
-            PortReachability::Failed(reason) => {
-                return Err(PlanAbort::Port443NotReachable(reason.clone()));
-            }
-            PortReachability::Skipped => {
-                return Err(PlanAbort::Port443NotReachable(
-                    "reachability was not performed".into(),
-                ));
+        for (port, verdict) in probe.ports() {
+            match verdict {
+                PortReachability::ReachedSelf => {}
+                PortReachability::Failed(reason) => {
+                    return Err(port.unreachable(reason.clone()));
+                }
+                PortReachability::Skipped => {
+                    return Err(port.unreachable("reachability was not performed".into()));
+                }
             }
         }
     }
 
     Ok(Plan {
-        root_domain: probe.target_domain.clone(),
+        tunnel_domain: probe.target_domain.clone(),
+        admin_domain: probe.admin_domain.clone(),
         db_path: probe.db_path.clone(),
         user: probe.user.clone(),
         prefix: probe.prefix.clone(),
@@ -255,5 +386,6 @@ pub fn plan_setup(probe: &SystemProbe) -> Result<Plan, PlanAbort> {
         has_eab: probe.has_eab,
         is_upgrade,
         reachability_skipped: probe.skip_reachability_check,
+        relay_ips: probe.root_ips.clone(),
     })
 }

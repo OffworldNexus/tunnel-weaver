@@ -55,12 +55,19 @@ rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"]
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 instant-acme = { version = "0.8", default-features = false, features = ["hyper-rustls", "ring"] }
+# Authoritative DNS responder and setup-side explicit DNS queries. `hickory-proto`
+# is sans-IO: it parses and serialises messages, and we drive the sockets
+# ourselves (UDP/TCP 53 inherited via systemd socket activation).
+hickory-proto = { version = "0.26", default-features = false, features = ["std"] }
 base64 = "0.22"
 bytes = "1"
 socket2 = "0.6"
 libc = "0.2"
 comfy-table = "7.1"
 crossterm = "0.29"
+# Line-editable prompts for `weaver-server setup`. Uses the same `crossterm`
+# backend as the rest of the CLI, so no second terminal crate is pulled in.
+inquire = "0.9"
 jiff = { version = "0.2", default-features = false, features = ["std", "tz-system"] }
 futures-util = "0.3"
 tokio-tungstenite = { version = "0.26", default-features = false, features = ["handshake"] }

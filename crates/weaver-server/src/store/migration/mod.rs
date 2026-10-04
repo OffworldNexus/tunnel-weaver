@@ -9,17 +9,16 @@
 use sea_orm_migration::prelude::*;
 
 mod m0001_init;
-mod m0002_usage;
 
 /// The ordered list of every migration known to this binary.
+///
+/// There has been no release, so the schema is described by this single initial
+/// migration; the former incremental `m0002`–`m0004` have been folded into it.
 pub struct Migrator;
 
 #[async_trait::async_trait]
 impl MigratorTrait for Migrator {
     fn migrations() -> Vec<Box<dyn MigrationTrait>> {
-        vec![
-            Box::new(m0001_init::Migration),
-            Box::new(m0002_usage::Migration),
-        ]
+        vec![Box::new(m0001_init::Migration)]
     }
 }

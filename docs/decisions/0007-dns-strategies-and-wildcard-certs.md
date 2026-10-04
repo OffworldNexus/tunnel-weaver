@@ -4,9 +4,12 @@ Date: 2026-09-20
 
 ## Status
 
-Proposed. Records a direction decided during OFF-75 testing; not implemented
-in M1. The edge WAF (`weaver-server/src/edge/waf.rs`) is the M1 stopgap for
-the exposure this ADR eventually closes.
+Superseded in part by [ADR 0008](0008-flat-hostnames-wildcard-cert.md), which
+implements the DNS-01/wildcard direction as a **single** `[<root>, *.<root>]`
+certificate over flat one-label hostnames (rather than per-machine wildcards),
+makes DNS a hard setup precondition (no Strategy A), and corrects the
+out-of-zone answer to `REFUSED`. The M1 per-hostname + TLS-ALPN-01 model this
+document describes has been deleted by OFF-190.
 
 ## Context
 

@@ -1,6 +1,7 @@
 //! Host setup, preflight checks, systemd management, reachability probes, and uninstallation.
 
 pub mod dns;
+pub mod doctor;
 pub mod install;
 pub mod interactive;
 pub mod planner;

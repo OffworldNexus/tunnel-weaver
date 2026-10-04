@@ -1,10 +1,13 @@
 //! Golden file tests asserting byte-identical rendering of systemd units.
 
+use std::net::IpAddr;
+
 use weaver_server::setup::units::{ServiceUnitParams, render_service_unit, render_socket_unit};
 
 #[test]
 fn test_socket_unit_golden_match() {
-    let rendered = render_socket_unit();
+    let relay_ip: IpAddr = "203.0.113.7".parse().unwrap();
+    let rendered = render_socket_unit(&[relay_ip]);
     let golden = include_str!("golden/weaver-server.socket");
     assert_eq!(
         rendered, golden,

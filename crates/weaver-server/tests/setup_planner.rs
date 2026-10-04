@@ -10,11 +10,17 @@ fn base_probe() -> SystemProbe {
         systemd_present: true,
         supported_arch: true,
         target_domain: "example.com".into(),
+        admin_domain: "relay-admin.test".into(),
         existing_install: None,
         root_ips: vec![IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))],
         probe_ips: vec![IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))],
+        ns_targets: vec!["example.com".into()],
+        delegation_ok: true,
+        resolvers_ok: true,
         port_80: PortReachability::ReachedSelf,
         port_443: PortReachability::ReachedSelf,
+        port_53: PortReachability::ReachedSelf,
+        resolver_stub_conflict: None,
         is_headless: false,
         confirmed_domain_change: false,
         skip_reachability_check: false,
@@ -30,9 +36,13 @@ fn base_probe() -> SystemProbe {
 fn test_happy_path_fresh_install() {
     let probe = base_probe();
     let plan = plan_setup(&probe).expect("happy path should succeed");
-    assert_eq!(plan.root_domain, "example.com");
+    assert_eq!(plan.tunnel_domain, "example.com");
     assert!(!plan.is_upgrade);
     assert!(!plan.reachability_skipped);
+    assert_eq!(
+        plan.relay_ips,
+        vec![IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))]
+    );
 }
 
 // OFF-73: Unsupported host environment preflight — halts setup planning when systemd
@@ -62,10 +72,21 @@ fn test_unsupported_arch_aborts() {
 }
 
 #[test]
+fn test_unsafe_admin_tunnel_split_aborts() {
+    let mut probe = base_probe();
+    // Admin under the delegated tunnel zone would put the relay's own DNS under
+    // the zone it is meant to control.
+    probe.admin_domain = "relay.example.com".into();
+    let err = plan_setup(&probe).unwrap_err();
+    assert!(matches!(err, PlanAbort::UnsafeDomainSplit(_)));
+    assert!(err.to_string().contains("subdomain"));
+}
+
+#[test]
 fn test_existing_install_same_domain_succeeds_as_upgrade() {
     let mut probe = base_probe();
     probe.existing_install = Some(ExistingInstall {
-        root_domain: "example.com".into(),
+        tunnel_domain: "example.com".into(),
     });
     let plan = plan_setup(&probe).expect("reinstalling same domain should succeed");
     assert!(plan.is_upgrade);
@@ -77,7 +98,7 @@ fn test_existing_install_same_domain_succeeds_as_upgrade() {
 fn test_existing_install_different_domain_unconfirmed_aborts() {
     let mut probe = base_probe();
     probe.existing_install = Some(ExistingInstall {
-        root_domain: "old.com".into(),
+        tunnel_domain: "old.com".into(),
     });
     probe.is_headless = false;
     probe.confirmed_domain_change = false;
@@ -94,7 +115,7 @@ fn test_existing_install_different_domain_unconfirmed_aborts() {
 fn test_existing_install_different_domain_headless_succeeds() {
     let mut probe = base_probe();
     probe.existing_install = Some(ExistingInstall {
-        root_domain: "old.com".into(),
+        tunnel_domain: "old.com".into(),
     });
     probe.is_headless = true;
     let plan = plan_setup(&probe).expect("headless mode confirms domain upgrade");
@@ -105,7 +126,7 @@ fn test_existing_install_different_domain_headless_succeeds() {
 fn test_existing_install_different_domain_confirmed_succeeds() {
     let mut probe = base_probe();
     probe.existing_install = Some(ExistingInstall {
-        root_domain: "old.com".into(),
+        tunnel_domain: "old.com".into(),
     });
     probe.confirmed_domain_change = true;
     let plan = plan_setup(&probe).expect("confirmed domain upgrade succeeds");
@@ -116,8 +137,40 @@ fn test_existing_install_different_domain_confirmed_succeeds() {
 fn test_dns_empty_aborts() {
     let mut probe = base_probe();
     probe.root_ips = vec![];
+    probe.probe_ips = vec![];
     let err = plan_setup(&probe).unwrap_err();
-    assert!(matches!(err, PlanAbort::DnsEmpty(_)));
+    assert!(matches!(err, PlanAbort::ApexMissing(_)));
+    assert!(err.to_string().contains("has no A or AAAA records"));
+}
+
+#[test]
+fn test_delegation_mismatch_aborts() {
+    let mut probe = base_probe();
+    probe.delegation_ok = false;
+    probe.ns_targets = vec!["ns1.parking.example".into()];
+    let err = plan_setup(&probe).unwrap_err();
+    assert!(matches!(err, PlanAbort::ProbeResolutionFailed(_)));
+    assert!(err.to_string().contains("not self-delegated"));
+    assert!(err.to_string().contains("ns1.parking.example"));
+}
+
+#[test]
+fn test_resolver_disagreement_aborts() {
+    let mut probe = base_probe();
+    probe.resolvers_ok = false;
+    probe.probe_ips = vec![IpAddr::V4(Ipv4Addr::new(93, 184, 216, 35))];
+    let err = plan_setup(&probe).unwrap_err();
+    assert!(matches!(err, PlanAbort::ApexMismatch { .. }));
+    assert!(err.to_string().contains("apex mismatch"));
+}
+
+#[test]
+fn test_resolver_stub_conflict_aborts() {
+    let mut probe = base_probe();
+    probe.resolver_stub_conflict = Some("systemd-resolved holds 127.0.0.53:53".into());
+    let err = plan_setup(&probe).unwrap_err();
+    assert!(matches!(err, PlanAbort::ResolverStubConflict(_)));
+    assert!(err.to_string().contains("systemd-resolved"));
 }
 
 #[test]
@@ -193,11 +246,24 @@ fn test_port_443_blocked_aborts() {
 }
 
 #[test]
+fn test_port_53_blocked_aborts() {
+    let mut probe = base_probe();
+    probe.port_53 = PortReachability::Failed("UDP: timed out waiting for UDP challenge".into());
+    let err = plan_setup(&probe).unwrap_err();
+    assert!(matches!(err, PlanAbort::Port53NotReachable(_)));
+    assert!(
+        err.to_string()
+            .contains("port 53 reachability check failed: UDP: timed out")
+    );
+}
+
+#[test]
 fn test_skip_reachability_allows_blocked_ports() {
     let mut probe = base_probe();
     probe.skip_reachability_check = true;
     probe.port_80 = PortReachability::Failed("blocked".into());
     probe.port_443 = PortReachability::Failed("blocked".into());
+    probe.port_53 = PortReachability::Failed("blocked".into());
     let plan = plan_setup(&probe).expect("skip reachability should bypass port checks");
     assert!(plan.reachability_skipped);
 }
