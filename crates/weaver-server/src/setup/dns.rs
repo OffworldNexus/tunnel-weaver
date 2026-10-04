@@ -269,24 +269,32 @@ pub async fn probe_registrar_delegation(
             "'{root}' has no parent zone to read a delegation from"
         ));
     }
-    let parent = labels[1..].join(".");
     let resolvers: Vec<IpAddr> = PUBLIC_RESOLVERS
         .iter()
         .filter_map(|s| s.parse::<IpAddr>().ok())
         .collect();
 
-    // 1. Find the parent's authoritative name servers through the recursives.
+    // 1. Walk up from the immediate parent to the enclosing zone. The base
+    //    domain may itself be a subdomain of a larger zone, in which case the
+    //    immediate parent has no NS records of its own; the first name with NS
+    //    records is the zone that holds the delegation.
     let mut parent_ns = Vec::new();
-    for resolver in &resolvers {
-        if let Ok(msg) = query_resolver(*resolver, &parent, RecordType::NS).await {
-            parent_ns.extend(collect_ns_targets(&msg));
+    for start in 1..labels.len() {
+        let candidate = labels[start..].join(".");
+        for resolver in &resolvers {
+            if let Ok(msg) = query_resolver(*resolver, &candidate, RecordType::NS).await {
+                parent_ns.extend(collect_ns_targets(&msg));
+            }
+        }
+        parent_ns.sort();
+        parent_ns.dedup();
+        if !parent_ns.is_empty() {
+            break;
         }
     }
-    parent_ns.sort();
-    parent_ns.dedup();
     if parent_ns.is_empty() {
         return Err(format!(
-            "could not discover the name servers for parent zone '{parent}'"
+            "could not discover an enclosing zone with name servers for '{root}'"
         ));
     }
 

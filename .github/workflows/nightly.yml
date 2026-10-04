@@ -50,14 +50,14 @@ jobs:
           #   admin  A/AAAA -> droplet  (relay's own hostname; HTTP-01 cert)
           #   tunnel NS admin           (delegated zone; DNS-01 wildcard)
           if [ "$BASE_DOMAIN" = "$ZONE" ]; then
-            SUB_PREFIX=""
+            SUB_SUFFIX=""
           else
-            SUB_PREFIX="${BASE_DOMAIN%."$ZONE"}."
+            SUB_SUFFIX=".${BASE_DOMAIN%."$ZONE"}"
           fi
-          ADMIN_DOMAIN="a${RUN_HEX}.${BASE_DOMAIN}"
-          TUNNEL_DOMAIN="t${RUN_HEX}.${BASE_DOMAIN}"
-          ADMIN_REC="${SUB_PREFIX}a${RUN_HEX}"
-          TUNNEL_REC="${SUB_PREFIX}t${RUN_HEX}"
+          ADMIN_DOMAIN="a${RUN_HEX}${SUB_SUFFIX}.${ZONE}"
+          TUNNEL_DOMAIN="t${RUN_HEX}${SUB_SUFFIX}.${ZONE}"
+          ADMIN_REC="a${RUN_HEX}${SUB_SUFFIX}"
+          TUNNEL_REC="t${RUN_HEX}${SUB_SUFFIX}"
 
           echo "admin_domain=$ADMIN_DOMAIN" >> "$GITHUB_OUTPUT"
           echo "tunnel_domain=$TUNNEL_DOMAIN" >> "$GITHUB_OUTPUT"
@@ -186,6 +186,10 @@ jobs:
             fi
             sleep 3
           done
+          if [ "$RESOLVED" != "$IP" ]; then
+            echo "::error::Admin domain $ADMIN_DOMAIN did not resolve to $IP (got '$RESOLVED')"
+            exit 1
+          fi
 
       - name: Deploy weaver-server and run headless setup
         run: |
