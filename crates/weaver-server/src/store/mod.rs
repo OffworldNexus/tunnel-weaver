@@ -409,10 +409,8 @@ impl Store {
 
     /// Lists certificate records in name order.
     ///
-    /// `only_best` is retained for the control surface: with one row per name
-    /// there is nothing to rank, so both variants return the same rows.
-    pub async fn list_certificates(&self, only_best: bool) -> Result<Vec<CertRecord>, StoreError> {
-        let _ = only_best;
+    /// There is exactly one row per name, so there is nothing to rank or filter.
+    pub async fn list_certificates(&self) -> Result<Vec<CertRecord>, StoreError> {
         let mut results: Vec<CertRecord> = certificate::Entity::find()
             .all(&self.db)
             .await?
@@ -427,8 +425,8 @@ impl Store {
         Ok(results)
     }
 
-    /// Lists every certificate including PEM material.
-    pub async fn list_best_certificates_full(&self) -> Result<Vec<FullCertRecord>, StoreError> {
+    /// Lists every certificate including PEM material, in name order.
+    pub async fn list_certificates_full(&self) -> Result<Vec<FullCertRecord>, StoreError> {
         let mut results: Vec<FullCertRecord> = certificate::Entity::find()
             .all(&self.db)
             .await?
@@ -441,11 +439,6 @@ impl Store {
                 .then_with(|| b.not_after.cmp(&a.not_after))
         });
         Ok(results)
-    }
-
-    /// Alias for [`Store::list_best_certificates_full`].
-    pub async fn list_certificates_full(&self) -> Result<Vec<FullCertRecord>, StoreError> {
-        self.list_best_certificates_full().await
     }
 
     /// Points a materialized domain at the certificate that covers it.
@@ -600,15 +593,6 @@ impl Store {
             .exec(&self.db)
             .await?;
         Ok(())
-    }
-
-    /// Legacy alias for `set_domain_active`.
-    pub async fn set_cert_active(
-        &self,
-        name: &str,
-        active_at: Option<i64>,
-    ) -> Result<(), StoreError> {
-        self.set_domain_active(name, active_at).await
     }
 
     // ----- auth: person, machine, machine_key, service -----

@@ -410,13 +410,13 @@ async fn handle_connection(
                     let no_only_best = req.no_only_best.unwrap_or(false);
 
                     let summaries = if !no_only_best {
-                        // Summary list: only the best certificate per domain
+                        // Summary list: one certificate row per managed name.
                         let mut domain_names = std::collections::BTreeSet::new();
                         domain_names.insert(root_domain.clone());
 
-                        let best_records = store.list_certificates(true).await.unwrap_or_default();
+                        let records = store.list_certificates().await.unwrap_or_default();
                         let mut records_map = std::collections::HashMap::new();
-                        for r in best_records {
+                        for r in records {
                             let lower = r.name.to_ascii_lowercase();
                             domain_names.insert(lower.clone());
                             records_map.insert(lower, r);
@@ -469,11 +469,11 @@ async fn handle_connection(
                         list
                     } else {
                         // Full list: all certificates for each domain
-                        let all_records = store.list_certificates(false).await.unwrap_or_default();
+                        let all_records = store.list_certificates().await.unwrap_or_default();
                         let mut list = Vec::new();
                         let mut seen_domains = std::collections::HashSet::new();
 
-                        // First partition: root domain certificates (best root first)
+                        // First partition: the root domain's certificate row
                         for r in &all_records {
                             if r.name.eq_ignore_ascii_case(&root_domain) {
                                 seen_domains.insert(root_domain.clone());

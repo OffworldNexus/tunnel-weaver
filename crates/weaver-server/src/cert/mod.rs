@@ -150,7 +150,7 @@ impl CertManager {
         let admin = self.admin_name();
         let root = self.root_name();
 
-        let certs = self.store.list_best_certificates_full().await?;
+        let certs = self.store.list_certificates_full().await?;
         let now = self.clock.now_unix();
         let mut valid: HashSet<String> = HashSet::new();
 
@@ -461,7 +461,7 @@ impl CertManager {
         let store = self.store.clone();
         let active_at = active.then_some(now);
         tokio::spawn(async move {
-            if let Err(err) = store.set_cert_active(&lower, active_at).await {
+            if let Err(err) = store.set_domain_active(&lower, active_at).await {
                 warn!(hostname = %lower, error = %err, "Failed to persist certificate active flag");
             }
         });

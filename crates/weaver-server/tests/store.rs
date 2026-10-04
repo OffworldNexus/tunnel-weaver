@@ -466,9 +466,7 @@ async fn test_certificate_and_event_round_trip() {
         .await
         .expect("save 2");
 
-    // Both `only_best` variants return the single row.
-    assert_eq!(store.list_certificates(true).await.expect("list").len(), 1);
-    assert_eq!(store.list_certificates(false).await.expect("list").len(), 1);
+    assert_eq!(store.list_certificates().await.expect("list").len(), 1);
     assert_eq!(
         store
             .get_certificate("host.example.com")
@@ -501,7 +499,7 @@ async fn test_certificate_and_event_round_trip() {
     assert_eq!(rec_by_id_str.id, best_cert.id);
 
     // The full record carries PEM material for cache hydration.
-    let full = store.list_best_certificates_full().await.unwrap();
+    let full = store.list_certificates_full().await.unwrap();
     assert_eq!(full.len(), 1);
     assert_eq!(full[0].cert_pem, "CERT");
     assert_eq!(full[0].key_pem, "KEY");
@@ -652,14 +650,12 @@ async fn test_multiple_certificates_distinct_names() {
         .await
         .unwrap();
 
-    // Certificates are global and keyed by name: three distinct rows, and the
-    // `only_best` flag no longer ranks within a domain.
-    assert_eq!(store.list_certificates(true).await.unwrap().len(), 3);
-    assert_eq!(store.list_certificates(false).await.unwrap().len(), 3);
-    assert_eq!(store.list_best_certificates_full().await.unwrap().len(), 3);
+    // Certificates are global and keyed by name: three distinct rows.
+    assert_eq!(store.list_certificates().await.unwrap().len(), 3);
+    assert_eq!(store.list_certificates_full().await.unwrap().len(), 3);
 
     let names: Vec<String> = store
-        .list_certificates(false)
+        .list_certificates()
         .await
         .unwrap()
         .into_iter()
@@ -675,7 +671,7 @@ async fn test_multiple_certificates_distinct_names() {
         .save_certificate("b.example.com", cert("PEM2B", "Issuer 2B", 4_000))
         .await
         .unwrap();
-    assert_eq!(store.list_certificates(false).await.unwrap().len(), 3);
+    assert_eq!(store.list_certificates().await.unwrap().len(), 3);
     let b = store
         .get_certificate("b.example.com")
         .await
@@ -684,7 +680,7 @@ async fn test_multiple_certificates_distinct_names() {
     assert_eq!(b.not_after, 4_000);
     assert_eq!(b.issuer.as_deref(), Some("Issuer 2B"));
     let full_b = store
-        .list_best_certificates_full()
+        .list_certificates_full()
         .await
         .unwrap()
         .into_iter()
