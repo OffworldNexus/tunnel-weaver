@@ -56,7 +56,7 @@ not part of the delegated zone. In one visit at your DNS provider, add:
 1. `A`/`AAAA <admin> -> <relay addresses>` (the relay's public IPs).
 2. `NS <root> -> <admin>.` (one flat label under `<root>` resolves to the relay).
 
-Then run `weaver-server setup --root-domain <root> --admin-domain <admin>`
+Then run `weaver-server setup --tunnel-domain <root> --admin-domain <admin>`
 (interactive `setup` prompts for both). It must reject an admin domain that is
 the same as, or a subdomain of, the tunnel domain before doing anything else:
 otherwise the tunnel delegation would control the admin DNS and the admin

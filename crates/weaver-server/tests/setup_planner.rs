@@ -36,7 +36,7 @@ fn base_probe() -> SystemProbe {
 fn test_happy_path_fresh_install() {
     let probe = base_probe();
     let plan = plan_setup(&probe).expect("happy path should succeed");
-    assert_eq!(plan.root_domain, "example.com");
+    assert_eq!(plan.tunnel_domain, "example.com");
     assert!(!plan.is_upgrade);
     assert!(!plan.reachability_skipped);
     assert_eq!(
@@ -86,7 +86,7 @@ fn test_unsafe_admin_tunnel_split_aborts() {
 fn test_existing_install_same_domain_succeeds_as_upgrade() {
     let mut probe = base_probe();
     probe.existing_install = Some(ExistingInstall {
-        root_domain: "example.com".into(),
+        tunnel_domain: "example.com".into(),
     });
     let plan = plan_setup(&probe).expect("reinstalling same domain should succeed");
     assert!(plan.is_upgrade);
@@ -98,7 +98,7 @@ fn test_existing_install_same_domain_succeeds_as_upgrade() {
 fn test_existing_install_different_domain_unconfirmed_aborts() {
     let mut probe = base_probe();
     probe.existing_install = Some(ExistingInstall {
-        root_domain: "old.com".into(),
+        tunnel_domain: "old.com".into(),
     });
     probe.is_headless = false;
     probe.confirmed_domain_change = false;
@@ -115,7 +115,7 @@ fn test_existing_install_different_domain_unconfirmed_aborts() {
 fn test_existing_install_different_domain_headless_succeeds() {
     let mut probe = base_probe();
     probe.existing_install = Some(ExistingInstall {
-        root_domain: "old.com".into(),
+        tunnel_domain: "old.com".into(),
     });
     probe.is_headless = true;
     let plan = plan_setup(&probe).expect("headless mode confirms domain upgrade");
@@ -126,7 +126,7 @@ fn test_existing_install_different_domain_headless_succeeds() {
 fn test_existing_install_different_domain_confirmed_succeeds() {
     let mut probe = base_probe();
     probe.existing_install = Some(ExistingInstall {
-        root_domain: "old.com".into(),
+        tunnel_domain: "old.com".into(),
     });
     probe.confirmed_domain_change = true;
     let plan = plan_setup(&probe).expect("confirmed domain upgrade succeeds");

@@ -60,7 +60,7 @@ pub fn is_public_ip(ip: &IpAddr) -> bool {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExistingInstall {
     /// Currently configured root domain in the existing installation.
-    pub root_domain: String,
+    pub tunnel_domain: String,
 }
 
 /// The network ports the relay must own and prove reachable.
@@ -262,7 +262,7 @@ pub enum PlanAbort {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Plan {
     /// Approved root domain.
-    pub root_domain: String,
+    pub tunnel_domain: String,
     /// The relay's own (admin) hostname, issued its own HTTP-01 certificate.
     pub admin_domain: String,
     /// Database path to open and configure.
@@ -308,12 +308,12 @@ pub fn plan_setup(probe: &SystemProbe) -> Result<Plan, PlanAbort> {
     let mut is_upgrade = false;
     if let Some(existing) = &probe.existing_install {
         is_upgrade = true;
-        if existing.root_domain != probe.target_domain
+        if existing.tunnel_domain != probe.target_domain
             && !probe.is_headless
             && !probe.confirmed_domain_change
         {
             return Err(PlanAbort::DomainMismatch {
-                existing: existing.root_domain.clone(),
+                existing: existing.tunnel_domain.clone(),
                 target: probe.target_domain.clone(),
             });
         }
@@ -377,7 +377,7 @@ pub fn plan_setup(probe: &SystemProbe) -> Result<Plan, PlanAbort> {
     }
 
     Ok(Plan {
-        root_domain: probe.target_domain.clone(),
+        tunnel_domain: probe.target_domain.clone(),
         admin_domain: probe.admin_domain.clone(),
         db_path: probe.db_path.clone(),
         user: probe.user.clone(),

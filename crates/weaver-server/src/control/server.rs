@@ -165,7 +165,7 @@ async fn build_doctor_report(
     store: &Store,
     cert_manager: &CertManager,
 ) -> DoctorReport {
-    let root = config.root_domain.to_ascii_lowercase();
+    let root = config.tunnel_domain.to_ascii_lowercase();
     let admin = config.admin_domain.to_ascii_lowercase();
 
     let mut relay_ips = config.relay_ips.clone();
@@ -182,7 +182,7 @@ async fn build_doctor_report(
 
     assemble_report(
         ReportInputs {
-            root_domain: root,
+            tunnel_domain: root,
             admin_domain: admin,
             relay_ips,
             admin_resolved,
@@ -209,21 +209,20 @@ async fn certificate_health_checks(
         .map(|elapsed| elapsed.as_secs() as i64)
         .unwrap_or(0);
 
-    let names = [
-        config.root_domain.to_ascii_lowercase(),
-        config.admin_domain.to_ascii_lowercase(),
-    ];
-
-    let mut checks = Vec::with_capacity(names.len());
-    for name in names {
-        let record = store.get_certificate(&name).await.ok().flatten();
-        let (validation, kind) = match &record {
-            Some(row) => (
-                row.validation.clone(),
-                if row.wildcard { "wildcard" } else { "single" },
-            ),
-            None => ("unknown".to_string(), "single"),
+    let managed = crate::cert::managed::ManagedCerts::from_config(config);
+    let mut checks = Vec::with_capacity(managed.all().len());
+    for cert in managed.all() {
+        let name = cert.name.clone();
+        let kind = if cert.wildcard() {
+            "wildcard"
+        } else {
+            "single"
         };
+        let record = store.get_certificate(&name).await.ok().flatten();
+        let validation = record
+            .as_ref()
+            .map(|row| row.validation.clone())
+            .unwrap_or_else(|| "unknown".to_string());
 
         let (ok, state) = match cert_manager.status(&name) {
             CertState::Issued { not_after } | CertState::Renewing { not_after } => {
@@ -280,6 +279,19 @@ where
     writer.write_all(&data).await?;
     writer.flush().await?;
     Ok(())
+}
+
+/// Whether a materialized domain is currently active (`last_active_at` set).
+///
+/// Activity lives on the domain row, not on a certificate: the tunnel registry
+/// owns the flag and the control surface reads it back.
+async fn is_active(store: &Store, name: &str) -> bool {
+    store
+        .get_domain(name)
+        .await
+        .ok()
+        .flatten()
+        .is_some_and(|d| d.last_active_at.is_some())
 }
 
 /// Handles a single control socket connection: reads one JSON request, dispatches it, and writes response.
@@ -366,14 +378,14 @@ async fn handle_connection(
         "status" => {
             let uptime = start_time.elapsed().as_secs();
             let pid = std::process::id();
-            let root_domain = config.root_domain.clone();
+            let tunnel_domain = config.tunnel_domain.clone();
             let admin_domain = config.admin_domain.clone();
             let listeners = ListenersInfo {
                 http: config.listen_http.to_string(),
                 https: config.listen_https.to_string(),
             };
             let root_cert = cert_manager.root_cert_status().to_string();
-            let cert_counts = cert_manager.cert_counts().await;
+            let cert_counts = cert_manager.cert_counts();
             let db_path = store
                 .path()
                 .map(|p| p.display().to_string())
@@ -390,7 +402,7 @@ async fn handle_connection(
                 version: env!("CARGO_PKG_VERSION").to_string(),
                 uptime,
                 pid,
-                root_domain,
+                tunnel_domain,
                 admin_domain,
                 listeners,
                 root_cert,
@@ -404,7 +416,7 @@ async fn handle_connection(
             reply(&mut writer, &resp).await?;
         }
         "cert.status" => {
-            let root_domain = config.root_domain.to_ascii_lowercase();
+            let tunnel_domain = config.tunnel_domain.to_ascii_lowercase();
             match req.name {
                 None => {
                     let no_only_best = req.no_only_best.unwrap_or(false);
@@ -412,7 +424,7 @@ async fn handle_connection(
                     let summaries = if !no_only_best {
                         // Summary list: one certificate row per managed name.
                         let mut domain_names = std::collections::BTreeSet::new();
-                        domain_names.insert(root_domain.clone());
+                        domain_names.insert(tunnel_domain.clone());
 
                         let records = store.list_certificates().await.unwrap_or_default();
                         let mut records_map = std::collections::HashMap::new();
@@ -427,9 +439,9 @@ async fn handle_connection(
 
                         // Order root first, then remaining alphabetically
                         let mut ordered_names = Vec::with_capacity(domain_names.len());
-                        ordered_names.push(root_domain.clone());
+                        ordered_names.push(tunnel_domain.clone());
                         for n in domain_names {
-                            if n != root_domain {
+                            if n != tunnel_domain {
                                 ordered_names.push(n);
                             }
                         }
@@ -441,7 +453,7 @@ async fn handle_connection(
                             let not_after = cert_rec
                                 .map(|c| c.not_after)
                                 .or_else(|| cert_manager.status(&name).not_after());
-                            let active = cert_manager.is_active(&name);
+                            let active = is_active(&store, &name).await;
                             let cert_id = cert_rec.map(|c| c.id);
                             let last_event = store
                                 .get_latest_cert_event(&name)
@@ -463,7 +475,6 @@ async fn handle_connection(
                                 last_event,
                                 cert_id,
                                 validation: cert_rec.map(|c| c.validation.clone()),
-                                wildcard: cert_rec.is_some_and(|c| c.wildcard),
                             });
                         }
                         list
@@ -475,12 +486,12 @@ async fn handle_connection(
 
                         // First partition: the root domain's certificate row
                         for r in &all_records {
-                            if r.name.eq_ignore_ascii_case(&root_domain) {
-                                seen_domains.insert(root_domain.clone());
-                                let state = cert_manager.status(&root_domain).label().to_string();
-                                let active = cert_manager.is_active(&root_domain);
+                            if r.name.eq_ignore_ascii_case(&tunnel_domain) {
+                                seen_domains.insert(tunnel_domain.clone());
+                                let state = cert_manager.status(&tunnel_domain).label().to_string();
+                                let active = is_active(&store, &tunnel_domain).await;
                                 let last_event = store
-                                    .get_latest_cert_event(&root_domain)
+                                    .get_latest_cert_event(&tunnel_domain)
                                     .await
                                     .ok()
                                     .flatten()
@@ -491,43 +502,41 @@ async fn handle_connection(
                                         detail: e.detail,
                                     });
                                 list.push(CertSummary {
-                                    name: root_domain.clone(),
+                                    name: tunnel_domain.clone(),
                                     state,
                                     not_after: Some(r.not_after),
                                     active,
                                     last_event,
                                     cert_id: Some(r.id),
                                     validation: Some(r.validation.clone()),
-                                    wildcard: r.wildcard,
                                 });
                             }
                         }
 
                         // If root had no certificates yet, add placeholder row
-                        if !seen_domains.contains(&root_domain) {
-                            let state = cert_manager.status(&root_domain).label().to_string();
-                            let not_after = cert_manager.status(&root_domain).not_after();
-                            let active = cert_manager.is_active(&root_domain);
+                        if !seen_domains.contains(&tunnel_domain) {
+                            let state = cert_manager.status(&tunnel_domain).label().to_string();
+                            let not_after = cert_manager.status(&tunnel_domain).not_after();
+                            let active = is_active(&store, &tunnel_domain).await;
                             list.push(CertSummary {
-                                name: root_domain.clone(),
+                                name: tunnel_domain.clone(),
                                 state,
                                 not_after,
                                 active,
                                 last_event: None,
                                 cert_id: None,
                                 validation: None,
-                                wildcard: false,
                             });
-                            seen_domains.insert(root_domain.clone());
+                            seen_domains.insert(tunnel_domain.clone());
                         }
 
                         // Second partition: non-root certificates
                         for r in &all_records {
                             let lower = r.name.to_ascii_lowercase();
-                            if lower != root_domain {
+                            if lower != tunnel_domain {
                                 seen_domains.insert(lower.clone());
                                 let state = cert_manager.status(&lower).label().to_string();
-                                let active = cert_manager.is_active(&lower);
+                                let active = is_active(&store, &lower).await;
                                 let last_event = store
                                     .get_latest_cert_event(&lower)
                                     .await
@@ -547,7 +556,6 @@ async fn handle_connection(
                                     last_event,
                                     cert_id: Some(r.id),
                                     validation: Some(r.validation.clone()),
-                                    wildcard: r.wildcard,
                                 });
                             }
                         }
@@ -558,7 +566,7 @@ async fn handle_connection(
                             if seen_domains.insert(lower.clone()) {
                                 let state = cert_manager.status(&lower).label().to_string();
                                 let not_after = cert_manager.status(&lower).not_after();
-                                let active = cert_manager.is_active(&lower);
+                                let active = is_active(&store, &lower).await;
                                 list.push(CertSummary {
                                     name: lower,
                                     state,
@@ -567,7 +575,6 @@ async fn handle_connection(
                                     last_event: None,
                                     cert_id: None,
                                     validation: None,
-                                    wildcard: false,
                                 });
                             }
                         }
@@ -585,7 +592,7 @@ async fn handle_connection(
                         store.get_certificate_by_id(cert_id).await.ok().flatten()
                     } else {
                         let target = if name == "root" {
-                            root_domain.clone()
+                            tunnel_domain.clone()
                         } else {
                             name.to_ascii_lowercase()
                         };
@@ -595,14 +602,14 @@ async fn handle_connection(
                     let target = if let Some(ref r) = cert_rec {
                         r.name.clone()
                     } else if name == "root" {
-                        root_domain.clone()
+                        tunnel_domain.clone()
                     } else {
                         name.to_ascii_lowercase()
                     };
 
                     let in_states = cert_manager.list_states().contains_key(&target);
 
-                    if target != root_domain && cert_rec.is_none() && !in_states {
+                    if target != tunnel_domain && cert_rec.is_none() && !in_states {
                         let resp = ErrorResponse::new(format!("Certificate '{name}' not found"));
                         reply(&mut writer, &resp).await?;
                         return Ok(());
@@ -633,13 +640,12 @@ async fn handle_connection(
                         .as_ref()
                         .map(|r| r.directory.clone())
                         .unwrap_or_else(|| config.acme_provider.clone());
-                    let active = cert_manager.is_active(&target);
+                    let active = is_active(&store, &target).await;
                     // Activity now lives on the domain, not the certificate;
                     // the wildcard row has no per-name activity timestamp.
                     let last_active_at = None;
                     let cert_id = cert_rec.as_ref().map(|r| r.id);
                     let validation = cert_rec.as_ref().map(|r| r.validation.clone());
-                    let wildcard = cert_rec.as_ref().is_some_and(|r| r.wildcard);
 
                     let resp = CertDetailResponse {
                         ok: true,
@@ -654,21 +660,20 @@ async fn handle_connection(
                         cert_events,
                         cert_id,
                         validation,
-                        wildcard,
                     };
                     reply(&mut writer, &resp).await?;
                 }
             }
         }
         "cert.wait" => {
-            let root_domain = config.root_domain.to_ascii_lowercase();
+            let tunnel_domain = config.tunnel_domain.to_ascii_lowercase();
             let target = match req.name.as_deref() {
-                Some("root") | None => root_domain.clone(),
+                Some("root") | None => tunnel_domain.clone(),
                 Some(n) => n.to_ascii_lowercase(),
             };
 
             // Verify requested hostname is in the certificate store
-            let is_root = target == root_domain;
+            let is_root = target == tunnel_domain;
             let exists = is_root
                 || cert_manager.list_states().contains_key(&target)
                 || store
@@ -785,9 +790,9 @@ async fn handle_connection(
                     }
                 }
             } else {
-                let root_domain = config.root_domain.to_ascii_lowercase();
+                let tunnel_domain = config.tunnel_domain.to_ascii_lowercase();
                 let target = match req.name.as_deref() {
-                    Some("root") | None => root_domain.clone(),
+                    Some("root") | None => tunnel_domain.clone(),
                     Some(n) => n.to_ascii_lowercase(),
                 };
 

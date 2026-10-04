@@ -21,13 +21,13 @@ use tokio_util::task::TaskTracker;
 use tracing::{debug, info, trace};
 
 use crate::cert::CertManager;
+use crate::cert::managed::{ManagedCerts, Validation};
 use crate::cert::resolver::CertResolver;
 use crate::edge::counting::{ConnBytes, CountingIo};
 use crate::edge::host::request_host;
 use crate::edge::waf;
 use crate::tunnel::proxy::{BoxBody, empty_body, forward_visitor_request, full_body};
 use crate::tunnel::registry::TunnelRegistry;
-use crate::zone::{CertKind, Zone};
 use weaver_assets::{apply_security_headers, render_no_tunnel, render_welcome};
 
 /// How often a live visitor connection reports its accumulated socket bytes to
@@ -38,10 +38,9 @@ const VISITOR_REPORT_INTERVAL: Duration = Duration::from_secs(5);
 /// Shared state for HTTPS request dispatch.
 #[derive(Clone)]
 pub struct HttpsEdgeConfig {
-    /// The relay's serving area: the tunnel apex and the admin hostname. The
-    /// admin host is served by its own certificate and never the tunnel
-    /// WebSocket endpoint.
-    pub zone: Zone,
+    /// The relay's managed certificates: coverage decides the admin host
+    /// (HTTP-01 certificate) from the tunnel zone (DNS-01 wildcard).
+    pub managed: Arc<ManagedCerts>,
     /// Dynamic certificate resolver used to determine if certificate is placeholder.
     pub cert_resolver: Option<Arc<CertResolver>>,
     /// Certificate manager, used to record visitor-triggered renewals.
@@ -53,8 +52,7 @@ pub struct HttpsEdgeConfig {
 impl std::fmt::Debug for HttpsEdgeConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("HttpsEdgeConfig")
-            .field("root_domain", &self.zone.root())
-            .field("admin_domain", &self.zone.admin())
+            .field("tunnel_domain", &self.managed.tunnel_domain())
             .field("has_cert_resolver", &self.cert_resolver.is_some())
             .field("has_cert_manager", &self.cert_manager.is_some())
             .field("has_tunnel_registry", &self.tunnel_registry.is_some())
@@ -151,7 +149,7 @@ pub async fn handle_https_request(
     }
 
     let host_lower = host.to_ascii_lowercase();
-    let zone = &config.zone;
+    let covering = config.managed.cert_for(&host_lower);
 
     let include_hsts = config
         .cert_resolver
@@ -159,16 +157,16 @@ pub async fn handle_https_request(
         .is_some_and(|r| !r.is_placeholder(&host));
 
     // The relay's own (admin) hostname is outside the tunnel zone and is served
-    // by its own single-name certificate. It gets the same welcome/health
+    // by its own single-name HTTP-01 certificate. It gets the same welcome/health
     // surface as the apex but never the tunnel WebSocket endpoint.
-    if zone.covering_cert(&host_lower) == Some(CertKind::Admin) {
+    if matches!(covering.map(|c| c.validation), Some(Validation::Http01)) {
         if let Some(mgr) = &config.cert_manager {
             mgr.note_visit(&host_lower);
         }
         return Ok(static_host_response(&req, include_hsts));
     }
 
-    if host_lower == zone.root() {
+    if config.managed.tunnel_domain() == Some(host_lower.as_str()) {
         if let Some(mgr) = &config.cert_manager {
             mgr.note_visit(&host_lower);
         }
@@ -220,7 +218,11 @@ pub async fn handle_https_request(
 
             if let Some(ref reg) = config.tunnel_registry {
                 let reg = Arc::clone(reg);
-                let root = config.zone.root().to_string();
+                let root = config
+                    .managed
+                    .tunnel_domain()
+                    .unwrap_or_default()
+                    .to_string();
                 tokio::spawn(async move {
                     match on_upgrade.await {
                         Ok(upgraded) => {
@@ -280,7 +282,7 @@ pub async fn handle_https_request(
                 Ok(resp)
             }
         }
-    } else if zone.in_tunnel_zone(&host_lower) {
+    } else if matches!(covering.map(|c| c.validation), Some(Validation::Dns01)) {
         // Always-on edge firewall: scanner probes are refused here so they
         // never open a tunnel stream or reach the origin (see `edge::waf`).
         let raw_path = req
@@ -350,7 +352,7 @@ pub async fn handle_https_request(
         Ok(resp)
     } else {
         // Unrecognized domain -> 421 Misdirected Request
-        debug!(%host, root_domain = %config.zone.root(), "Unrecognized domain, returning 421");
+        debug!(%host, tunnel_domain = %config.managed.tunnel_domain().unwrap_or_default(), "Unrecognized domain, returning 421");
         Ok(Response::builder()
             .status(StatusCode::MISDIRECTED_REQUEST)
             .body(full_body("421 Misdirected Request\n"))
@@ -407,14 +409,14 @@ fn static_host_response(
 pub async fn run_https_server(
     listener: TcpListener,
     tls_config: Arc<ServerConfig>,
-    root_domain: String,
+    tunnel_domain: impl AsRef<str>,
     cert_resolver: Option<Arc<CertResolver>>,
     shutdown_token: CancellationToken,
 ) {
     run_https_server_with_registry(
         listener,
         tls_config,
-        root_domain,
+        tunnel_domain.as_ref(),
         cert_resolver,
         None,
         shutdown_token,
@@ -426,7 +428,7 @@ pub async fn run_https_server(
 pub async fn run_https_server_with_registry(
     listener: TcpListener,
     tls_config: Arc<ServerConfig>,
-    root_domain: String,
+    tunnel_domain: impl AsRef<str>,
     cert_resolver: Option<Arc<CertResolver>>,
     tunnel_registry: Option<Arc<TunnelRegistry>>,
     shutdown_token: CancellationToken,
@@ -435,7 +437,7 @@ pub async fn run_https_server_with_registry(
         listener,
         tls_config,
         HttpsEdgeConfig {
-            zone: Zone::new(&root_domain, &root_domain),
+            managed: Arc::new(ManagedCerts::for_tunnel(tunnel_domain.as_ref())),
             cert_resolver,
             cert_manager: None,
             tunnel_registry,
@@ -471,7 +473,7 @@ pub async fn run_https_server_full(
 
     info!(
         addr = %addr_str,
-        root_domain = %edge_config.zone.root(),
+        tunnel_domain = %edge_config.managed.tunnel_domain().unwrap_or_default(),
         "HTTPS edge server running"
     );
 

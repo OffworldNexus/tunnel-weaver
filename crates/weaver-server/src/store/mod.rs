@@ -339,7 +339,6 @@ impl Store {
             directory: Set(cert.directory),
             obtained_at: Set(cert.obtained_at),
             validation: Set(cert.validation),
-            wildcard: Set(cert.wildcard),
             ..Default::default()
         };
         certificate::Entity::insert(active)
@@ -354,7 +353,6 @@ impl Store {
                         certificate::Column::Directory,
                         certificate::Column::ObtainedAt,
                         certificate::Column::Validation,
-                        certificate::Column::Wildcard,
                     ])
                     .to_owned(),
             )
@@ -441,27 +439,6 @@ impl Store {
         Ok(results)
     }
 
-    /// Points a materialized domain at the certificate that covers it.
-    ///
-    /// In the wildcard model every domain points at the single apex
-    /// certificate, which is what keeps the routing join to one hop.
-    pub async fn set_domain_certificate(
-        &self,
-        domain_name: &str,
-        certificate_id: i32,
-    ) -> Result<(), StoreError> {
-        let lower = domain_name.to_ascii_lowercase();
-        domain::Entity::update_many()
-            .col_expr(
-                domain::Column::CertificateId,
-                Expr::value(Some(certificate_id)),
-            )
-            .filter(domain::Column::Name.eq(lower))
-            .exec(&self.db)
-            .await?;
-        Ok(())
-    }
-
     // ----- ACME challenge registry (DNS-01 TXT + HTTP-01 tokens) -----
 
     /// Publishes one DNS-01 TXT value for `name`, ignoring duplicates.
@@ -473,12 +450,14 @@ impl Store {
         &self,
         name: &str,
         value: &str,
+        certificate: Option<&str>,
         at: i64,
     ) -> Result<(), StoreError> {
         let lower = name.to_ascii_lowercase();
         let active = challenge::ActiveModel {
             name: Set(lower),
             value: Set(value.to_string()),
+            certificate: Set(certificate.map(str::to_string)),
             created_at: Set(at),
             kind: Set("dns-01".to_string()),
             ..Default::default()
@@ -541,6 +520,7 @@ impl Store {
         &self,
         token: &str,
         key_auth: &str,
+        certificate: Option<&str>,
         at: i64,
     ) -> Result<(), StoreError> {
         challenge::Entity::delete_many()
@@ -551,6 +531,7 @@ impl Store {
         let active = challenge::ActiveModel {
             name: Set(token.to_string()),
             value: Set(key_auth.to_string()),
+            certificate: Set(certificate.map(str::to_string)),
             created_at: Set(at),
             kind: Set("http-01".to_string()),
             ..Default::default()
@@ -947,8 +928,6 @@ pub struct NewCertificate {
     /// ACME validation mechanism that produced this certificate
     /// (`dns-01`/`http-01`).
     pub validation: String,
-    /// Whether the certificate carries a wildcard SAN (`*.<root>`).
-    pub wildcard: bool,
 }
 
 /// Maps a certificate model into a `CertRecord`.
@@ -962,7 +941,6 @@ fn to_cert_record(cert: certificate::Model) -> CertRecord {
         directory: cert.directory,
         obtained_at: cert.obtained_at,
         validation: cert.validation,
-        wildcard: cert.wildcard,
     }
 }
 
@@ -978,7 +956,6 @@ fn to_full_cert_record(cert: certificate::Model) -> FullCertRecord {
         directory: cert.directory,
         obtained_at: cert.obtained_at,
         validation: cert.validation,
-        wildcard: cert.wildcard,
     }
 }
 
@@ -994,8 +971,6 @@ pub struct CertRecord {
     pub obtained_at: i64,
     /// ACME validation mechanism that produced this row (`dns-01`/`http-01`).
     pub validation: String,
-    /// Whether the certificate carries a wildcard SAN (`*.<root>`).
-    pub wildcard: bool,
 }
 
 /// Full certificate record with PEM material, used for startup cache hydration.
@@ -1012,8 +987,6 @@ pub struct FullCertRecord {
     pub obtained_at: i64,
     /// ACME validation mechanism that produced this row (`dns-01`/`http-01`).
     pub validation: String,
-    /// Whether the certificate carries a wildcard SAN (`*.<root>`).
-    pub wildcard: bool,
 }
 
 /// Certificate event database record.

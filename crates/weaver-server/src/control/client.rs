@@ -277,7 +277,7 @@ pub async fn client_status(socket_path: &Path, json: bool) -> i32 {
     println!(
         "  {:<14} {}",
         "Root Domain:".dark_grey(),
-        resp.root_domain.bold()
+        resp.tunnel_domain.bold()
     );
     if !resp.admin_domain.is_empty() {
         println!(
@@ -383,9 +383,6 @@ pub async fn client_cert_status(
             Cell::new("NAME")
                 .add_attribute(Attribute::Bold)
                 .fg(Color::Cyan),
-            Cell::new("KIND")
-                .add_attribute(Attribute::Bold)
-                .fg(Color::Cyan),
             Cell::new("STATE")
                 .add_attribute(Attribute::Bold)
                 .fg(Color::Cyan),
@@ -416,11 +413,6 @@ pub async fn client_cert_status(
 
             let state_cell = styled_state_cell(&cert.state);
 
-            let kind_cell = if cert.wildcard {
-                Cell::new("wildcard").fg(Color::Cyan)
-            } else {
-                Cell::new("single").fg(Color::DarkGrey)
-            };
             let validation_cell = match cert.validation.as_deref() {
                 Some(mech) => Cell::new(mech),
                 None => Cell::new("-").fg(Color::DarkGrey),
@@ -463,7 +455,6 @@ pub async fn client_cert_status(
             }
             row.extend(vec![
                 name_cell,
-                kind_cell,
                 state_cell,
                 validation_cell,
                 days_cell,
@@ -509,14 +500,6 @@ pub async fn client_cert_status(
         table.add_row(vec![
             Cell::new("State").fg(Color::DarkCyan),
             styled_state_cell(resp.state.label()),
-        ]);
-        table.add_row(vec![
-            Cell::new("Kind").fg(Color::DarkCyan),
-            if resp.wildcard {
-                Cell::new("wildcard").fg(Color::Cyan)
-            } else {
-                Cell::new("single").fg(Color::DarkGrey)
-            },
         ]);
         table.add_row(vec![
             Cell::new("Validation").fg(Color::DarkCyan),

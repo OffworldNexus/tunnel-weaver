@@ -65,7 +65,7 @@ pub fn ensure_root_or_elevate(config: &GatheredConfig, is_headless: bool) {
     cmd.arg(current_exe);
     cmd.arg("setup");
 
-    cmd.arg("--root-domain").arg(&config.root_domain);
+    cmd.arg("--tunnel-domain").arg(&config.tunnel_domain);
     cmd.arg("--admin-domain").arg(&config.admin_domain);
     cmd.arg("--email").arg(&config.admin_email);
     cmd.arg("--acme-provider").arg(&config.acme_provider);

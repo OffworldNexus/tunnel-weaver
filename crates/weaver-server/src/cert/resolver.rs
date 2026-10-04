@@ -10,7 +10,7 @@ use tracing::{debug, trace};
 
 use crate::cert::acme::parse_cert_validity;
 use crate::cert::clock::{Clock, SystemClock};
-use crate::zone::Zone;
+use crate::cert::managed::ManagedCerts;
 
 /// In-memory stored certificate with its parsed expiration timestamp.
 #[derive(Clone)]
@@ -69,10 +69,10 @@ pub const DEFAULT_HOLD_TIMEOUT: Duration = Duration::from_secs(30);
 /// - Rejects unknown hostnames, missing SNI, failed orders, and timed-out orders at the TCP level
 /// - Strictly prohibits serving self-signed or placeholder certificates to public HTTPS clients
 pub struct CertResolver {
-    /// The relay's serving area. The admin host gets its own single-name
-    /// certificate and must never be covered by the tunnel wildcard, nor a
-    /// tunnel name by the admin certificate.
-    zone: Zone,
+    /// The managed certificates that define which SNI is served by which
+    /// certificate. There is no separate zone type: coverage comes from the
+    /// catalog itself.
+    managed: Arc<ManagedCerts>,
     certs: RwLock<HashMap<String, StoredCert>>,
     ordering_waiters: Mutex<HashMap<String, Arc<HandshakeWaiter>>>,
     clock: Arc<dyn Clock>,
@@ -82,41 +82,35 @@ pub struct CertResolver {
 impl std::fmt::Debug for CertResolver {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CertResolver")
-            .field("root_domain", &self.zone.root())
-            .field("admin_domain", &self.zone.admin())
+            .field("managed", &self.managed.all().len())
             .field("certs_count", &self.certs.read().unwrap().len())
             .finish()
     }
 }
 
 impl CertResolver {
-    /// Creates a new `CertResolver` with the given root domain.
+    /// Creates a new `CertResolver` serving a single tunnel wildcard.
     ///
-    /// The admin domain defaults to the root domain; production callers set it
-    /// with [`CertResolver::with_admin_domain`].
-    pub fn new(root_domain: String) -> Self {
-        Self::with_clock(root_domain, Arc::new(SystemClock))
+    /// Convenience for tests and tunnel-only callers; production wires the full
+    /// catalog with [`CertResolver::with_managed`].
+    pub fn new(tunnel_domain: impl AsRef<str>) -> Self {
+        Self::with_clock(tunnel_domain, Arc::new(SystemClock))
     }
 
     /// Creates a new `CertResolver` with an injected clock for deterministic time in tests.
-    pub fn with_clock(root_domain: String, clock: Arc<dyn Clock>) -> Self {
-        let zone = Zone::new(&root_domain, &root_domain);
+    pub fn with_clock(tunnel_domain: impl AsRef<str>, clock: Arc<dyn Clock>) -> Self {
+        Self::with_managed(Arc::new(ManagedCerts::for_tunnel(tunnel_domain)), clock)
+    }
+
+    /// Creates a resolver driven by the full managed-certificate catalog.
+    pub fn with_managed(managed: Arc<ManagedCerts>, clock: Arc<dyn Clock>) -> Self {
         Self {
-            zone,
+            managed,
             certs: RwLock::new(HashMap::new()),
             ordering_waiters: Mutex::new(HashMap::new()),
             clock,
             hold_timeout: DEFAULT_HOLD_TIMEOUT,
         }
-    }
-
-    /// Sets the relay's own (admin) hostname, served by its own certificate.
-    ///
-    /// Builder form keeps the many root-only test constructors unchanged while
-    /// letting production wire in the real split.
-    pub fn with_admin_domain(mut self, admin_domain: String) -> Self {
-        self.zone = Zone::new(self.zone.root(), admin_domain);
-        self
     }
 
     /// Overrides the handshake hold timeout (defaults to 30s).
@@ -127,12 +121,11 @@ impl CertResolver {
 
     /// Maps an SNI to the certificate name that serves it.
     ///
-    /// The admin certificate covers exactly `admin_domain`; the tunnel wildcard
-    /// covers the apex and exactly one label beneath it. The two never overlap:
-    /// a tunnel name is not the admin name, and a name under the tunnel zone
-    /// cannot fall through to the admin certificate (or vice versa).
+    /// The managed catalog decides coverage: the admin certificate covers
+    /// exactly the admin hostname; the tunnel certificate covers the apex and
+    /// exactly one label beneath it.
     fn cert_name_for(&self, host: &str) -> Option<String> {
-        self.zone.cert_name_for(host)
+        self.managed.cert_for(host).map(|c| c.name.clone())
     }
 
     /// Checks whether the certificate currently served for `name` is a placeholder certificate.

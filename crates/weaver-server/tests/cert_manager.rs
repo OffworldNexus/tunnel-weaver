@@ -89,9 +89,9 @@ fn create_test_client_config() -> Arc<rustls::ClientConfig> {
     create_test_client_config_with_alpn(vec![b"http/1.1".to_vec()])
 }
 
-fn test_config(root_domain: &str, acme_provider: &str, acme_directory: Option<String>) -> Config {
+fn test_config(tunnel_domain: &str, acme_provider: &str, acme_directory: Option<String>) -> Config {
     Config {
-        root_domain: root_domain.to_string(),
+        tunnel_domain: tunnel_domain.to_string(),
         admin_domain: "relay-admin.test".to_string(),
         admin_email: "admin@example.com".into(),
         acme_provider: acme_provider.to_string(),
@@ -160,22 +160,20 @@ fn test_providers_catalog() {
     assert!(table.contains("letsencrypt"));
     assert!(table.contains("google"));
     assert!(table.contains("zerossl"));
-    assert!(table.contains("buypass"));
     assert!(table.contains("custom"));
 
-    // DNS-01 needs wildcard support: the catalog advertises which providers
-    // can issue `*.<root>`.
+    // Every catalogued provider is wildcard-capable (OFF-190 issues the tunnel
+    // wildcard unconditionally); the catalog no longer models the distinction.
     let letsencrypt = find_provider("letsencrypt").expect("letsencrypt provider");
-    assert!(letsencrypt.wildcard_capable);
-    assert!(PROVIDERS.iter().any(|p| p.wildcard_capable));
-    assert!(PROVIDERS.iter().any(|p| !p.wildcard_capable));
+    assert_eq!(letsencrypt.id, "letsencrypt");
+    assert!(PROVIDERS.iter().all(|p| !p.id.is_empty()));
 }
 
 // OFF-79: Public TLS handshakes for uncertified, unknown, or missing SNI terminate immediately
 // at the TCP level without completing a handshake or serving placeholder certificates.
 #[tokio::test]
 async fn test_cert_resolver_placeholder_and_hsts() {
-    let resolver = Arc::new(CertResolver::new("example.com".to_string()));
+    let resolver = Arc::new(CertResolver::new("example.com"));
 
     // Initially placeholder (uncertified) for the apex and any one-label host.
     assert!(resolver.is_placeholder("example.com"));
@@ -202,14 +200,7 @@ async fn test_cert_resolver_placeholder_and_hsts() {
     let res_clone = Arc::clone(&resolver);
     let s_tok = shutdown_token.clone();
     tokio::spawn(async move {
-        run_https_server(
-            listener,
-            tls_config,
-            "example.com".into(),
-            Some(res_clone),
-            s_tok,
-        )
-        .await;
+        run_https_server(listener, tls_config, "example.com", Some(res_clone), s_tok).await;
     });
 
     let client_config = create_test_client_config();
@@ -259,7 +250,7 @@ async fn test_cert_resolver_placeholder_and_hsts() {
 // successfully once the certificate is provisioned within the hold window.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_resolver_handshake_hold_unblocks_on_cert_insert() {
-    let resolver = Arc::new(CertResolver::new("example.com".to_string()));
+    let resolver = Arc::new(CertResolver::new("example.com"));
 
     // The wildcard covers `wait.example.com`; ordering is tracked on the apex.
     let host = "wait.example.com";
@@ -282,7 +273,7 @@ async fn test_resolver_handshake_hold_unblocks_on_cert_insert() {
         run_https_server(
             listener,
             tls_config,
-            "example.com".into(),
+            "example.com",
             Some(res_for_server),
             s_tok,
         )
@@ -348,7 +339,6 @@ async fn test_sqlite_caching_and_server_restart_no_reorder() {
                 directory: "https://acme-staging-v02.api.letsencrypt.org/directory".into(),
                 obtained_at: 1_700_000_000,
                 validation: "dns-01".to_string(),
-                wildcard: true,
             },
         )
         .await
@@ -357,7 +347,7 @@ async fn test_sqlite_caching_and_server_restart_no_reorder() {
     let config = Arc::new(test_config("test.example.com", "letsencrypt-staging", None));
 
     let resolver = Arc::new(CertResolver::with_clock(
-        "test.example.com".into(),
+        "test.example.com",
         Arc::clone(&clock) as Arc<dyn Clock>,
     ));
 
@@ -399,7 +389,7 @@ async fn test_init_holds_when_no_certificate_present() {
 
     let config = Arc::new(test_config("example.com", "letsencrypt-staging", None));
     let resolver = Arc::new(CertResolver::with_clock(
-        "example.com".into(),
+        "example.com",
         Arc::clone(&clock) as Arc<dyn Clock>,
     ));
     let manager = CertManager::new(config, Arc::clone(&store), resolver, clock);
@@ -414,39 +404,24 @@ async fn test_init_holds_when_no_certificate_present() {
 }
 
 #[tokio::test]
-async fn test_active_inactive_renewal_policy() {
+async fn test_managed_cert_counts_partition_by_state() {
     let dir = tempdir().unwrap();
     let db_path = dir.path().join("weaver.db");
     let store = Arc::new(Store::open(&db_path).await.unwrap());
     let clock = Arc::new(MockClock::new(1_700_000_000));
 
     let config = Arc::new(test_config("example.com", "letsencrypt-staging", None));
-    let resolver = Arc::new(CertResolver::new("example.com".into()));
+    let resolver = Arc::new(CertResolver::new("example.com"));
 
     let manager = CertManager::new(config, Arc::clone(&store), resolver, clock);
 
-    // Hostname initially active
-    manager.set_active("host1.example.com", true);
-    assert!(manager.is_active("host1.example.com"));
-
-    // Set inactive
-    manager.set_active("host1.example.com", false);
-    assert!(!manager.is_active("host1.example.com"));
-
-    // Re-activate
-    manager.set_active("host1.example.com", true);
-    assert!(manager.is_active("host1.example.com"));
-
-    // Cert counts span both managed certificates (tunnel wildcard + admin), so
-    // with neither active both report inactive.
-    let counts = manager.cert_counts().await;
-    assert_eq!(counts.inactive, 2);
-    manager.set_active("example.com", true);
-    let counts = manager.cert_counts().await;
-    assert_eq!(counts.inactive, 1);
-    manager.set_active("relay-admin.test", true);
-    let counts = manager.cert_counts().await;
-    assert_eq!(counts.inactive, 0);
+    // Both managed certificates (tunnel wildcard + admin) start Pending and are
+    // marked as ordering during init.
+    manager.init().await.unwrap();
+    let counts = manager.cert_counts();
+    assert_eq!(counts.ordering, 2);
+    assert_eq!(counts.issued, 0);
+    assert_eq!(counts.failed, 0);
 }
 
 #[tokio::test]
@@ -478,14 +453,13 @@ async fn test_forced_expiration_triggers_renewal_flow_and_event() {
                 directory: "https://acme-staging-v02.api.letsencrypt.org/directory".into(),
                 obtained_at: 1_600_000_000,
                 validation: "dns-01".to_string(),
-                wildcard: true,
             },
         )
         .await
         .unwrap();
 
     let config = Arc::new(test_config("example.com", "letsencrypt-staging", None));
-    let resolver = Arc::new(CertResolver::new("example.com".into()));
+    let resolver = Arc::new(CertResolver::new("example.com"));
 
     let manager = CertManager::new(config, Arc::clone(&store), resolver, clock);
 
@@ -534,7 +508,7 @@ async fn test_exponential_backoff_on_failure() {
         Some("http://127.0.0.1:1/nonexistent-directory".into()),
     ));
 
-    let resolver = Arc::new(CertResolver::new("example.com".into()));
+    let resolver = Arc::new(CertResolver::new("example.com"));
 
     let manager = CertManager::new(config, Arc::clone(&store), Arc::clone(&resolver), clock);
 
@@ -580,7 +554,7 @@ async fn test_concurrent_ensure_deduplication() {
         Some("http://127.0.0.1:1/nonexistent".into()),
     ));
 
-    let resolver = Arc::new(CertResolver::new("example.com".into()));
+    let resolver = Arc::new(CertResolver::new("example.com"));
 
     let manager = CertManager::new(config, Arc::clone(&store), resolver, clock);
 
@@ -602,7 +576,7 @@ async fn test_concurrent_ensure_deduplication() {
 // at the TCP level without completing a TLS handshake.
 #[tokio::test]
 async fn test_strict_tls_unknown_sni_terminates_tcp() {
-    let resolver = Arc::new(CertResolver::new("example.com".to_string()));
+    let resolver = Arc::new(CertResolver::new("example.com"));
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -614,14 +588,7 @@ async fn test_strict_tls_unknown_sni_terminates_tcp() {
     let res_clone = Arc::clone(&resolver);
     let s_tok = shutdown_token.clone();
     tokio::spawn(async move {
-        run_https_server(
-            listener,
-            tls_config,
-            "example.com".into(),
-            Some(res_clone),
-            s_tok,
-        )
-        .await;
+        run_https_server(listener, tls_config, "example.com", Some(res_clone), s_tok).await;
     });
 
     let client_config = create_test_client_config();
@@ -646,7 +613,7 @@ async fn test_strict_tls_unknown_sni_terminates_tcp() {
 // OFF-79: Incoming TLS handshake with missing SNI terminates immediately at the TCP level.
 #[tokio::test]
 async fn test_strict_tls_missing_sni_terminates_tcp() {
-    let resolver = Arc::new(CertResolver::new("example.com".to_string()));
+    let resolver = Arc::new(CertResolver::new("example.com"));
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -658,14 +625,7 @@ async fn test_strict_tls_missing_sni_terminates_tcp() {
     let res_clone = Arc::clone(&resolver);
     let s_tok = shutdown_token.clone();
     tokio::spawn(async move {
-        run_https_server(
-            listener,
-            tls_config,
-            "example.com".into(),
-            Some(res_clone),
-            s_tok,
-        )
-        .await;
+        run_https_server(listener, tls_config, "example.com", Some(res_clone), s_tok).await;
     });
 
     let client_config = create_test_client_config();
@@ -686,7 +646,7 @@ async fn test_strict_tls_missing_sni_terminates_tcp() {
 // immediately at the TCP level without completing a TLS handshake.
 #[tokio::test]
 async fn test_strict_tls_failed_order_terminates_tcp() {
-    let resolver = Arc::new(CertResolver::new("example.com".to_string()));
+    let resolver = Arc::new(CertResolver::new("example.com"));
 
     let host = "failed-order.example.com";
     resolver.mark_ordering("example.com");
@@ -704,14 +664,7 @@ async fn test_strict_tls_failed_order_terminates_tcp() {
     let res_clone = Arc::clone(&resolver);
     let s_tok = shutdown_token.clone();
     tokio::spawn(async move {
-        run_https_server(
-            listener,
-            tls_config,
-            "example.com".into(),
-            Some(res_clone),
-            s_tok,
-        )
-        .await;
+        run_https_server(listener, tls_config, "example.com", Some(res_clone), s_tok).await;
     });
 
     let client_config = create_test_client_config();
@@ -734,7 +687,7 @@ async fn test_strict_tls_failed_order_terminates_tcp() {
 // certificate completes immediately, serving the existing certificate without holding.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_strict_tls_renewing_serves_immediately_without_hold() {
-    let resolver = Arc::new(CertResolver::new("example.com".to_string()));
+    let resolver = Arc::new(CertResolver::new("example.com"));
 
     let host = "renew.example.com";
     let cert = make_wildcard_certified_key("example.com");
@@ -755,14 +708,7 @@ async fn test_strict_tls_renewing_serves_immediately_without_hold() {
     let res_clone = Arc::clone(&resolver);
     let s_tok = shutdown_token.clone();
     tokio::spawn(async move {
-        run_https_server(
-            listener,
-            tls_config,
-            "example.com".into(),
-            Some(res_clone),
-            s_tok,
-        )
-        .await;
+        run_https_server(listener, tls_config, "example.com", Some(res_clone), s_tok).await;
     });
 
     let client_config = create_test_client_config();
@@ -797,9 +743,8 @@ async fn test_strict_tls_renewing_serves_immediately_without_hold() {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_strict_tls_hold_timeout_terminates_tcp() {
     // Use short timeout (50ms) to test timeout termination deterministically
-    let resolver = Arc::new(
-        CertResolver::new("example.com".to_string()).with_hold_timeout(Duration::from_millis(50)),
-    );
+    let resolver =
+        Arc::new(CertResolver::new("example.com").with_hold_timeout(Duration::from_millis(50)));
 
     let host = "timeout.example.com";
     resolver.mark_ordering("example.com");
@@ -814,14 +759,7 @@ async fn test_strict_tls_hold_timeout_terminates_tcp() {
     let res_clone = Arc::clone(&resolver);
     let s_tok = shutdown_token.clone();
     tokio::spawn(async move {
-        run_https_server(
-            listener,
-            tls_config,
-            "example.com".into(),
-            Some(res_clone),
-            s_tok,
-        )
-        .await;
+        run_https_server(listener, tls_config, "example.com", Some(res_clone), s_tok).await;
     });
 
     let client_config = create_test_client_config();
@@ -845,7 +783,7 @@ async fn test_cert_name_selection_admin_vs_tunnel() {
     let dir = tempdir().unwrap();
     let store = Arc::new(Store::open(dir.path().join("select.db")).await.unwrap());
     let config = Arc::new(test_config("example.com", "letsencrypt-staging", None));
-    let resolver = Arc::new(CertResolver::new("example.com".into()));
+    let resolver = Arc::new(CertResolver::new("example.com"));
     let manager = CertManager::new(config, store, resolver, Arc::new(MockClock::new(0)));
 
     // The admin host maps to its own certificate, never the tunnel wildcard.
@@ -881,7 +819,7 @@ async fn test_note_visit_records_event_and_triggers_issuance() {
         "custom",
         Some("http://127.0.0.1:1/directory".into()),
     ));
-    let resolver = Arc::new(CertResolver::new("example.com".into()));
+    let resolver = Arc::new(CertResolver::new("example.com"));
     let manager = CertManager::new(config, Arc::clone(&store), resolver, clock);
     manager.init().await.unwrap();
 

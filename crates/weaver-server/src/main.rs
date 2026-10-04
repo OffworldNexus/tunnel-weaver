@@ -191,7 +191,7 @@ fn validate_cert_name(name: &Option<String>) {
 pub struct SetupArgs {
     /// Base domain for routed public tunnels (e.g. "example.com").
     #[arg(long, value_name = "DOMAIN")]
-    pub root_domain: Option<String>,
+    pub tunnel_domain: Option<String>,
 
     /// The relay's own stable hostname (e.g. "relay.example.net"), kept outside
     /// the tunnel delegation and issued its own HTTP-01 certificate.
@@ -257,7 +257,7 @@ pub struct SetupArgs {
 pub struct DoctorArgs {
     /// Tunnel domain (the delegated zone). Falls back to the stored config.
     #[arg(long, value_name = "DOMAIN")]
-    pub root_domain: Option<String>,
+    pub tunnel_domain: Option<String>,
 
     /// The relay's own admin hostname. Falls back to the stored config.
     #[arg(long, value_name = "DOMAIN")]
@@ -302,7 +302,7 @@ pub struct UninstallArgs {
 pub struct ConfigureArgs {
     /// Base domain for routed public tunnels (e.g. "example.com").
     #[arg(long, value_name = "DOMAIN")]
-    pub root_domain: Option<String>,
+    pub tunnel_domain: Option<String>,
 
     /// The relay's own stable hostname (e.g. "relay.example.net").
     #[arg(long, value_name = "DOMAIN")]
@@ -467,7 +467,7 @@ async fn main() {
 
             let gathered = gather_acme_config(
                 AcmeConfigInputs {
-                    root_domain: args.root_domain,
+                    tunnel_domain: args.tunnel_domain,
                     admin_domain: args.admin_domain,
                     email: args.email,
                     acme_provider: args.acme_provider,
@@ -487,7 +487,7 @@ async fn main() {
                 },
             );
             let GatheredAcme {
-                root_domain,
+                tunnel_domain,
                 admin_domain,
                 admin_email,
                 acme_provider,
@@ -525,7 +525,7 @@ async fn main() {
             };
 
             let config = Config {
-                root_domain,
+                tunnel_domain,
                 admin_domain,
                 admin_email,
                 acme_provider,
@@ -736,7 +736,7 @@ fn resolve_usage_window(
 
 /// ACME and domain inputs shared by `setup` and `configure`.
 struct AcmeConfigInputs {
-    root_domain: Option<String>,
+    tunnel_domain: Option<String>,
     admin_domain: Option<String>,
     email: Option<String>,
     acme_provider: String,
@@ -760,7 +760,7 @@ struct GatherOptions {
 
 /// The gathered, validated ACME/domain configuration.
 struct GatheredAcme {
-    root_domain: String,
+    tunnel_domain: String,
     admin_domain: String,
     admin_email: String,
     acme_provider: String,
@@ -808,19 +808,19 @@ fn gather_acme_config(mut inputs: AcmeConfigInputs, options: GatherOptions) -> G
     let mut eab_kid = inputs.acme_eab_kid;
     let mut root_ca = inputs.acme_root_ca;
 
-    let (root_domain, admin_domain, admin_email) = if inputs.no_prompt_values {
+    let (tunnel_domain, admin_domain, admin_email) = if inputs.no_prompt_values {
         (
             inputs
-                .root_domain
-                .expect("root_domain missing with --no-prompt-values"),
+                .tunnel_domain
+                .expect("tunnel_domain missing with --no-prompt-values"),
             inputs
                 .admin_domain
                 .expect("admin_domain missing with --no-prompt-values"),
             inputs.email.expect("email missing with --no-prompt-values"),
         )
     } else if inputs.headless {
-        let Some(rd) = inputs.root_domain else {
-            eprintln!("Error: Missing required option --root-domain in headless mode");
+        let Some(rd) = inputs.tunnel_domain else {
+            eprintln!("Error: Missing required option --tunnel-domain in headless mode");
             std::process::exit(2);
         };
         let Some(ad) = inputs.admin_domain else {
@@ -861,7 +861,7 @@ fn gather_acme_config(mut inputs: AcmeConfigInputs, options: GatherOptions) -> G
             interactive::print_domain_step_intro();
         }
 
-        let rd = match inputs.root_domain {
+        let rd = match inputs.tunnel_domain {
             Some(d) => {
                 if !interactive::validate_fqdn(&d) {
                     eprintln!("Error: Invalid root domain '{d}'. Must be a valid FQDN.");
@@ -973,7 +973,7 @@ fn gather_acme_config(mut inputs: AcmeConfigInputs, options: GatherOptions) -> G
     };
 
     GatheredAcme {
-        root_domain,
+        tunnel_domain,
         admin_domain,
         admin_email,
         acme_provider,
@@ -988,7 +988,7 @@ async fn handle_setup(args: SetupArgs, db_path: PathBuf) {
     // 1. Gather configuration (shared with `configure`).
     let gathered_acme = gather_acme_config(
         AcmeConfigInputs {
-            root_domain: args.root_domain,
+            tunnel_domain: args.tunnel_domain,
             admin_domain: args.admin_domain,
             email: args.email,
             acme_provider: args.acme_provider,
@@ -1006,7 +1006,7 @@ async fn handle_setup(args: SetupArgs, db_path: PathBuf) {
         },
     );
     let GatheredAcme {
-        root_domain,
+        tunnel_domain,
         admin_domain,
         admin_email,
         acme_provider,
@@ -1017,7 +1017,7 @@ async fn handle_setup(args: SetupArgs, db_path: PathBuf) {
     } = gathered_acme;
 
     let gathered = weaver_server::setup::interactive::GatheredConfig {
-        root_domain: root_domain.clone(),
+        tunnel_domain: tunnel_domain.clone(),
         admin_domain: admin_domain.clone(),
         admin_email: admin_email.clone(),
         acme_provider: acme_provider.clone(),
@@ -1084,7 +1084,7 @@ async fn handle_setup(args: SetupArgs, db_path: PathBuf) {
 
     println!("\n{}", "Preflight Checks".bold().white());
     let report = weaver_server::setup::doctor::run_in_process(
-        &root_domain,
+        &tunnel_domain,
         &admin_domain,
         &args.relay_ips,
         args.skip_reachability_check,
@@ -1157,7 +1157,7 @@ async fn handle_setup(args: SetupArgs, db_path: PathBuf) {
     let probe = weaver_server::setup::planner::SystemProbe {
         systemd_present: true,
         supported_arch: true,
-        target_domain: root_domain.clone(),
+        target_domain: tunnel_domain.clone(),
         admin_domain: admin_domain.clone(),
         existing_install: existing_install.clone(),
         root_ips: relay_ips.clone(),
@@ -1283,7 +1283,7 @@ async fn handle_setup(args: SetupArgs, db_path: PathBuf) {
     );
 
     if let Err(err) = weaver_server::setup::verify::verify_setup(
-        &plan.root_domain,
+        &plan.tunnel_domain,
         &plan.admin_domain,
         &socket_path,
     )
@@ -1337,7 +1337,7 @@ async fn load_stored_domains(db_path: &std::path::Path) -> Option<(String, Strin
     let store = Store::open(db_path).await.ok()?;
     let config = store.load_config().await.ok()?;
     let _ = store.close().await;
-    Some((config.root_domain, config.admin_domain))
+    Some((config.tunnel_domain, config.admin_domain))
 }
 
 /// Runs the standalone `weaver-server doctor` preflight.
@@ -1358,7 +1358,7 @@ async fn handle_doctor(args: DoctorArgs, db_path: PathBuf, socket_path: PathBuf)
 
     // Pre-install / host-down path: resolve the domains from the arguments,
     // falling back to the installed config, and bind the ports in-process.
-    let (root_domain, admin_domain) = match (args.root_domain, args.admin_domain) {
+    let (tunnel_domain, admin_domain) = match (args.tunnel_domain, args.admin_domain) {
         (Some(root), Some(admin)) => (root, admin),
         (root, admin) => {
             let stored = load_stored_domains(std::path::Path::new(&db_path)).await;
@@ -1368,7 +1368,7 @@ async fn handle_doctor(args: DoctorArgs, db_path: PathBuf, socket_path: PathBuf)
                 (Some(root), Some(admin)) => (root, admin),
                 _ => {
                     eprintln!(
-                        "Error: --root-domain and --admin-domain are required when no installed \
+                        "Error: --tunnel-domain and --admin-domain are required when no installed \
                          configuration exists at {}",
                         db_path.display()
                     );
@@ -1378,8 +1378,8 @@ async fn handle_doctor(args: DoctorArgs, db_path: PathBuf, socket_path: PathBuf)
         }
     };
 
-    if !weaver_server::setup::interactive::validate_fqdn(&root_domain) {
-        eprintln!("Error: Invalid root domain '{root_domain}'. Must be a valid FQDN.");
+    if !weaver_server::setup::interactive::validate_fqdn(&tunnel_domain) {
+        eprintln!("Error: Invalid root domain '{tunnel_domain}'. Must be a valid FQDN.");
         std::process::exit(2);
     }
     if !weaver_server::setup::interactive::validate_fqdn(&admin_domain) {
@@ -1388,7 +1388,7 @@ async fn handle_doctor(args: DoctorArgs, db_path: PathBuf, socket_path: PathBuf)
     }
 
     let report = weaver_server::setup::doctor::run_in_process(
-        &root_domain,
+        &tunnel_domain,
         &admin_domain,
         &args.relay_ips,
         args.skip_reachability_check,

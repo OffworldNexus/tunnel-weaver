@@ -9,7 +9,6 @@ pub mod server;
 pub mod setup;
 pub mod store;
 pub mod tunnel;
-pub mod zone;
 
 pub use config::{Config, ConfigError};
 pub use store::{Migrator, Store, StoreError};

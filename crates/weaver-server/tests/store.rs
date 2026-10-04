@@ -21,7 +21,7 @@ where
 
 fn sample_config() -> Config {
     Config {
-        root_domain: "example.com".into(),
+        tunnel_domain: "example.com".into(),
         admin_domain: "relay-admin.test".into(),
         admin_email: "admin@example.com".into(),
         acme_provider: "letsencrypt".into(),
@@ -151,7 +151,7 @@ async fn test_config_load_on_unconfigured_db_lists_missing_keys() {
 
     match Config::load(&store).await {
         Err(ConfigError::MissingKeys(keys)) => {
-            assert!(keys.contains(&"root_domain".to_string()));
+            assert!(keys.contains(&"tunnel_domain".to_string()));
             assert!(keys.contains(&"admin_email".to_string()));
             assert!(keys.contains(&"acme_provider".to_string()));
             assert!(keys.contains(&"listen_http".to_string()));
@@ -286,7 +286,7 @@ async fn test_config_validation_rules() {
 
     // The reverse nesting (tunnel under admin) is safe and must load.
     let tunnel_under_admin = Config {
-        root_domain: "tunnels.relay.example.net".into(),
+        tunnel_domain: "tunnels.relay.example.net".into(),
         admin_domain: "relay.example.net".into(),
         acme_provider: "letsencrypt".into(),
         admin_email: "admin@example.com".into(),
@@ -309,7 +309,7 @@ async fn test_set_config_mutates_single_key() {
     let store = Store::open(&db_path).await.expect("open failed");
 
     for (k, v) in [
-        ("root_domain", "tunnel.nexus.com"),
+        ("tunnel_domain", "tunnel.nexus.com"),
         ("admin_domain", "\"relay.nexus.com\""),
         ("admin_email", "ops@nexus.com"),
         ("acme_provider", "letsencrypt"),
@@ -321,7 +321,7 @@ async fn test_set_config_mutates_single_key() {
     }
 
     let loaded = store.load_config().await.expect("load_config failed");
-    assert_eq!(loaded.root_domain, "tunnel.nexus.com");
+    assert_eq!(loaded.tunnel_domain, "tunnel.nexus.com");
     assert_eq!(loaded.admin_email, "ops@nexus.com");
     assert_eq!(loaded.acme_provider, "letsencrypt");
     assert_eq!(
@@ -338,7 +338,7 @@ async fn test_backup_creates_openable_database() {
 
     let store = Store::open(&original_db).await.expect("open failed");
     let config = Config {
-        root_domain: "backup.nexus.com".into(),
+        tunnel_domain: "backup.nexus.com".into(),
         ..sample_config()
     };
     store.save_config(&config).await.expect("save failed");
@@ -436,7 +436,6 @@ async fn test_certificate_and_event_round_trip() {
         directory: "https://acme.test/dir".into(),
         obtained_at: 100,
         validation: "dns-01".to_string(),
-        wildcard: true,
     };
     store
         .save_certificate("host.example.com", cert.clone())
@@ -452,7 +451,6 @@ async fn test_certificate_and_event_round_trip() {
     assert_eq!(rec.name, "host.example.com");
     assert_eq!(rec.not_after, 200);
     assert_eq!(rec.validation, "dns-01");
-    assert!(rec.wildcard);
 
     // Saving under the same name upserts in place: one global row per name.
     store
@@ -504,7 +502,6 @@ async fn test_certificate_and_event_round_trip() {
     assert_eq!(full[0].cert_pem, "CERT");
     assert_eq!(full[0].key_pem, "KEY");
     assert_eq!(full[0].validation, "dns-01");
-    assert!(full[0].wildcard);
 
     // Events, newest first
     store
@@ -537,11 +534,11 @@ async fn test_challenge_kinds_are_isolated_and_validation_round_trips() {
     // DNS-01 TXT rows and HTTP-01 token rows live in the same table but never
     // leak into each other's reads.
     store
-        .publish_challenge("_acme-challenge.example.com", "digest-a", 1)
+        .publish_challenge("_acme-challenge.example.com", "digest-a", None, 1)
         .await
         .unwrap();
     store
-        .publish_http01("token-1", "key-auth-1", 1)
+        .publish_http01("token-1", "key-auth-1", None, 1)
         .await
         .unwrap();
 
@@ -575,11 +572,8 @@ async fn test_challenge_kinds_are_isolated_and_validation_round_trips() {
             .is_empty()
     );
 
-    // `validation` and `wildcard` round-trip both mechanisms.
-    for (name, mechanism, wildcard) in [
-        ("example.com", "dns-01", true),
-        ("relay.example.net", "http-01", false),
-    ] {
+    // `validation` round-trips both mechanisms.
+    for (name, mechanism) in [("example.com", "dns-01"), ("relay.example.net", "http-01")] {
         store
             .save_certificate(
                 name,
@@ -592,14 +586,12 @@ async fn test_challenge_kinds_are_isolated_and_validation_round_trips() {
                     directory: "https://acme.test/dir".into(),
                     obtained_at: 1,
                     validation: mechanism.to_string(),
-                    wildcard,
                 },
             )
             .await
             .unwrap();
         let rec = store.get_certificate(name).await.unwrap().unwrap();
         assert_eq!(rec.validation, mechanism);
-        assert_eq!(rec.wildcard, wildcard);
     }
 }
 
@@ -634,7 +626,6 @@ async fn test_multiple_certificates_distinct_names() {
         directory: "dir".into(),
         obtained_at: 1_000,
         validation: "dns-01".to_string(),
-        wildcard: false,
     };
 
     store
@@ -690,7 +681,7 @@ async fn test_multiple_certificates_distinct_names() {
 }
 
 #[tokio::test]
-async fn test_deleting_certificate_clears_domain_reference() {
+async fn test_domain_and_certificate_lifecycles_are_independent() {
     use sea_orm::EntityTrait;
     let store = Store::connect("sqlite::memory:").await.expect("connect");
 
@@ -703,28 +694,17 @@ async fn test_deleting_certificate_clears_domain_reference() {
         directory: "dir".into(),
         obtained_at: 1_000,
         validation: "dns-01".to_string(),
-        wildcard: false,
     };
     let saved = store
         .save_certificate("cascade.example.com", cert)
         .await
         .unwrap();
 
-    // A materialized domain points at the covering certificate.
-    store
+    // A materialized domain is independent of the certificate table.
+    let domain = store
         .get_or_create_domain("cascade.example.com", None)
         .await
         .unwrap();
-    store
-        .set_domain_certificate("cascade.example.com", saved.id)
-        .await
-        .unwrap();
-    let domain = store
-        .get_domain("cascade.example.com")
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(domain.certificate_id, Some(saved.id));
 
     // Certificates are global: deleting a domain must not delete them.
     weaver_server::store::entity::domain::Entity::delete_by_id(domain.id)
@@ -740,14 +720,10 @@ async fn test_deleting_certificate_clears_domain_reference() {
         "deleting a domain must leave the global certificate alone"
     );
 
-    // Conversely, deleting the certificate nulls the referencing domain
-    // (`ON DELETE SET NULL`) rather than cascading the domain away.
+    // Deleting the certificate leaves the domain alone: the covering
+    // certificate is resolved at run time, not by a foreign key.
     let recreated = store
         .get_or_create_domain("cascade.example.com", None)
-        .await
-        .unwrap();
-    store
-        .set_domain_certificate("cascade.example.com", saved.id)
         .await
         .unwrap();
     weaver_server::store::entity::certificate::Entity::delete_by_id(saved.id)
@@ -760,7 +736,6 @@ async fn test_deleting_certificate_clears_domain_reference() {
         .unwrap()
         .unwrap();
     assert_eq!(after.id, recreated.id);
-    assert_eq!(after.certificate_id, None);
 }
 
 #[tokio::test]

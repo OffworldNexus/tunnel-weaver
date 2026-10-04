@@ -8,11 +8,6 @@ pub struct AcmeProviderInfo {
     pub id: &'static str,
     pub directory: &'static str,
     pub eab_required: bool,
-    /// Whether the provider's EAB/profile permits wildcard identifiers.
-    ///
-    /// OFF-190 issues a single `[<root>, *.<root>]` order, so a provider that
-    /// cannot issue wildcards is unusable as a primary or fallback.
-    pub wildcard_capable: bool,
     /// The CA's CAA issuer domain, if known.
     ///
     /// The authoritative responder publishes `issue`/`issuewild` CAA records
@@ -29,7 +24,6 @@ pub const PROVIDERS: &[AcmeProviderInfo] = &[
         id: "letsencrypt",
         directory: "https://acme-v02.api.letsencrypt.org/directory",
         eab_required: false,
-        wildcard_capable: true,
         caa_identifier: Some("letsencrypt.org"),
         quota: "50 new certs / week / registered domain (renewals exempt); 300 orders / 3 h; free increase via https://isrg.formstack.com/forms/rate_limit_adjustment_request",
         guidance: "—",
@@ -38,7 +32,6 @@ pub const PROVIDERS: &[AcmeProviderInfo] = &[
         id: "letsencrypt-staging",
         directory: "https://acme-staging-v02.api.letsencrypt.org/directory",
         eab_required: false,
-        wildcard_capable: true,
         caa_identifier: Some("letsencrypt.org"),
         quota: "very high, untrusted certs",
         guidance: "—",
@@ -47,7 +40,6 @@ pub const PROVIDERS: &[AcmeProviderInfo] = &[
         id: "google",
         directory: "https://dv.acme-v02.api.pki.goog/directory",
         eab_required: true,
-        wildcard_capable: true,
         caa_identifier: Some("pki.goog"),
         quota: "very high, adjustable in GCP",
         guidance: "GCP project → enable Public Certificate Authority API → gcloud publicca external-account-keys create → keyId + b64MacKey. Key must be used within 7 days of creation. Docs: https://cloud.google.com/certificate-manager/docs/public-ca-tutorial",
@@ -56,26 +48,14 @@ pub const PROVIDERS: &[AcmeProviderInfo] = &[
         id: "zerossl",
         directory: "https://acme.zerossl.com/v2/DV90",
         eab_required: true,
-        wildcard_capable: true,
         caa_identifier: Some("sectigo.com"),
         quota: "unlimited 90-day",
         guidance: "free account → Developer → EAB Credentials for ACME Clients. Docs: https://zerossl.com/documentation/acme/",
     },
     AcmeProviderInfo {
-        id: "buypass",
-        directory: "https://api.buypass.com/acme/directory",
-        eab_required: false,
-        // Buypass does not offer wildcard DNS-01; excluded from OFF-190.
-        wildcard_capable: false,
-        caa_identifier: Some("buypass.com"),
-        quota: "20 / week / domain, 180-day certs",
-        guidance: "—",
-    },
-    AcmeProviderInfo {
         id: "custom",
         directory: "any URL",
         eab_required: false,
-        wildcard_capable: true,
         caa_identifier: None,
         quota: "—",
         guidance: "Pebble, step-ca, internal CAs; optional acme_root_ca_pem to trust the directory endpoint",
@@ -101,15 +81,6 @@ pub fn caa_identifiers(provider: &str, fallbacks: &[String]) -> Vec<String> {
         }
     }
     out
-}
-
-/// Whether the provider can issue the wildcard certificate OFF-190 requires.
-///
-/// Unknown providers are treated as wildcard-capable: `custom` covers private
-/// CAs whose capabilities we cannot enumerate, and hard-failing on an unknown
-/// ID would be worse than letting the ACME order speak for itself.
-pub fn is_wildcard_capable(provider_id: &str) -> bool {
-    find_provider(provider_id).is_none_or(|p| p.wildcard_capable)
 }
 
 /// Resolves the ACME directory URL for a provider ID.

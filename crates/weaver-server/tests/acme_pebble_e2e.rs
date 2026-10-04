@@ -54,10 +54,11 @@ async fn spawn_dns_responder(
     store: Arc<Store>,
     token: CancellationToken,
 ) -> Option<(tokio::task::JoinHandle<()>, tokio::task::JoinHandle<()>)> {
-    let responder = Arc::new(weaver_server::dns::DnsResponder::new(
-        &weaver_server::dns::DnsResponderConfig::from_config(config),
-        store,
-    ));
+    let generator_config = weaver_server::dns::DnsResponderConfig::from_config(config);
+    let responder = Arc::new(weaver_server::dns::DnsResponder::new(vec![
+        Arc::new(weaver_server::dns::AcmeChallenges::new(Arc::clone(&store))),
+        Arc::new(weaver_server::dns::TunnelDomains::new(&generator_config)),
+    ]));
 
     let mut udp = None;
     let mut tcp = None;
@@ -202,9 +203,9 @@ async fn test_pebble_e2e_issuance_and_lazy_ensure() {
     let https_listener = TcpListener::bind("0.0.0.0:5001").await.unwrap();
     let https_port = https_listener.local_addr().unwrap().port();
 
-    let root_domain = "pebble.test";
+    let tunnel_domain = "pebble.test";
     let config = Arc::new(Config {
-        root_domain: root_domain.into(),
+        tunnel_domain: tunnel_domain.into(),
         admin_domain: "relay-admin.test".into(),
         admin_email: "admin@pebble.test".into(),
         acme_provider: "custom".into(),
@@ -226,7 +227,7 @@ async fn test_pebble_e2e_issuance_and_lazy_ensure() {
         .await
         .expect("test DNS responder could not bind 127.0.0.1:1053");
 
-    let resolver = Arc::new(CertResolver::new(root_domain.into()));
+    let resolver = Arc::new(CertResolver::new(tunnel_domain));
 
     let manager = CertManager::new(
         Arc::clone(&config),
@@ -243,9 +244,11 @@ async fn test_pebble_e2e_issuance_and_lazy_ensure() {
     tokio::spawn(async move {
         run_http_server(
             http_listener,
-            root_domain.into(),
+            tunnel_domain.into(),
             https_port,
-            http_store,
+            vec![Arc::new(weaver_server::cert::solver::Http01Solver::new(
+                http_store,
+            ))],
             s_tok1,
         )
         .await;
@@ -260,7 +263,7 @@ async fn test_pebble_e2e_issuance_and_lazy_ensure() {
         run_https_server(
             https_listener,
             tls_config,
-            root_domain.into(),
+            tunnel_domain,
             Some(res_clone),
             s_tok2,
         )
@@ -275,7 +278,7 @@ async fn test_pebble_e2e_issuance_and_lazy_ensure() {
     let mut issued = false;
     for _ in 0..60 {
         tokio::time::sleep(Duration::from_millis(500)).await;
-        if let CertState::Issued { .. } = manager.status(root_domain) {
+        if let CertState::Issued { .. } = manager.status(tunnel_domain) {
             issued = true;
             break;
         }
@@ -292,7 +295,7 @@ async fn test_pebble_e2e_issuance_and_lazy_ensure() {
     let tcp = TcpStream::connect(format!("127.0.0.1:{https_port}"))
         .await
         .unwrap();
-    let server_name = ServerName::try_from(root_domain).unwrap().to_owned();
+    let server_name = ServerName::try_from(tunnel_domain).unwrap().to_owned();
     let mut tls = connector.connect(server_name, tcp).await.unwrap();
     tls.write_all(b"GET / HTTP/1.1\r\nHost: pebble.test\r\nConnection: close\r\n\r\n")
         .await
@@ -306,7 +309,7 @@ async fn test_pebble_e2e_issuance_and_lazy_ensure() {
     let sub = "remy-laptop-web.pebble.test";
     assert!(manager.ensure(sub).await.is_ok());
     assert!(matches!(
-        manager.status(root_domain),
+        manager.status(tunnel_domain),
         CertState::Issued { .. }
     ));
 
@@ -339,9 +342,9 @@ async fn test_pebble_e2e_tunnel_registration_and_proxying() {
     let https_listener = TcpListener::bind("0.0.0.0:5001").await.unwrap();
     let https_port = https_listener.local_addr().unwrap().port();
 
-    let root_domain = "pebble.test";
+    let tunnel_domain = "pebble.test";
     let config = Arc::new(Config {
-        root_domain: root_domain.into(),
+        tunnel_domain: tunnel_domain.into(),
         admin_domain: "relay-admin.test".into(),
         admin_email: "admin@pebble.test".into(),
         acme_provider: "custom".into(),
@@ -363,7 +366,7 @@ async fn test_pebble_e2e_tunnel_registration_and_proxying() {
         .await
         .expect("test DNS responder could not bind 127.0.0.1:1053");
 
-    let resolver = Arc::new(CertResolver::new(root_domain.into()));
+    let resolver = Arc::new(CertResolver::new(tunnel_domain));
 
     let manager = CertManager::new(
         Arc::clone(&config),
@@ -376,7 +379,7 @@ async fn test_pebble_e2e_tunnel_registration_and_proxying() {
         store.as_ref().clone(),
     ));
     let registry = Arc::new(weaver_server::tunnel::TunnelRegistry::new(
-        root_domain.into(),
+        tunnel_domain.into(),
         Arc::clone(&manager),
         identity_resolver,
         store.as_ref().clone(),
@@ -393,9 +396,11 @@ async fn test_pebble_e2e_tunnel_registration_and_proxying() {
     tokio::spawn(async move {
         run_http_server(
             http_listener,
-            root_domain.into(),
+            tunnel_domain.into(),
             https_port,
-            http_store,
+            vec![Arc::new(weaver_server::cert::solver::Http01Solver::new(
+                http_store,
+            ))],
             s_tok1,
         )
         .await;
@@ -411,7 +416,7 @@ async fn test_pebble_e2e_tunnel_registration_and_proxying() {
         weaver_server::edge::https::run_https_server_with_registry(
             https_listener,
             tls_config,
-            root_domain.into(),
+            tunnel_domain,
             Some(res_clone),
             Some(reg_server_clone),
             s_tok2,
@@ -427,7 +432,7 @@ async fn test_pebble_e2e_tunnel_registration_and_proxying() {
     let mut issued = false;
     for _ in 0..60 {
         tokio::time::sleep(Duration::from_millis(500)).await;
-        if let CertState::Issued { .. } = manager.status(root_domain) {
+        if let CertState::Issued { .. } = manager.status(tunnel_domain) {
             issued = true;
             break;
         }
@@ -503,7 +508,7 @@ async fn test_pebble_e2e_tunnel_registration_and_proxying() {
     for _ in 0..60 {
         tokio::time::sleep(Duration::from_millis(500)).await;
         if registry.resolve(target_hostname).await.is_some()
-            && matches!(manager.status(root_domain), CertState::Issued { .. })
+            && matches!(manager.status(tunnel_domain), CertState::Issued { .. })
         {
             ready = true;
             break;

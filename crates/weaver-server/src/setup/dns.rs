@@ -1,12 +1,10 @@
-//! Explicit DNS delegation probes for setup host verification.
+//! DNS delegation probes for setup host verification.
 //!
-//! Queries the public recursive resolvers (`1.1.1.1`, `8.8.8.8`, `9.9.9.9`)
-//! directly with a hand-built `hickory-proto` message rather than the system
-//! resolver. On a relay running `systemd-resolved`, the local stub masks a
-//! broken delegation: it happily answers from a stale upstream cache or from
-//! the parent zone, so setup would proceed against a zone it cannot actually
-//! serve. Talking to public resolvers over a fresh UDP socket shows what the
-//! rest of the internet sees.
+//! Queries the **system resolver configuration** (`/etc/resolv.conf`) directly
+//! with a hand-built `hickory-proto` message. Talking to the configured
+//! nameservers over a fresh UDP socket (rather than going through
+//! `getaddrinfo`) is what lets the probe read NS and TXT records and see the
+//! same answer the rest of the internet would.
 
 use std::net::{IpAddr, SocketAddr};
 use std::str::FromStr;
@@ -17,10 +15,33 @@ use hickory_proto::rr::{Name, RData, RecordType};
 use sha2::Digest;
 use tokio::net::UdpSocket;
 
-use crate::zone::normalize_domain;
+use crate::store::names::normalize_domain;
 
-/// Public recursive resolvers queried directly during setup.
-pub const PUBLIC_RESOLVERS: &[&str] = &["1.1.1.1", "8.8.8.8", "9.9.9.9"];
+/// The nameservers configured for the host (`/etc/resolv.conf`).
+///
+/// Setup uses the system resolver configuration rather than a hardcoded list of
+/// public resolvers: a host behind a local forwarder or a corporate resolver
+/// must be asked through that resolver, not one we picked.
+pub fn system_resolvers() -> Vec<IpAddr> {
+    let mut resolvers = Vec::new();
+    if let Ok(contents) = std::fs::read_to_string("/etc/resolv.conf") {
+        for line in contents.lines() {
+            let mut parts = line.split_whitespace();
+            if parts.next() == Some("nameserver")
+                && let Some(addr) = parts.next().and_then(|s| s.parse::<IpAddr>().ok())
+                && !resolvers.contains(&addr)
+            {
+                resolvers.push(addr);
+            }
+        }
+    }
+    if resolvers.is_empty() {
+        // The systemd-resolved stub, the conventional system resolver when
+        // `/etc/resolv.conf` is absent (e.g. a container).
+        resolvers.push(IpAddr::from([127, 0, 0, 53]));
+    }
+    resolvers
+}
 
 /// UDP port of a DNS resolver.
 const RESOLVER_PORT: u16 = 53;
@@ -201,12 +222,9 @@ async fn resolve_both(resolver: IpAddr, qname: &str) -> Result<Vec<IpAddr>, Stri
 /// `<root>` itself. This reads only the parent zone, so it works before the
 /// relay's own responder is running — which is what lets `setup` bring DNS up
 /// first and verify delegation second.
-pub async fn probe_delegation(root_domain: &str) -> Result<(Vec<String>, bool), String> {
-    let root = normalize_domain(root_domain);
-    let resolvers: Vec<IpAddr> = PUBLIC_RESOLVERS
-        .iter()
-        .filter_map(|s| s.parse::<IpAddr>().ok())
-        .collect();
+pub async fn probe_delegation(tunnel_domain: &str) -> Result<(Vec<String>, bool), String> {
+    let root = normalize_domain(tunnel_domain);
+    let resolvers = system_resolvers();
 
     let mut ns_targets = Vec::new();
     let mut ns_failures = Vec::new();
@@ -255,10 +273,10 @@ pub async fn probe_delegation(root_domain: &str) -> Result<(Vec<String>, bool), 
 /// zone to the admin name, which is always resolvable because it lives outside
 /// the delegation.
 pub async fn probe_registrar_delegation(
-    root_domain: &str,
+    tunnel_domain: &str,
     expected_ns: &str,
 ) -> Result<(Vec<String>, bool), String> {
-    let root = normalize_domain(root_domain);
+    let root = normalize_domain(tunnel_domain);
     let expected = normalize_domain(expected_ns);
     let labels: Vec<&str> = root.split('.').collect();
     if labels.len() < 2 {
@@ -266,10 +284,7 @@ pub async fn probe_registrar_delegation(
             "'{root}' has no parent zone to read a delegation from"
         ));
     }
-    let resolvers: Vec<IpAddr> = PUBLIC_RESOLVERS
-        .iter()
-        .filter_map(|s| s.parse::<IpAddr>().ok())
-        .collect();
+    let resolvers = system_resolvers();
 
     // 1. Walk up from the immediate parent to the enclosing zone. The base
     //    domain may itself be a subdomain of a larger zone, in which case the
@@ -339,12 +354,9 @@ pub fn delegation_matches(targets: &[String], expected_ns: &str) -> bool {
 ///
 /// This needs the relay's authoritative responder to be up (and the delegation
 /// to point at it), so call it *after* the DNS socket is started.
-pub async fn probe_zone(root_domain: &str) -> ZoneProbe {
-    let root = normalize_domain(root_domain);
-    let resolvers: Vec<IpAddr> = PUBLIC_RESOLVERS
-        .iter()
-        .filter_map(|s| s.parse::<IpAddr>().ok())
-        .collect();
+pub async fn probe_zone(tunnel_domain: &str) -> ZoneProbe {
+    let root = normalize_domain(tunnel_domain);
+    let resolvers = system_resolvers();
 
     // Apex A/AAAA through the public resolvers (union of both families).
     let mut root_ips = Vec::new();
@@ -393,10 +405,7 @@ pub async fn probe_zone(root_domain: &str) -> ZoneProbe {
 /// currently points at before any host modification.
 pub async fn resolve_public(name: &str) -> Vec<IpAddr> {
     let qname = normalize_domain(name);
-    let resolvers: Vec<IpAddr> = PUBLIC_RESOLVERS
-        .iter()
-        .filter_map(|s| s.parse::<IpAddr>().ok())
-        .collect();
+    let resolvers = system_resolvers();
     let mut ips = Vec::new();
     for resolver in &resolvers {
         if let Ok(found) = resolve_both(*resolver, &qname).await {

@@ -41,6 +41,6 @@ pub async fn detect_existing_install(db_path: &Path) -> Option<ExistingInstall> 
     let store = Store::open(db_path).await.ok()?;
     let config = store.load_config().await.ok()?;
     Some(ExistingInstall {
-        root_domain: config.root_domain,
+        tunnel_domain: config.tunnel_domain,
     })
 }

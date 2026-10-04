@@ -216,7 +216,7 @@ fn create_client_tls_config(alpn: Vec<Vec<u8>>) -> Arc<ClientConfig> {
 #[allow(dead_code)]
 struct TestRelay {
     addr: SocketAddr,
-    root_domain: String,
+    tunnel_domain: String,
     registry: Arc<TunnelRegistry>,
     cert_manager: Arc<CertManager>,
     store: Arc<Store>,
@@ -227,7 +227,7 @@ struct TestRelay {
     _temp_ca: NamedTempFile,
 }
 
-async fn spawn_test_relay(root_domain: &str) -> TestRelay {
+async fn spawn_test_relay(tunnel_domain: &str) -> TestRelay {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
 
@@ -235,7 +235,7 @@ async fn spawn_test_relay(root_domain: &str) -> TestRelay {
     let store = Arc::new(Store::open(temp_db.path()).await.unwrap());
 
     let config = Arc::new(Config {
-        root_domain: root_domain.to_string(),
+        tunnel_domain: tunnel_domain.to_string(),
         admin_domain: "relay-admin.test".to_string(),
         admin_email: "admin@weaver.test".to_string(),
         acme_provider: "letsencrypt-staging".to_string(),
@@ -252,7 +252,7 @@ async fn spawn_test_relay(root_domain: &str) -> TestRelay {
         setup_complete: false,
     });
 
-    let resolver = Arc::new(CertResolver::new(root_domain.to_string()));
+    let resolver = Arc::new(CertResolver::new(tunnel_domain));
 
     let cert_manager = CertManager::new(
         Arc::clone(&config),
@@ -266,8 +266,8 @@ async fn spawn_test_relay(root_domain: &str) -> TestRelay {
     let (server_tls, cert_pem) = {
         let key_pair = rcgen::KeyPair::generate().unwrap();
         let params = rcgen::CertificateParams::new(vec![
-            root_domain.to_string(),
-            format!("*.{}", root_domain),
+            tunnel_domain.to_string(),
+            format!("*.{}", tunnel_domain),
             "127.0.0.1".to_string(),
             "localhost".to_string(),
         ])
@@ -300,7 +300,7 @@ async fn spawn_test_relay(root_domain: &str) -> TestRelay {
         std::time::Duration::from_secs(60),
     ));
     let registry = Arc::new(TunnelRegistry::new(
-        root_domain.to_string(),
+        tunnel_domain.to_string(),
         Arc::clone(&cert_manager),
         resolver,
         store.as_ref().clone(),
@@ -309,7 +309,7 @@ async fn spawn_test_relay(root_domain: &str) -> TestRelay {
 
     let shutdown_token = CancellationToken::new();
     let s_tok = shutdown_token.clone();
-    let root = root_domain.to_string();
+    let root = tunnel_domain.to_string();
     let reg_clone = Arc::clone(&registry);
 
     tokio::spawn(async move {
@@ -319,7 +319,7 @@ async fn spawn_test_relay(root_domain: &str) -> TestRelay {
 
     TestRelay {
         addr,
-        root_domain: root_domain.to_string(),
+        tunnel_domain: tunnel_domain.to_string(),
         registry,
         cert_manager,
         store,
@@ -360,7 +360,7 @@ async fn test_tunnel_registration_and_http1_http2_proxying() {
     assert!(registered, "Service should register within 5 seconds");
 
     // Verify cert_manager active status
-    assert!(relay.cert_manager.is_active(&expected_hostname));
+    assert!(relay.registry.is_active(&expected_hostname));
 
     // 3. Visitor request over HTTP/1.1
     let client_tls_h1 = create_client_tls_config(vec![b"http/1.1".to_vec()]);
@@ -516,7 +516,7 @@ async fn test_tunnel_registration_and_http1_http2_proxying() {
         sleep(Duration::from_millis(100)).await;
     }
     assert!(unreg, "Route should be removed within 1 second");
-    assert!(!relay.cert_manager.is_active(&expected_hostname));
+    assert!(!relay.registry.is_active(&expected_hostname));
 
     // Send another request and expect 404
     let tcp3 = TcpStream::connect(relay.addr).await.unwrap();
@@ -570,7 +570,7 @@ async fn test_control_stream_is_the_registration_lease() {
         sleep(Duration::from_millis(100)).await;
     }
     assert!(registered, "service should register");
-    assert!(relay.cert_manager.is_active(&hostname));
+    assert!(relay.registry.is_active(&hostname));
 
     // Drop the lease; the connection stays open.
     release.cancel();
@@ -583,7 +583,7 @@ async fn test_control_stream_is_the_registration_lease() {
         sleep(Duration::from_millis(100)).await;
     }
     assert!(released, "finishing the control stream must unregister");
-    assert!(!relay.cert_manager.is_active(&hostname));
+    assert!(!relay.registry.is_active(&hostname));
     assert!(
         !client_task.is_finished(),
         "connection must survive the lease release"
@@ -2068,7 +2068,7 @@ async fn test_client_leaving_during_cert_issuance_does_not_leave_hostname_active
     let temp_db = NamedTempFile::new().unwrap();
     let store = Arc::new(Store::open(temp_db.path()).await.unwrap());
     let config = Arc::new(Config {
-        root_domain: root.to_string(),
+        tunnel_domain: root.to_string(),
         admin_domain: "relay-admin.test".to_string(),
         admin_email: "admin@weaver.test".to_string(),
         acme_provider: "custom".to_string(),
@@ -2084,7 +2084,7 @@ async fn test_client_leaving_during_cert_issuance_does_not_leave_hostname_active
         relay_ips: Vec::new(),
         setup_complete: false,
     });
-    let resolver = Arc::new(CertResolver::new(root.to_string()));
+    let resolver = Arc::new(CertResolver::new(root));
     let cert_manager = CertManager::new(
         Arc::clone(&config),
         Arc::clone(&store),
@@ -2128,7 +2128,7 @@ async fn test_client_leaving_during_cert_issuance_does_not_leave_hostname_active
         sleep(Duration::from_millis(20)).await;
     }
     assert!(routed, "route must appear before the order completes");
-    assert!(cert_manager.is_active(&hostname));
+    assert!(registry.is_active(&hostname));
     // Give the order a real chance to finish early if the stall were not
     // holding: it must still be in flight.
     sleep(Duration::from_millis(300)).await;
@@ -2137,7 +2137,7 @@ async fn test_client_leaving_during_cert_issuance_does_not_leave_hostname_active
     // The client goes away mid-order.
     registry.unregister_connection(key, conn_id);
     assert!(registry.resolve(&hostname).await.is_none());
-    assert!(!cert_manager.is_active(&hostname));
+    assert!(!registry.is_active(&hostname));
 
     // Let the order finish (by failing: the stalled socket is dropped).
     stall_task.abort();
@@ -2150,7 +2150,7 @@ async fn test_client_leaving_during_cert_issuance_does_not_leave_hostname_active
     // The whole point: nothing resurrected the departed tunnel's hostname.
     assert!(registry.resolve(&hostname).await.is_none());
     assert!(
-        !cert_manager.is_active(&hostname),
+        !registry.is_active(&hostname),
         "a hostname whose tunnel left during issuance must not be active"
     );
 }

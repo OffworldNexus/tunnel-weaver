@@ -14,7 +14,7 @@ fn create_valid_test_config(
     control_socket: std::path::PathBuf,
 ) -> Config {
     Config {
-        root_domain: "weaver.test".to_string(),
+        tunnel_domain: "weaver.test".to_string(),
         admin_domain: "relay-admin.test".to_string(),
         admin_email: "admin@weaver.test".to_string(),
         acme_provider: "letsencrypt-staging".to_string(),

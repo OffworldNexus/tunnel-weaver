@@ -271,7 +271,7 @@ pub async fn execute_install(
     };
 
     let config = Config {
-        root_domain: gathered.root_domain.clone(),
+        tunnel_domain: gathered.tunnel_domain.clone(),
         admin_domain: gathered.admin_domain.clone(),
         admin_email: gathered.admin_email.clone(),
         acme_provider: gathered.acme_provider.clone(),

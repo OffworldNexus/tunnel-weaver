@@ -1,14 +1,16 @@
 //! Cleartext HTTP edge server.
 //!
 //! Listens on HTTP (port 80). ACME HTTP-01 validation requests under
-//! `/.well-known/acme-challenge/` are answered from the store (used for the
-//! relay's own admin certificate); every other cleartext request is redirected
-//! to HTTPS via HTTP 308 Permanent Redirect, preserving host, port, and query
-//! string. The tunnel wildcard uses DNS-01, so it does not touch this path.
+//! `/.well-known/acme-challenge/` are handed to the registered
+//! [`ChallengeResponder`]s — the edge knows only the trait, never how a
+//! challenge is stored. Every other cleartext request is redirected to HTTPS
+//! via HTTP 308 Permanent Redirect, preserving host, port, and query string.
+//! The tunnel wildcard uses DNS-01, so it does not touch this path.
 
 use std::convert::Infallible;
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use bytes::Bytes;
 use http::{Request, Response, StatusCode, Version};
 use http_body_util::Full;
@@ -21,30 +23,37 @@ use tokio_util::task::TaskTracker;
 use tracing::{debug, info, trace};
 
 use crate::edge::host::{HostError, request_host};
-use crate::store::Store;
 
 /// Path prefix ACME HTTP-01 validation requests use.
 const ACME_CHALLENGE_PREFIX: &str = "/.well-known/acme-challenge/";
 
+/// A source that can recognise and answer an ACME HTTP-01 challenge.
+///
+/// The HTTP edge depends only on this trait: challenge material lives wherever
+/// the business side puts it, and the edge asks each responder in turn.
+#[async_trait]
+pub trait ChallengeResponder: Send + Sync {
+    /// The key authorization to serve for `token`, or `None` if unknown.
+    async fn respond(&self, token: &str) -> Option<String>;
+}
+
 /// Shared state for HTTP edge service.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct HttpEdgeConfig {
-    /// Configured root domain.
-    pub root_domain: String,
+    /// Configured tunnel domain (loopback redirects rewrite to it).
+    pub tunnel_domain: String,
     /// Port of the HTTPS listener to redirect to.
     pub https_port: u16,
-    /// State store holding live HTTP-01 key authorizations, if any.
-    ///
-    /// `None` in tests that only exercise the redirect; the challenge path then
-    /// always returns 404 rather than panicking.
-    pub store: Option<Arc<Store>>,
+    /// Responders polled for ACME HTTP-01 challenges, in order.
+    pub challenge_responders: Vec<Arc<dyn ChallengeResponder>>,
 }
 
 impl std::fmt::Debug for HttpEdgeConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("HttpEdgeConfig")
-            .field("root_domain", &self.root_domain)
+            .field("tunnel_domain", &self.tunnel_domain)
             .field("https_port", &self.https_port)
+            .field("challenge_responders", &self.challenge_responders.len())
             .finish()
     }
 }
@@ -89,7 +98,7 @@ pub async fn handle_http_redirect(
         .map(|pq| pq.as_str())
         .unwrap_or("/");
 
-    let target_host = format_target_host(&host, &config.root_domain, config.https_port);
+    let target_host = format_target_host(&host, &config.tunnel_domain, config.https_port);
     let location = format!("https://{target_host}{path_and_query}");
 
     trace!(%location, "Redirecting cleartext HTTP request to HTTPS");
@@ -111,10 +120,15 @@ pub async fn handle_http_redirect(
 /// not echo whether the miss was an unknown token or no store — both are the
 /// same to a validator.
 async fn handle_http01_challenge(token: &str, config: &HttpEdgeConfig) -> Response<Full<Bytes>> {
-    let key_auth = match &config.store {
-        Some(store) if !token.is_empty() => store.get_http01(token).await.ok().flatten(),
-        _ => None,
-    };
+    let mut key_auth = None;
+    if !token.is_empty() {
+        for responder in &config.challenge_responders {
+            if let Some(value) = responder.respond(token).await {
+                key_auth = Some(value);
+                break;
+            }
+        }
+    }
 
     match key_auth {
         Some(value) => {
@@ -150,10 +164,10 @@ fn extract_host_name(raw: &str) -> &str {
 
 /// Computes the target redirect host.
 ///
-/// Rewrites localhost / 127.0.0.1 / `[::1]` loopback addresses to `root_domain`.
+/// Rewrites localhost / 127.0.0.1 / `[::1]` loopback addresses to `tunnel_domain`.
 /// If the effective host does not specify an explicit port and https_port != 443,
 /// appends `:{https_port}`.
-pub fn format_target_host(incoming_host: &str, root_domain: &str, https_port: u16) -> String {
+pub fn format_target_host(incoming_host: &str, tunnel_domain: &str, https_port: u16) -> String {
     let host_name = extract_host_name(incoming_host);
 
     let is_loopback = host_name.is_empty()
@@ -163,7 +177,7 @@ pub fn format_target_host(incoming_host: &str, root_domain: &str, https_port: u1
         || host_name == "[::1]";
 
     let effective_host = if is_loopback {
-        root_domain.to_string()
+        tunnel_domain.to_string()
     } else {
         host_name.to_string()
     };
@@ -185,15 +199,15 @@ pub fn format_target_host(incoming_host: &str, root_domain: &str, https_port: u1
 /// Runs the HTTP cleartext edge server on the given listener until the cancellation token is triggered.
 pub async fn run_http_server(
     listener: TcpListener,
-    root_domain: String,
+    tunnel_domain: String,
     https_port: u16,
-    store: Arc<Store>,
+    challenge_responders: Vec<Arc<dyn ChallengeResponder>>,
     shutdown_token: CancellationToken,
 ) {
     let edge_config = Arc::new(HttpEdgeConfig {
-        root_domain,
+        tunnel_domain,
         https_port,
-        store: Some(store),
+        challenge_responders,
     });
     let auto_builder = Builder::new(TokioExecutor::new());
     let tracker = TaskTracker::new();
@@ -205,7 +219,7 @@ pub async fn run_http_server(
 
     info!(
         addr = %addr_str,
-        root_domain = %edge_config.root_domain,
+        tunnel_domain = %edge_config.tunnel_domain,
         https_port,
         "HTTP cleartext edge server running"
     );

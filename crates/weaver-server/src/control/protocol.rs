@@ -112,7 +112,7 @@ pub struct StatusResponse {
     pub version: String,
     pub uptime: u64,
     pub pid: u32,
-    pub root_domain: String,
+    pub tunnel_domain: String,
     /// The relay's own hostname, served by the admin interface and covered by
     /// its own HTTP-01 certificate.
     #[serde(default)]
@@ -157,9 +157,6 @@ pub struct CertSummary {
     /// when no certificate has been issued for the name yet.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub validation: Option<String>,
-    /// Whether the stored certificate carries a wildcard SAN.
-    #[serde(default)]
-    pub wildcard: bool,
 }
 
 /// Response payload for `cert.status` without a hostname.
@@ -187,9 +184,6 @@ pub struct CertDetailResponse {
     /// ACME validation mechanism of the stored row (`dns-01`/`http-01`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub validation: Option<String>,
-    /// Whether the stored certificate carries a wildcard SAN.
-    #[serde(default)]
-    pub wildcard: bool,
 }
 
 /// Individual streamed event for `cert.wait`.

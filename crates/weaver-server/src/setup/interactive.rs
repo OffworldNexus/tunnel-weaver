@@ -15,7 +15,7 @@ use inquire::{Confirm, InquireError, Password, Select, Text};
 /// Configuration values gathered interactively or via CLI arguments.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GatheredConfig {
-    pub root_domain: String,
+    pub tunnel_domain: String,
     pub admin_domain: String,
     pub admin_email: String,
     pub acme_provider: String,
@@ -408,7 +408,7 @@ pub fn display_plan_and_confirm(config: &GatheredConfig, is_headless: bool) -> b
     println!(
         "  {:<18} {}",
         "Tunnel Domain:".dark_grey(),
-        config.root_domain.as_str().bold().green()
+        config.tunnel_domain.as_str().bold().green()
     );
     println!(
         "  {:<18} {}",

@@ -203,7 +203,7 @@ jobs:
           ssh -o StrictHostKeyChecking=no -i ~/.ssh/id_nightly root@"$IP" \
             "install -m 755 /tmp/weaver-server /usr/local/bin/weaver-server && \
              /usr/local/bin/weaver-server setup --headless \
-               --root-domain $TARGET_DOMAIN \
+               --tunnel-domain $TARGET_DOMAIN \
                --admin-domain $ADMIN_DOMAIN \
                --email admin@$TARGET_DOMAIN \
                --acme-provider letsencrypt-staging"

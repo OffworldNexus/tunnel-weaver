@@ -33,7 +33,7 @@ pub struct Config {
     ///
     /// This is the *delegated* zone: the parent delegates it in full to the
     /// relay, which then owns every name beneath it.
-    pub root_domain: String,
+    pub tunnel_domain: String,
     /// The relay's own stable hostname (e.g. "relay.example.net").
     ///
     /// Kept outside the tunnel delegation so the relay's own DNS, control
@@ -106,14 +106,14 @@ fn default_usage_flush_interval() -> u64 {
 ///
 /// Returns `None` when the pair is acceptable. Callers are expected to have
 /// already rejected empty names, but an empty input is reported here too.
-pub fn domain_split_issue(admin_domain: &str, root_domain: &str) -> Option<String> {
-    let admin = crate::zone::normalize_domain(admin_domain);
-    let root = crate::zone::normalize_domain(root_domain);
+pub fn domain_split_issue(admin_domain: &str, tunnel_domain: &str) -> Option<String> {
+    let admin = crate::store::names::normalize_domain(admin_domain);
+    let root = crate::store::names::normalize_domain(tunnel_domain);
     if admin.is_empty() || root.is_empty() {
-        return Some("admin_domain and root_domain must both be non-empty".into());
+        return Some("admin_domain and tunnel_domain must both be non-empty".into());
     }
     if admin == root {
-        return Some("admin_domain and root_domain must differ".into());
+        return Some("admin_domain and tunnel_domain must differ".into());
     }
     if admin.ends_with(&format!(".{root}")) {
         return Some(format!(
@@ -133,7 +133,7 @@ impl Config {
 
         let Some(json_str) = raw_json else {
             return Err(ConfigError::MissingKeys(vec![
-                "root_domain".into(),
+                "tunnel_domain".into(),
                 "admin_domain".into(),
                 "admin_email".into(),
                 "acme_provider".into(),
@@ -151,7 +151,7 @@ impl Config {
         })?;
 
         let required_keys = [
-            "root_domain",
+            "tunnel_domain",
             "admin_domain",
             "admin_email",
             "acme_provider",
@@ -176,17 +176,17 @@ impl Config {
 
         // Semantic validation
         let mut validation_issues = Vec::new();
-        if config.root_domain.trim().is_empty() {
-            validation_issues.push("root_domain must not be empty".into());
+        if config.tunnel_domain.trim().is_empty() {
+            validation_issues.push("tunnel_domain must not be empty".into());
         }
         if config.admin_domain.trim().is_empty() {
             validation_issues.push("admin_domain must not be empty".into());
         }
         // Only compare the pair once both are present; the empty checks above
         // already reported the missing side.
-        if !config.root_domain.trim().is_empty()
+        if !config.tunnel_domain.trim().is_empty()
             && !config.admin_domain.trim().is_empty()
-            && let Some(issue) = domain_split_issue(&config.admin_domain, &config.root_domain)
+            && let Some(issue) = domain_split_issue(&config.admin_domain, &config.tunnel_domain)
         {
             validation_issues.push(issue);
         }

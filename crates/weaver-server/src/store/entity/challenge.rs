@@ -8,7 +8,9 @@
 //! `kind` separates DNS-01 TXT rows (`dns-01`, `name =
 //! _acme-challenge.<root>`, `value = <digest>`) from HTTP-01 token rows
 //! (`http-01`, `name = <token>`, `value = <key authorization>`) so the two
-//! responders only ever read their own rows.
+//! responders only ever read their own rows. `certificate` names the managed
+//! certificate the challenge is being solved for, so an operator can tell which
+//! order a live row belongs to.
 
 use sea_orm::entity::prelude::*;
 
@@ -19,6 +21,8 @@ pub struct Model {
     pub id: i64,
     pub name: String,
     pub value: String,
+    /// Store key of the managed certificate this challenge is being solved for.
+    pub certificate: Option<String>,
     pub created_at: i64,
     /// `dns-01` (TXT digest) or `http-01` (key authorization).
     pub kind: String,

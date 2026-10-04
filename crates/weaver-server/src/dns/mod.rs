@@ -1,14 +1,17 @@
-//! Authoritative DNS responder for the relay's root zone.
+//! Authoritative DNS responder for the relay's tunnel zone.
 //!
-//! Answers A/AAAA/NS/CAA/SOA and DNS-01 TXT queries for `<root>` and any single
-//! label directly beneath it. It is generative — no zone files, no second
-//! binary — reading relay addresses from config and TXT values from the live
-//! challenge registry in the `Store`. The zone's NS and SOA MNAME point at the
-//! relay's own admin domain, which lives outside the delegated tunnel zone.
+//! The responder itself is a thin protocol shell: it validates the query shape
+//! and asks a list of [`DomainGenerator`]s, in order, to produce an answer for
+//! the name. The generators are the business side — the tunnel domain mapping
+//! (A/AAAA/NS/SOA/CAA for the apex and one label beneath it) and the ACME
+//! DNS-01 challenge registry (TXT for live `_acme-challenge` names) — so the
+//! responder never reads the store or knows what a "zone" is. There are no zone
+//! files and no second binary.
+//!
+//! A name no generator claims is `REFUSED`: we are not authoritative for it.
 //!
 //! Design points (OFF-190):
-//! - **No recursion, ever.** `RA=0`; out-of-zone names get `REFUSED` because we
-//!   are not authoritative for the parent (NXDOMAIN would be a lie).
+//! - **No recursion, ever.** `RA=0`.
 //! - **Every in-zone name resolves identically** to the relay's addresses. That
 //!   is the anti-enumeration mechanism: there are no distinct records to walk.
 //! - **TXT is answered only for live challenge names**, `NODATA` otherwise, so
@@ -20,6 +23,7 @@ use std::net::IpAddr;
 use std::str::FromStr;
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use hickory_proto::op::{Edns, Message, MessageType, Metadata, OpCode, ResponseCode};
 use hickory_proto::rr::rdata::{A, AAAA, CAA, HINFO, NS, SOA, TXT};
 use hickory_proto::rr::{Name, RData, Record, RecordType};
@@ -29,7 +33,7 @@ use tracing::{debug, trace, warn};
 
 use crate::config::Config;
 use crate::store::Store;
-use crate::zone::{Zone, normalize_domain};
+use crate::store::names::normalize_domain;
 
 /// The subset of relay configuration the authoritative responder needs.
 ///
@@ -39,7 +43,7 @@ use crate::zone::{Zone, normalize_domain};
 /// is resolved from the provider catalog.
 pub struct DnsResponderConfig {
     /// The delegated tunnel zone apex.
-    pub root_domain: String,
+    pub tunnel_domain: String,
     /// The relay's own admin hostname (the zone's NS/SOA target).
     pub admin_domain: String,
     /// The relay's public addresses, answered for every in-zone name.
@@ -53,7 +57,7 @@ impl DnsResponderConfig {
     /// Builds the responder inputs from relay configuration.
     pub fn from_config(config: &Config) -> Self {
         Self {
-            root_domain: config.root_domain.clone(),
+            tunnel_domain: config.tunnel_domain.clone(),
             admin_domain: config.admin_domain.clone(),
             relay_ips: config.relay_ips.clone(),
             caa_issuers: crate::cert::providers::caa_identifiers(
@@ -82,111 +86,47 @@ pub const CAA_TTL: u32 = 60;
 /// resolver that cached NODATA for `_acme-challenge.<root>` would break DCV.
 pub const NEGATIVE_TTL: u32 = 30;
 
-/// The prefix of the DNS-01 challenge name, `_acme-challenge.<root>`.
-// The responder matches the full `_acme-challenge.<root>` name via the store,
-// so the prefix is documentation only for now.
-const _ACME_PREFIX: &str = "_acme-challenge";
+/// The answer a [`DomainGenerator`] produced for a query.
+#[derive(Debug, Default)]
+pub struct Generated {
+    /// Records for the answer section.
+    pub answers: Vec<Record>,
+    /// Records for the authority section (typically the SOA for NODATA).
+    pub authority: Vec<Record>,
+}
 
-/// Generative authoritative responder bound to one root zone.
+/// A business-side source of DNS records.
+///
+/// Generators are polled in order; the first that returns `Some` owns the name.
+/// `None` means "not mine, try the next". A generator that owns the name but has
+/// no data for the type returns `Some` with empty answers (NODATA).
+#[async_trait]
+pub trait DomainGenerator: Send + Sync {
+    /// Records for `qname` (normalized: lowercased, no trailing dot) of `qtype`.
+    async fn generate(&self, qname: &str, qtype: RecordType) -> Option<Generated>;
+}
+
+/// Generative authoritative responder over an ordered set of generators.
 pub struct DnsResponder {
-    /// The relay's serving area: the delegated tunnel apex and the admin host.
-    /// The admin host is the zone's NS/SOA MNAME but is *not* in the tunnel
-    /// zone, so the responder answers only `<root>` and one label beneath it.
-    zone: Zone,
-    root_name: Name,
-    /// The name server target for the zone's NS and SOA MNAME records: the
-    /// relay's own stable (admin) hostname, which lives outside the delegation.
-    admin_name: Name,
-    relay_ips: Vec<IpAddr>,
-    soa: SOA,
-    /// CA issuer domains for the `issue`/`issuewild` CAA records. Empty means
-    /// we cannot name the CA, so no CAA is served (permissive).
-    caa_issuers: Vec<String>,
-    store: Arc<Store>,
+    generators: Vec<Arc<dyn DomainGenerator>>,
 }
 
 impl std::fmt::Debug for DnsResponder {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DnsResponder")
-            .field("root_domain", &self.zone.root())
-            .field("admin_name", &self.admin_name)
-            .field("relay_ips", &self.relay_ips)
+            .field("generators", &self.generators.len())
             .finish()
     }
 }
 
 impl DnsResponder {
-    /// Builds a responder for the configured root zone.
-    pub fn new(config: &DnsResponderConfig, store: Arc<Store>) -> Self {
-        let zone = Zone::new(&config.root_domain, &config.admin_domain);
-        let root_name =
-            Name::from_str(&format!("{}.", zone.root())).expect("root domain is a Name");
-        // The zone is delegated to the relay, whose own stable hostname is the
-        // admin domain; NS and SOA advertise that name, never the apex (an
-        // apex self-reference is not resolvable once delegated).
-        let admin_name =
-            Name::from_str(&format!("{}.", zone.admin())).expect("admin domain is a Name");
-        let soa = SOA::new(
-            admin_name.clone(),
-            admin_name.clone(),
-            1,
-            7200,
-            3600,
-            1_209_600,
-            NEGATIVE_TTL,
-        );
-        Self {
-            zone,
-            root_name,
-            admin_name,
-            relay_ips: config.relay_ips.clone(),
-            soa,
-            caa_issuers: config.caa_issuers.clone(),
-            store,
-        }
-    }
-
-    /// True if `name` (lowercased, no trailing dot) is the apex or one label
-    /// beneath it. The wildcard matches exactly one label, so deeper names are
-    /// out of zone.
-    fn in_zone(&self, name: &str) -> bool {
-        self.zone.in_tunnel_zone(name)
-    }
-
-    fn a_records(&self, owner: &Name) -> Vec<Record> {
-        self.relay_ips
-            .iter()
-            .filter_map(|ip| match ip {
-                IpAddr::V4(v4) => Some(Record::from_rdata(
-                    owner.clone(),
-                    STATIC_TTL,
-                    RData::A(A(*v4)),
-                )),
-                IpAddr::V6(_) => None,
-            })
-            .collect()
-    }
-
-    fn aaaa_records(&self, owner: &Name) -> Vec<Record> {
-        self.relay_ips
-            .iter()
-            .filter_map(|ip| match ip {
-                IpAddr::V6(v6) => Some(Record::from_rdata(
-                    owner.clone(),
-                    STATIC_TTL,
-                    RData::AAAA(AAAA(*v6)),
-                )),
-                IpAddr::V4(_) => None,
-            })
-            .collect()
-    }
-
-    fn soa_record(&self) -> Record {
-        Record::from_rdata(
-            self.root_name.clone(),
-            NEGATIVE_TTL,
-            RData::SOA(self.soa.clone()),
-        )
+    /// Builds a responder from an ordered generator list.
+    ///
+    /// Order matters: the ACME challenge generator must come before the tunnel
+    /// domain generator so `_acme-challenge.<tunnel>` is answered as TXT/NODATA
+    /// rather than as a wildcard A record.
+    pub fn new(generators: Vec<Arc<dyn DomainGenerator>>) -> Self {
+        Self { generators }
     }
 
     /// Builds the reply for a decoded query, or `None` to drop it silently.
@@ -250,73 +190,165 @@ impl DnsResponder {
             return Some(resp);
         }
 
-        // Out of zone: we are authoritative only for `<root>` and one label.
-        if !self.in_zone(&qname) {
-            resp.metadata.response_code = ResponseCode::Refused;
-            return Some(resp);
+        // Ask the generators, in order. The first that owns the name wins.
+        for generator in &self.generators {
+            if let Some(generated) = generator.generate(&qname, qtype).await {
+                for answer in generated.answers {
+                    resp.add_answer(answer);
+                }
+                for authority in generated.authority {
+                    resp.add_authority(authority);
+                }
+                return Some(resp);
+            }
         }
 
-        // ANY is minimised per RFC 8482 with a single HINFO.
-        if qtype == RecordType::ANY {
-            resp.add_answer(Record::from_rdata(
-                query.name().clone(),
-                STATIC_TTL,
-                RData::HINFO(HINFO::new("RFC8482".to_string(), String::new())),
-            ));
-            return Some(resp);
-        }
+        // No generator owns the name: we are not authoritative for it, so
+        // `REFUSED` (NXDOMAIN would claim authority we do not have).
+        resp.metadata.response_code = ResponseCode::Refused;
+        Some(resp)
+    }
+}
 
-        let owner = query.name().clone();
+/// The tunnel domain: generative A/AAAA for the apex and one label beneath it,
+/// plus the zone's NS/SOA/CAA.
+///
+/// Every in-zone name resolves to the relay's addresses, which is the
+/// anti-enumeration property. Deeper names are not ours.
+pub struct TunnelDomains {
+    tunnel: String,
+    root_name: Name,
+    admin_name: Name,
+    relay_ips: Vec<IpAddr>,
+    soa: SOA,
+    caa_issuers: Vec<String>,
+}
+
+impl TunnelDomains {
+    /// Builds the tunnel-domain generator from configuration.
+    pub fn new(config: &DnsResponderConfig) -> Self {
+        let tunnel = normalize_domain(&config.tunnel_domain);
+        let root_name = Name::from_str(&format!("{tunnel}.")).expect("tunnel domain is a Name");
+        let admin_name = Name::from_str(&format!("{}.", normalize_domain(&config.admin_domain)))
+            .expect("admin domain is a Name");
+        let soa = SOA::new(
+            admin_name.clone(),
+            admin_name.clone(),
+            1,
+            7200,
+            3600,
+            1_209_600,
+            NEGATIVE_TTL,
+        );
+        Self {
+            tunnel,
+            root_name,
+            admin_name,
+            relay_ips: config.relay_ips.clone(),
+            soa,
+            caa_issuers: config.caa_issuers.clone(),
+        }
+    }
+
+    /// True if `name` (normalized) is the apex or exactly one label beneath it.
+    /// The wildcard matches exactly one label, so deeper names are out of zone.
+    fn in_zone(&self, name: &str) -> bool {
+        if name == self.tunnel {
+            return true;
+        }
+        match name.strip_suffix(&format!(".{}", self.tunnel)) {
+            Some(label) => !label.is_empty() && !label.contains('.'),
+            None => false,
+        }
+    }
+
+    fn a_records(&self, owner: &Name) -> Vec<Record> {
+        self.relay_ips
+            .iter()
+            .filter_map(|ip| match ip {
+                IpAddr::V4(v4) => Some(Record::from_rdata(
+                    owner.clone(),
+                    STATIC_TTL,
+                    RData::A(A(*v4)),
+                )),
+                IpAddr::V6(_) => None,
+            })
+            .collect()
+    }
+
+    fn aaaa_records(&self, owner: &Name) -> Vec<Record> {
+        self.relay_ips
+            .iter()
+            .filter_map(|ip| match ip {
+                IpAddr::V6(v6) => Some(Record::from_rdata(
+                    owner.clone(),
+                    STATIC_TTL,
+                    RData::AAAA(AAAA(*v6)),
+                )),
+                IpAddr::V4(_) => None,
+            })
+            .collect()
+    }
+
+    fn soa_record(&self) -> Record {
+        Record::from_rdata(
+            self.root_name.clone(),
+            NEGATIVE_TTL,
+            RData::SOA(self.soa.clone()),
+        )
+    }
+}
+
+#[async_trait]
+impl DomainGenerator for TunnelDomains {
+    async fn generate(&self, qname: &str, qtype: RecordType) -> Option<Generated> {
+        if !self.in_zone(qname) {
+            return None;
+        }
+        let owner = Name::from_str(&format!("{qname}.")).ok()?;
+        let mut generated = Generated::default();
 
         match qtype {
             RecordType::A => {
                 let records = self.a_records(&owner);
                 if records.is_empty() {
-                    resp.add_authority(self.soa_record());
+                    generated.authority.push(self.soa_record());
                 } else {
-                    resp.add_answers(records);
+                    generated.answers = records;
                 }
             }
             RecordType::AAAA => {
                 let records = self.aaaa_records(&owner);
                 if records.is_empty() {
-                    resp.add_authority(self.soa_record());
+                    generated.authority.push(self.soa_record());
                 } else {
-                    resp.add_answers(records);
+                    generated.answers = records;
                 }
             }
-            RecordType::TXT => {
-                let values = self.store.get_challenges(&qname).await.unwrap_or_default();
-                if values.is_empty() {
-                    // Only live challenge names have TXT. NODATA (not NXDOMAIN)
-                    // keeps the wildcard's non-enumerability intact.
-                    resp.add_authority(self.soa_record());
-                } else {
-                    for value in values {
-                        resp.add_answer(Record::from_rdata(
-                            owner.clone(),
-                            CHALLENGE_TTL,
-                            RData::TXT(TXT::new(vec![value])),
-                        ));
-                    }
-                }
+            // ANY is minimised per RFC 8482 with a single HINFO.
+            RecordType::ANY => {
+                generated.answers.push(Record::from_rdata(
+                    owner.clone(),
+                    STATIC_TTL,
+                    RData::HINFO(HINFO::new("RFC8482".to_string(), String::new())),
+                ));
             }
-            RecordType::SOA if qname == self.zone.root() => {
-                resp.add_answer(self.soa_record());
+            RecordType::SOA if qname == self.tunnel => {
+                generated.answers.push(self.soa_record());
             }
-            RecordType::NS if qname == self.zone.root() => {
-                resp.add_answer(Record::from_rdata(
+            RecordType::NS if qname == self.tunnel => {
+                generated.answers.push(Record::from_rdata(
                     self.root_name.clone(),
                     STATIC_TTL,
                     RData::NS(NS(self.admin_name.clone())),
                 ));
             }
-            RecordType::CAA if qname == self.zone.root() => {
+            RecordType::CAA if qname == self.tunnel => {
                 // Authorise the configured CA(s) for both ordinary and wildcard
                 // issuance. An empty `issuewild` would *forbid* wildcards, so if
                 // the CA is unknown we serve no CAA at all (NODATA).
                 if self.caa_issuers.is_empty() {
-                    resp.add_authority(self.soa_record());
+                    generated.authority.push(self.soa_record());
                 } else {
                     for issuer in &self.caa_issuers {
                         // Parse *without* a trailing dot: hickory's `CAA`
@@ -326,12 +358,12 @@ impl DnsResponder {
                         let Ok(name) = Name::from_str(issuer) else {
                             continue;
                         };
-                        resp.add_answer(Record::from_rdata(
+                        generated.answers.push(Record::from_rdata(
                             self.root_name.clone(),
                             CAA_TTL,
                             RData::CAA(CAA::new_issue(false, Some(name.clone()), Vec::new())),
                         ));
-                        resp.add_answer(Record::from_rdata(
+                        generated.answers.push(Record::from_rdata(
                             self.root_name.clone(),
                             CAA_TTL,
                             RData::CAA(CAA::new_issuewild(false, Some(name), Vec::new())),
@@ -339,13 +371,58 @@ impl DnsResponder {
                     }
                 }
             }
+            // The tunnel zone carries no TXT records; NODATA keeps the
+            // wildcard's non-enumerability intact.
             _ => {
-                // NODATA: NOERROR, no answers, SOA for negative caching.
-                resp.add_authority(self.soa_record());
+                generated.authority.push(self.soa_record());
             }
         }
 
-        Some(resp)
+        Some(generated)
+    }
+}
+
+/// The ACME DNS-01 challenge registry: TXT for live `_acme-challenge` names.
+///
+/// Owns every `_acme-challenge.*` name (returning NODATA for non-TXT) so the
+/// tunnel-domain generator never mistakes a challenge name for a service.
+pub struct AcmeChallenges {
+    store: Arc<Store>,
+}
+
+impl AcmeChallenges {
+    /// Creates a challenge generator backed by the challenge registry.
+    pub fn new(store: Arc<Store>) -> Self {
+        Self { store }
+    }
+
+    /// True if `name` is an ACME challenge owner name.
+    fn owns(name: &str) -> bool {
+        name.starts_with("_acme-challenge.")
+    }
+}
+
+#[async_trait]
+impl DomainGenerator for AcmeChallenges {
+    async fn generate(&self, qname: &str, qtype: RecordType) -> Option<Generated> {
+        if !Self::owns(qname) {
+            return None;
+        }
+
+        let mut generated = Generated::default();
+        if qtype == RecordType::TXT {
+            let values = self.store.get_challenges(qname).await.unwrap_or_default();
+            let owner = Name::from_str(&format!("{qname}.")).ok()?;
+            for value in values {
+                generated.answers.push(Record::from_rdata(
+                    owner.clone(),
+                    CHALLENGE_TTL,
+                    RData::TXT(TXT::new(vec![value])),
+                ));
+            }
+        }
+        // No live value (or a non-TXT type): NODATA, not NXDOMAIN.
+        Some(generated)
     }
 }
 
@@ -459,13 +536,18 @@ mod tests {
     use crate::store::Store;
     use hickory_proto::op::Query;
 
-    async fn responder(relay_ips: Vec<IpAddr>) -> Arc<DnsResponder> {
+    struct TestResponder {
+        responder: Arc<DnsResponder>,
+        store: Arc<Store>,
+    }
+
+    async fn responder(relay_ips: Vec<IpAddr>) -> TestResponder {
         // Keep the temp directory alive for the whole test: `TempDir` drops on
         // scope exit and would unlink the SQLite file under the open connection.
         let dir = tempfile::tempdir().unwrap().keep();
-        let store = Store::open(dir.join("test.db")).await.unwrap();
+        let store = Arc::new(Store::open(dir.join("test.db")).await.unwrap());
         let config = Config {
-            root_domain: "example.com".into(),
+            tunnel_domain: "example.com".into(),
             admin_domain: "relay-admin.test".into(),
             admin_email: "ops@example.com".into(),
             acme_provider: "letsencrypt".into(),
@@ -481,10 +563,12 @@ mod tests {
             relay_ips,
             setup_complete: false,
         };
-        Arc::new(DnsResponder::new(
-            &DnsResponderConfig::from_config(&config),
-            Arc::new(store),
-        ))
+        let generator_config = DnsResponderConfig::from_config(&config);
+        let responder = Arc::new(DnsResponder::new(vec![
+            Arc::new(AcmeChallenges::new(Arc::clone(&store))),
+            Arc::new(TunnelDomains::new(&generator_config)),
+        ]));
+        TestResponder { responder, store }
     }
 
     fn query(qname: &str, qtype: RecordType, class: hickory_proto::rr::DNSClass) -> Message {
@@ -497,9 +581,10 @@ mod tests {
 
     #[tokio::test]
     async fn wildcard_a_resolves_every_in_zone_name() {
-        let r = responder(vec!["203.0.113.7".parse().unwrap()]).await;
+        let t = responder(vec!["203.0.113.7".parse().unwrap()]).await;
         for name in ["example.com", "poc-laptop-web.example.com"] {
-            let resp = r
+            let resp = t
+                .responder
                 .answer(&query(name, RecordType::A, hickory_proto::rr::DNSClass::IN))
                 .await
                 .unwrap();
@@ -514,8 +599,9 @@ mod tests {
 
     #[tokio::test]
     async fn multi_label_is_out_of_zone() {
-        let r = responder(vec!["203.0.113.7".parse().unwrap()]).await;
-        let resp = r
+        let t = responder(vec!["203.0.113.7".parse().unwrap()]).await;
+        let resp = t
+            .responder
             .answer(&query(
                 "a.b.example.com",
                 RecordType::A,
@@ -528,8 +614,9 @@ mod tests {
 
     #[tokio::test]
     async fn out_of_zone_is_refused_not_nxdomain() {
-        let r = responder(vec!["203.0.113.7".parse().unwrap()]).await;
-        let resp = r
+        let t = responder(vec!["203.0.113.7".parse().unwrap()]).await;
+        let resp = t
+            .responder
             .answer(&query(
                 "other.net",
                 RecordType::A,
@@ -543,17 +630,28 @@ mod tests {
 
     #[tokio::test]
     async fn challenge_txt_is_multi_value_and_absent_is_nodata() {
-        let r = responder(vec!["203.0.113.7".parse().unwrap()]).await;
-        r.store
-            .publish_challenge("_acme-challenge.example.com", "value-a", 0)
+        let t = responder(vec!["203.0.113.7".parse().unwrap()]).await;
+        t.store
+            .publish_challenge(
+                "_acme-challenge.example.com",
+                "value-a",
+                Some("example.com"),
+                0,
+            )
             .await
             .unwrap();
-        r.store
-            .publish_challenge("_acme-challenge.example.com", "value-b", 0)
+        t.store
+            .publish_challenge(
+                "_acme-challenge.example.com",
+                "value-b",
+                Some("example.com"),
+                0,
+            )
             .await
             .unwrap();
 
-        let resp = r
+        let resp = t
+            .responder
             .answer(&query(
                 "_acme-challenge.example.com",
                 RecordType::TXT,
@@ -564,7 +662,8 @@ mod tests {
         assert_eq!(resp.response_code, ResponseCode::NoError);
         assert_eq!(resp.answers.len(), 2);
 
-        let resp = r
+        let resp = t
+            .responder
             .answer(&query(
                 "poc-laptop-web.example.com",
                 RecordType::TXT,
@@ -579,8 +678,9 @@ mod tests {
 
     #[tokio::test]
     async fn axfr_and_any_are_handled() {
-        let r = responder(vec!["203.0.113.7".parse().unwrap()]).await;
-        let resp = r
+        let t = responder(vec!["203.0.113.7".parse().unwrap()]).await;
+        let resp = t
+            .responder
             .answer(&query(
                 "example.com",
                 RecordType::AXFR,
@@ -590,7 +690,8 @@ mod tests {
             .unwrap();
         assert_eq!(resp.response_code, ResponseCode::Refused);
 
-        let resp = r
+        let resp = t
+            .responder
             .answer(&query(
                 "example.com",
                 RecordType::ANY,
@@ -604,7 +705,7 @@ mod tests {
 
     #[tokio::test]
     async fn bad_edns_version_is_badvers() {
-        let r = responder(vec!["203.0.113.7".parse().unwrap()]).await;
+        let t = responder(vec!["203.0.113.7".parse().unwrap()]).await;
         let mut msg = query(
             "example.com",
             RecordType::A,
@@ -613,7 +714,7 @@ mod tests {
         let mut edns = Edns::new();
         edns.set_version(1);
         msg.set_edns(edns);
-        let resp = r.answer(&msg).await.unwrap();
+        let resp = t.responder.answer(&msg).await.unwrap();
         assert_eq!(resp.response_code, ResponseCode::BADVERS);
     }
 
@@ -622,8 +723,9 @@ mod tests {
         // The responder is built with `acme_provider = letsencrypt`, so it must
         // publish `issue`/`issuewild` for letsencrypt.org. An empty value would
         // forbid wildcard issuance and break the ACME order.
-        let r = responder(vec!["203.0.113.7".parse().unwrap()]).await;
-        let resp = r
+        let t = responder(vec!["203.0.113.7".parse().unwrap()]).await;
+        let resp = t
+            .responder
             .answer(&query(
                 "example.com",
                 RecordType::CAA,

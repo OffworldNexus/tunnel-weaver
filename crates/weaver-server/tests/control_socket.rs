@@ -15,7 +15,7 @@ fn create_valid_test_config(
     control_socket: std::path::PathBuf,
 ) -> Config {
     Config {
-        root_domain: "weaver.test".to_string(),
+        tunnel_domain: "weaver.test".to_string(),
         admin_domain: "relay-admin.test".to_string(),
         admin_email: "admin@weaver.test".to_string(),
         acme_provider: "letsencrypt-staging".to_string(),
@@ -173,7 +173,6 @@ async fn test_control_socket_daemon_suite() {
             directory: "letsencrypt-staging".to_string(),
             obtained_at: now - 3600,
             validation: "dns-01".to_string(),
-            wildcard: true,
         };
     // Seed an older wildcard (30 days left), then upsert the newer one (90
     // days left): one global row keyed by the apex name.
@@ -290,16 +289,15 @@ async fn test_control_socket_daemon_suite() {
         assert_eq!(output.status.code(), Some(0));
         let val: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
         assert_eq!(val["ok"], true);
-        assert_eq!(val["root_domain"], "weaver.test");
+        assert_eq!(val["tunnel_domain"], "weaver.test");
         assert_eq!(val["admin_domain"], "relay-admin.test");
         assert_eq!(val["schema_version"], 1);
-        // The display-only active flag is set when a tunnel registers, not at
-        // startup, so an idle relay reports both managed certificates inactive
-        // (the tunnel wildcard and the admin certificate).
-        assert_eq!(val["cert_counts"]["issued"], 0);
-        assert_eq!(val["cert_counts"]["inactive"], 2);
-        assert_eq!(val["cert_counts"]["ordering"], 0);
+        // The seeded tunnel wildcard reports issued; the admin certificate has
+        // no stored row and is still pending, so it counts as ordering.
+        assert_eq!(val["cert_counts"]["issued"], 1);
+        assert_eq!(val["cert_counts"]["ordering"], 1);
         assert_eq!(val["cert_counts"]["failed"], 0);
+        assert_eq!(val["cert_counts"]["inactive"], 0);
     }
 
     // --- Test CLI: status human-readable ---
@@ -591,7 +589,7 @@ async fn test_cert_wait_streaming_failed_exit_4_and_renew_rate_limit() {
 
     let store = Arc::new(Store::open(&db_path).await.unwrap());
     let config = Arc::new(Config {
-        root_domain: "weaver.test".to_string(),
+        tunnel_domain: "weaver.test".to_string(),
         admin_domain: "relay-admin.test".to_string(),
         admin_email: "admin@weaver.test".to_string(),
         acme_provider: "letsencrypt-staging".to_string(),
@@ -609,7 +607,7 @@ async fn test_cert_wait_streaming_failed_exit_4_and_renew_rate_limit() {
     });
     store.save_config(&config).await.unwrap();
 
-    let resolver = Arc::new(CertResolver::new(config.root_domain.clone()));
+    let resolver = Arc::new(CertResolver::new(config.tunnel_domain.clone()));
 
     let cert_manager = CertManager::new(
         Arc::clone(&config),
@@ -778,7 +776,7 @@ async fn test_usage_control_verb_and_cli() {
     let config = Arc::new(create_valid_test_config(0, 0, control_sock_path.clone()));
     store.save_config(&config).await.unwrap();
 
-    let resolver = Arc::new(CertResolver::new(config.root_domain.clone()));
+    let resolver = Arc::new(CertResolver::new(config.tunnel_domain.clone()));
     let cert_manager = CertManager::new(
         Arc::clone(&config),
         Arc::clone(&store),
@@ -983,7 +981,6 @@ async fn test_status_and_cert_status_report_admin_and_cert_metadata() {
                 directory: "letsencrypt-staging".into(),
                 obtained_at: now - 60,
                 validation: "dns-01".into(),
-                wildcard: true,
             },
         )
         .await
@@ -1000,13 +997,12 @@ async fn test_status_and_cert_status_report_admin_and_cert_metadata() {
                 directory: "letsencrypt-staging".into(),
                 obtained_at: now - 60,
                 validation: "http-01".into(),
-                wildcard: false,
             },
         )
         .await
         .unwrap();
 
-    let resolver = Arc::new(CertResolver::new(config.root_domain.clone()));
+    let resolver = Arc::new(CertResolver::new(config.tunnel_domain.clone()));
     let cert_manager = CertManager::new(
         Arc::clone(&config),
         Arc::clone(&store),
@@ -1046,7 +1042,7 @@ async fn test_status_and_cert_status_report_admin_and_cert_metadata() {
         serde_json::json!({"v": 1, "cmd": "status"}),
     )
     .await;
-    assert_eq!(status["root_domain"], "weaver.test");
+    assert_eq!(status["tunnel_domain"], "weaver.test");
     assert_eq!(status["admin_domain"], "relay-admin.test");
 
     // `cert.status` list carries validation + wildcard for both rows.
@@ -1060,13 +1056,11 @@ async fn test_status_and_cert_status_report_admin_and_cert_metadata() {
         .iter()
         .find(|c| c["name"] == "weaver.test")
         .expect("tunnel row");
-    assert_eq!(root["wildcard"], true);
     assert_eq!(root["validation"], "dns-01");
     let admin = certs
         .iter()
         .find(|c| c["name"] == "relay-admin.test")
         .expect("admin row");
-    assert_eq!(admin["wildcard"], false);
     assert_eq!(admin["validation"], "http-01");
 
     // Detail view for the admin name reports its mechanism and kind.
@@ -1077,7 +1071,6 @@ async fn test_status_and_cert_status_report_admin_and_cert_metadata() {
     .await;
     assert_eq!(detail["ok"], true);
     assert_eq!(detail["validation"], "http-01");
-    assert_eq!(detail["wildcard"], false);
 
     shutdown_token.cancel();
 }
@@ -1113,13 +1106,12 @@ async fn test_doctor_control_verb_and_cli() {
                 directory: "letsencrypt-staging".into(),
                 obtained_at: now - 60,
                 validation: "dns-01".into(),
-                wildcard: true,
             },
         )
         .await
         .unwrap();
 
-    let resolver = Arc::new(CertResolver::new(config.root_domain.clone()));
+    let resolver = Arc::new(CertResolver::new(config.tunnel_domain.clone()));
     let cert_manager = CertManager::new(
         Arc::clone(&config),
         Arc::clone(&store),
@@ -1160,7 +1152,7 @@ async fn test_doctor_control_verb_and_cli() {
         serde_json::json!({"v": 1, "cmd": "doctor"}),
     )
     .await;
-    assert_eq!(report["root_domain"], "weaver.test");
+    assert_eq!(report["tunnel_domain"], "weaver.test");
     assert_eq!(report["admin_domain"], "relay-admin.test");
     let titles: Vec<&str> = report["checks"]
         .as_array()
@@ -1217,7 +1209,7 @@ async fn test_doctor_control_verb_and_cli() {
     assert_eq!(output.status.code(), Some(1));
     let val: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(val["ok"], false);
-    assert_eq!(val["root_domain"], "weaver.test");
+    assert_eq!(val["tunnel_domain"], "weaver.test");
 
     // Human path prints the rendered checklist.
     let cli_sock = control_sock_path.clone();

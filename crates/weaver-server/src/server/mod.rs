@@ -13,9 +13,14 @@ use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
+use crate::cert::managed::ManagedCerts;
+use crate::cert::solver::Http01Solver;
 use crate::cert::{CertManager, CertResolver, SystemClock};
 use crate::config::{Config, ConfigError};
-use crate::edge::http::run_http_server;
+use crate::dns::{
+    AcmeChallenges, DnsResponder, DnsResponderConfig, DomainGenerator, TunnelDomains,
+};
+use crate::edge::http::{ChallengeResponder, run_http_server};
 use crate::edge::tls::{TlsError, create_server_config};
 use crate::notify::{notify_ready_with_cert_status, notify_stopping};
 use crate::server::listener::{ListenerError, acquire_listeners};
@@ -94,7 +99,7 @@ pub async fn run_server(
     };
 
     info!(
-        root_domain = %config.root_domain,
+        tunnel_domain = %config.tunnel_domain,
         admin_domain = %config.admin_domain,
         http_listen = %config.listen_http,
         https_listen = %config.listen_https,
@@ -113,10 +118,10 @@ pub async fn run_server(
     };
 
     // 5. Initialize certificate manager and dynamic TLS resolver
-    let resolver = Arc::new(
-        CertResolver::new(config.root_domain.clone())
-            .with_admin_domain(config.admin_domain.clone()),
-    );
+    let resolver = Arc::new(CertResolver::with_managed(
+        Arc::new(ManagedCerts::from_config(&config)),
+        Arc::new(SystemClock),
+    ));
 
     let cert_manager = CertManager::new(
         Arc::new(config.clone()),
@@ -161,7 +166,7 @@ pub async fn run_server(
         Duration::from_secs(config.usage_flush_interval_secs),
     ));
     let tunnel_registry = Arc::new(crate::tunnel::TunnelRegistry::new(
-        config.root_domain.clone(),
+        config.tunnel_domain.clone(),
         Arc::clone(&cert_manager),
         identity_resolver,
         store.clone(),
@@ -174,11 +179,13 @@ pub async fn run_server(
     let usage_task = Arc::clone(&metering).start(shutdown_token.clone());
 
     let http_token = shutdown_token.clone();
+    let challenge_responders: Vec<Arc<dyn ChallengeResponder>> =
+        vec![Arc::new(Http01Solver::new(Arc::new(store.clone())))];
     let http_task = tokio::spawn(run_http_server(
         listeners.http,
-        config.root_domain.clone(),
+        config.tunnel_domain.clone(),
         config.listen_https.port(),
-        Arc::new(store.clone()),
+        challenge_responders,
         http_token,
     ));
 
@@ -187,7 +194,7 @@ pub async fn run_server(
         listeners.https,
         tls_config,
         crate::edge::https::HttpsEdgeConfig {
-            zone: crate::zone::Zone::new(&config.root_domain, &config.admin_domain),
+            managed: Arc::new(ManagedCerts::from_config(&config)),
             cert_resolver: Some(Arc::clone(&resolver)),
             cert_manager: Some(Arc::clone(&cert_manager)),
             tunnel_registry: Some(tunnel_registry),
@@ -196,11 +203,14 @@ pub async fn run_server(
     ));
 
     // Authoritative DNS responder: one task per inherited/self-bound socket.
-    // It shares the store, so it sees ACME DNS-01 challenge values live.
-    let dns_responder = Arc::new(crate::dns::DnsResponder::new(
-        &crate::dns::DnsResponderConfig::from_config(&config),
-        Arc::new(store.clone()),
-    ));
+    // It polls the ACME challenge generator (TXT) and the tunnel-domain
+    // generator (A/AAAA/NS/SOA/CAA), in that order.
+    let generator_config = DnsResponderConfig::from_config(&config);
+    let generators: Vec<Arc<dyn DomainGenerator>> = vec![
+        Arc::new(AcmeChallenges::new(Arc::new(store.clone()))),
+        Arc::new(TunnelDomains::new(&generator_config)),
+    ];
+    let dns_responder = Arc::new(DnsResponder::new(generators));
     let mut dns_tasks = Vec::new();
     for socket in listeners.dns_udp {
         dns_tasks.push(tokio::spawn(crate::dns::run_udp(

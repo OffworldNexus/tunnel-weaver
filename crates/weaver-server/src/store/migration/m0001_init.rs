@@ -82,7 +82,6 @@ enum Certificates {
     Directory,
     ObtainedAt,
     Validation,
-    Wildcard,
 }
 
 #[derive(DeriveIden)]
@@ -92,7 +91,6 @@ enum Domains {
     Name,
     LastActiveAt,
     ServiceId,
-    CertificateId,
 }
 
 #[derive(DeriveIden)]
@@ -124,6 +122,7 @@ enum Challenge {
     Id,
     Name,
     Value,
+    Certificate,
     CreatedAt,
     Kind,
 }
@@ -278,11 +277,6 @@ impl MigrationTrait for Migration {
                     .col(text(Certificates::Directory))
                     .col(big_integer(Certificates::ObtainedAt))
                     .col(text(Certificates::Validation).default("dns-01"))
-                    // Whether the certificate carries a wildcard SAN. Stored
-                    // explicitly rather than re-derived from the name so
-                    // `cert status` can label a row accurately even after the
-                    // zone model changes.
-                    .col(boolean(Certificates::Wildcard).default(false))
                     .to_owned(),
             )
             .await?;
@@ -299,8 +293,8 @@ impl MigrationTrait for Migration {
             .await?;
 
         // 6. domains table: materialized flat service hostnames. `service_id`
-        // and `certificate_id` are nullable so a domain survives either side
-        // being removed (`ON DELETE SET NULL`).
+        // is nullable so a domain survives the service being removed
+        // (`ON DELETE SET NULL`).
         manager
             .create_table(
                 Table::create()
@@ -309,20 +303,11 @@ impl MigrationTrait for Migration {
                     .col(text(Domains::Name).unique_key())
                     .col(big_integer_null(Domains::LastActiveAt))
                     .col(integer_null(Domains::ServiceId))
-                    .col(integer_null(Domains::CertificateId))
                     .foreign_key(
                         ForeignKey::create()
                             .name("fk_domains_service_id")
                             .from(Domains::Table, Domains::ServiceId)
                             .to(Service::Table, Service::Id)
-                            .on_delete(ForeignKeyAction::SetNull)
-                            .on_update(ForeignKeyAction::Cascade),
-                    )
-                    .foreign_key(
-                        ForeignKey::create()
-                            .name("fk_domains_certificate_id")
-                            .from(Domains::Table, Domains::CertificateId)
-                            .to(Certificates::Table, Certificates::Id)
                             .on_delete(ForeignKeyAction::SetNull)
                             .on_update(ForeignKeyAction::Cascade),
                     )
@@ -414,6 +399,7 @@ impl MigrationTrait for Migration {
                     .col(big_pk_auto(Challenge::Id))
                     .col(text(Challenge::Name))
                     .col(text(Challenge::Value))
+                    .col(text_null(Challenge::Certificate))
                     .col(big_integer(Challenge::CreatedAt))
                     .col(text(Challenge::Kind).default("dns-01"))
                     .to_owned(),

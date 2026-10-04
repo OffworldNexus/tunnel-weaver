@@ -125,7 +125,7 @@ OFF-190 made the tunnel zone self-delegated (`NS <root> -> <root>`) and gave the
 relay one wildcard certificate. That couples the relay's own hostname and DNS to
 the delegated zone. OFF-198 splits them:
 
-- `root_domain` is the **tunnel** domain, delegated in full to the relay.
+- `tunnel_domain` is the **tunnel** domain, delegated in full to the relay.
 - `admin_domain` is the relay's own stable hostname, *outside* the delegation.
   `A`/`AAAA <admin>` points at the relay and `NS <root>` points at `<admin>`.
 

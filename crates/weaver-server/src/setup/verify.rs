@@ -116,7 +116,7 @@ pub async fn wait_for_systemd_active() -> Result<(), String> {
 /// exercised through a random one-label name) and the admin certificate
 /// (HTTP-01). `setup_complete` is only persisted once both pass.
 pub async fn verify_setup(
-    root_domain: &str,
+    tunnel_domain: &str,
     admin_domain: &str,
     socket_path: &Path,
 ) -> Result<(), String> {
@@ -132,16 +132,21 @@ pub async fn verify_setup(
     println!(
         "  {} Waiting for certificate issuance for '{}' (timeout: 300s)...",
         "•".blue(),
-        root_domain.bold().cyan()
+        tunnel_domain.bold().cyan()
     );
 
-    let wait_code =
-        client_cert_wait(socket_path, Some(root_domain.to_string()), Some(300), false).await;
+    let wait_code = client_cert_wait(
+        socket_path,
+        Some(tunnel_domain.to_string()),
+        Some(300),
+        false,
+    )
+    .await;
 
     if wait_code != 0 {
         print_failure_guidance();
         return Err(format!(
-            "certificate issuance failed or timed out for '{root_domain}'"
+            "certificate issuance failed or timed out for '{tunnel_domain}'"
         ));
     }
 
@@ -149,13 +154,13 @@ pub async fn verify_setup(
     print!(
         "  {} Testing HTTPS GET https://{}/...",
         "•".blue(),
-        root_domain
+        tunnel_domain
     );
-    match https_probe(&format!("https://{root_domain}/"), true) {
+    match https_probe(&format!("https://{tunnel_domain}/"), true) {
         HttpsProbe::Succeeded(status_code) => println!(
             "\r  {} HTTPS GET https://{}/ succeeded (HTTP {})",
             "✓".green(),
-            root_domain,
+            tunnel_domain,
             status_code.bold()
         ),
         HttpsProbe::TrustFailure(_) => println!(
@@ -225,7 +230,7 @@ pub async fn verify_setup(
     //    handshake. Any HTTP response (even 404) proves the wildcard
     //    certificate covers the name; only a TLS failure is a problem.
     let sample_name = format!("sample-{}", generate_random_hex(4));
-    let sample_url = format!("https://{sample_name}.{root_domain}/");
+    let sample_url = format!("https://{sample_name}.{tunnel_domain}/");
     print!(
         "  {} Testing wildcard HTTPS GET {}/...",
         "•".blue(),
@@ -264,7 +269,7 @@ pub async fn verify_setup(
     println!(
         "  {:<18} {}",
         "Relay URL:".dark_grey(),
-        format!("https://{root_domain}").bold().cyan()
+        format!("https://{tunnel_domain}").bold().cyan()
     );
     println!(
         "  {:<18} {}",

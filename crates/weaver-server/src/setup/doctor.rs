@@ -34,7 +34,7 @@ use tokio::net::{TcpStream, UdpSocket};
 use super::dns;
 use super::planner::{Port, PortReachability};
 use super::reachability;
-use crate::zone::normalize_domain;
+use crate::store::names::normalize_domain;
 
 /// Per-attempt timeout for a daemon self-connect probe.
 const SELF_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -67,7 +67,7 @@ pub struct DoctorCheck {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DoctorReport {
     /// Tunnel zone under test.
-    pub root_domain: String,
+    pub tunnel_domain: String,
     /// Admin hostname under test.
     pub admin_domain: String,
     /// The public addresses the relay answers on: the operator override, else
@@ -105,7 +105,7 @@ impl DoctorReport {
         out.push_str(&format!(
             "  {:<14} {}\n",
             "Tunnel domain:".dark_grey(),
-            self.root_domain.as_str().bold()
+            self.tunnel_domain.as_str().bold()
         ));
         out.push_str(&format!(
             "  {:<14} {}\n",
@@ -178,7 +178,7 @@ impl DoctorReport {
 #[derive(Debug, Clone)]
 pub struct ReportInputs {
     /// Tunnel zone under test.
-    pub root_domain: String,
+    pub tunnel_domain: String,
     /// Admin hostname under test.
     pub admin_domain: String,
     /// The public addresses the relay answers on.
@@ -290,15 +290,15 @@ pub struct SelfConnectReachability {
     /// Admin hostname used as the HTTP `Host` header on the port-80 probe.
     admin_domain: String,
     /// Tunnel apex queried in the port-53 UDP probe.
-    root_domain: String,
+    tunnel_domain: String,
 }
 
 impl SelfConnectReachability {
     /// Builds a self-connect probe for the given admin hostname and apex.
-    pub fn new(admin_domain: impl Into<String>, root_domain: impl Into<String>) -> Self {
+    pub fn new(admin_domain: impl Into<String>, tunnel_domain: impl Into<String>) -> Self {
         Self {
             admin_domain: admin_domain.into(),
-            root_domain: root_domain.into(),
+            tunnel_domain: tunnel_domain.into(),
         }
     }
 
@@ -416,7 +416,7 @@ impl SelfConnectReachability {
     /// One timed DNS query over UDP; any response proves the datagram path.
     async fn probe_dns(&self, ip: IpAddr, port: u16) -> Result<(), String> {
         let target = SocketAddr::new(ip, port);
-        let name = Name::from_str(&format!("{}.", self.root_domain))
+        let name = Name::from_str(&format!("{}.", self.tunnel_domain))
             .map_err(|err| format!("invalid apex name: {err}"))?;
         let id = u16::from_str_radix(&dns::generate_random_hex(2), 16).unwrap_or(0);
         let mut message = Message::new(id, MessageType::Query, OpCode::Query);
@@ -502,7 +502,7 @@ pub async fn assemble_report(
     reachability: &dyn Reachability,
 ) -> DoctorReport {
     let mut checks = vec![
-        domain_split_check(&inputs.admin_domain, &inputs.root_domain),
+        domain_split_check(&inputs.admin_domain, &inputs.tunnel_domain),
         admin_addresses_check(
             &inputs.admin_domain,
             &inputs.relay_ips,
@@ -516,18 +516,18 @@ pub async fn assemble_report(
             ok: false,
             detail: format!(
                 "could not read the parent delegation for '{}': {err}",
-                inputs.root_domain
+                inputs.tunnel_domain
             ),
             remediation: Some(delegation_records(
                 &inputs.admin_domain,
-                &inputs.root_domain,
+                &inputs.tunnel_domain,
                 &inputs.relay_ips,
             )),
             status: None,
         }),
         None => checks.push(delegation_check(
             &inputs.admin_domain,
-            &inputs.root_domain,
+            &inputs.tunnel_domain,
             &inputs.ns_targets,
         )),
     }
@@ -547,7 +547,7 @@ pub async fn assemble_report(
     }
 
     DoctorReport {
-        root_domain: inputs.root_domain,
+        tunnel_domain: inputs.tunnel_domain,
         admin_domain: inputs.admin_domain,
         relay_ips: inputs.relay_ips,
         admin_resolved: inputs.admin_resolved,
@@ -563,12 +563,12 @@ pub async fn assemble_report(
 /// was given, reads the delegation from the parent zone, and probes the ports
 /// with [`BindReachability`] (throwaway listeners). It never mutates the host.
 pub async fn run_in_process(
-    root_domain: &str,
+    tunnel_domain: &str,
     admin_domain: &str,
     relay_ips_override: &[IpAddr],
     skip_reachability: bool,
 ) -> DoctorReport {
-    let root = normalize_domain(root_domain);
+    let root = normalize_domain(tunnel_domain);
     let admin = normalize_domain(admin_domain);
 
     let admin_resolved = dns::resolve_public(&admin).await;
@@ -589,7 +589,7 @@ pub async fn run_in_process(
     let bind = BindReachability;
     assemble_report(
         ReportInputs {
-            root_domain: root,
+            tunnel_domain: root,
             admin_domain: admin,
             relay_ips,
             admin_resolved,
@@ -628,13 +628,13 @@ pub fn port_status(report: &DoctorReport, port: Port) -> PortReachability {
 /// The tunnel zone is delegated in full to this relay, so an admin domain
 /// *under* it would put the relay's own DNS (and therefore the admin
 /// HTTP-01 DCV) under the zone the relay is meant to control.
-pub fn domain_split_check(admin_domain: &str, root_domain: &str) -> DoctorCheck {
-    match crate::config::domain_split_issue(admin_domain, root_domain) {
+pub fn domain_split_check(admin_domain: &str, tunnel_domain: &str) -> DoctorCheck {
+    match crate::config::domain_split_issue(admin_domain, tunnel_domain) {
         None => DoctorCheck {
             title: "Domain split".to_string(),
             ok: true,
             detail: format!(
-                "admin domain '{admin_domain}' is outside the delegated tunnel zone '{root_domain}'"
+                "admin domain '{admin_domain}' is outside the delegated tunnel zone '{tunnel_domain}'"
             ),
             remediation: None,
             status: None,
@@ -659,12 +659,16 @@ pub fn domain_split_check(admin_domain: &str, root_domain: &str) -> DoctorCheck 
 /// Only the `NS` record is produced here. The admin `A`/`AAAA` is checked (and
 /// asked for) separately by [`admin_addresses_check`], so a relay whose admin
 /// name already resolves is never told to recreate it.
-pub fn delegation_records(admin_domain: &str, root_domain: &str, _relay_ips: &[IpAddr]) -> String {
-    let parent = root_domain
+pub fn delegation_records(
+    admin_domain: &str,
+    tunnel_domain: &str,
+    _relay_ips: &[IpAddr],
+) -> String {
+    let parent = tunnel_domain
         .split_once('.')
         .map(|(_, rest)| rest)
-        .unwrap_or(root_domain);
-    format!("In the DNS zone for '{parent}', add:\n  {root_domain}.  NS  {admin_domain}.")
+        .unwrap_or(tunnel_domain);
+    format!("In the DNS zone for '{parent}', add:\n  {tunnel_domain}.  NS  {admin_domain}.")
 }
 
 /// Builds the delegation checklist item from NS targets read from the parent.
@@ -674,14 +678,14 @@ pub fn delegation_records(admin_domain: &str, root_domain: &str, _relay_ips: &[I
 /// failure path is unit-testable without touching the network.
 pub fn delegation_check(
     admin_domain: &str,
-    root_domain: &str,
+    tunnel_domain: &str,
     ns_targets: &[String],
 ) -> DoctorCheck {
     if dns::delegation_matches(ns_targets, admin_domain) {
         return DoctorCheck {
             title: "Delegation".to_string(),
             ok: true,
-            detail: format!("parent zone delegates '{root_domain}' to '{admin_domain}'"),
+            detail: format!("parent zone delegates '{tunnel_domain}' to '{admin_domain}'"),
             remediation: None,
             status: None,
         };
@@ -694,8 +698,8 @@ pub fn delegation_check(
     DoctorCheck {
         title: "Delegation".to_string(),
         ok: false,
-        detail: format!("'{root_domain}' is not delegated to '{admin_domain}' (found: {found})"),
-        remediation: Some(delegation_records(admin_domain, root_domain, &[])),
+        detail: format!("'{tunnel_domain}' is not delegated to '{admin_domain}' (found: {found})"),
+        remediation: Some(delegation_records(admin_domain, tunnel_domain, &[])),
         status: None,
     }
 }
@@ -842,7 +846,7 @@ mod tests {
     #[test]
     fn report_ok_requires_every_check() {
         let report = DoctorReport {
-            root_domain: "example.com".into(),
+            tunnel_domain: "example.com".into(),
             admin_domain: "relay.example.net".into(),
             relay_ips: vec!["203.0.113.7".parse().unwrap()],
             admin_resolved: vec![],
@@ -890,7 +894,7 @@ mod tests {
     #[test]
     fn port_status_recovers_the_planner_verdict() {
         let mut report = DoctorReport {
-            root_domain: "example.com".into(),
+            tunnel_domain: "example.com".into(),
             admin_domain: "relay.example.net".into(),
             relay_ips: vec![],
             admin_resolved: vec![],
@@ -955,7 +959,7 @@ mod tests {
         let bind = BindReachability;
         let report = assemble_report(
             ReportInputs {
-                root_domain: "example.com".into(),
+                tunnel_domain: "example.com".into(),
                 admin_domain: "relay.example.net".into(),
                 relay_ips: vec!["203.0.113.7".parse().unwrap()],
                 admin_resolved: vec!["203.0.113.7".parse().unwrap()],

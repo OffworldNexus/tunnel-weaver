@@ -139,7 +139,7 @@ jobs:
             ubuntu:latest bash -c "
               apt-get update -qq && apt-get install -y -qq curl ca-certificates >/dev/null 2>&1
               weaver-server --db /var/lib/weaver/smoke.db configure --headless \
-                --root-domain root.pebble.test \
+                --tunnel-domain root.pebble.test \
                 --admin-domain admin.pebble.test \
                 --email admin@pebble.test \
                 --acme-provider custom \
@@ -177,7 +177,7 @@ jobs:
             sleep 1
           done
           docker exec systemd-smoke /usr/local/bin/weaver-server setup --headless \
-            --root-domain root.pebble.test \
+            --tunnel-domain root.pebble.test \
             --admin-domain admin.pebble.test \
             --email admin@pebble.test \
             --acme-provider custom \

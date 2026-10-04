@@ -56,6 +56,11 @@ pub fn is_valid_service(name: &str) -> bool {
     !prev_dash && !name.starts_with('-')
 }
 
+/// Lowercases a domain and strips any trailing dot, for comparison.
+pub fn normalize_domain(domain: &str) -> String {
+    domain.trim().trim_end_matches('.').to_ascii_lowercase()
+}
+
 /// Builds the materialized flat hostname for a service, lowercased.
 pub fn flat_hostname(person: &str, machine: &str, service: &str, root: &str) -> String {
     format!(
