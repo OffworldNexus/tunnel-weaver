@@ -29,6 +29,7 @@ fn create_valid_test_config(
         usage_flush_interval_secs: 60,
         relay_ips: Vec::new(),
         setup_complete: false,
+        email: None,
     }
 }
 

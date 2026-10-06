@@ -562,6 +562,7 @@ mod tests {
             usage_flush_interval_secs: 60,
             relay_ips,
             setup_complete: false,
+            email: None,
         };
         let generator_config = DnsResponderConfig::from_config(&config);
         let responder = Arc::new(DnsResponder::new(vec![

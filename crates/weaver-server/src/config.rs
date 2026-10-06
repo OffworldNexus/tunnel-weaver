@@ -88,6 +88,73 @@ pub struct Config {
     /// first boot does not race an unreachable zone.
     #[serde(default)]
     pub setup_complete: bool,
+    /// Optional transactional-email configuration.
+    ///
+    /// Absent means email is disabled: the server still boots and every caller
+    /// receives [`crate::email::MailerError::NotConfigured`]. Present means the
+    /// nested block is validated by [`Config::load`]. Credentials live here
+    /// because the config JSON is stored in the 0600 SQLite database — the same
+    /// trust model as the ACME EAB material and certificate private keys.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub email: Option<EmailConfig>,
+}
+
+/// Operator-supplied transactional-email settings.
+///
+/// Field names are deliberately provider-neutral: the catalog in
+/// [`crate::email::providers`] maps them onto each provider's auth scheme and
+/// request body. All fields are optional at the type level so a config stored
+/// before a field existed still deserialises; [`Config::load`] enforces the
+/// per-provider requirements.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct EmailConfig {
+    /// Catalog provider id (e.g. "resend", "smtp").
+    pub provider: String,
+    /// Verified sender address; the mailer stamps it as the `From` header.
+    pub from: String,
+    /// Optional display name for the sender.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_name: Option<String>,
+    /// HTTP API key, or the SMTP password.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
+    /// Mailjet secret half of the Basic credential.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret: Option<String>,
+    /// SMTP or HTTP Basic username.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
+    /// Cloud region (AWS SES, Azure ACS).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub region: Option<String>,
+    /// Mailgun sending domain, carried in the request path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domain: Option<String>,
+    /// Base-URL override: regional hosts, the EU Mailgun API, or a CI mock.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
+    /// Transactional template id, required by template-only providers (Loops).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template_id: Option<String>,
+}
+
+/// Redacts credentials so `EmailConfig` can sit inside `Config`'s derived
+/// `Debug` without printing secrets in logs, error paths, or `status` output.
+impl std::fmt::Debug for EmailConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EmailConfig")
+            .field("provider", &self.provider)
+            .field("from", &self.from)
+            .field("from_name", &self.from_name)
+            .field("username", &self.username)
+            .field("region", &self.region)
+            .field("domain", &self.domain)
+            .field("endpoint", &self.endpoint)
+            .field("template_id", &self.template_id)
+            .field("api_key", &self.api_key.as_ref().map(|_| "[redacted]"))
+            .field("secret", &self.secret.as_ref().map(|_| "[redacted]"))
+            .finish()
+    }
 }
 
 /// Default usage flush interval, in seconds.
@@ -228,6 +295,12 @@ impl Config {
                 .is_empty()
         {
             validation_issues.push("acme_provider 'custom' requires acme_directory URL".into());
+        }
+
+        // Email is opt-in: an absent block means the server boots with email
+        // disabled, while a present block must fully validate.
+        if let Some(email) = &config.email {
+            validation_issues.extend(crate::email::providers::validate_email_config(email));
         }
 
         if !validation_issues.is_empty() {

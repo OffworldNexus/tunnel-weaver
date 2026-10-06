@@ -36,6 +36,7 @@ fn sample_config() -> Config {
         usage_flush_interval_secs: 60,
         relay_ips: Vec::new(),
         setup_complete: false,
+        email: None,
     }
 }
 

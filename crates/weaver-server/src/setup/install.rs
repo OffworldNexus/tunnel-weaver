@@ -289,6 +289,9 @@ pub async fn execute_install(
         // bindings; never a wildcard.
         relay_ips: plan.relay_ips.clone(),
         setup_complete: previously_setup_complete,
+        // The email block is carried from the setup wizard (or its 0600 staging
+        // file) and written with the rest of the config.
+        email: gathered.email.clone(),
     };
 
     store

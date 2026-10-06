@@ -1,0 +1,17 @@
+<mjml lang="en">
+  <mj-include path="./partials/head.mjml" />
+  <mj-body width="600px" background-color="#fefaf3">
+    <mj-include path="./partials/header.mjml" />
+    <mj-section background-color="#ffffff">
+      <mj-column>
+        <mj-text mj-class="heading">{{heading}}</mj-text>
+        <mj-text>{{intro}}</mj-text>
+        <!-- A single selectable code string, never split digit boxes. -->
+        <mj-text font-family="ui-monospace, 'Cascadia Code', 'Source Code Pro', Menlo, Consolas, 'DejaVu Sans Mono', 'Courier New', monospace" font-size="32px" line-height="40px" font-weight="bold" letter-spacing="4px" padding="8px 32px 24px">{{code}}</mj-text>
+        <mj-text mj-class="quiet">{{expiry}}</mj-text>
+        <mj-text mj-class="quiet">{{safety}}</mj-text>
+      </mj-column>
+    </mj-section>
+    <mj-include path="./partials/footer.mjml" />
+  </mj-body>
+</mjml>

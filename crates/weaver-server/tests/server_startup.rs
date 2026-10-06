@@ -32,6 +32,7 @@ fn create_valid_test_config(http_port: u16, https_port: u16) -> Config {
         usage_flush_interval_secs: 60,
         relay_ips: Vec::new(),
         setup_complete: false,
+        email: None,
     }
 }
 

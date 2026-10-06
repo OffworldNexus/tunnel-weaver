@@ -29,8 +29,19 @@ pub enum Commands {
     /// Configures or initializes the SQLite state store with required settings.
     Configure(Box<ConfigureArgs>),
 
-    /// Displays the supported ACME provider catalog.
-    Providers,
+    /// Displays the supported provider catalogs (ACME/SSL by default).
+    Providers {
+        /// Which catalog to show; omitted means the ACME/SSL providers.
+        #[command(subcommand)]
+        command: Option<ProviderCommands>,
+    },
+
+    /// Sends a development joke to an address through the configured provider.
+    ///
+    /// Deliberately temporary and hidden: deleted once real account email
+    /// (OFF-194/OFF-191) ships.
+    #[command(hide = true, name = "send-a-joke")]
+    SendAJoke(Box<SendAJokeArgs>),
 
     /// Displays runtime server status, listeners, and certificate counts.
     Status {
@@ -89,6 +100,15 @@ pub enum Commands {
         #[arg(long)]
         json: bool,
     },
+}
+
+/// Provider catalogs shown by `weaver-server providers`.
+#[derive(Subcommand, Debug, Clone)]
+pub enum ProviderCommands {
+    /// ACME certificate authority providers (the default).
+    Ssl,
+    /// Transactional email providers.
+    Email,
 }
 
 /// Subcommands for certificate operations.
@@ -247,6 +267,15 @@ pub struct SetupArgs {
     #[arg(long, default_value = "/usr/local/bin", value_name = "PATH")]
     pub prefix: PathBuf,
 
+    /// Transactional-email settings for headless setup.
+    #[command(flatten)]
+    pub email_settings: EmailArgs,
+
+    /// Internal: path to a 0600 staging file carrying the gathered email block
+    /// across the `sudo` re-exec (credentials never travel in `argv`).
+    #[arg(long, hide = true, value_name = "PATH")]
+    pub email_config_file: Option<PathBuf>,
+
     /// Internal flag signaling that interactive prompt values are already provided.
     #[arg(long, hide = true)]
     pub no_prompt_values: bool,
@@ -362,9 +391,134 @@ pub struct ConfigureArgs {
     #[arg(long, default_value_t = 60, value_name = "SECS")]
     pub usage_flush_interval: u64,
 
+    /// Transactional-email settings.
+    #[command(flatten)]
+    pub email_settings: EmailArgs,
+
     /// Non-interactive headless execution mode.
     #[arg(long)]
     pub headless: bool,
+}
+
+/// Email settings shared by `configure` (and, in part, `setup`).
+///
+/// `--email-provider` and `--no-email` conflict; passing any other email flag
+/// without `--email-provider` is an error rather than a silent default.
+#[derive(Args, Debug, Clone, Default)]
+pub struct EmailArgs {
+    /// Transactional email provider id (see `providers email`).
+    #[arg(long, value_name = "ID", conflicts_with = "no_email")]
+    pub email_provider: Option<String>,
+
+    /// Disable email accounts, clearing any configured provider.
+    #[arg(long)]
+    pub no_email: bool,
+
+    /// Verified sender address.
+    #[arg(long, value_name = "ADDRESS")]
+    pub email_from: Option<String>,
+
+    /// Sender display name.
+    #[arg(long, value_name = "NAME")]
+    pub email_from_name: Option<String>,
+
+    /// Provider API key, or the SMTP password.
+    #[arg(long, value_name = "KEY", conflicts_with = "email_api_key_file")]
+    pub email_api_key: Option<String>,
+
+    /// File containing the provider API key or SMTP password.
+    #[arg(long, value_name = "PATH")]
+    pub email_api_key_file: Option<PathBuf>,
+
+    /// Mailjet secret key.
+    #[arg(long, value_name = "SECRET")]
+    pub email_secret: Option<String>,
+
+    /// SMTP or HTTP Basic username.
+    #[arg(long, value_name = "USER")]
+    pub email_username: Option<String>,
+
+    /// Cloud region (AWS SES, Azure ACS).
+    #[arg(long, value_name = "REGION")]
+    pub email_region: Option<String>,
+
+    /// Mailgun sending domain.
+    #[arg(long, value_name = "DOMAIN")]
+    pub email_domain: Option<String>,
+
+    /// Base-URL override: regional host, EU endpoint, or a CI mock.
+    #[arg(long, env = "WEAVER_EMAIL_ENDPOINT", value_name = "URL")]
+    pub email_endpoint: Option<String>,
+
+    /// Template id required by template-only providers (Loops).
+    #[arg(long, value_name = "ID")]
+    pub email_template: Option<String>,
+
+    /// OTP code sent by a prior run, proving the provider.
+    #[arg(long, env = "WEAVER_EMAIL_OTP", value_name = "CODE")]
+    pub email_otp: Option<String>,
+}
+
+impl EmailArgs {
+    /// Whether any flag that selects or configures email was supplied.
+    pub fn configures_email(&self) -> bool {
+        self.email_provider.is_some()
+            || self.email_from.is_some()
+            || self.email_from_name.is_some()
+            || self.email_api_key.is_some()
+            || self.email_api_key_file.is_some()
+            || self.email_secret.is_some()
+            || self.email_username.is_some()
+            || self.email_region.is_some()
+            || self.email_domain.is_some()
+            || self.email_endpoint.is_some()
+            || self.email_template.is_some()
+    }
+
+    /// Builds an [`EmailConfig`] from the flags, reading the key file if given.
+    fn to_config(&self) -> Result<weaver_server::config::EmailConfig, String> {
+        let provider = self
+            .email_provider
+            .clone()
+            .ok_or("configure requires --email-provider when setting email")?;
+        let from = self
+            .email_from
+            .clone()
+            .ok_or("configure requires --email-from when setting email")?;
+        let api_key = match &self.email_api_key_file {
+            Some(path) => Some(
+                std::fs::read_to_string(path)
+                    .map_err(|e| format!("failed to read key file {}: {e}", path.display()))?
+                    .trim()
+                    .to_string(),
+            ),
+            None => self.email_api_key.clone(),
+        };
+        Ok(weaver_server::config::EmailConfig {
+            provider,
+            from,
+            from_name: self.email_from_name.clone(),
+            api_key,
+            secret: self.email_secret.clone(),
+            username: self.email_username.clone(),
+            region: self.email_region.clone(),
+            domain: self.email_domain.clone(),
+            endpoint: self.email_endpoint.clone(),
+            template_id: self.email_template.clone(),
+        })
+    }
+}
+
+/// Arguments for the hidden `send-a-joke` dev/e2e verb.
+#[derive(Args, Debug, Clone)]
+pub struct SendAJokeArgs {
+    /// Recipient address.
+    #[arg(value_name = "ADDRESS")]
+    pub address: String,
+
+    /// Override the provider base URL so CI can point at a mock.
+    #[arg(long, env = "WEAVER_EMAIL_ENDPOINT", value_name = "URL")]
+    pub email_endpoint: Option<String>,
 }
 
 #[tokio::main]
@@ -502,16 +656,20 @@ async fn main() {
                 std::process::exit(1);
             });
 
-            // Preserve the relay's detected public addresses across a config
-            // rewrite; re-running setup is the path that refreshes them.
-            let existing_relay_ips = store
+            // Load the previous config once: it supplies the detected public
+            // addresses (re-running setup refreshes them) and the existing
+            // email block, which flags preserve when they do not set one.
+            let existing_config: Option<Config> = store
                 .load_config_json()
                 .await
                 .ok()
                 .flatten()
-                .and_then(|json| serde_json::from_str::<Config>(&json).ok())
-                .map(|cfg| cfg.relay_ips)
+                .and_then(|json| serde_json::from_str::<Config>(&json).ok());
+            let existing_relay_ips = existing_config
+                .as_ref()
+                .map(|cfg| cfg.relay_ips.clone())
                 .unwrap_or_default();
+            let existing_email = existing_config.as_ref().and_then(|cfg| cfg.email.clone());
 
             let root_ca_pem = match acme_root_ca {
                 Some(path) => match std::fs::read_to_string(&path) {
@@ -524,10 +682,19 @@ async fn main() {
                 None => None,
             };
 
-            let config = Config {
+            let email_decision =
+                match decide_configure_email(&args.email_settings, existing_email.clone()) {
+                    Ok(decision) => decision,
+                    Err(msg) => {
+                        eprintln!("{} {msg}", "✗ Error:".red().bold());
+                        std::process::exit(2);
+                    }
+                };
+
+            let mut config = Config {
                 tunnel_domain,
-                admin_domain,
-                admin_email,
+                admin_domain: admin_domain.clone(),
+                admin_email: admin_email.clone(),
                 acme_provider,
                 listen_http: args.listen_http,
                 listen_https: args.listen_https,
@@ -544,7 +711,72 @@ async fn main() {
                 // Mark setup complete so the daemon auto-orders the wildcard at
                 // startup instead of waiting for a `setup` that never runs.
                 setup_complete: true,
+                email: None,
             };
+
+            match email_decision {
+                ConfigureEmail::Preserve(email) => {
+                    config.email = email;
+                }
+                ConfigureEmail::Disable => {
+                    config.email = None;
+                    let _ = weaver_server::email::otp::PendingOtp::clear(&store).await;
+                }
+                ConfigureEmail::Verify(code) => {
+                    match weaver_server::email::otp::PendingOtp::load(&store).await {
+                        Ok(Some(mut pending)) => match pending.verify(&code) {
+                            Ok(()) => config.email = Some(pending.pending.clone()),
+                            Err(err) => {
+                                // Persist the incremented attempt count, then stop.
+                                let _ = pending.save(&store).await;
+                                eprintln!("{} {err}", "✗ Error:".red().bold());
+                                std::process::exit(1);
+                            }
+                        },
+                        Ok(None) => {
+                            eprintln!(
+                                "{} no pending email OTP; run configure with the email flags first",
+                                "✗ Error:".red().bold()
+                            );
+                            std::process::exit(1);
+                        }
+                        Err(err) => {
+                            eprintln!("{} {err}", "✗ Error:".red().bold());
+                            std::process::exit(1);
+                        }
+                    }
+                }
+                ConfigureEmail::Begin(cfg) => {
+                    // Persist the base config first so the pending challenge can
+                    // live in the same JSON singleton.
+                    config.email = existing_email;
+                    if let Err(err) = store.save_config(&config).await {
+                        eprintln!("Failed to write configuration: {err}");
+                        std::process::exit(1);
+                    }
+                    let support_url = format!("https://{admin_domain}");
+                    let code =
+                        match weaver_server::email::otp::PendingOtp::issue(&store, cfg.clone())
+                            .await
+                        {
+                            Ok(code) => code,
+                            Err(err) => {
+                                eprintln!("{} {err}", "✗ Error:".red().bold());
+                                std::process::exit(1);
+                            }
+                        };
+                    if let Err(err) = send_email_otp(&cfg, &support_url, &admin_email, &code).await
+                    {
+                        let _ = weaver_server::email::otp::PendingOtp::clear(&store).await;
+                        eprintln!("{} {err}", "✗ Error:".red().bold());
+                        std::process::exit(1);
+                    }
+                    println!(
+                        "An email OTP was sent to {admin_email}. Re-run configure with --email-otp CODE."
+                    );
+                    std::process::exit(1);
+                }
+            }
 
             if let Err(err) = store.save_config(&config).await {
                 eprintln!("Failed to write configuration: {err}");
@@ -553,8 +785,20 @@ async fn main() {
 
             println!("Configuration saved to {}", db_path.display());
         }
-        Commands::Providers => {
-            weaver_server::cert::providers::print_providers();
+        Commands::Providers { command } => match command {
+            None | Some(ProviderCommands::Ssl) => {
+                weaver_server::cert::providers::print_providers();
+            }
+            Some(ProviderCommands::Email) => {
+                weaver_server::email::providers::print_providers();
+            }
+        },
+        Commands::SendAJoke(args) => {
+            let db_path = cli
+                .db
+                .unwrap_or_else(|| PathBuf::from("/var/lib/weaver/weaver.db"));
+            let code = handle_send_a_joke(*args, db_path).await;
+            std::process::exit(code);
         }
         Commands::Status { json } => {
             let socket_path = cli
@@ -675,6 +919,356 @@ async fn main() {
             std::process::exit(code);
         }
     }
+}
+
+/// Sends a development joke through the configured provider.
+///
+/// Returns the process exit code. Errors already carry redacted provider
+/// detail; this only adds the surrounding frame.
+async fn handle_send_a_joke(args: SendAJokeArgs, db_path: PathBuf) -> i32 {
+    use weaver_server::email::{Joke, Mailbox, jokes, mailer_from_config};
+
+    let store = match Store::open(&db_path).await {
+        Ok(store) => store,
+        Err(err) => {
+            eprintln!(
+                "{} Failed to open database at {}: {err}",
+                "✗ Error:".red().bold(),
+                db_path.display()
+            );
+            return 1;
+        }
+    };
+    let config = match Config::load(&store).await {
+        Ok(config) => config,
+        Err(err) => {
+            eprintln!("{} {err}", "✗ Error:".red().bold());
+            return 1;
+        }
+    };
+    let _ = store.close().await;
+
+    // The support link in the shared footer is the relay's own admin host.
+    let support_url = format!("https://{}", config.admin_domain);
+    let mut email_config = config.email.clone();
+    if let (Some(cfg), Some(endpoint)) = (email_config.as_mut(), args.email_endpoint.as_deref()) {
+        cfg.endpoint = Some(endpoint.to_string());
+    }
+
+    let mailer = match mailer_from_config(email_config.as_ref(), &support_url) {
+        Ok(mailer) => mailer,
+        Err(err) => {
+            eprintln!("{} {err}", "✗ Error:".red().bold());
+            return 1;
+        }
+    };
+
+    let to = match Mailbox::parse(&args.address, None) {
+        Ok(to) => to,
+        Err(err) => {
+            eprintln!("{} {err}", "✗ Error:".red().bold());
+            return 2;
+        }
+    };
+
+    let joke = Joke {
+        line: jokes::pick().to_string(),
+    };
+    let email = match mailer.compose(to, &joke) {
+        Ok(email) => email,
+        Err(err) => {
+            eprintln!("{} {err}", "✗ Error:".red().bold());
+            return 1;
+        }
+    };
+
+    match mailer.send(&email).await {
+        Ok(receipt) => {
+            println!(
+                "sent via {} (id={})",
+                mailer.identity().display,
+                receipt.message_id.as_deref().unwrap_or("-")
+            );
+            0
+        }
+        Err(err) => {
+            eprintln!("{} {err}", "✗ Error:".red().bold());
+            1
+        }
+    }
+}
+
+/// What a `configure` invocation decided about email.
+enum ConfigureEmail {
+    /// No email flags: keep whatever was stored.
+    Preserve(Option<weaver_server::config::EmailConfig>),
+    /// `--no-email`: clear it.
+    Disable,
+    /// `--email-otp CODE`: verify the pending challenge.
+    Verify(String),
+    /// First run: the config was built and validated; send an OTP next.
+    Begin(weaver_server::config::EmailConfig),
+}
+
+/// Decides how `configure` changes the email block, building and validating a
+/// new one when the flags ask for it.
+fn decide_configure_email(
+    settings: &EmailArgs,
+    existing: Option<weaver_server::config::EmailConfig>,
+) -> Result<ConfigureEmail, String> {
+    if settings.no_email {
+        return Ok(ConfigureEmail::Disable);
+    }
+    if let Some(code) = settings.email_otp.clone() {
+        return Ok(ConfigureEmail::Verify(code));
+    }
+    if !settings.configures_email() {
+        return Ok(ConfigureEmail::Preserve(existing));
+    }
+    let cfg = settings.to_config()?;
+    let issues = weaver_server::email::providers::validate_email_config(&cfg);
+    if !issues.is_empty() {
+        return Err(format!(
+            "email configuration invalid: {}",
+            issues.join("; ")
+        ));
+    }
+    Ok(ConfigureEmail::Begin(cfg))
+}
+
+/// Sends the setup/configure OTP as a plain-text message through the provider.
+async fn send_email_otp(
+    cfg: &weaver_server::config::EmailConfig,
+    support_url: &str,
+    admin_email: &str,
+    code: &str,
+) -> Result<(), weaver_server::email::MailerError> {
+    use weaver_server::email::{Mailbox, Otp, mailer_from_config};
+    let mailer = mailer_from_config(Some(cfg), support_url)?;
+    let to = Mailbox::parse(admin_email, None)?;
+    let email = mailer.compose(
+        to,
+        &Otp {
+            code: code.to_string(),
+        },
+    )?;
+    mailer.send(&email).await.map(|_| ())
+}
+
+/// Resolves the setup email block for the current phase.
+///
+/// Interactive setup prompts and returns the config (the OTP is proven later,
+/// after the plan). Headless setup uses the flags plus the persisted two-step
+/// OTP. The elevated child only reads the staged file.
+async fn resolve_setup_email(
+    email_settings: &EmailArgs,
+    email_config_file: Option<&std::path::Path>,
+    no_prompt_values: bool,
+    headless: bool,
+    db_path: &std::path::Path,
+    admin_domain: &str,
+    admin_email: &str,
+) -> Option<weaver_server::config::EmailConfig> {
+    if no_prompt_values {
+        return match email_config_file {
+            Some(path) => match read_email_config_file(path) {
+                Ok(cfg) => cfg,
+                Err(err) => {
+                    eprintln!(
+                        "{} Failed to read staged email config: {err}",
+                        "✗ Error:".red().bold()
+                    );
+                    std::process::exit(1);
+                }
+            },
+            None => None,
+        };
+    }
+
+    if headless {
+        if !email_settings.configures_email() && email_settings.email_otp.is_none() {
+            return None;
+        }
+        let store = Store::open(db_path).await.unwrap_or_else(|err| {
+            eprintln!("Failed to open database at {}: {err}", db_path.display());
+            std::process::exit(1);
+        });
+
+        if let Some(code) = email_settings.email_otp.clone() {
+            let mut pending = match weaver_server::email::otp::PendingOtp::load(&store).await {
+                Ok(Some(pending)) => pending,
+                Ok(None) => {
+                    eprintln!(
+                        "{} no pending email OTP; run setup with the email flags first",
+                        "✗ Error:".red().bold()
+                    );
+                    std::process::exit(1);
+                }
+                Err(err) => {
+                    eprintln!("{} {err}", "✗ Error:".red().bold());
+                    std::process::exit(1);
+                }
+            };
+            return match pending.verify(&code) {
+                Ok(()) => Some(pending.pending.clone()),
+                Err(err) => {
+                    let _ = pending.save(&store).await;
+                    eprintln!("{} {err}", "✗ Error:".red().bold());
+                    std::process::exit(1);
+                }
+            };
+        }
+
+        let cfg = match email_settings.to_config() {
+            Ok(cfg) => cfg,
+            Err(msg) => {
+                eprintln!("{} {msg}", "✗ Error:".red().bold());
+                std::process::exit(2);
+            }
+        };
+        let issues = weaver_server::email::providers::validate_email_config(&cfg);
+        if !issues.is_empty() {
+            eprintln!(
+                "{} email configuration invalid: {}",
+                "✗ Error:".red().bold(),
+                issues.join("; ")
+            );
+            std::process::exit(2);
+        }
+        let support_url = format!("https://{admin_domain}");
+        let code = match weaver_server::email::otp::PendingOtp::issue(&store, cfg.clone()).await {
+            Ok(code) => code,
+            Err(err) => {
+                eprintln!("{} {err}", "✗ Error:".red().bold());
+                std::process::exit(1);
+            }
+        };
+        if let Err(err) = send_email_otp(&cfg, &support_url, admin_email, &code).await {
+            let _ = weaver_server::email::otp::PendingOtp::clear(&store).await;
+            eprintln!("{} {err}", "✗ Error:".red().bold());
+            std::process::exit(1);
+        }
+        println!("An email OTP was sent to {admin_email}. Re-run setup with --email-otp CODE.");
+        std::process::exit(1);
+    }
+
+    match weaver_server::setup::interactive::prompt_email_config() {
+        Ok(cfg) => cfg,
+        Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {
+            eprintln!("\n{} Cancelled by user.", "•".blue());
+            std::process::exit(130);
+        }
+        Err(err) => {
+            eprintln!(
+                "{} Interactive prompt failed: {err}",
+                "✗ Error:".red().bold()
+            );
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Sends and verifies the interactive setup OTP before any host change.
+async fn verify_setup_email_otp(
+    cfg: &weaver_server::config::EmailConfig,
+    admin_domain: &str,
+    admin_email: &str,
+) {
+    use weaver_server::email::otp::{self, OtpChallenge};
+    use weaver_server::email::{Mailbox, Otp, mailer_from_config};
+
+    let support_url = format!("https://{admin_domain}");
+    let mailer = match mailer_from_config(Some(cfg), &support_url) {
+        Ok(mailer) => mailer,
+        Err(err) => {
+            eprintln!("{} {err}", "✗ Error:".red().bold());
+            std::process::exit(1);
+        }
+    };
+    let to = match Mailbox::parse(admin_email, None) {
+        Ok(to) => to,
+        Err(err) => {
+            eprintln!("{} {err}", "✗ Error:".red().bold());
+            std::process::exit(1);
+        }
+    };
+
+    let mut challenge = OtpChallenge::generate();
+    let email = match mailer.compose(
+        to,
+        &Otp {
+            code: challenge.code().to_string(),
+        },
+    ) {
+        Ok(email) => email,
+        Err(err) => {
+            eprintln!("{} {err}", "✗ Error:".red().bold());
+            std::process::exit(1);
+        }
+    };
+    if let Err(err) = mailer.send(&email).await {
+        eprintln!(
+            "{} Failed to send the verification email: {err}",
+            "✗ Error:".red().bold()
+        );
+        std::process::exit(1);
+    }
+    println!("  {} An email OTP was sent to {admin_email}.", "•".blue());
+
+    loop {
+        let input = prompt_required(|| {
+            weaver_server::setup::interactive::prompt_line("Enter the email OTP", None)
+        });
+        match challenge.verify(&input) {
+            Ok(()) => {
+                println!("  {} Email provider verified.", "✓".green());
+                return;
+            }
+            Err(err) => {
+                eprintln!("{} {err}", "✗ Error:".red().bold());
+                if matches!(err, otp::OtpError::Expired | otp::OtpError::TooManyAttempts) {
+                    std::process::exit(1);
+                }
+            }
+        }
+    }
+}
+
+/// Writes the gathered email block to a mode-0600 file whose path alone crosses
+/// the `sudo` boundary. Returns the path.
+fn write_email_config_staging(
+    cfg: &weaver_server::config::EmailConfig,
+) -> std::io::Result<PathBuf> {
+    let path = std::env::temp_dir().join(format!("weaver-email-{}.json", std::process::id()));
+    let json = serde_json::to_vec(cfg).map_err(std::io::Error::other)?;
+
+    #[cfg(unix)]
+    {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&path)?;
+        file.write_all(&json)?;
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(&path, &json)?;
+    }
+    Ok(path)
+}
+
+/// Reads and unlinks the staged email block from the elevated child.
+fn read_email_config_file(
+    path: &std::path::Path,
+) -> std::io::Result<Option<weaver_server::config::EmailConfig>> {
+    let bytes = std::fs::read(path)?;
+    let _ = std::fs::remove_file(path);
+    let cfg = serde_json::from_slice(&bytes).map_err(std::io::Error::other)?;
+    Ok(Some(cfg))
 }
 
 /// Current wall-clock time as absolute Unix seconds.
@@ -1045,7 +1639,20 @@ async fn handle_setup(args: SetupArgs, db_path: PathBuf) {
         acme_root_ca: root_ca_path,
     } = gathered_acme;
 
-    let gathered = weaver_server::setup::interactive::GatheredConfig {
+    // Gather email settings before the plan so the table can show the provider
+    // and sender; the OTP proof runs after confirmation, before elevation.
+    let email_config = resolve_setup_email(
+        &args.email_settings,
+        args.email_config_file.as_deref(),
+        args.no_prompt_values,
+        args.headless,
+        &db_path,
+        &admin_domain,
+        &admin_email,
+    )
+    .await;
+
+    let mut gathered = weaver_server::setup::interactive::GatheredConfig {
         tunnel_domain: tunnel_domain.clone(),
         admin_domain: admin_domain.clone(),
         admin_email: admin_email.clone(),
@@ -1059,6 +1666,8 @@ async fn handle_setup(args: SetupArgs, db_path: PathBuf) {
         prefix: args.prefix.clone(),
         skip_reachability_check: args.skip_reachability_check,
         relay_ips: args.relay_ips.clone(),
+        email: email_config.clone(),
+        email_config_file: None,
     };
 
     // 2. Display execution plan & confirm (if not already elevated)
@@ -1083,7 +1692,32 @@ async fn handle_setup(args: SetupArgs, db_path: PathBuf) {
             }
         }
 
-        // 3. Privilege elevation if needed
+        // 3. Prove the email provider before elevation, then stage credentials.
+        //    Interactive setup sends and verifies the OTP now; headless already
+        //    proved it via the persisted two-step. Credentials never travel in
+        //    `argv`, so a 0600 file carries the block and only its path is
+        //    forwarded across `sudo`.
+        if !args.headless
+            && let Some(cfg) = email_config.as_ref()
+        {
+            verify_setup_email_otp(cfg, &admin_domain, &admin_email).await;
+        }
+        if let Some(cfg) = email_config.as_ref()
+            && !weaver_server::setup::privilege::is_root()
+        {
+            match write_email_config_staging(cfg) {
+                Ok(path) => gathered.email_config_file = Some(path),
+                Err(err) => {
+                    eprintln!(
+                        "{} Failed to stage email credentials: {err}",
+                        "✗ Error:".red().bold()
+                    );
+                    std::process::exit(1);
+                }
+            }
+        }
+
+        // 4. Privilege elevation if needed
         weaver_server::setup::privilege::ensure_root_or_elevate(&gathered, args.headless);
     }
 

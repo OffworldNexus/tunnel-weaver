@@ -76,6 +76,15 @@ jobs:
       - name: Build release binaries (weaver-server and weave)
         run: cargo build --release -p weaver-server -p weave
 
+      # Real-provider email e2e. The test skips unless RESEND_API_KEY and
+      # WEAVER_E2E_EMAIL are configured, so PRs without the secrets stay green.
+      - name: Real-provider email e2e (Resend)
+        env:
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          WEAVER_E2E_EMAIL: ${{ secrets.WEAVER_E2E_EMAIL }}
+          WEAVER_E2E_FROM: ${{ secrets.WEAVER_E2E_FROM }}
+        run: cargo test -p weaver-server --test email_resend_e2e -- --ignored --nocapture
+
       - name: Generate ephemeral SSH key pair
         run: |
           mkdir -p ~/.ssh

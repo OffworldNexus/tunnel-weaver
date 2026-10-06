@@ -1,0 +1,16 @@
+<mjml>
+  <mj-include path="./partials/head.mjml" />
+  <mj-body width="600px" background-color="#fefaf3">
+    <mj-include path="./partials/header.mjml" />
+    <mj-section background-color="#ffffff">
+      <mj-column>
+        <mj-text mj-class="heading">Verify your email</mj-text>
+        <mj-text>Confirm this email address to continue creating your Tunnel Weaver account.</mj-text>
+        <mj-button href="{{verification_url}}">Verify email</mj-button>
+        <mj-text mj-class="quiet">This link expires in {{expires_in}}. If you didn’t create an account, you can ignore this email.</mj-text>
+        <mj-text mj-class="quiet">Button not working? <a href="{{verification_url}}" style="color:#772a0a;text-decoration:underline;word-break:break-all;">{{verification_url}}</a></mj-text>
+      </mj-column>
+    </mj-section>
+    <mj-include path="./partials/footer.mjml" />
+  </mj-body>
+</mjml>

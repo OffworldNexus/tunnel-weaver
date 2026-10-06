@@ -13,9 +13,10 @@
 - Conformance (nightly / PR to develop only, needs the DO droplet): h2spec
   and Autobahn run in `.github/workflows/nightly.yml`; allow-lists live in
   `ci/conformance/*-allowlist.txt`, one case per line with a justification.
-- Last measured: 2026-10-04, full suite 388 passed/0 failed (ignored suite
-  skipped; the 3 `#[ignore = "e2e"]` cases only build without Pebble).
-  (Prior: 2026-10-04, 364 passed.)
+- Last measured: 2026-10-06, full suite 441 passed/0 failed (ignored suite
+  skipped; the `#[ignore = "e2e"]` cases are the Pebble wildcard/admin orders
+  and the Resend send, which skips unless `RESEND_API_KEY` and `WEAVER_E2E_EMAIL`
+  are set). (Prior: 2026-10-04, 388 passed.)
 
 ## Crate notes
 

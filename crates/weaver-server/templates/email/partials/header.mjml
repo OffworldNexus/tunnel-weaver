@@ -1,0 +1,9 @@
+<!-- Text branding works with remote images disabled. No custom font required. -->
+<mj-section background-color="#201a16" padding="24px 0">
+  <mj-column>
+    <mj-text color="#fefaf3" font-family="ui-monospace, 'Cascadia Code', 'Source Code Pro', Menlo, Consolas, 'DejaVu Sans Mono', 'Courier New', monospace" font-size="22px" font-weight="bold" letter-spacing="1px" padding="0 32px">TUNNEL WEAVER<span style="color:#ffbc19;">_</span></mj-text>
+  </mj-column>
+</mj-section>
+<mj-section background-color="#ffbc19" padding="0">
+  <mj-column><mj-spacer height="4px" /></mj-column>
+</mj-section>

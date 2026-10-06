@@ -9,6 +9,10 @@ allow = [
     "ISC",
     "CDLA-Permissive-2.0",
     "Zlib",
+    # Pulled transitively by mrml's css-inline feature (cssparser, selectors).
+    "MPL-2.0",
+    # Pulled by lettre's builder (quoted_printable) and the mailparse dev-dep.
+    "0BSD",
 ]
 confidence-threshold = 0.8
 

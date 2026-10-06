@@ -30,6 +30,7 @@ fn create_valid_test_config(
         usage_flush_interval_secs: 60,
         relay_ips: Vec::new(),
         setup_complete: false,
+        email: None,
     }
 }
 
@@ -604,6 +605,7 @@ async fn test_cert_wait_streaming_failed_exit_4_and_renew_rate_limit() {
         usage_flush_interval_secs: 60,
         relay_ips: Vec::new(),
         setup_complete: false,
+        email: None,
     });
     store.save_config(&config).await.unwrap();
 
