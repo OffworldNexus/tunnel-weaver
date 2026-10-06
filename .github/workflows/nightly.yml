@@ -85,6 +85,87 @@ jobs:
           WEAVER_E2E_FROM: ${{ secrets.WEAVER_E2E_FROM }}
         run: cargo test -p weaver-server --test email_resend_e2e -- --ignored --nocapture
 
+      # Real OTP round-trip: the two-step headless `configure` sends a code to
+      # the receiving domain, we read it back through Resend's Receiving API,
+      # and the second run proves it. This exercises the mandatory OTP against
+      # the real provider, not just the joke send above. The Receiving API
+      # needs a full-access key; the step skips when the secrets are blank so
+      # PRs without them stay green.
+      - name: Real-provider OTP configure e2e (Resend)
+        env:
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          WEAVER_E2E_EMAIL: ${{ secrets.WEAVER_E2E_EMAIL }}
+          WEAVER_E2E_FROM: ${{ secrets.WEAVER_E2E_FROM }}
+        run: |
+          if [ -z "$RESEND_API_KEY" ] || [ -z "$WEAVER_E2E_EMAIL" ] || [ -z "$WEAVER_E2E_FROM" ]; then
+            echo "::notice::RESEND_API_KEY/WEAVER_E2E_EMAIL/WEAVER_E2E_FROM not set; skipping the OTP configure e2e."
+            exit 0
+          fi
+
+          BIN=./target/release/weaver-server
+          DB="$(mktemp -d)/otp-configure.db"
+          COMMON=(
+            configure
+            --db "$DB"
+            --tunnel-domain example.com
+            --admin-domain relay.example.net
+            --email "$WEAVER_E2E_EMAIL"
+            --headless
+            --email-provider resend
+            --email-from "$WEAVER_E2E_FROM"
+            --email-api-key "$RESEND_API_KEY"
+          )
+
+          # Snapshot already-received ids first, so a stale OTP from an earlier
+          # run (same subject) cannot be mistaken for this run's code.
+          BEFORE=$(curl -s -H "Authorization: Bearer $RESEND_API_KEY" \
+            "https://api.resend.com/emails/receiving?limit=20" | jq -r '.data[].id' | tr '\n' ' ')
+
+          # First run issues and sends the code, then exits non-zero.
+          set +e
+          FIRST=$("$BIN" "${COMMON[@]}" 2>&1)
+          FIRST_RC=$?
+          set -e
+          echo "$FIRST"
+          if [ "$FIRST_RC" -eq 0 ]; then
+            echo "::error::first configure run should have required the OTP"
+            exit 1
+          fi
+          echo "$FIRST" | grep -q "OTP was sent" || { echo "::error::no OTP was sent"; exit 1; }
+
+          # Read the code back through Resend's Receiving API, accepting only an
+          # email that arrived after the snapshot above.
+          CODE=""
+          for _ in $(seq 1 30); do
+            RESP=$(curl -s -H "Authorization: Bearer $RESEND_API_KEY" \
+              "https://api.resend.com/emails/receiving?limit=20")
+            ID=$(echo "$RESP" | jq -r --arg to "$WEAVER_E2E_EMAIL" --arg before "$BEFORE" '
+              ($before | split(" ")) as $seen
+              | .data[]
+              | select((.to | index($to)) and (.subject | test("verification code"; "i")))
+              | .id as $id
+              | select(($seen | index($id)) == null)
+              | $id' | head -n 1)
+            if [ -n "$ID" ] && [ "$ID" != "null" ]; then
+              TEXT=$(curl -s -H "Authorization: Bearer $RESEND_API_KEY" \
+                "https://api.resend.com/emails/receiving/$ID" | jq -r '.text // .html // ""')
+              CODE=$(printf '%s' "$TEXT" | grep -oE '[0-9]{6}' | head -n 1 || true)
+              if [ -n "$CODE" ]; then
+                break
+              fi
+            fi
+            sleep 2
+          done
+          if [ -z "$CODE" ]; then
+            echo "::error::did not receive an OTP email at $WEAVER_E2E_EMAIL"
+            exit 1
+          fi
+          echo "received OTP email (code redacted)"
+
+          # Second run proves the code and persists the email block.
+          "$BIN" "${COMMON[@]}" --email-otp "$CODE"
+          echo "OTP accepted; email configuration persisted"
+
       - name: Generate ephemeral SSH key pair
         run: |
           mkdir -p ~/.ssh
