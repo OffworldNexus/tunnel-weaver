@@ -7,19 +7,29 @@
 use weaver_server::config::EmailConfig;
 use weaver_server::email::{Joke, Mailbox, mailer_from_config};
 
+/// Reads an environment variable, treating an unset or blank value as absent.
+///
+/// GitHub Actions expands an unset secret to an *empty string* rather than
+/// omitting the variable, so `env::var` alone reports `Ok("")` and the e2e
+/// would run with empty credentials. Filtering blanks lets it skip cleanly.
+fn non_empty(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+}
+
 #[tokio::test]
 #[ignore = "e2e: requires RESEND_API_KEY and WEAVER_E2E_EMAIL"]
 async fn resend_sends_a_real_joke() {
-    let Ok(api_key) = std::env::var("RESEND_API_KEY") else {
+    let Some(api_key) = non_empty("RESEND_API_KEY") else {
         eprintln!("skipping: RESEND_API_KEY is not set");
         return;
     };
-    let Ok(to) = std::env::var("WEAVER_E2E_EMAIL") else {
+    let Some(to) = non_empty("WEAVER_E2E_EMAIL") else {
         eprintln!("skipping: WEAVER_E2E_EMAIL is not set");
         return;
     };
-    let from =
-        std::env::var("WEAVER_E2E_FROM").unwrap_or_else(|_| "onboarding@resend.dev".to_string());
+    let from = non_empty("WEAVER_E2E_FROM").unwrap_or_else(|| "onboarding@resend.dev".to_string());
 
     let cfg = EmailConfig {
         provider: "resend".into(),
