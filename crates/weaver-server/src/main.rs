@@ -438,10 +438,6 @@ pub struct EmailArgs {
     #[arg(long, value_name = "USER")]
     pub email_username: Option<String>,
 
-    /// Cloud region (AWS SES, Azure ACS).
-    #[arg(long, value_name = "REGION")]
-    pub email_region: Option<String>,
-
     /// Mailgun sending domain.
     #[arg(long, value_name = "DOMAIN")]
     pub email_domain: Option<String>,
@@ -469,7 +465,6 @@ impl EmailArgs {
             || self.email_api_key_file.is_some()
             || self.email_secret.is_some()
             || self.email_username.is_some()
-            || self.email_region.is_some()
             || self.email_domain.is_some()
             || self.email_endpoint.is_some()
             || self.email_template.is_some()
@@ -501,7 +496,6 @@ impl EmailArgs {
             api_key,
             secret: self.email_secret.clone(),
             username: self.email_username.clone(),
-            region: self.email_region.clone(),
             domain: self.email_domain.clone(),
             endpoint: self.email_endpoint.clone(),
             template_id: self.email_template.clone(),
@@ -1036,7 +1030,7 @@ fn decide_configure_email(
     Ok(ConfigureEmail::Begin(cfg))
 }
 
-/// Sends the setup/configure OTP as a plain-text message through the provider.
+/// Sends the setup/configure OTP through the configured provider.
 async fn send_email_otp(
     cfg: &weaver_server::config::EmailConfig,
     support_url: &str,

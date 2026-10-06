@@ -70,13 +70,11 @@ impl HttpMailer {
                 cfg.provider
             ))
         })?;
-        if !info.kind.is_transported()
-            || !matches!(
-                info.kind,
-                crate::email::providers::ProviderKind::HttpJson
-                    | crate::email::providers::ProviderKind::HttpForm
-            )
-        {
+        if !matches!(
+            info.kind,
+            crate::email::providers::ProviderKind::HttpJson
+                | crate::email::providers::ProviderKind::HttpForm
+        ) {
             return Err(MailerError::Config(format!(
                 "email provider '{}' is not an HTTP provider",
                 cfg.provider
@@ -174,10 +172,7 @@ pub(crate) fn resolve_base(
         .filter(|s| !s.is_empty())
         .or(info.api_base)
         .ok_or_else(|| {
-            MailerError::Config(format!(
-                "email provider '{}' requires an endpoint (region-dependent)",
-                info.id
-            ))
+            MailerError::Config(format!("email provider '{}' requires an endpoint", info.id))
         })?;
     Ok(base.trim_end_matches('/').to_string())
 }
@@ -314,9 +309,7 @@ fn resend_body(email: &Email) -> Value {
         "subject": email.subject,
         "text": email.text,
     });
-    if let Some(html) = &email.html {
-        body["html"] = json!(html);
-    }
+    body["html"] = json!(email.html);
     if let Some(reply) = reply_value(email) {
         body["reply_to"] = json!(reply.address);
     }
@@ -338,10 +331,10 @@ fn sendgrid_body(email: &Email) -> Value {
 
 /// SendGrid content array: text first, HTML second (the documented order).
 fn content_array(email: &Email) -> Value {
-    let mut content = vec![json!({ "type": "text/plain", "value": email.text })];
-    if let Some(html) = &email.html {
-        content.push(json!({ "type": "text/html", "value": html }));
-    }
+    let content = vec![
+        json!({ "type": "text/plain", "value": email.text }),
+        json!({ "type": "text/html", "value": email.html }),
+    ];
     Value::Array(content)
 }
 
@@ -352,9 +345,7 @@ fn mailjet_body(email: &Email) -> Value {
         "Subject": email.subject,
         "TextPart": email.text,
     });
-    if let Some(html) = &email.html {
-        message["HTMLPart"] = json!(html);
-    }
+    message["HTMLPart"] = json!(email.html);
     if let Some(reply) = reply_value(email) {
         message["ReplyTo"] = object_email(reply);
     }
@@ -364,7 +355,7 @@ fn mailjet_body(email: &Email) -> Value {
 fn mandrill_body(cfg: &EmailConfig, email: &Email) -> Value {
     let key = cfg.api_key.clone().unwrap_or_default();
     let mut message = json!({
-        "html": email.html.clone().unwrap_or_default(),
+        "html": email.html.clone(),
         "text": email.text,
         "subject": email.subject,
         "from_email": email.from.address,
@@ -390,9 +381,7 @@ fn brevo_body(email: &Email) -> Value {
         "subject": email.subject,
         "textContent": email.text,
     });
-    if let Some(html) = &email.html {
-        body["htmlContent"] = json!(html);
-    }
+    body["htmlContent"] = json!(email.html);
     if let Some(reply) = reply_value(email) {
         body["replyTo"] = object_email(reply);
     }
@@ -405,9 +394,7 @@ fn sparkpost_body(email: &Email) -> Value {
         "subject": email.subject,
         "text": email.text,
     });
-    if let Some(html) = &email.html {
-        content["html"] = json!(html);
-    }
+    content["html"] = json!(email.html);
     if let Some(reply) = reply_value(email) {
         content["reply_to"] = json!(reply.address);
     }
@@ -424,9 +411,7 @@ fn mailersend_body(email: &Email) -> Value {
         "subject": email.subject,
         "text": email.text,
     });
-    if let Some(html) = &email.html {
-        body["html"] = json!(html);
-    }
+    body["html"] = json!(email.html);
     if let Some(reply) = reply_value(email) {
         body["reply_to"] = object_email(reply);
     }
@@ -440,17 +425,15 @@ fn zeptomail_body(email: &Email) -> Value {
         "subject": email.subject,
         "textbody": email.text,
     });
-    if let Some(html) = &email.html {
-        body["htmlbody"] = json!(html);
-    }
+    body["htmlbody"] = json!(email.html);
     body
 }
 
 fn elasticemail_body(email: &Email) -> Value {
-    let mut body_parts = vec![json!({ "ContentType": "PlainText", "Content": email.text })];
-    if let Some(html) = &email.html {
-        body_parts.push(json!({ "ContentType": "HTML", "Content": html }));
-    }
+    let body_parts = vec![
+        json!({ "ContentType": "PlainText", "Content": email.text }),
+        json!({ "ContentType": "HTML", "Content": email.html }),
+    ];
     let mut content = json!({
         "From": addr_spec(&email.from),
         "Subject": email.subject,
@@ -486,9 +469,7 @@ fn postmark_body(email: &Email) -> Value {
         "Subject": email.subject,
         "TextBody": email.text,
     });
-    if let Some(html) = &email.html {
-        body["HtmlBody"] = json!(html);
-    }
+    body["HtmlBody"] = json!(email.html);
     if let Some(reply) = reply_value(email) {
         body["ReplyTo"] = json!(reply.address);
     }
@@ -506,9 +487,7 @@ fn form_body(email: &Email) -> String {
         ("subject".into(), email.subject.clone()),
         ("text".into(), email.text.clone()),
     ];
-    if let Some(html) = &email.html {
-        fields.push(("html".into(), html.clone()));
-    }
+    fields.push(("html".into(), email.html.clone()));
     if let Some(reply) = reply_value(email) {
         fields.push(("h:Reply-To".into(), reply.address.clone()));
     }
@@ -682,7 +661,7 @@ mod tests {
             reply_to: Some(Mailbox::new("reply@example.com")),
             subject: "Hello".into(),
             text: "plain body".into(),
-            html: Some("<p>html body</p>".into()),
+            html: "<p>html body</p>".into(),
         }
     }
 
@@ -889,16 +868,6 @@ mod tests {
             p.url,
             "https://api.eu.mailgun.net/v3/mg.example.com/messages"
         );
-    }
-
-    #[test]
-    fn plain_text_message_has_no_html_field() {
-        let mut email = fixture();
-        email.html = None;
-        let cfg = config("resend");
-        let info = find_provider("resend").unwrap();
-        let p = prepare_request(info, &cfg, "https://api.resend.com", &email).unwrap();
-        assert!(body_json(&p).get("html").is_none());
     }
 
     #[test]

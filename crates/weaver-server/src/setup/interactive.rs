@@ -533,7 +533,6 @@ fn set_credential(cfg: &mut EmailConfig, field: CredentialField, value: String) 
         CredentialField::ApiKey => cfg.api_key = Some(value),
         CredentialField::Secret => cfg.secret = Some(value),
         CredentialField::Username => cfg.username = Some(value),
-        CredentialField::Region => cfg.region = Some(value),
         CredentialField::Domain => cfg.domain = Some(value),
         CredentialField::TemplateId => cfg.template_id = Some(value),
     }
@@ -553,11 +552,8 @@ pub fn prompt_email_config() -> std::io::Result<Option<EmailConfig>> {
         return Ok(None);
     }
 
-    // Offer only providers whose transport ships in this release; the full
-    // catalog (including the fast-follow AWS/Azure rows) is `providers email`.
     let options: Vec<EmailProviderOption> = PROVIDERS
         .iter()
-        .filter(|p| p.kind.is_transported())
         .map(|p| EmailProviderOption {
             id: p.id,
             label: format!("{} ({})", p.id, p.display),

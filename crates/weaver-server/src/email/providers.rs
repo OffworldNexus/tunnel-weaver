@@ -16,10 +16,6 @@ pub enum ProviderKind {
     HttpForm,
     /// Raw SMTP via lettre, over STARTTLS or implicit TLS.
     Smtp,
-    /// AWS SES SigV4-signed HTTP (catalogued; transport is a fast follow).
-    AwsSes,
-    /// Azure Communication Services HMAC-SAS HTTP (catalogued; fast follow).
-    AzureAcs,
 }
 
 impl ProviderKind {
@@ -29,17 +25,7 @@ impl ProviderKind {
             ProviderKind::HttpJson => "http-json",
             ProviderKind::HttpForm => "http-form",
             ProviderKind::Smtp => "smtp",
-            ProviderKind::AwsSes => "aws",
-            ProviderKind::AzureAcs => "azure",
         }
-    }
-
-    /// Whether the transport for this kind is implemented in this ticket.
-    pub fn is_transported(self) -> bool {
-        matches!(
-            self,
-            ProviderKind::HttpJson | ProviderKind::HttpForm | ProviderKind::Smtp
-        )
     }
 }
 
@@ -70,8 +56,6 @@ pub enum CredentialField {
     Secret,
     /// [`EmailConfig::username`].
     Username,
-    /// [`EmailConfig::region`].
-    Region,
     /// [`EmailConfig::domain`].
     Domain,
     /// [`EmailConfig::template_id`].
@@ -98,7 +82,6 @@ impl EmailConfig {
             CredentialField::ApiKey => self.api_key.as_deref(),
             CredentialField::Secret => self.secret.as_deref(),
             CredentialField::Username => self.username.as_deref(),
-            CredentialField::Region => self.region.as_deref(),
             CredentialField::Domain => self.domain.as_deref(),
             CredentialField::TemplateId => self.template_id.as_deref(),
         };
@@ -115,7 +98,7 @@ pub struct EmailProviderInfo {
     pub display: &'static str,
     /// Transport family.
     pub kind: ProviderKind,
-    /// Base API URL. `None` for providers whose host depends on region.
+    /// Base API URL. `None` when the endpoint is operator-supplied (SMTP).
     pub api_base: Option<&'static str>,
     /// Auth presentation.
     pub auth: AuthScheme,
@@ -341,48 +324,6 @@ pub const PROVIDERS: &[EmailProviderInfo] = &[
         guidance: "Server → API Tokens. Docs: https://postmarkapp.com/developer/api/email-api",
     },
     EmailProviderInfo {
-        id: "aws-ses",
-        display: "AWS SES",
-        kind: ProviderKind::AwsSes,
-        api_base: None,
-        auth: AuthScheme::None,
-        needs_domain: false,
-        template_only: false,
-        credential_fields: &[
-            CredField {
-                field: CredentialField::Region,
-                label: "AWS region",
-                env: Some("AWS_REGION"),
-            },
-            CredField {
-                field: CredentialField::ApiKey,
-                label: "access key id",
-                env: Some("AWS_ACCESS_KEY_ID"),
-            },
-            CredField {
-                field: CredentialField::Secret,
-                label: "secret access key",
-                env: Some("AWS_SECRET_ACCESS_KEY"),
-            },
-        ],
-        guidance: "Ambient AWS credentials (env or IMDS) are preferred. SigV4 transport is a fast follow.",
-    },
-    EmailProviderInfo {
-        id: "azure-acs",
-        display: "Azure Communication Services",
-        kind: ProviderKind::AzureAcs,
-        api_base: None,
-        auth: AuthScheme::None,
-        needs_domain: false,
-        template_only: false,
-        credential_fields: &[CredField {
-            field: CredentialField::ApiKey,
-            label: "connection string",
-            env: Some("AZURE_COMMUNICATION_CONNECTION_STRING"),
-        }],
-        guidance: "Connection string from the Communication Services resource. HMAC-SAS transport is a fast follow.",
-    },
-    EmailProviderInfo {
         id: "smtp",
         display: "SMTP",
         kind: ProviderKind::Smtp,
@@ -513,7 +454,7 @@ pub fn format_providers_table() -> String {
                 .fg(Color::White)
         };
 
-        let endpoint = p.api_base.unwrap_or("region-dependent");
+        let endpoint = p.api_base.unwrap_or("operator-supplied");
         let auth = match p.auth {
             AuthScheme::Bearer => "Bearer".to_string(),
             AuthScheme::Header { name, prefix } => {
@@ -586,8 +527,6 @@ mod tests {
             "elasticemail",
             "loops",
             "postmark",
-            "aws-ses",
-            "azure-acs",
             "smtp",
         ] {
             assert!(find_provider(expected).is_some(), "missing {expected}");

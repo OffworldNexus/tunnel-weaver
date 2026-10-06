@@ -2,11 +2,10 @@
 //!
 //! lettre owns MIME/`Message` building and the SMTP conversation; this module
 //! only maps the normalised [`Email`] onto a lettre message and maps failures
-//! into [`MailerError`]. A message with an HTML body is
-//! `multipart/alternative`; one without stays a single text part.
+//! into [`MailerError`]. Every message is `multipart/alternative`.
 
 use async_trait::async_trait;
-use lettre::message::{Mailbox as LettreMailbox, MultiPart, SinglePart};
+use lettre::message::{Mailbox as LettreMailbox, MultiPart};
 use lettre::transport::smtp::authentication::Credentials;
 use lettre::{AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
 
@@ -92,17 +91,12 @@ fn build_message(email: &Email) -> Result<Message, MailerError> {
         builder = builder.reply_to(to_lettre(reply_to)?);
     }
 
-    let message = match &email.html {
-        Some(html) => builder
-            .multipart(MultiPart::alternative_plain_html(
-                email.text.clone(),
-                html.clone(),
-            ))
-            .map_err(|e| MailerError::Config(format!("failed to build message: {e}")))?,
-        None => builder
-            .singlepart(SinglePart::plain(email.text.clone()))
-            .map_err(|e| MailerError::Config(format!("failed to build message: {e}")))?,
-    };
+    let message = builder
+        .multipart(MultiPart::alternative_plain_html(
+            email.text.clone(),
+            email.html.clone(),
+        ))
+        .map_err(|e| MailerError::Config(format!("failed to build message: {e}")))?;
     Ok(message)
 }
 
@@ -117,7 +111,7 @@ mod tests {
             reply_to: Some(Mailbox::new("reply@example.com")),
             subject: "Hello".into(),
             text: "plain body".into(),
-            html: Some("<p>html body</p>".into()),
+            html: "<p>html body</p>".into(),
         }
     }
 
@@ -169,16 +163,6 @@ mod tests {
             .find(|h| h.get_key() == "Subject")
             .unwrap();
         assert_eq!(subj.get_value(), "Hello");
-    }
-
-    #[test]
-    fn plain_message_has_no_html_part() {
-        let mut email = fixture();
-        email.html = None;
-        let raw = build_message(&email).unwrap().formatted();
-        let parsed = mailparse::parse_mail(&raw).unwrap();
-        assert_eq!(parsed.ctype.mimetype, "text/plain");
-        assert!(parsed.get_body().unwrap().contains("plain body"));
     }
 
     #[test]

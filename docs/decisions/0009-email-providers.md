@@ -38,19 +38,15 @@ The HTTP client is `hyper` + `hyper-rustls` with the platform verifier and
 redirects disabled, reusing crates already in the dependency graph rather than
 adding `reqwest`. Every send is awaited under a 10 s timeout.
 
-AWS SES (SigV4) and Azure ACS (HMAC SAS) are catalogued — so the catalog stays
-the whole OFF-164 answer and validation accepts them — but their bespoke
-signing transports are a fast follow; `mailer_from_config` returns a clear
-`Config` error for them.
-
 ### Secret storage and redaction
 
 Credentials live in the existing config singleton inside SQLite, the same
 trust model as the ACME EAB material and certificate private keys: the DB file
 is 0600. `EmailConfig` has a hand-written `Debug` that prints `api_key` and
 `secret` as `[redacted]`, and every transport error string is scrubbed of the
-mailer's secrets before it becomes a `MailerError`. `status` and `doctor` never
-print credentials.
+mailer's secrets before it becomes a `MailerError`. `status` reports the
+configured provider and sender but never a credential; `doctor` prints none
+either.
 
 Interactive `setup` gathers credentials before the `sudo` re-exec — where the
 secrets would otherwise appear in `argv` and hence in `ps` — and hands them to
@@ -81,8 +77,9 @@ filesystem at runtime. This is the inverse of the brand README's "compile MJML
 first, then substitute": filling first and compiling once satisfies the same
 rules (escape everything, reject missing values, never inject untrusted markup)
 in a single pass. `mrml` runs with strict validation and CSS inlining, per send
-and uncached. Every templated send is `multipart/alternative`; the setup OTP is
-plain text.
+and uncached. Every templated send is `multipart/alternative`, including the
+setup OTP, which renders the base layout and carries the existing plain-text
+body as its twin.
 
 ### Localisation (deferred)
 
@@ -97,9 +94,9 @@ the seam open — a later ticket can introduce per-locale tables behind the same
 - Adding an HTTP provider is one catalog row plus, at most, a body-shape branch;
   a request-shaping test pins its method, URL, auth header, content type, and
   exact body against a fixture message.
-- Provider differences that are not expressible as catalog data (SES/Azure
-  signing, Loops' template-only constraint) are isolated and explicit; Loops is
-  accepted only with a template id.
+- Provider differences that are not expressible as catalog data (Loops'
+  template-only constraint) are isolated and explicit; Loops is accepted only
+  with a template id.
 - No bounce/suppression/retry/queue/webhook machinery exists: an accepted send
   is a tracing event and nothing is persisted. This is deliberate (OFF-161) and
   is revisited only if a provider forces it.

@@ -124,9 +124,6 @@ pub struct EmailConfig {
     /// SMTP or HTTP Basic username.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub username: Option<String>,
-    /// Cloud region (AWS SES, Azure ACS).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub region: Option<String>,
     /// Mailgun sending domain, carried in the request path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub domain: Option<String>,
@@ -147,7 +144,6 @@ impl std::fmt::Debug for EmailConfig {
             .field("from", &self.from)
             .field("from_name", &self.from_name)
             .field("username", &self.username)
-            .field("region", &self.region)
             .field("domain", &self.domain)
             .field("endpoint", &self.endpoint)
             .field("template_id", &self.template_id)

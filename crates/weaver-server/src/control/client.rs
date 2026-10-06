@@ -13,6 +13,7 @@ use super::protocol::{
     StatusResponse, UsageResponse,
 };
 use crate::cert::format_unix_timestamp;
+use crate::email::providers::display_name;
 
 /// Connects to the UNIX domain control socket, printing diagnostic hints on failure.
 async fn connect_control_socket(socket_path: &Path) -> Result<UnixStream, i32> {
@@ -290,6 +291,35 @@ pub async fn client_status(socket_path: &Path, json: bool) -> i32 {
     println!("  {:<14} {}", "HTTPS:".dark_grey(), resp.listeners.https);
     if !resp.control_socket.is_empty() {
         println!("  {:<14} {}", "Control:".dark_grey(), resp.control_socket);
+    }
+    println!();
+
+    println!("{}", "Email".bold().white());
+    match &resp.email {
+        Some(email) => {
+            println!(
+                "  {:<14} {}",
+                "Provider:".dark_grey(),
+                display_name(&email.provider)
+            );
+            let sender = match email.from_name.as_deref().filter(|n| !n.is_empty()) {
+                Some(name) => format!("{name} <{}>", email.from),
+                None => email.from.clone(),
+            };
+            println!("  {:<14} {}", "Sender:".dark_grey(), sender);
+            if let Some(domain) = email.domain.as_deref().filter(|s| !s.is_empty()) {
+                println!("  {:<14} {}", "Domain:".dark_grey(), domain);
+            }
+            if let Some(endpoint) = email.endpoint.as_deref().filter(|s| !s.is_empty()) {
+                println!("  {:<14} {}", "Endpoint:".dark_grey(), endpoint);
+            }
+            if let Some(template) = email.template_id.as_deref().filter(|s| !s.is_empty()) {
+                println!("  {:<14} {}", "Template:".dark_grey(), template);
+            }
+        }
+        None => {
+            println!("  {:<14} {}", "Status:".dark_grey(), "disabled".dark_grey());
+        }
     }
     println!();
 

@@ -90,10 +90,10 @@ pub struct Email {
     pub reply_to: Option<Mailbox>,
     /// Message subject.
     pub subject: String,
-    /// Plain-text alternative. Always present for templated mail.
+    /// Plain-text alternative.
     pub text: String,
-    /// Responsive HTML body. `None` for plain-text-only messages (setup OTP).
-    pub html: Option<String>,
+    /// Responsive HTML body.
+    pub html: String,
 }
 
 impl Email {
@@ -277,20 +277,8 @@ impl MailerIdentity {
             reply_to: None,
             subject: rendered.subject,
             text: rendered.text,
-            html: Some(rendered.html),
+            html: rendered.html,
         })
-    }
-
-    /// Builds a plain-text-only message with the configured `From` injected.
-    pub fn plain(&self, to: Mailbox, subject: String, text: String) -> Email {
-        Email {
-            from: self.from.clone(),
-            to: vec![to],
-            reply_to: None,
-            subject,
-            text,
-            html: None,
-        }
     }
 }
 
@@ -313,11 +301,6 @@ pub trait Mailer: Send + Sync {
     /// Renders a known template, with the configured `From` injected.
     fn compose(&self, to: Mailbox, template: &dyn EmailTemplate) -> Result<Email, MailerError> {
         self.identity().compose(to, template)
-    }
-
-    /// Builds a plain-text-only message with the configured `From` injected.
-    fn plain(&self, to: Mailbox, subject: String, text: String) -> Email {
-        self.identity().plain(to, subject, text)
     }
 
     /// Sends a message, awaited by the caller so failures are visible.
@@ -474,7 +457,7 @@ mod tests {
         let email = identity.compose(to, &Joke { line: "hi".into() }).unwrap();
         assert_eq!(email.from.address, "from@example.com");
         assert!(email.reply_to.is_none());
-        assert!(email.html.is_some());
+        assert!(email.html.contains("<html"));
         // Opting in is explicit.
         let with_reply = email.with_reply_to(Mailbox::new("reply@example.com"));
         assert_eq!(

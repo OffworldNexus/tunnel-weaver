@@ -27,11 +27,6 @@ pub(crate) fn build(
             Ok(Arc::new(http::HttpMailer::new(identity, cfg)?))
         }
         ProviderKind::Smtp => Ok(Arc::new(smtp::SmtpMailer::new(identity, cfg)?)),
-        kind => Err(MailerError::Config(format!(
-            "email provider '{}' ({}) transport is not implemented yet",
-            info.id,
-            kind.label()
-        ))),
     }
 }
 

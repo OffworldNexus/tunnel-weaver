@@ -116,9 +116,8 @@ Email is opt-in. With no `email` block in the config, the relay boots normally
 and any caller that needs to send gets `email is not configured`; the daemon
 itself sends nothing in this milestone.
 
-- List the catalogued providers with `weaver-server providers email` (or the
-  full set including the AWS/Azure fast-follows). `providers` alone still shows
-  the ACME/SSL table.
+- List the provider catalog with `weaver-server providers email`. `providers`
+  alone still shows the ACME/SSL table.
 - `setup` asks whether to enable email after the ACME step, shows the chosen
   provider's guidance, gathers the verified sender and credentials (offering
   ambient env values such as `RESEND_API_KEY` when present), then **sends and
@@ -134,7 +133,8 @@ itself sends nothing in this milestone.
   hosts, Mailgun EU, or a CI mock). `--no-email` clears the block and conflicts
   with `--email-provider`.
 - Credentials live in the 0600 SQLite file, like the certificate keys. `status`
-  and `doctor` never print them, and provider error output is redacted.
+  reports the configured provider and sender but never a credential, `doctor`
+  prints none either, and provider error output is redacted.
 - `weaver-server send-a-joke ADDRESS [--email-endpoint URL]` is a temporary
   hidden dev/e2e verb that sends the joke template through the configured
   provider; it exits non-zero with the redacted provider error on rejection. It
