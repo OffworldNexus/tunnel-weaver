@@ -29,6 +29,16 @@ pub struct DbStore {
     store: Store,
 }
 
+impl DbStore {
+    /// Wrap a [`Store`] as the budget backend.
+    ///
+    /// Public so benchmarks and tests can drive the store directly; the daemon
+    /// builds it via [`build`].
+    pub fn new(store: Store) -> Self {
+        Self { store }
+    }
+}
+
 #[async_trait]
 impl BudgetStore for DbStore {
     async fn check(
@@ -96,7 +106,7 @@ pub fn build(config: &Config, store: Store) -> Arc<Pipeline> {
             },
         )]);
         let gate = Gate::new(
-            DbStore { store },
+            DbStore::new(store),
             policies,
             secs_to_ms(abuse.retry_after_cap_secs),
         );
