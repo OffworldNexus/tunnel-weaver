@@ -220,6 +220,7 @@ async fn test_pebble_e2e_issuance_and_lazy_ensure() {
         usage_flush_interval_secs: 60,
         relay_ips: vec!["127.0.0.1".parse().unwrap()],
         setup_complete: true,
+        email: None,
     });
 
     let dns_token = CancellationToken::new();
@@ -359,6 +360,7 @@ async fn test_pebble_e2e_tunnel_registration_and_proxying() {
         usage_flush_interval_secs: 60,
         relay_ips: vec!["127.0.0.1".parse().unwrap()],
         setup_complete: true,
+        email: None,
     });
 
     let dns_token = CancellationToken::new();

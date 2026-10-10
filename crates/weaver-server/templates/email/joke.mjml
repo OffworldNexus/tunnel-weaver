@@ -1,0 +1,14 @@
+<mjml lang="en">
+  <mj-include path="./partials/head.mjml" />
+  <mj-body width="600px" background-color="#fefaf3">
+    <mj-include path="./partials/header.mjml" />
+    <mj-section background-color="#ffffff">
+      <mj-column>
+        <mj-text mj-class="heading">{{heading}}</mj-text>
+        <mj-text>{{line}}</mj-text>
+        <mj-text mj-class="quiet">{{footnote}}</mj-text>
+      </mj-column>
+    </mj-section>
+    <mj-include path="./partials/footer.mjml" />
+  </mj-body>
+</mjml>

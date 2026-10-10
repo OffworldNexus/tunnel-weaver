@@ -250,6 +250,7 @@ async fn spawn_test_relay(tunnel_domain: &str) -> TestRelay {
         usage_flush_interval_secs: 60,
         relay_ips: Vec::new(),
         setup_complete: false,
+        email: None,
     });
 
     let resolver = Arc::new(CertResolver::new(tunnel_domain));
@@ -2083,6 +2084,7 @@ async fn test_client_leaving_during_cert_issuance_does_not_leave_hostname_active
         usage_flush_interval_secs: 60,
         relay_ips: Vec::new(),
         setup_complete: false,
+        email: None,
     });
     let resolver = Arc::new(CertResolver::new(root));
     let cert_manager = CertManager::new(

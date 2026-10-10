@@ -23,6 +23,7 @@ path = "src/main.rs"
 test-util = []
 
 [dependencies]
+askama = { workspace = true }
 base64 = { workspace = true }
 bytes = { workspace = true }
 clap = { workspace = true }
@@ -34,11 +35,15 @@ http = { workspace = true }
 http-body-util = { workspace = true }
 hyper = { workspace = true }
 hyper-util = { workspace = true }
+hyper-rustls = { workspace = true }
 hickory-proto = { workspace = true }
 inquire = { workspace = true }
 instant-acme = { workspace = true }
 jiff = { workspace = true }
+lettre = { workspace = true }
 libc = { workspace = true }
+mrml = { workspace = true }
+rand = { workspace = true }
 rcgen = { workspace = true }
 sea-orm = { workspace = true }
 sea-orm-migration = { workspace = true }
@@ -66,5 +71,6 @@ weaver-server = { path = ".", features = ["test-util"] }
 ed25519-dalek = { workspace = true }
 hyper = { workspace = true, features = ["client"] }
 hyper-util = { workspace = true, features = ["client", "client-legacy"] }
+mailparse = "0.18"
 weave = { path = "../weave" }
 weaver-mux = { workspace = true, features = ["test-util"] }

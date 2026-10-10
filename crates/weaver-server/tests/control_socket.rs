@@ -7,6 +7,7 @@ use std::time::Duration;
 use tempfile::tempdir;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
+use weaver_server::config::EmailConfig;
 use weaver_server::{Config, Store};
 
 fn create_valid_test_config(
@@ -30,6 +31,7 @@ fn create_valid_test_config(
         usage_flush_interval_secs: 60,
         relay_ips: Vec::new(),
         setup_complete: false,
+        email: None,
     }
 }
 
@@ -146,7 +148,17 @@ async fn test_control_socket_daemon_suite() {
     drop(l2);
 
     let store = Store::open(&db_path).await.unwrap();
-    let config = create_valid_test_config(http_port, https_port, control_sock_path.clone());
+    let mut config = create_valid_test_config(http_port, https_port, control_sock_path.clone());
+    // Configure a provider so `status` can prove it reports the non-secret
+    // summary -- and never the API key.
+    config.email = Some(EmailConfig {
+        provider: "resend".into(),
+        from: "relay@weaver.test".into(),
+        from_name: Some("Weaver Test".into()),
+        api_key: Some("sk_status_must_not_leak".into()),
+        endpoint: Some("https://api.eu.resend.example".into()),
+        ..Default::default()
+    });
     store.save_config(&config).await.unwrap();
 
     // Generate the single wildcard certificate `[weaver.test, *.weaver.test]`.
@@ -298,6 +310,13 @@ async fn test_control_socket_daemon_suite() {
         assert_eq!(val["cert_counts"]["ordering"], 1);
         assert_eq!(val["cert_counts"]["failed"], 0);
         assert_eq!(val["cert_counts"]["inactive"], 0);
+        // The configured provider is summarised, and its key never travels.
+        assert_eq!(val["email"]["provider"], "resend");
+        assert_eq!(val["email"]["from"], "relay@weaver.test");
+        assert_eq!(val["email"]["from_name"], "Weaver Test");
+        assert_eq!(val["email"]["endpoint"], "https://api.eu.resend.example");
+        let raw = String::from_utf8_lossy(&output.stdout);
+        assert!(!raw.contains("sk_status_must_not_leak"), "{raw}");
     }
 
     // --- Test CLI: status human-readable ---
@@ -318,6 +337,11 @@ async fn test_control_socket_daemon_suite() {
         assert!(stdout.contains("relay-admin.test"));
         assert!(stdout.contains("issued"));
         assert!(stdout.contains("inactive"));
+        // Email is shown by name and sender, never by credential.
+        assert!(stdout.contains("Email"));
+        assert!(stdout.contains("Resend"));
+        assert!(stdout.contains("relay@weaver.test"));
+        assert!(!stdout.contains("sk_status_must_not_leak"));
     }
 
     // --- Test CLI: cert status (list view) ---
@@ -604,6 +628,7 @@ async fn test_cert_wait_streaming_failed_exit_4_and_renew_rate_limit() {
         usage_flush_interval_secs: 60,
         relay_ips: Vec::new(),
         setup_complete: false,
+        email: None,
     });
     store.save_config(&config).await.unwrap();
 

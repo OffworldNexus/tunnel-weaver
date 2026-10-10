@@ -106,6 +106,7 @@ fn test_config(tunnel_domain: &str, acme_provider: &str, acme_directory: Option<
         usage_flush_interval_secs: 60,
         relay_ips: Vec::new(),
         setup_complete: false,
+        email: None,
     }
 }
 

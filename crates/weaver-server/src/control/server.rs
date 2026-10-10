@@ -10,7 +10,7 @@ use tracing::{debug, info, warn};
 use super::protocol::{
     BackupResponse, CertDetailResponse, CertEventSummary, CertListResponse, CertSummary,
     CertWaitEvent, ControlRequest, ErrorResponse, ListenersInfo, RenewResponse, ShutdownResponse,
-    StatusResponse, UsageResponse, UsageService,
+    StatusEmail, StatusResponse, UsageResponse, UsageService,
 };
 use crate::cert::{CertManager, CertState};
 use crate::config::Config;
@@ -397,6 +397,17 @@ async fn handle_connection(
                 .unwrap_or(0);
             let schema_version = store.schema_version().await.unwrap_or(0);
 
+            // Non-secret email summary: provider + sender so an operator can
+            // confirm what the relay will send as, never the credentials.
+            let email = config.email.as_ref().map(|e| StatusEmail {
+                provider: e.provider.clone(),
+                from: e.from.clone(),
+                from_name: e.from_name.clone(),
+                domain: e.domain.clone(),
+                endpoint: e.endpoint.clone(),
+                template_id: e.template_id.clone(),
+            });
+
             let resp = StatusResponse {
                 ok: true,
                 version: env!("CARGO_PKG_VERSION").to_string(),
@@ -411,6 +422,7 @@ async fn handle_connection(
                 db_size,
                 schema_version,
                 control_socket: config.control_socket.display().to_string(),
+                email,
             };
 
             reply(&mut writer, &resp).await?;

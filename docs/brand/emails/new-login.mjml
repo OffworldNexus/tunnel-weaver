@@ -1,0 +1,16 @@
+<mjml>
+  <mj-include path="./partials/head.mjml" />
+  <mj-body width="600px" background-color="#fefaf3">
+    <mj-include path="./partials/header.mjml" />
+    <mj-section background-color="#ffffff">
+      <mj-column>
+        <mj-text mj-class="heading">A new sign-in</mj-text>
+        <mj-text>Your Tunnel Weaver account was signed in to from a device we haven’t seen before.</mj-text>
+        <mj-text><strong>Device</strong><br />{{device_label}}<br /><br /><strong>When</strong><br />{{event_time}}</mj-text>
+        <mj-text>If this was you, there’s nothing else to do.</mj-text>
+        <mj-text>Don’t recognise this sign-in? <a href="{{recovery_url}}" style="color:#772a0a;text-decoration:underline;">Reset your password</a> or <a href="{{support_url}}" style="color:#772a0a;text-decoration:underline;">contact support</a>.</mj-text>
+      </mj-column>
+    </mj-section>
+    <mj-include path="./partials/footer.mjml" />
+  </mj-body>
+</mjml>

@@ -10,7 +10,10 @@ use comfy_table::modifiers::UTF8_ROUND_CORNERS;
 use comfy_table::presets::UTF8_FULL;
 use comfy_table::{Attribute, Cell, Color, ContentArrangement, Table};
 use crossterm::style::Stylize;
-use inquire::{Confirm, InquireError, Password, Select, Text};
+use inquire::{Confirm, InquireError, Password, PasswordDisplayMode, Select, Text};
+
+use crate::config::EmailConfig;
+use crate::email::providers::{CredentialField, PROVIDERS};
 
 /// Configuration values gathered interactively or via CLI arguments.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -30,6 +33,11 @@ pub struct GatheredConfig {
     /// Operator-supplied public IPs, forwarded across the `sudo` re-exec so a
     /// NAT deployment keeps its explicit `--relay-ip` values.
     pub relay_ips: Vec<std::net::IpAddr>,
+    /// Gathered transactional-email settings, or `None` when email is off.
+    pub email: Option<EmailConfig>,
+    /// A 0600 staging file the elevated child reads the email block from, so
+    /// credentials never cross the privilege boundary in `argv`.
+    pub email_config_file: Option<PathBuf>,
 }
 
 /// Validates whether a domain name is a structurally valid Fully Qualified Domain Name (FQDN).
@@ -104,12 +112,20 @@ pub fn prompt_line(prompt: &str, default: Option<&str>) -> std::io::Result<Strin
         .map_err(inquire_err)
 }
 
-/// Reads masked input for sensitive values (such as EAB HMAC keys).
+/// Reads masked input for sensitive values (such as API keys and EAB HMAC keys).
 ///
-/// Uses `inquire`'s hidden-display [`Password`] prompt. Confirmation is
-/// disabled to preserve the previous single-entry semantics.
+/// Uses `inquire`'s [`Password`] prompt. Its default display mode is *hidden*:
+/// nothing is drawn while the operator types, so a dropped character, a stray
+/// paste, or accidental surrounding quoting is invisible until the provider
+/// refuses the credential. We render the input masked instead (one `*` per
+/// character) and leave the Ctrl+R reveal toggle enabled, so the value can be
+/// checked before submitting. Confirmation stays disabled to preserve the
+/// single-entry semantics.
 pub fn read_masked_input(prompt: &str) -> std::io::Result<String> {
     Password::new(prompt)
+        .with_display_mode(PasswordDisplayMode::Masked)
+        .with_display_toggle_enabled()
+        .with_help_message("Ctrl+R reveals the value; Enter submits")
         .without_confirmation()
         .prompt()
         .map_err(inquire_err)
@@ -448,6 +464,21 @@ pub fn display_plan_and_confirm(
     println!("  {:<18} {}", "EAB Account:".dark_grey(), eab_status);
     println!();
 
+    if let Some(email) = &config.email {
+        println!("{}", "Email".bold().white());
+        println!(
+            "  {:<18} {}",
+            "Provider:".dark_grey(),
+            crate::email::providers::display_name(&email.provider)
+        );
+        let sender = match email.from_name.as_deref() {
+            Some(name) if !name.is_empty() => format!("{name} <{}>", email.from),
+            _ => email.from.clone(),
+        };
+        println!("  {:<18} {}", "Sender:".dark_grey(), sender);
+        println!();
+    }
+
     println!("{}", "Host & Services".bold().white());
     println!(
         "  {:<18} {}",
@@ -482,6 +513,128 @@ pub fn display_plan_and_confirm(
         .with_default(false)
         .prompt()
         .map_err(inquire_err)
+}
+
+/// One selectable email provider for the interactive menu.
+struct EmailProviderOption {
+    id: &'static str,
+    label: String,
+}
+
+impl fmt::Display for EmailProviderOption {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.label)
+    }
+}
+
+/// Assigns a gathered credential to its [`EmailConfig`] slot.
+fn set_credential(cfg: &mut EmailConfig, field: CredentialField, value: String) {
+    match field {
+        CredentialField::ApiKey => cfg.api_key = Some(value),
+        CredentialField::Secret => cfg.secret = Some(value),
+        CredentialField::Username => cfg.username = Some(value),
+        CredentialField::Domain => cfg.domain = Some(value),
+        CredentialField::TemplateId => cfg.template_id = Some(value),
+    }
+}
+
+/// Asks whether to enable email and, if so, gathers a complete [`EmailConfig`].
+///
+/// Ambient credentials offered by the environment win by default but the
+/// operator may still type a value. The returned block is validated; the OTP
+/// proof is performed by the caller after the plan is confirmed.
+pub fn prompt_email_config() -> std::io::Result<Option<EmailConfig>> {
+    let enable = Confirm::new("Enable email-based accounts?")
+        .with_default(false)
+        .prompt()
+        .map_err(inquire_err)?;
+    if !enable {
+        return Ok(None);
+    }
+
+    let options: Vec<EmailProviderOption> = PROVIDERS
+        .iter()
+        .map(|p| EmailProviderOption {
+            id: p.id,
+            label: format!("{} ({})", p.id, p.display),
+        })
+        .collect();
+    let chosen = Select::new("Email provider", options)
+        .with_starting_cursor(0)
+        .prompt()
+        .map_err(inquire_err)?;
+    let info = crate::email::providers::find_provider(chosen.id).expect("catalog provider");
+    println!("  {} {}", "•".blue(), info.guidance);
+
+    let from = loop {
+        let input = prompt_line("Verified sender address", None)?;
+        if crate::email::is_valid_address(&input) {
+            break input;
+        }
+        println!("{} Invalid email address.", "✗".red().bold());
+    };
+    let from_name = prompt_line("Sender display name (optional)", Some(""))?;
+    let from_name = (!from_name.trim().is_empty()).then(|| from_name.trim().to_string());
+
+    let mut cfg = EmailConfig {
+        provider: info.id.to_string(),
+        from,
+        from_name,
+        ..Default::default()
+    };
+
+    for field in info.credential_fields {
+        // Prefer an ambient value when the conventional env var is present.
+        if let Some(env) = field.env
+            && let Ok(value) = std::env::var(env)
+            && !value.trim().is_empty()
+        {
+            let use_ambient = Confirm::new(&format!("Use ambient {env} for the {}?", field.label))
+                .with_default(true)
+                .prompt()
+                .map_err(inquire_err)?;
+            if use_ambient {
+                set_credential(&mut cfg, field.field, value.trim().to_string());
+                continue;
+            }
+        }
+        let value = read_masked_input(&format!("{} ({})", field.label, info.id))?;
+        set_credential(&mut cfg, field.field, value.trim().to_string());
+    }
+
+    if info.needs_domain && cfg.domain.is_none() {
+        loop {
+            let input = prompt_line("Sending domain", None)?;
+            if !input.trim().is_empty() {
+                cfg.domain = Some(input.trim().to_string());
+                break;
+            }
+        }
+    }
+    if info.template_only && cfg.template_id.is_none() {
+        loop {
+            let input = prompt_line("Transactional template id", None)?;
+            if !input.trim().is_empty() {
+                cfg.template_id = Some(input.trim().to_string());
+                break;
+            }
+        }
+    }
+    if info.kind == crate::email::providers::ProviderKind::Smtp && cfg.endpoint.is_none() {
+        loop {
+            let input = prompt_line("SMTP endpoint (e.g. smtp://host:587)", None)?;
+            if !input.trim().is_empty() {
+                cfg.endpoint = Some(input.trim().to_string());
+                break;
+            }
+        }
+    }
+
+    let issues = crate::email::providers::validate_email_config(&cfg);
+    if !issues.is_empty() {
+        return Err(std::io::Error::other(issues.join("; ")));
+    }
+    Ok(Some(cfg))
 }
 
 #[cfg(test)]

@@ -1,0 +1,6 @@
+<mj-section padding="24px 0">
+  <mj-column>
+    <mj-text mj-class="quiet" padding="0 32px 8px">Tunnel Weaver · Small bird. Strong connections.</mj-text>
+    <mj-text mj-class="quiet" padding="0 32px">An account message from Tunnel Weaver. Need help? <a href="{{support_url}}" style="color:#772a0a;text-decoration:underline;">Contact support</a>.</mj-text>
+  </mj-column>
+</mj-section>

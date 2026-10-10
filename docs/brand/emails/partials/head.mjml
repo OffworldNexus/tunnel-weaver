@@ -1,0 +1,12 @@
+<mj-head>
+  <mj-title>{{subject}}</mj-title>
+  <mj-preview>{{preview}}</mj-preview>
+  <mj-attributes>
+    <mj-all font-family="Inter, Roboto, 'Helvetica Neue', 'Arial Nova', 'Nimbus Sans', Arial, sans-serif" />
+    <mj-text color="#38312b" font-size="16px" line-height="26px" padding="0 32px 20px" />
+    <mj-section padding="0" />
+    <mj-button background-color="#aebd68" color="#1e2500" font-size="16px" font-weight="bold" border-radius="3px" inner-padding="16px 24px" align="left" padding="4px 32px 24px" />
+    <mj-class name="heading" font-size="28px" line-height="34px" font-weight="bold" padding="28px 32px 20px" />
+    <mj-class name="quiet" color="#6d635c" font-size="14px" line-height="22px" />
+  </mj-attributes>
+</mj-head>

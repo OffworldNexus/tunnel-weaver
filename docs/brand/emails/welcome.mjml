@@ -1,0 +1,16 @@
+<mjml>
+  <mj-include path="./partials/head.mjml" />
+  <mj-body width="600px" background-color="#fefaf3">
+    <mj-include path="./partials/header.mjml" />
+    <mj-section background-color="#ffffff">
+      <mj-column>
+        <mj-text mj-class="heading">Welcome to Tunnel Weaver</mj-text>
+        <mj-text>Your account is ready. Open Tunnel Weaver when you’re ready to get connected.</mj-text>
+        <mj-button href="{{account_url}}">Open Tunnel Weaver</mj-button>
+        <mj-text mj-class="quiet">You’re all set. Keep this email if you’d like a quick way back to your account.</mj-text>
+        <mj-text mj-class="quiet">Button not working? <a href="{{account_url}}" style="color:#772a0a;text-decoration:underline;word-break:break-all;">{{account_url}}</a></mj-text>
+      </mj-column>
+    </mj-section>
+    <mj-include path="./partials/footer.mjml" />
+  </mj-body>
+</mjml>

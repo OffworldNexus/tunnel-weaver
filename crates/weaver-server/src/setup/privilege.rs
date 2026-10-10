@@ -89,6 +89,10 @@ pub fn ensure_root_or_elevate(config: &GatheredConfig, is_headless: bool) {
     if let Some(ca) = &config.acme_root_ca_path {
         cmd.arg("--acme-root-ca").arg(ca);
     }
+    // Only the path crosses sudo; the credentials stay in the 0600 file.
+    if let Some(path) = &config.email_config_file {
+        cmd.arg("--email-config-file").arg(path);
+    }
     if config.skip_reachability_check {
         cmd.arg("--skip-reachability-check");
     }

@@ -109,3 +109,38 @@ certificate is independent: its failure only affects the relay's own endpoint.
 systemd owns the binds; the service runs with an empty `CapabilityBoundingSet=`.
 Without socket activation (containers), DNS self-bind on 53 needs
 `CAP_NET_BIND_SERVICE` or a privileged port mapping.
+
+## Transactional email
+
+Email is opt-in. With no `email` block in the config, the relay boots normally
+and any caller that needs to send gets `email is not configured`; the daemon
+itself sends nothing in this milestone.
+
+- List the provider catalog with `weaver-server providers email`. `providers`
+  alone still shows the ACME/SSL table.
+- `setup` asks whether to enable email after the ACME step, shows the chosen
+  provider's guidance, gathers the verified sender and credentials (offering
+  ambient env values such as `RESEND_API_KEY` when present), then **sends and
+  verifies a numeric OTP** to the admin address. Setup cannot complete until the
+  code is accepted.
+- `configure` is headless and two-step. The first run with email flags sends the
+  OTP and exits non-zero:
+  `configure --email-provider resend --email-from relay@example.com --email-api-key-file /root/resend.key …`
+  The second run proves it:
+  `configure --email-otp 123456 …` (or `WEAVER_EMAIL_OTP`).
+- Use `--email-api-key-file` rather than `--email-api-key` so keys stay out of
+  shell history. `--email-endpoint` overrides the provider base URL (regional
+  hosts, Mailgun EU, or a CI mock). `--no-email` clears the block and conflicts
+  with `--email-provider`.
+- Credentials live in the 0600 SQLite file, like the certificate keys. `status`
+  reports the configured provider and sender but never a credential, `doctor`
+  prints none either, and provider error output is redacted.
+- `weaver-server send-a-joke ADDRESS [--email-endpoint URL]` is a temporary
+  hidden dev/e2e verb that sends the joke template through the configured
+  provider; it exits non-zero with the redacted provider error on rejection. It
+  is removed once real account email ships.
+
+No retries, queue, bounce handling, or delivery webhooks exist: a send is
+awaited, and an accepted send is a tracing event. A non-2xx provider response
+becomes a typed rejection carrying the HTTP status and provider message.
+

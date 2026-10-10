@@ -105,6 +105,31 @@ pub struct CertCounts {
     pub inactive: usize,
 }
 
+/// Non-secret summary of the configured transactional-email provider.
+///
+/// Only operator-safe routing/identity fields travel here. Credentials
+/// (`api_key`, `secret`, and `username`, which is the API key for some
+/// providers) are deliberately absent so `status` can never leak them.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StatusEmail {
+    /// Catalog provider id (e.g. `resend`).
+    pub provider: String,
+    /// Verified sender address.
+    pub from: String,
+    /// Optional sender display name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_name: Option<String>,
+    /// Mailgun sending domain, when the provider needs one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domain: Option<String>,
+    /// Base-URL override (regional host, EU endpoint, or a CI mock).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
+    /// Transactional template id required by template-only providers (Loops).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template_id: Option<String>,
+}
+
 /// Response payload for the `status` command.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct StatusResponse {
@@ -125,6 +150,9 @@ pub struct StatusResponse {
     pub schema_version: u32,
     #[serde(default)]
     pub control_socket: String,
+    /// Configured email provider, or absent when email is disabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub email: Option<StatusEmail>,
 }
 
 /// Response payload for the `doctor` verb.
