@@ -236,3 +236,92 @@ async fn test_http01_challenge_served_on_port_80() {
     shutdown_token.cancel();
     server_task.await.unwrap();
 }
+
+/// Sends a raw cleartext HTTP/1.1 request and returns the full response text.
+async fn http_request(addr: std::net::SocketAddr, raw_request: &str) -> String {
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    stream.write_all(raw_request.as_bytes()).await.unwrap();
+    let mut resp = String::new();
+    stream.read_to_string(&mut resp).await.unwrap();
+    resp
+}
+
+// WVR-134: the cleartext surface refuses the same scanner probes the TLS
+// surface does, before the redirect, so port-80 probing is visible in the same
+// log stream (scheme=http). ACME HTTP-01 stays exempt; ordinary paths still
+// redirect.
+#[tokio::test]
+async fn test_http_refuses_scanner_probes_and_keeps_acme_and_redirects() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let shutdown_token = CancellationToken::new();
+    let store = test_store().await;
+    store
+        .publish_http01("tok-cleartext", "key-auth-cleartext", None, 0)
+        .await
+        .unwrap();
+
+    let store_for_server = Arc::clone(&store);
+    let token_clone = shutdown_token.clone();
+    let server_task = tokio::spawn(async move {
+        run_http_server(
+            listener,
+            "weaver.test".to_string(),
+            443,
+            vec![Arc::new(Http01Solver::new(store_for_server))],
+            token_clone,
+        )
+        .await;
+    });
+
+    // A scanner playbook probe is refused on cleartext with the branded 403,
+    // the reason header and the shared security headers — and never redirects.
+    let resp = http_request(
+        addr,
+        "GET /.env HTTP/1.1\r\nHost: weaver.test\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert!(
+        resp.starts_with("HTTP/1.1 403 Forbidden"),
+        "expected 403, got {resp:?}"
+    );
+    assert!(resp.contains("x-weaver-blocked: dotfile"));
+    assert!(resp.contains("content-security-policy:"));
+    assert!(
+        !resp.contains("location:"),
+        "a blocked probe must not redirect"
+    );
+
+    // TRACE is refused on cleartext too.
+    let resp = http_request(
+        addr,
+        "TRACE / HTTP/1.1\r\nHost: weaver.test\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert!(
+        resp.starts_with("HTTP/1.1 403 Forbidden"),
+        "expected 403, got {resp:?}"
+    );
+    assert!(resp.contains("x-weaver-blocked: trace"));
+
+    // ACME HTTP-01 remains reachable on port 80.
+    let resp = http_request(
+        addr,
+        "GET /.well-known/acme-challenge/tok-cleartext HTTP/1.1\r\nHost: weaver.test\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert!(resp.starts_with("HTTP/1.1 200"), "got {resp:?}");
+    assert!(resp.ends_with("key-auth-cleartext"));
+
+    // An ordinary path still redirects to HTTPS.
+    let resp = http_request(
+        addr,
+        "GET /foo/bar HTTP/1.1\r\nHost: weaver.test\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert!(resp.starts_with("HTTP/1.1 308"), "got {resp:?}");
+    assert!(resp.contains("location: https://weaver.test/foo/bar"));
+
+    shutdown_token.cancel();
+    server_task.await.unwrap();
+}
