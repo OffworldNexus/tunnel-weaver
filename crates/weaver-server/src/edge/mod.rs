@@ -1,6 +1,7 @@
 //! Network edge implementations for cleartext HTTP and TLS HTTPS ingress.
 
 pub mod counting;
+pub mod guard;
 pub mod host;
 pub mod http;
 pub mod https;

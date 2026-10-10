@@ -24,8 +24,8 @@ use crate::cert::CertManager;
 use crate::cert::managed::{ManagedCerts, Validation};
 use crate::cert::resolver::CertResolver;
 use crate::edge::counting::{ConnBytes, CountingIo};
+use crate::edge::guard::{self, Host, Surface};
 use crate::edge::host::request_host;
-use crate::edge::waf;
 use crate::tunnel::proxy::{BoxBody, empty_body, forward_visitor_request, full_body};
 use crate::tunnel::registry::TunnelRegistry;
 use weaver_assets::{apply_security_headers, render_no_tunnel, render_welcome};
@@ -156,6 +156,45 @@ pub async fn handle_https_request(
         .as_ref()
         .is_some_and(|r| !r.is_placeholder(&host));
 
+    // One surface-aware firewall for every host the relay serves, applied here
+    // at the single routing boundary so no branch can forget it. The surface is
+    // derived from the same certificate coverage the branches below use, with
+    // the admin certificate checked first: the apex is covered by the tunnel
+    // wildcard, so testing `Http01` before the apex name is what keeps admin and
+    // tunnel policy from being conflated. Unknown hosts (no covering cert) fall
+    // through to the existing 421 and are not guarded.
+    let surface = if matches!(covering.map(|c| c.validation), Some(Validation::Http01)) {
+        Some(Surface::https(Host::Admin))
+    } else if config.managed.tunnel_domain() == Some(host_lower.as_str()) {
+        Some(Surface::https(Host::TunnelRoot))
+    } else if matches!(covering.map(|c| c.validation), Some(Validation::Dns01)) {
+        Some(Surface::https(Host::Tunneled))
+    } else {
+        None
+    };
+
+    if let Some(surface) = surface
+        && let Some(verdict) = guard::inspect_surface(surface, &req)
+    {
+        debug!(
+            hostname = %host_lower,
+            visitor = %remote_addr.ip(),
+            method = %req.method(),
+            scheme = surface.scheme.as_str(),
+            surface = surface.host.as_str(),
+            path = %guard::bounded_path(req.uri().path()),
+            rule = verdict.as_str(),
+            "WAF blocked request"
+        );
+        let mut resp = Response::builder()
+            .status(StatusCode::FORBIDDEN)
+            .header("x-weaver-blocked", verdict.as_str())
+            .body(full_body(weaver_assets::render_forbidden(verdict.as_str())))
+            .unwrap();
+        apply_security_headers(&mut resp, include_hsts);
+        return Ok(resp);
+    }
+
     // The relay's own (admin) hostname is outside the tunnel zone and is served
     // by its own single-name HTTP-01 certificate. It gets the same welcome/health
     // surface as the apex but never the tunnel WebSocket endpoint.
@@ -283,30 +322,8 @@ pub async fn handle_https_request(
             }
         }
     } else if matches!(covering.map(|c| c.validation), Some(Validation::Dns01)) {
-        // Always-on edge firewall: scanner probes are refused here so they
-        // never open a tunnel stream or reach the origin (see `edge::waf`).
-        let raw_path = req
-            .uri()
-            .path_and_query()
-            .map(|pq| pq.as_str())
-            .unwrap_or(req.uri().path());
-        if let Some(verdict) = waf::inspect(req.method(), raw_path) {
-            debug!(
-                hostname = %host_lower,
-                visitor = %remote_addr.ip(),
-                method = %req.method(),
-                path = raw_path,
-                rule = verdict.as_str(),
-                "WAF blocked request"
-            );
-            let mut resp = Response::builder()
-                .status(StatusCode::FORBIDDEN)
-                .header("x-weaver-blocked", verdict.as_str())
-                .body(full_body(weaver_assets::render_forbidden(verdict.as_str())))
-                .unwrap();
-            apply_security_headers(&mut resp, include_hsts);
-            return Ok(resp);
-        }
+        // Scanner probes were already refused by the surface guard above; what
+        // remains here is ordinary tunnel traffic.
 
         // Check if there is an active tunnel for this subdomain. Resolution is
         // DB-backed: `domains.name -> service -> live proxy channel`.

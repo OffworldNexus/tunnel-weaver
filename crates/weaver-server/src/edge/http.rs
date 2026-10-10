@@ -8,6 +8,7 @@
 //! The tunnel wildcard uses DNS-01, so it does not touch this path.
 
 use std::convert::Infallible;
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -22,7 +23,9 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 use tracing::{debug, info, trace};
 
+use crate::edge::guard::{self, Surface};
 use crate::edge::host::{HostError, request_host};
+use weaver_assets::{apply_security_headers, render_forbidden};
 
 /// Path prefix ACME HTTP-01 validation requests use.
 const ACME_CHALLENGE_PREFIX: &str = "/.well-known/acme-challenge/";
@@ -63,6 +66,7 @@ impl std::fmt::Debug for HttpEdgeConfig {
 pub async fn handle_http_redirect(
     req: Request<hyper::body::Incoming>,
     config: Arc<HttpEdgeConfig>,
+    remote_addr: SocketAddr,
 ) -> Result<Response<Full<Bytes>>, Infallible> {
     // ACME HTTP-01 validation is plaintext and must be answered before the
     // redirect: the CA will not follow a 3xx to https for a challenge. The path
@@ -91,6 +95,34 @@ pub async fn handle_http_redirect(
             return Ok(response);
         }
     };
+
+    // WVR-134: the cleartext surface refuses the same scanner probes the TLS
+    // surface does — and logs them with `scheme=http` — so port-80 probing is
+    // visible in the same stream instead of silently redirected. ACME HTTP-01
+    // is handled above and exempt; ordinary paths fall through to the redirect
+    // unchanged.
+    let surface = Surface::cleartext();
+    if let Some(verdict) = guard::inspect_surface(surface, &req) {
+        debug!(
+            hostname = %host,
+            visitor = %remote_addr.ip(),
+            method = %req.method(),
+            scheme = surface.scheme.as_str(),
+            surface = surface.host.as_str(),
+            path = %guard::bounded_path(req.uri().path()),
+            rule = verdict.as_str(),
+            "WAF blocked request"
+        );
+        let mut response = Response::builder()
+            .status(StatusCode::FORBIDDEN)
+            .header("x-weaver-blocked", verdict.as_str())
+            .body(Full::new(Bytes::from(render_forbidden(verdict.as_str()))))
+            .unwrap();
+        // No HSTS on cleartext: it is meaningless over http and belongs to the
+        // TLS response; the rest of the shared headers still apply.
+        apply_security_headers(&mut response, false);
+        return Ok(response);
+    }
 
     let path_and_query = req
         .uri()
@@ -247,7 +279,7 @@ pub async fn run_http_server(
                     let io = TokioIo::new(stream);
                     let service = service_fn(move |req| {
                         let cfg = Arc::clone(&config);
-                        async move { handle_http_redirect(req, cfg).await }
+                        async move { handle_http_redirect(req, cfg, remote_addr).await }
                     });
 
                     let conn = auto.serve_connection_with_upgrades(io, service);
