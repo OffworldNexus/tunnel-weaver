@@ -706,6 +706,7 @@ async fn main() {
                 // startup instead of waiting for a `setup` that never runs.
                 setup_complete: true,
                 email: None,
+                abuse: None,
             };
 
             match email_decision {

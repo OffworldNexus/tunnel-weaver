@@ -30,6 +30,7 @@ fn create_valid_test_config(
         relay_ips: Vec::new(),
         setup_complete: false,
         email: None,
+        abuse: None,
     }
 }
 

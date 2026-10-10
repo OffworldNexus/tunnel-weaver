@@ -21,11 +21,12 @@ use hyper_util::server::conn::auto::Builder;
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
-use tracing::{debug, info, trace};
+use tracing::{debug, info, trace, warn};
 
-use crate::edge::guard::{self, Surface};
+use crate::abuse::Refusal;
 use crate::edge::host::{HostError, request_host};
-use weaver_assets::{apply_security_headers, render_forbidden};
+use weaver_abuse::{Decision, Pipeline, Surface, ViewId, bounded_path};
+use weaver_assets::apply_security_headers;
 
 /// Path prefix ACME HTTP-01 validation requests use.
 const ACME_CHALLENGE_PREFIX: &str = "/.well-known/acme-challenge/";
@@ -49,6 +50,8 @@ pub struct HttpEdgeConfig {
     pub https_port: u16,
     /// Responders polled for ACME HTTP-01 challenges, in order.
     pub challenge_responders: Vec<Arc<dyn ChallengeResponder>>,
+    /// The safety pipeline run at the request boundary (scanner + budget).
+    pub guard: Arc<Pipeline>,
 }
 
 impl std::fmt::Debug for HttpEdgeConfig {
@@ -57,8 +60,21 @@ impl std::fmt::Debug for HttpEdgeConfig {
             .field("tunnel_domain", &self.tunnel_domain)
             .field("https_port", &self.https_port)
             .field("challenge_responders", &self.challenge_responders.len())
+            .field("passes", &self.guard.pass_names())
             .finish()
     }
+}
+
+/// Build the branded refusal response for a blocked/throttled/unavailable request.
+fn refusal_response(refusal: Refusal) -> Response<Full<Bytes>> {
+    let mut resp = Response::builder()
+        .status(refusal.status())
+        .body(Full::new(Bytes::from(refusal.body())))
+        .unwrap();
+    refusal.apply(&mut resp);
+    // Cleartext: no HSTS; the shared headers still apply.
+    apply_security_headers(&mut resp, false);
+    resp
 }
 
 /// Handles incoming cleartext HTTP requests: ACME HTTP-01 challenges are served
@@ -96,32 +112,50 @@ pub async fn handle_http_redirect(
         }
     };
 
-    // WVR-134: the cleartext surface refuses the same scanner probes the TLS
-    // surface does — and logs them with `scheme=http` — so port-80 probing is
-    // visible in the same stream instead of silently redirected. ACME HTTP-01
-    // is handled above and exempt; ordinary paths fall through to the redirect
-    // unchanged.
+    // The safety pipeline runs on the cleartext surface too: scanner probes are
+    // refused and relay-web requests are budgeted before the redirect. ACME was
+    // answered above and is exempt; anything reaching here is ordinary redirect
+    // traffic.
     let surface = Surface::cleartext();
-    if let Some(verdict) = guard::inspect_surface(surface, &req) {
-        debug!(
+    let mut ctx = crate::abuse::context(
+        surface,
+        &req,
+        remote_addr,
+        ViewId::RELAY_WEB,
+        crate::abuse::unix_ms(),
+    );
+    let decision = config.guard.evaluate(&mut ctx).await;
+    match decision {
+        Decision::Block { verdict, rule } => debug!(
             hostname = %host,
             visitor = %remote_addr.ip(),
             method = %req.method(),
             scheme = surface.scheme.as_str(),
             surface = surface.host.as_str(),
-            path = %guard::bounded_path(req.uri().path()),
-            rule = verdict.as_str(),
-            "WAF blocked request"
-        );
-        let mut response = Response::builder()
-            .status(StatusCode::FORBIDDEN)
-            .header("x-weaver-blocked", verdict.as_str())
-            .body(Full::new(Bytes::from(render_forbidden(verdict.as_str()))))
-            .unwrap();
-        // No HSTS on cleartext: it is meaningless over http and belongs to the
-        // TLS response; the rest of the shared headers still apply.
-        apply_security_headers(&mut response, false);
-        return Ok(response);
+            path = %bounded_path(req.uri().path()),
+            rule,
+            verdict = verdict.as_str(),
+            "safety pipeline blocked request"
+        ),
+        Decision::Throttle {
+            policy,
+            retry_after_ms,
+        } => debug!(
+            hostname = %host,
+            visitor = %remote_addr.ip(),
+            path = %bounded_path(req.uri().path()),
+            policy = policy.as_str(),
+            retry_after_ms,
+            "safety pipeline throttled request"
+        ),
+        Decision::Degraded { policy } => warn!(
+            policy = policy.as_str(),
+            "safety pipeline budget store unavailable; serving degraded"
+        ),
+        Decision::Allow | Decision::Challenge { .. } | Decision::Unavailable { .. } => {}
+    }
+    if let Some(refusal) = Refusal::from_decision(decision) {
+        return Ok(refusal_response(refusal));
     }
 
     let path_and_query = req
@@ -236,11 +270,29 @@ pub async fn run_http_server(
     challenge_responders: Vec<Arc<dyn ChallengeResponder>>,
     shutdown_token: CancellationToken,
 ) {
-    let edge_config = Arc::new(HttpEdgeConfig {
-        tunnel_domain,
-        https_port,
-        challenge_responders,
-    });
+    run_http_server_full(
+        listener,
+        HttpEdgeConfig {
+            tunnel_domain,
+            https_port,
+            challenge_responders,
+            guard: Arc::new(Pipeline::scanner_only()),
+        },
+        shutdown_token,
+    )
+    .await;
+}
+
+/// Runs the HTTP cleartext edge server with a fully-populated [`HttpEdgeConfig`].
+///
+/// The full form is what the daemon uses: it carries the relay-web request
+/// budget (WVR-135) in addition to the redirect/ACME configuration.
+pub async fn run_http_server_full(
+    listener: TcpListener,
+    config: HttpEdgeConfig,
+    shutdown_token: CancellationToken,
+) {
+    let edge_config = Arc::new(config);
     let auto_builder = Builder::new(TokioExecutor::new());
     let tracker = TaskTracker::new();
 
@@ -252,7 +304,7 @@ pub async fn run_http_server(
     info!(
         addr = %addr_str,
         tunnel_domain = %edge_config.tunnel_domain,
-        https_port,
+        https_port = edge_config.https_port,
         "HTTP cleartext edge server running"
     );
 

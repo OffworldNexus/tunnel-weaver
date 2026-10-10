@@ -107,6 +107,7 @@ fn test_config(tunnel_domain: &str, acme_provider: &str, acme_directory: Option<
         relay_ips: Vec::new(),
         setup_complete: false,
         email: None,
+        abuse: None,
     }
 }
 

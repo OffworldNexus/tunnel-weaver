@@ -563,6 +563,7 @@ mod tests {
             relay_ips,
             setup_complete: false,
             email: None,
+            abuse: None,
         };
         let generator_config = DnsResponderConfig::from_config(&config);
         let responder = Arc::new(DnsResponder::new(vec![

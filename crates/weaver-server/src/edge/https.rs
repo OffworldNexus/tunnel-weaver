@@ -18,16 +18,17 @@ use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
-use tracing::{debug, info, trace};
+use tracing::{debug, info, trace, warn};
 
+use crate::abuse::Refusal;
 use crate::cert::CertManager;
 use crate::cert::managed::{ManagedCerts, Validation};
 use crate::cert::resolver::CertResolver;
 use crate::edge::counting::{ConnBytes, CountingIo};
-use crate::edge::guard::{self, Host, Surface};
 use crate::edge::host::request_host;
 use crate::tunnel::proxy::{BoxBody, empty_body, forward_visitor_request, full_body};
 use crate::tunnel::registry::TunnelRegistry;
+use weaver_abuse::{Decision, Host, Pipeline, Surface, ViewId, bounded_path};
 use weaver_assets::{apply_security_headers, render_no_tunnel, render_welcome};
 
 /// How often a live visitor connection reports its accumulated socket bytes to
@@ -47,6 +48,8 @@ pub struct HttpsEdgeConfig {
     pub cert_manager: Option<Arc<CertManager>>,
     /// Active tunnel registry for routing subdomain requests and handling connection upgrades.
     pub tunnel_registry: Option<Arc<TunnelRegistry>>,
+    /// The safety pipeline run at the request boundary (scanner + budget).
+    pub guard: Arc<Pipeline>,
 }
 
 impl std::fmt::Debug for HttpsEdgeConfig {
@@ -56,6 +59,7 @@ impl std::fmt::Debug for HttpsEdgeConfig {
             .field("has_cert_resolver", &self.cert_resolver.is_some())
             .field("has_cert_manager", &self.cert_manager.is_some())
             .field("has_tunnel_registry", &self.tunnel_registry.is_some())
+            .field("passes", &self.guard.pass_names())
             .finish()
     }
 }
@@ -68,6 +72,17 @@ pub fn is_ip_literal(host: &str) -> bool {
         host
     };
     unbracketed.parse::<IpAddr>().is_ok()
+}
+
+/// Build the branded refusal response for a blocked/throttled/unavailable request.
+fn refusal_response(refusal: Refusal, include_hsts: bool) -> Response<BoxBody> {
+    let mut resp = Response::builder()
+        .status(refusal.status())
+        .body(full_body(refusal.body()))
+        .unwrap();
+    refusal.apply(&mut resp);
+    apply_security_headers(&mut resp, include_hsts);
+    resp
 }
 
 pub use weaver_tokio::{set_tcp_nodelay, set_tcp_notsent_lowat};
@@ -156,13 +171,12 @@ pub async fn handle_https_request(
         .as_ref()
         .is_some_and(|r| !r.is_placeholder(&host));
 
-    // One surface-aware firewall for every host the relay serves, applied here
-    // at the single routing boundary so no branch can forget it. The surface is
-    // derived from the same certificate coverage the branches below use, with
-    // the admin certificate checked first: the apex is covered by the tunnel
-    // wildcard, so testing `Http01` before the apex name is what keeps admin and
-    // tunnel policy from being conflated. Unknown hosts (no covering cert) fall
-    // through to the existing 421 and are not guarded.
+    // The safety pipeline runs at this single routing boundary for every host
+    // the relay serves, so no branch can forget it. The surface is derived from
+    // the same certificate coverage the branches below use, with the admin
+    // certificate checked first: the apex is covered by the tunnel wildcard, so
+    // testing `Http01` before the apex name keeps admin and tunnel policy from
+    // being conflated. Unknown hosts (no covering cert) fall through to 421.
     let surface = if matches!(covering.map(|c| c.validation), Some(Validation::Http01)) {
         Some(Surface::https(Host::Admin))
     } else if config.managed.tunnel_domain() == Some(host_lower.as_str()) {
@@ -173,26 +187,47 @@ pub async fn handle_https_request(
         None
     };
 
-    if let Some(surface) = surface
-        && let Some(verdict) = guard::inspect_surface(surface, &req)
-    {
-        debug!(
-            hostname = %host_lower,
-            visitor = %remote_addr.ip(),
-            method = %req.method(),
-            scheme = surface.scheme.as_str(),
-            surface = surface.host.as_str(),
-            path = %guard::bounded_path(req.uri().path()),
-            rule = verdict.as_str(),
-            "WAF blocked request"
-        );
-        let mut resp = Response::builder()
-            .status(StatusCode::FORBIDDEN)
-            .header("x-weaver-blocked", verdict.as_str())
-            .body(full_body(weaver_assets::render_forbidden(verdict.as_str())))
-            .unwrap();
-        apply_security_headers(&mut resp, include_hsts);
-        return Ok(resp);
+    if let Some(surface) = surface {
+        let view = if surface.host == Host::Tunneled {
+            ViewId::TUNNEL
+        } else {
+            ViewId::RELAY_WEB
+        };
+        let mut ctx =
+            crate::abuse::context(surface, &req, remote_addr, view, crate::abuse::unix_ms());
+        let decision = config.guard.evaluate(&mut ctx).await;
+        match decision {
+            Decision::Block { verdict, rule } => debug!(
+                hostname = %host_lower,
+                visitor = %remote_addr.ip(),
+                method = %req.method(),
+                scheme = surface.scheme.as_str(),
+                surface = surface.host.as_str(),
+                path = %bounded_path(req.uri().path()),
+                rule,
+                verdict = verdict.as_str(),
+                "safety pipeline blocked request"
+            ),
+            Decision::Throttle {
+                policy,
+                retry_after_ms,
+            } => debug!(
+                hostname = %host_lower,
+                visitor = %remote_addr.ip(),
+                path = %bounded_path(req.uri().path()),
+                policy = policy.as_str(),
+                retry_after_ms,
+                "safety pipeline throttled request"
+            ),
+            Decision::Degraded { policy } => warn!(
+                policy = policy.as_str(),
+                "safety pipeline budget store unavailable; serving degraded"
+            ),
+            Decision::Allow | Decision::Challenge { .. } | Decision::Unavailable { .. } => {}
+        }
+        if let Some(refusal) = Refusal::from_decision(decision) {
+            return Ok(refusal_response(refusal, include_hsts));
+        }
     }
 
     // The relay's own (admin) hostname is outside the tunnel zone and is served
@@ -458,6 +493,7 @@ pub async fn run_https_server_with_registry(
             cert_resolver,
             cert_manager: None,
             tunnel_registry,
+            guard: Arc::new(Pipeline::scanner_only()),
         },
         shutdown_token,
     )

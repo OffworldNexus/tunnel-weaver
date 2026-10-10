@@ -3,7 +3,7 @@
 //! Run with:
 //!
 //! ```text
-//! cargo bench -p weaver-server --bench waf
+//! cargo bench -p weaver-server --bench scanner
 //! ```
 //!
 //! Set `WAF_BENCH_DUMP=1` to print the generated corpus for inspection.
@@ -19,7 +19,7 @@ use std::hint::black_box;
 use std::time::{Duration, Instant};
 
 use http::Method;
-use weaver_server::edge::waf::{Verdict, inspect};
+use weaver_abuse::scanner::{ScanVerdict, inspect};
 
 /// URLs of each kind in the corpus.
 const BLOCKED: usize = 1000;
@@ -210,37 +210,37 @@ fn build_blocked() -> Vec<(Method, String)> {
             0 => (
                 Method::GET,
                 format!("{prefix}{}", rng.pick(DOTFILES)),
-                Verdict::Dotfile,
+                ScanVerdict::Dotfile,
             ),
             1 => (
                 Method::GET,
                 format!("{prefix}{}", rng.pick(TRAVERSALS)),
-                Verdict::Traversal,
+                ScanVerdict::Traversal,
             ),
             2 => (
                 Method::GET,
                 format!("{prefix}{}", rng.pick(LEFTOVERS)),
-                Verdict::Leftover,
+                ScanVerdict::Leftover,
             ),
             3 => (
                 Method::GET,
                 format!("{prefix}{}", rng.pick(SECRETS)),
-                Verdict::SecretMaterial,
+                ScanVerdict::SecretMaterial,
             ),
             4 => (
                 Method::GET,
                 format!("{prefix}{}", rng.pick(DEBUG)),
-                Verdict::DebugEndpoint,
+                ScanVerdict::DebugEndpoint,
             ),
             5 => (
                 Method::GET,
                 format!("{prefix}{}", rng.pick(MALFORMED)),
-                Verdict::Malformed,
+                ScanVerdict::Malformed,
             ),
             _ => (
                 Method::TRACE,
                 format!("{prefix}{}", rng.pick(SAFE_PATHS)),
-                Verdict::Trace,
+                ScanVerdict::Trace,
             ),
         };
 
@@ -451,7 +451,7 @@ fn main() {
     combined.extend(allowed.iter().cloned());
 
     println!(
-        "waf::inspect — {} urls/corpus, best of {ROUNDS} rounds",
+        "scanner::inspect — {} urls/corpus, best of {ROUNDS} rounds",
         combined.len()
     );
     report("blocked", time_corpus(&blocked, ROUNDS), blocked.len());

@@ -20,7 +20,7 @@ use crate::config::{Config, ConfigError};
 use crate::dns::{
     AcmeChallenges, DnsResponder, DnsResponderConfig, DomainGenerator, TunnelDomains,
 };
-use crate::edge::http::{ChallengeResponder, run_http_server};
+use crate::edge::http::{ChallengeResponder, HttpEdgeConfig, run_http_server_full};
 use crate::edge::tls::{TlsError, create_server_config};
 use crate::notify::{notify_ready_with_cert_status, notify_stopping};
 use crate::server::listener::{ListenerError, acquire_listeners};
@@ -178,14 +178,45 @@ pub async fn run_server(
     // minute, which the drain below awaits before the store is closed.
     let usage_task = Arc::clone(&metering).start(shutdown_token.clone());
 
+    // WVR-135: the relay-web budget gate (None when abuse is unconfigured) plus
+    // a background sweep that drops idle buckets so the table stays bounded.
+    let guard = crate::abuse::build(&config, store.clone());
+    let abuse_task = config
+        .abuse
+        .as_ref()
+        .filter(|abuse| abuse.enabled)
+        .map(|cfg| {
+            let store = store.clone();
+            let ttl_ms = (cfg.bucket_ttl_secs as i64).saturating_mul(1000).max(1);
+            let token = shutdown_token.clone();
+            info!(ttl_secs = cfg.bucket_ttl_secs, "abuse bucket sweep running");
+            tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(Duration::from_secs(600));
+                loop {
+                    tokio::select! {
+                        _ = token.cancelled() => break,
+                        _ = ticker.tick() => {
+                            let cutoff = crate::abuse::unix_ms() - ttl_ms;
+                            if let Err(err) = store.abuse_sweep(cutoff).await {
+                                warn!(error = %err, "abuse bucket sweep failed");
+                            }
+                        }
+                    }
+                }
+            })
+        });
+
     let http_token = shutdown_token.clone();
     let challenge_responders: Vec<Arc<dyn ChallengeResponder>> =
         vec![Arc::new(Http01Solver::new(Arc::new(store.clone())))];
-    let http_task = tokio::spawn(run_http_server(
+    let http_task = tokio::spawn(run_http_server_full(
         listeners.http,
-        config.tunnel_domain.clone(),
-        config.listen_https.port(),
-        challenge_responders,
+        HttpEdgeConfig {
+            tunnel_domain: config.tunnel_domain.clone(),
+            https_port: config.listen_https.port(),
+            challenge_responders,
+            guard: guard.clone(),
+        },
         http_token,
     ));
 
@@ -198,6 +229,7 @@ pub async fn run_server(
             cert_resolver: Some(Arc::clone(&resolver)),
             cert_manager: Some(Arc::clone(&cert_manager)),
             tunnel_registry: Some(tunnel_registry),
+            guard: guard.clone(),
         },
         https_token,
     ));
@@ -308,6 +340,9 @@ pub async fn run_server(
 
     let drain = async {
         let _ = tokio::join!(http_task, https_task, control_task, usage_task);
+        if let Some(task) = abuse_task {
+            let _ = task.await;
+        }
         let _ = futures_util::future::join_all(dns_tasks).await;
     };
 

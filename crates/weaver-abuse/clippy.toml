@@ -1,0 +1,7 @@
+# weaver-abuse is sans-IO: the caller supplies `now_ms`. These bans (enforced by
+# `#![forbid(clippy::disallowed_methods)]` in lib.rs) make it impossible to
+# reach for the wall clock inside the engine.
+disallowed-methods = [
+    { path = "std::time::Instant::now", reason = "sans-IO: time is passed in by the caller as `now_ms: i64`" },
+    { path = "std::time::SystemTime::now", reason = "sans-IO: time is passed in by the caller as `now_ms: i64`" },
+]

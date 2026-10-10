@@ -1,0 +1,9 @@
+{% extends "base.html" %}
+{% block title %}Slow Down{% endblock %}
+{% block tone %}page--danger{% endblock %}
+{% block icon %}!{% endblock %}
+{% block status %}429 Too Many Requests{% endblock %}
+{% block heading %}Too many requests.{% endblock %}
+{% block summary %}This address sent requests faster than the relay allows right now. The allowance refills automatically.{% endblock %}
+{% block detail %}<dl class="detail"><dt>Retry after</dt><dd><code>{{ retry_after }}s</code></dd></dl>{% endblock %}
+{% block guidance %}Wait for the indicated time, then retry your request.{% endblock %}

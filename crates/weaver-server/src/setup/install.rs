@@ -248,14 +248,19 @@ pub async fn execute_install(
     // Preserve an already-completed setup across upgrades: only the first
     // install leaves `setup_complete` false so the daemon does not auto-order
     // the wildcard before setup has verified the delegation and port 53.
-    let previously_setup_complete = store
+    let existing_config = store
         .load_config_json()
         .await
         .ok()
         .flatten()
-        .and_then(|json| serde_json::from_str::<Config>(&json).ok())
+        .and_then(|json| serde_json::from_str::<Config>(&json).ok());
+    let previously_setup_complete = existing_config
+        .as_ref()
         .map(|existing| existing.setup_complete)
         .unwrap_or(false);
+    // Abuse limits are operator-tuned and not part of the wizard; carry them
+    // forward so a re-run of setup does not silently disarm the relay web budget.
+    let previous_abuse = existing_config.and_then(|existing| existing.abuse);
 
     let root_ca_pem = match &gathered.acme_root_ca_path {
         Some(path) => match fs::read_to_string(path) {
@@ -292,6 +297,7 @@ pub async fn execute_install(
         // The email block is carried from the setup wizard (or its 0600 staging
         // file) and written with the rest of the config.
         email: gathered.email.clone(),
+        abuse: previous_abuse,
     };
 
     store
