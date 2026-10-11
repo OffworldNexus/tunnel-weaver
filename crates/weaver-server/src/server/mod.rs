@@ -181,6 +181,14 @@ pub async fn run_server(
     // WVR-135: the relay-web budget gate (None when abuse is unconfigured) plus
     // a background sweep that drops idle buckets so the table stays bounded.
     let guard = crate::abuse::build(&config, store.clone());
+    // WVR-136: the ALTCHA runtime (None when `abuse.altcha` is not enabled).
+    let altcha =
+        crate::altcha::AltchaRuntime::from_config(&config, store.clone()).map_err(|e| {
+            ServerError::Activation(format!("Failed to initialize ALTCHA runtime: {e}"))
+        })?;
+    altcha.ensure_demo_client().await.map_err(|e| {
+        ServerError::Activation(format!("Failed to provision the ALTCHA demo client: {e}"))
+    })?;
     let abuse_task = config
         .abuse
         .as_ref()
@@ -206,6 +214,33 @@ pub async fn run_server(
             })
         });
 
+    // WVR-136: sweep expired spent-proof markers so the table stays bounded. The
+    // ALTCHA API is always served, so this always runs.
+    let altcha_sweep = config
+        .abuse
+        .as_ref()
+        .and_then(|abuse| abuse.altcha.clone())
+        .unwrap_or_else(crate::config::AltchaConfig::builtin);
+    let altcha_task = {
+        let store = store.clone();
+        let interval = altcha_sweep.sweep_interval_secs.max(1);
+        let token = shutdown_token.clone();
+        info!(interval_secs = interval, "ALTCHA proof sweep running");
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(interval));
+            loop {
+                tokio::select! {
+                    _ = token.cancelled() => break,
+                    _ = ticker.tick() => {
+                        let cutoff = crate::abuse::unix_ms();
+                        if let Err(err) = store.altcha_sweep_proofs(cutoff).await {
+                            warn!(error = %err, "ALTCHA proof sweep failed");
+                        }
+                    }
+                }
+            }
+        })
+    };
     let http_token = shutdown_token.clone();
     let challenge_responders: Vec<Arc<dyn ChallengeResponder>> =
         vec![Arc::new(Http01Solver::new(Arc::new(store.clone())))];
@@ -230,6 +265,7 @@ pub async fn run_server(
             cert_manager: Some(Arc::clone(&cert_manager)),
             tunnel_registry: Some(tunnel_registry),
             guard: guard.clone(),
+            altcha: Some(altcha.clone()),
         },
         https_token,
     ));
@@ -343,6 +379,7 @@ pub async fn run_server(
         if let Some(task) = abuse_task {
             let _ = task.await;
         }
+        let _ = altcha_task.await;
         let _ = futures_util::future::join_all(dns_tasks).await;
     };
 

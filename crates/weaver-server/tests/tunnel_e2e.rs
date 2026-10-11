@@ -548,7 +548,11 @@ async fn test_tunnel_registration_and_http1_http2_proxying() {
 
 /// The control stream is the registration lease: finishing it drops the
 /// route and deactivates the cert while the tunnel connection stays up.
-#[tokio::test]
+///
+/// Multi-threaded on purpose: the client driver, the relay, and this poll loop
+/// all make progress on their own worker, so a busy `cargo test --workspace`
+/// run cannot starve the lease release into a spurious timeout.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_control_stream_is_the_registration_lease() {
     let root = "localhost";
     let relay = spawn_test_relay(root).await;
@@ -574,10 +578,13 @@ async fn test_control_stream_is_the_registration_lease() {
     assert!(registered, "service should register");
     assert!(relay.registry.is_active(&hostname));
 
-    // Drop the lease; the connection stays open.
+    // Drop the lease; the connection stays open. The relay only unregisters
+    // after the control stream finishes and the drop is observed, which under a
+    // fully parallel test run can take well over two seconds — wait generously
+    // rather than flake.
     release.cancel();
     let mut released = false;
-    for _ in 0..20 {
+    for _ in 0..100 {
         if relay.registry.resolve(&hostname).await.is_none() {
             released = true;
             break;

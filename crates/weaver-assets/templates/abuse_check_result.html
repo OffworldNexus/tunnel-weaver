@@ -1,0 +1,8 @@
+{% extends "base.html" %}
+{% block title %}ALTCHA diagnostic result{% endblock %}
+{% block tone %}{% endblock %}
+{% block icon %}{% if verified %}✓{% else %}!{% endif %}{% endblock %}
+{% block status %}{% if verified %}Verified{% else %}Rejected{% endif %}{% endblock %}
+{% block heading %}{% if verified %}Proof accepted.{% else %}Proof rejected.{% endif %}{% endblock %}
+{% block summary %}{{ summary }}{% endblock %}
+{% block guidance %}This was a diagnostic only. Return to the <a href="/abuse/check">diagnostic page</a> to try again.{% endblock %}

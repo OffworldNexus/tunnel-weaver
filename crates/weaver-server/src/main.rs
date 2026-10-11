@@ -100,6 +100,81 @@ pub enum Commands {
         #[arg(long)]
         json: bool,
     },
+
+    /// Manages ALTCHA proof-of-work API clients.
+    Altcha {
+        /// The operation to perform.
+        #[command(subcommand)]
+        command: AltchaCommands,
+    },
+}
+
+/// Subcommands for ALTCHA operations.
+#[derive(Subcommand, Debug, Clone)]
+pub enum AltchaCommands {
+    /// Manages ALTCHA API clients.
+    Clients {
+        /// The operation to perform.
+        #[command(subcommand)]
+        command: ClientsCommands,
+    },
+}
+
+/// Subcommands for managing ALTCHA API clients.
+#[derive(Subcommand, Debug, Clone)]
+pub enum ClientsCommands {
+    /// Creates a client: the internal (admin) client by default, or a service's.
+    Create {
+        /// Flat service hostname to bind the client to (e.g.
+        /// `alice-laptop-web.weaver.test`). Omit for the internal (admin) client.
+        #[arg(long, value_name = "HOSTNAME")]
+        service: Option<String>,
+
+        /// Key-derivation algorithm (default: the configured or built-in one).
+        #[arg(long, value_name = "ALGORITHM")]
+        algorithm: Option<String>,
+
+        /// PBKDF2 iteration count (default: the configured or built-in one).
+        #[arg(long, value_name = "N")]
+        cost: Option<u32>,
+
+        /// Hex key prefix the derived key must match.
+        #[arg(long, value_name = "HEX")]
+        key_prefix: Option<String>,
+
+        /// Challenge lifetime, in seconds.
+        #[arg(long, value_name = "SECS")]
+        ttl: Option<u64>,
+
+        /// Outputs the created client as raw JSON (including the secret).
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Replaces a client's secret (the new secret is shown once).
+    Rotate {
+        /// The client's public key.
+        #[arg(value_name = "PUBLIC_KEY")]
+        public_key: String,
+
+        /// Outputs the result as raw JSON (including the new secret).
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Revokes a client. Existing challenges stop verifying.
+    Revoke {
+        /// The client's public key.
+        #[arg(value_name = "PUBLIC_KEY")]
+        public_key: String,
+    },
+
+    /// Lists clients (secrets are never shown).
+    List {
+        /// Outputs the clients as raw JSON (without secrets).
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// Provider catalogs shown by `weaver-server providers`.
@@ -913,6 +988,13 @@ async fn main() {
             .await;
             std::process::exit(code);
         }
+        Commands::Altcha { command } => {
+            let db_path = cli
+                .db
+                .unwrap_or_else(|| PathBuf::from("/var/lib/weaver/weaver.db"));
+            let code = handle_altcha(command, db_path).await;
+            std::process::exit(code);
+        }
     }
 }
 
@@ -1600,6 +1682,242 @@ fn gather_acme_config(mut inputs: AcmeConfigInputs, options: GatherOptions) -> G
         acme_eab_hmac: eab_hmac,
         acme_root_ca: root_ca,
     }
+}
+
+/// Handles `weaver-server altcha …` against the local store.
+///
+/// Like `configure`, this opens the database directly rather than going through
+/// the daemon: the daemon re-reads client rows per request, so a one-shot create
+/// here takes effect immediately.
+async fn handle_altcha(command: AltchaCommands, db_path: PathBuf) -> i32 {
+    let store = match Store::open(&db_path).await {
+        Ok(store) => store,
+        Err(err) => {
+            eprintln!("Failed to open database at {}: {err}", db_path.display());
+            return 1;
+        }
+    };
+    let altcha_cfg = Config::load(&store)
+        .await
+        .ok()
+        .and_then(|config| config.abuse)
+        .and_then(|abuse| abuse.altcha);
+    let now_ms = weaver_server::abuse::unix_ms();
+
+    let AltchaCommands::Clients { command } = command;
+    match command {
+        ClientsCommands::Create {
+            service,
+            algorithm,
+            cost,
+            key_prefix,
+            ttl,
+            json,
+        } => {
+            let service_id = match &service {
+                Some(host) => {
+                    let normalized = host.trim().trim_end_matches('.').to_ascii_lowercase();
+                    match store.service_id_for_domain(&normalized).await {
+                        Ok(Some(id)) => Some(id),
+                        Ok(None) => {
+                            eprintln!("Error: no service is registered for host '{host}'");
+                            return 1;
+                        }
+                        Err(err) => {
+                            eprintln!("Error: {err}");
+                            return 1;
+                        }
+                    }
+                }
+                None => None,
+            };
+            let (default_cost, default_prefix, default_ttl) = altcha_cfg
+                .as_ref()
+                .map(|cfg| {
+                    (
+                        cfg.default_cost,
+                        cfg.default_key_prefix.clone(),
+                        cfg.default_ttl_secs,
+                    )
+                })
+                .unwrap_or((5_000, "00".to_string(), 300));
+            let public_key = format!("ak_{}", random_hex(16));
+            let secret = random_hex(32);
+            let new = weaver_server::store::altcha::NewAltchaClient {
+                public_key,
+                secret: secret.clone(),
+                algorithm: algorithm
+                    .unwrap_or_else(|| weaver_abuse::altcha::SUPPORTED_ALGORITHM.to_string()),
+                cost: cost.unwrap_or(default_cost) as i32,
+                key_length: 32,
+                key_prefix: key_prefix.unwrap_or(default_prefix),
+                ttl_secs: ttl.unwrap_or(default_ttl) as i64,
+                service_id,
+            };
+            match store.altcha_client_create(new, now_ms).await {
+                Ok(model) => {
+                    report_client_created(&model, &secret, json);
+                    0
+                }
+                Err(err) => {
+                    eprintln!("Error: {err}");
+                    1
+                }
+            }
+        }
+        ClientsCommands::Rotate { public_key, json } => {
+            let secret = random_hex(32);
+            match store
+                .altcha_client_rotate(&public_key, &secret, now_ms)
+                .await
+            {
+                Ok(Some(_)) => {
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::json!({ "public_key": public_key, "secret": secret })
+                        );
+                    } else {
+                        println!("Rotated client {public_key}.");
+                        println!("  New secret: {secret}");
+                        println!();
+                        println!("The secret is shown once; store it now.");
+                    }
+                    0
+                }
+                Ok(None) => {
+                    eprintln!("Error: no client with public key '{public_key}'");
+                    1
+                }
+                Err(err) => {
+                    eprintln!("Error: {err}");
+                    1
+                }
+            }
+        }
+        ClientsCommands::Revoke { public_key } => {
+            match store.altcha_client_revoke(&public_key, now_ms).await {
+                Ok(true) => {
+                    println!("Revoked client {public_key}.");
+                    0
+                }
+                Ok(false) => {
+                    eprintln!("Error: no live client with public key '{public_key}'");
+                    1
+                }
+                Err(err) => {
+                    eprintln!("Error: {err}");
+                    1
+                }
+            }
+        }
+        ClientsCommands::List { json } => match store.altcha_clients_list().await {
+            Ok(models) => {
+                report_client_list(&models, json);
+                0
+            }
+            Err(err) => {
+                eprintln!("Error: {err}");
+                1
+            }
+        },
+    }
+}
+
+/// Print a freshly created client, showing its secret exactly once.
+fn report_client_created(
+    model: &weaver_server::store::entity::altcha_client::Model,
+    secret: &str,
+    json: bool,
+) {
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "public_key": model.public_key,
+                "secret": secret,
+                "algorithm": model.algorithm,
+                "cost": model.cost,
+                "key_length": model.key_length,
+                "key_prefix": model.key_prefix,
+                "ttl_secs": model.ttl_secs,
+                "service_id": model.service_id,
+            })
+        );
+        return;
+    }
+    println!("Created ALTCHA client.");
+    println!("  Public key: {}", model.public_key);
+    println!("  Secret:     {secret}");
+    println!(
+        "  Scope:      {}",
+        if model.service_id.is_some() {
+            "service"
+        } else {
+            "internal (admin)"
+        }
+    );
+    println!(
+        "  Algorithm:  {} (cost {}, prefix {}, key {}B)",
+        model.algorithm, model.cost, model.key_prefix, model.key_length
+    );
+    println!("  Lifetime:   {}s", model.ttl_secs);
+    println!();
+    println!("The secret is shown once; store it now.");
+}
+
+/// Print clients without any secret.
+fn report_client_list(models: &[weaver_server::store::entity::altcha_client::Model], json: bool) {
+    if json {
+        let items: Vec<serde_json::Value> = models
+            .iter()
+            .map(|model| {
+                serde_json::json!({
+                    "public_key": model.public_key,
+                    "algorithm": model.algorithm,
+                    "cost": model.cost,
+                    "key_prefix": model.key_prefix,
+                    "ttl_secs": model.ttl_secs,
+                    "service_id": model.service_id,
+                    "revoked": model.revoked_at.is_some(),
+                })
+            })
+            .collect();
+        println!("{}", serde_json::Value::Array(items));
+        return;
+    }
+    if models.is_empty() {
+        println!("No ALTCHA clients.");
+        return;
+    }
+    for model in models {
+        println!(
+            "{}  {}  {}  {}  cost={}  prefix={}  ttl={}s",
+            model.public_key,
+            if model.revoked_at.is_some() {
+                "revoked"
+            } else {
+                "active"
+            },
+            if model.service_id.is_some() {
+                "service"
+            } else {
+                "internal"
+            },
+            model.algorithm,
+            model.cost,
+            model.key_prefix,
+            model.ttl_secs,
+        );
+    }
+}
+
+/// A random lowercase-hex string of `n` bytes.
+fn random_hex(n: usize) -> String {
+    use rand::RngCore;
+    let mut bytes = vec![0u8; n];
+    rand::rng().fill_bytes(&mut bytes);
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 async fn handle_setup(args: SetupArgs, db_path: PathBuf) {

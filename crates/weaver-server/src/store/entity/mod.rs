@@ -6,6 +6,8 @@
 
 pub mod abuse_bucket;
 pub mod acme_account;
+pub mod altcha_client;
+pub mod altcha_proof;
 pub mod cert_event;
 pub mod certificate;
 pub mod challenge;

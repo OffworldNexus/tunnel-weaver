@@ -36,6 +36,7 @@ fn tight_abuse() -> AbuseConfig {
         },
         retry_after_cap_secs: 60,
         bucket_ttl_secs: 3600,
+        altcha: None,
     }
 }
 
@@ -177,9 +178,10 @@ async fn disabling_abuse_leaves_the_surface_unchanged() {
         enabled: false,
         ..tight_abuse()
     }));
-    // A disabled block drops the budget pass but keeps the scanner pass.
+    // A disabled block drops the relay-web budget; the budget pass itself stays
+    // because the always-on ALTCHA API is budgeted.
     let guard = abuse::build(&cfg, store.clone());
-    assert_eq!(guard.pass_names(), vec!["scanner"]);
+    assert_eq!(guard.pass_names(), vec!["scanner", "budget"]);
 
     let token = shutdown.clone();
     let server = tokio::spawn(run_http_server_full(
@@ -294,6 +296,7 @@ async fn https_apex_is_throttled_but_health_is_exempt() {
             cert_manager: None,
             tunnel_registry: None,
             guard,
+            altcha: None,
         },
         token,
     ));

@@ -44,6 +44,13 @@ sqlx = { version = "0.9", default-features = false, features = ["sqlite-bundled"
 tokio = { version = "1.43", features = ["sync", "rt", "fs", "macros", "net", "time", "signal", "rt-multi-thread", "io-util"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 sha2 = { version = "0.11", default-features = false }
+# ALTCHA v3 proof-of-work (WVR-136): the challenge KDF (PBKDF2/SHA-256) plus
+# HMAC-SHA256 challenge signing and constant-time comparison. Same RustCrypto
+# digest line as `sha2` (0.11), so the whole workspace shares one digest.
+hmac = "0.13"
+pbkdf2 = "0.13"
+hex = "0.4"
+subtle = "2.6"
 serde_json = { version = "1.0", default-features = false, features = ["alloc"] }
 tempfile = "3"
 hyper = { version = "1.6", features = ["server", "http1", "http2", "client"] }
