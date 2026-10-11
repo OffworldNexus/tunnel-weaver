@@ -183,6 +183,72 @@ pub struct AbuseConfig {
     /// Idle lifetime of a persisted bucket, in seconds, before the sweep drops it.
     #[serde(default = "default_bucket_ttl_secs")]
     pub bucket_ttl_secs: u64,
+    /// Optional ALTCHA proof-of-work tuning (WVR-136).
+    ///
+    /// The ALTCHA API is always served; this block only tunes its budgets and
+    /// client defaults. Absent, the built-in defaults apply.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub altcha: Option<AltchaConfig>,
+}
+
+/// Operator-supplied ALTCHA proof-of-work tuning (WVR-136).
+///
+/// The ALTCHA API is always served — it is the relay's own service, not an
+/// optional feature — so this block only tunes it. Every field has a built-in
+/// default, and an absent block is exactly [`AltchaConfig::builtin`].
+///
+/// Challenge issuance and verification carry independent budgets, so exhausting
+/// issuance cannot spend the verification budget or fall through to unbounded
+/// work. The remaining fields are the defaults new clients are provisioned with.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AltchaConfig {
+    /// Budget for challenge issuance.
+    #[serde(default = "default_altcha_challenge_budget")]
+    pub challenge: BudgetConfig,
+    /// Budget for solution verification.
+    #[serde(default = "default_altcha_verify_budget")]
+    pub verify: BudgetConfig,
+    /// Default PBKDF2 iteration count for new clients.
+    #[serde(default = "default_altcha_cost")]
+    pub default_cost: u32,
+    /// Default hex key prefix for new clients.
+    #[serde(default = "default_altcha_key_prefix")]
+    pub default_key_prefix: String,
+    /// Default challenge lifetime, in seconds.
+    #[serde(default = "default_altcha_ttl_secs")]
+    pub default_ttl_secs: u64,
+    /// Upper bound on live spent-proof rows before verification fails closed.
+    #[serde(default = "default_altcha_proof_cap")]
+    pub proof_cap: u64,
+    /// How often the spent-proof sweep runs, in seconds.
+    #[serde(default = "default_altcha_sweep_secs")]
+    pub sweep_interval_secs: u64,
+    /// Override for the public base URL of the ALTCHA API.
+    ///
+    /// Defaults to `https://<tunnel domain>`. Set for non-standard deployments,
+    /// or a local endpoint in tests, where the diagnostic's server-side call
+    /// should not traverse the public apex.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_base_url: Option<String>,
+}
+
+impl AltchaConfig {
+    /// The built-in tuning, used when no `abuse.altcha` block is configured.
+    ///
+    /// Kept in one place so the serde defaults and the "no block" path cannot
+    /// drift.
+    pub(crate) fn builtin() -> Self {
+        Self {
+            challenge: default_altcha_challenge_budget(),
+            verify: default_altcha_verify_budget(),
+            default_cost: default_altcha_cost(),
+            default_key_prefix: default_altcha_key_prefix(),
+            default_ttl_secs: default_altcha_ttl_secs(),
+            proof_cap: default_altcha_proof_cap(),
+            sweep_interval_secs: default_altcha_sweep_secs(),
+            api_base_url: None,
+        }
+    }
 }
 
 /// One token bucket's burst and refill.
@@ -229,6 +295,49 @@ fn default_bucket_ttl_secs() -> u64 {
     3600
 }
 
+/// Default challenge-issuance budget: a 60-request burst refilling per minute.
+fn default_altcha_challenge_budget() -> BudgetConfig {
+    BudgetConfig {
+        burst: 60,
+        refill_units: 60,
+        refill_per_secs: 60,
+    }
+}
+
+/// Default verification budget: a 30-request burst refilling per minute.
+fn default_altcha_verify_budget() -> BudgetConfig {
+    BudgetConfig {
+        burst: 30,
+        refill_units: 30,
+        refill_per_secs: 60,
+    }
+}
+
+/// Default PBKDF2 iteration count for new ALTCHA clients.
+fn default_altcha_cost() -> u32 {
+    5_000
+}
+
+/// Default hex key prefix for new ALTCHA clients.
+fn default_altcha_key_prefix() -> String {
+    "00".to_string()
+}
+
+/// Default ALTCHA challenge lifetime, in seconds.
+fn default_altcha_ttl_secs() -> u64 {
+    300
+}
+
+/// Default cap on live spent-proof rows.
+fn default_altcha_proof_cap() -> u64 {
+    100_000
+}
+
+/// Default spent-proof sweep interval, in seconds.
+fn default_altcha_sweep_secs() -> u64 {
+    60
+}
+
 /// Rejects an armed [`AbuseConfig`] whose buckets could never admit anything.
 ///
 /// A disabled block is never rejected; its numbers are not in play.
@@ -253,6 +362,42 @@ fn validate_abuse_config(abuse: &AbuseConfig) -> Vec<String> {
     }
     if abuse.bucket_ttl_secs < 1 {
         issues.push("abuse.bucket_ttl_secs must be >= 1".into());
+    }
+    if let Some(altcha) = &abuse.altcha {
+        for (name, budget) in [
+            ("altcha.challenge", &altcha.challenge),
+            ("altcha.verify", &altcha.verify),
+        ] {
+            if budget.burst < 1 {
+                issues.push(format!("abuse.{name}.burst must be >= 1"));
+            }
+            if budget.refill_units < 1 {
+                issues.push(format!("abuse.{name}.refill_units must be >= 1"));
+            }
+            if budget.refill_per_secs < 1 {
+                issues.push(format!("abuse.{name}.refill_per_secs must be >= 1"));
+            }
+        }
+        if altcha.default_cost < 1 {
+            issues.push("abuse.altcha.default_cost must be >= 1".into());
+        }
+        if altcha.default_key_prefix.is_empty()
+            || !altcha
+                .default_key_prefix
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit())
+        {
+            issues.push("abuse.altcha.default_key_prefix must be a non-empty hex string".into());
+        }
+        if altcha.default_ttl_secs < 1 {
+            issues.push("abuse.altcha.default_ttl_secs must be >= 1".into());
+        }
+        if altcha.proof_cap < 1 {
+            issues.push("abuse.altcha.proof_cap must be >= 1".into());
+        }
+        if altcha.sweep_interval_secs < 1 {
+            issues.push("abuse.altcha.sweep_interval_secs must be >= 1".into());
+        }
     }
     issues
 }

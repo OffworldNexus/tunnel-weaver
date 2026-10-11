@@ -37,4 +37,12 @@ pub enum StoreError {
     /// The operation is only implemented for some SQL backends (e.g. file backup).
     #[error("Operation '{0}' is not supported on the {1:?} backend")]
     UnsupportedBackend(&'static str, sea_orm::DbBackend),
+
+    /// A caller-level conflict, e.g. an entity that must be unique already exists.
+    #[error("Conflict: {0}")]
+    Conflict(String),
+
+    /// A bounded table has reached its configured capacity.
+    #[error("bounded table at capacity: {0}")]
+    Capacity(&'static str),
 }

@@ -1,0 +1,168 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>ALTCHA diagnostic · Tunnel Weaver</title>
+  <link rel="stylesheet" href="/abuse/check/assets/altcha/{{ asset_version }}/altcha.css">
+  <script type="module" src="/abuse/check/assets/altcha/{{ asset_version }}/altcha.js"></script>
+  <script type="module" src="/abuse/check/assets/altcha/{{ asset_version }}/demo-bootstrap.js"></script>
+  <style>
+    {% include "partials/styles.css" %}
+    @layer tokens {
+      :root {
+        /* Keycap · Confirm tier (Figma "03 · UI primitives"). The cap keeps the
+           same fill in both themes; only the pedestal below it changes. */
+        --tw-confirm: #aebd68;
+        --tw-confirm-hover: #becb84;
+        --tw-on-confirm: #1e2500;
+        --tw-key-pedestal: #524943;
+        --tw-focus: #ba480d;
+      }
+      @media (prefers-color-scheme: dark) {
+        :root { --tw-key-pedestal: #0b0604; }
+      }
+    }
+    @layer components {
+      .demo-lede { margin-top: 20px; color: var(--tw-muted); font-size: 18px; max-width: 62ch; }
+      .demo-form { margin-top: 32px; display: flex; flex-direction: column; align-items: flex-start; gap: 28px; }
+      altcha-widget {
+        display: block;
+        width: 100%;
+        max-width: 420px;
+        /* Blend the upstream widget into the relay's palette. */
+        --altcha-border-radius: var(--tw-radius);
+        --altcha-border-color: var(--tw-border);
+        --altcha-color-base: var(--tw-well);
+        --altcha-color-base-content: var(--tw-text);
+        --altcha-color-primary: var(--tw-accent);
+        --altcha-max-width: 100%;
+      }
+      /* Keycap · Confirm, Rest/Hover/Pressed/Focus, from the Figma primitives:
+         44px hit area, 34px cap, 3px radii, 10px upper-right cut. Press travels
+         the cap 4px onto its pedestal (70ms hard stop, 100ms release). */
+      .keycap {
+        position: relative;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        min-width: 152px;
+        height: 44px;
+        padding: 0 20px;
+        border: 0;
+        background: transparent;
+        color: var(--tw-on-confirm);
+        font: 700 16px/1.4 var(--tw-sans);
+        cursor: pointer;
+        isolation: isolate;
+        border-radius: 3px;
+      }
+      .keycap::before,
+      .keycap::after {
+        content: "";
+        position: absolute;
+        left: 2px;
+        right: 2px;
+        height: 34px;
+        border-radius: 3px;
+        clip-path: polygon(0 0, calc(100% - 10px) 0, 100% 10px, 100% 100%, 0 100%);
+      }
+      .keycap::before { top: 7px; background: var(--tw-key-pedestal); }
+      .keycap::after {
+        top: 3px;
+        background: var(--tw-confirm);
+        box-shadow: inset 0 1px 0 rgb(255 255 255 / 0.4), inset 0 -1px 0 rgb(0 0 0 / 0.15);
+        transition: top 100ms ease, bottom 100ms ease, background-color 100ms ease;
+      }
+      .keycap > span { position: relative; z-index: 1; }
+      .keycap:hover::after { background: var(--tw-confirm-hover); }
+      .keycap:active::after { top: 7px; transition-duration: 70ms; }
+      .keycap:focus-visible { outline: 2px solid var(--tw-focus); outline-offset: 3px; }
+      @media (prefers-reduced-motion: reduce) {
+        .keycap::after { transition: none; }
+        .keycap:active::after { top: 3px; }
+      }
+      .demo-hint { color: var(--tw-muted); font-size: 14px; }
+      /* Keycap · Ghost: an outline keycap for secondary actions. */
+      .keycap--ghost { color: var(--tw-text); }
+      .keycap--ghost::before { background: transparent; }
+      .keycap--ghost::after {
+        background: transparent;
+        border: 1px solid var(--tw-border);
+        box-shadow: none;
+      }
+      .keycap--ghost:hover::after { background: var(--tw-deck); }
+      .demo-fail { margin-top: 40px; padding-top: 28px; border-top: 1px solid var(--tw-border); }
+      .demo-fail h2 { font-size: 16px; }
+      .demo-fail p { margin: 8px 0 16px; color: var(--tw-muted); }
+      .demo-modes {
+        margin-top: 20px;
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: 8px 16px;
+        color: var(--tw-muted);
+        font-size: 14px;
+      }
+      .demo-modes a {
+        color: var(--tw-accent);
+        text-decoration: none;
+        border-bottom: 1px solid transparent;
+        padding-bottom: 1px;
+      }
+      .demo-modes a:hover { border-bottom-color: currentColor; }
+      .demo-modes a[aria-current="true"] {
+        color: var(--tw-text);
+        font-weight: 700;
+        border-bottom-color: var(--tw-accent);
+      }
+    }
+  </style>
+</head>
+<body>
+  <main class="deck">
+    <header class="brand">
+      {% include "partials/weaver-mark.svg" %}
+      <span>Tunnel Weaver</span>
+      <span class="brand__detail">ALTCHA diagnostic</span>
+    </header>
+    <section class="well" aria-labelledby="page-title">
+      <div class="status"><span class="status__icon" aria-hidden="true">✓</span>Proof of work</div>
+      <h1 id="page-title">ALTCHA diagnostic</h1>
+      <p class="demo-lede">This page demonstrates the relay's ALTCHA proof-of-work API. It is a <strong>diagnostic</strong> — not evidence of humanity — and grants no account, session or reusable clearance.</p>
+      <p class="demo-modes">
+        Mode:
+        <a href="/abuse/check?mode=standard"{% if mode == "standard" %} aria-current="true"{% endif %}>Standard</a>
+        <a href="/abuse/check?mode=auto"{% if mode == "auto" %} aria-current="true"{% endif %}>Automatic (invisible)</a>
+      </p>
+      <form class="demo-form" method="post" action="/abuse/check/verify">
+        <altcha-widget challenge="{{ challenge_url }}" auto="onsubmit" display="{{ display }}" configuration='{"hideFooter": true, "hideLogo": true}'></altcha-widget>
+        <input type="hidden" name="flow" value="{{ flow }}">
+        <div>
+          <button class="keycap" type="submit"><span>Verify</span></button>
+          {% if mode == "auto" %}
+          <p class="demo-hint">No checkbox: the proof is solved automatically when you submit.</p>
+          {% else %}
+          <p class="demo-hint">Tick the box to solve early, or just press Verify — a proof is solved on submit either way, and re-solved if the earlier one expired.</p>
+          {% endif %}
+        </div>
+      </form>
+      <div class="guidance">
+        <h2>What this proves</h2>
+        <p>The widget fetches a signed challenge from the ALTCHA API on <code>tunnel.offworld.nexus</code>, solves a real proof of work, and submits it. The relay verifies the signature, the signed purpose and flow, and consumes the proof exactly once.</p>
+      </div>
+      <div class="demo-fail">
+        <h2>See a failed check</h2>
+        <p>Submits a well-formed but unsigned proof, so the relay refuses it — and nothing is consumed.</p>
+        <form method="post" action="/abuse/check/verify">
+          <input type="hidden" name="flow" value="{{ flow }}">
+          <input type="hidden" name="altcha" value="{{ failure_payload }}">
+          <button class="keycap keycap--ghost" type="submit"><span>Submit an invalid proof</span></button>
+        </form>
+      </div>
+    </section>
+    <footer><span>Small bird. Strong connections.</span><span class="footer__detail">Tunnel Weaver</span></footer>
+  </main>
+</body>
+</html>

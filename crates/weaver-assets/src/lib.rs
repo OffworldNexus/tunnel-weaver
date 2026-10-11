@@ -43,6 +43,28 @@ struct Throttled {
 #[template(path = "unavailable.html")]
 struct Unavailable;
 
+#[derive(Template)]
+#[template(path = "abuse_check.html")]
+struct AbuseCheck<'a> {
+    challenge_url: &'a str,
+    flow: &'a str,
+    /// The widget `display` mode: `standard`, `bar`, or `floating`.
+    display: &'a str,
+    /// The currently selected mode, for the toggle's active state.
+    mode: &'a str,
+    /// Content version prefix for the vendored asset URLs.
+    asset_version: &'a str,
+    /// A well-formed but unverifiable payload, to demo a failing check.
+    failure_payload: &'a str,
+}
+
+#[derive(Template)]
+#[template(path = "abuse_check_result.html")]
+struct AbuseCheckResult<'a> {
+    verified: bool,
+    summary: &'a str,
+}
+
 /// Render the informational relay welcome page (not a live health check).
 pub fn render_welcome() -> String {
     render(Welcome)
@@ -76,6 +98,93 @@ pub fn render_unavailable() -> String {
     render(Unavailable)
 }
 
+/// The dynamic values for the ALTCHA diagnostic page.
+pub struct AbuseCheckPage<'a> {
+    /// The absolute challenge URL the widget fetches, including the client key
+    /// and the signed purpose/flow.
+    pub challenge_url: &'a str,
+    /// The per-render flow id, echoed back on submit.
+    pub flow: &'a str,
+    /// The widget `display` mode to render (`standard`, `bar`, `floating`).
+    pub display: &'a str,
+    /// The selected mode, for the toggle's active state.
+    pub mode: &'a str,
+    /// A well-formed but unverifiable payload, to demo a failing check.
+    pub failure_payload: &'a str,
+}
+
+/// Render the ALTCHA diagnostic page served on the admin host.
+pub fn render_abuse_check(page: AbuseCheckPage<'_>) -> String {
+    render(AbuseCheck {
+        challenge_url: page.challenge_url,
+        flow: page.flow,
+        display: page.display,
+        mode: page.mode,
+        asset_version: altcha_asset_version(),
+        failure_payload: page.failure_payload,
+    })
+}
+
+/// Render the outcome of a diagnostic proof-of-work submission.
+pub fn render_abuse_check_result(verified: bool, summary: &str) -> String {
+    render(AbuseCheckResult { verified, summary })
+}
+
+/// A content version for the vendored ALTCHA assets.
+///
+/// WhiteNoise-style manifest versioning: the page links
+/// `/abuse/check/assets/altcha/<version>/<file>`, so a change to *any* vendored
+/// file changes the version and busts every cache. Computed once per process
+/// over the embedded bytes; no build script needed.
+pub fn altcha_asset_version() -> &'static str {
+    static VERSION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    VERSION.get_or_init(|| {
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        for name in [
+            "altcha.js",
+            "altcha.css",
+            "demo-bootstrap.js",
+            "workers/pbkdf2.js",
+        ] {
+            if let Some((bytes, _)) = altcha_asset(name) {
+                for &byte in bytes {
+                    hash ^= u64::from(byte);
+                    hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+                }
+            }
+        }
+        format!("{hash:016x}")
+    })
+}
+
+/// The vendored ALTCHA widget assets, keyed by their path under
+/// `assets/altcha/`. Returns the bytes and the content type to serve them with.
+///
+/// Pinned to the upstream `altcha` widget v3.3.0 `dist/external` bundle (see
+/// `static/altcha/PROVENANCE.md`); the external build is deliberate so the demo
+/// works under a strict CSP without `blob:` or inline styles.
+pub fn altcha_asset(path: &str) -> Option<(&'static [u8], &'static str)> {
+    Some(match path {
+        "altcha.js" => (
+            include_bytes!("../static/altcha/altcha.js"),
+            "text/javascript; charset=utf-8",
+        ),
+        "altcha.css" => (
+            include_bytes!("../static/altcha/altcha.css"),
+            "text/css; charset=utf-8",
+        ),
+        "demo-bootstrap.js" => (
+            include_bytes!("../static/altcha/demo-bootstrap.js"),
+            "text/javascript; charset=utf-8",
+        ),
+        "workers/pbkdf2.js" => (
+            include_bytes!("../static/altcha/workers/pbkdf2.js"),
+            "text/javascript; charset=utf-8",
+        ),
+        _ => return None,
+    })
+}
+
 /// String-only templates have no fallible filters or custom Display values;
 /// writing their literals and borrowed strings into a String cannot fail.
 fn render(template: impl Template) -> String {
@@ -102,6 +211,78 @@ pub fn apply_security_headers<B>(response: &mut http::Response<B>, include_hsts:
             "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'",
         ),
     );
+    headers.insert(
+        http::header::X_CONTENT_TYPE_OPTIONS,
+        http::HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(
+        http::header::X_FRAME_OPTIONS,
+        http::HeaderValue::from_static("DENY"),
+    );
+    headers.insert(
+        http::header::REFERRER_POLICY,
+        http::HeaderValue::from_static("no-referrer"),
+    );
+    if include_hsts {
+        headers.insert(
+            http::header::STRICT_TRANSPORT_SECURITY,
+            http::HeaderValue::from_static("max-age=31536000; includeSubDomains"),
+        );
+    }
+}
+
+/// Security headers for non-HTML responses (JSON, static assets).
+///
+/// Sets the anti-sniffing / anti-framing / referrer headers and optional HSTS,
+/// but deliberately not `Content-Type` or a CSP — the caller owns those.
+pub fn apply_common_security_headers<B>(response: &mut http::Response<B>, include_hsts: bool) {
+    let headers = response.headers_mut();
+    headers.insert(
+        http::header::X_CONTENT_TYPE_OPTIONS,
+        http::HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(
+        http::header::X_FRAME_OPTIONS,
+        http::HeaderValue::from_static("DENY"),
+    );
+    headers.insert(
+        http::header::REFERRER_POLICY,
+        http::HeaderValue::from_static("no-referrer"),
+    );
+    if include_hsts {
+        headers.insert(
+            http::header::STRICT_TRANSPORT_SECURITY,
+            http::HeaderValue::from_static("max-age=31536000; includeSubDomains"),
+        );
+    }
+}
+
+/// Security headers for the ALTCHA diagnostic page.
+///
+/// This is the one deliberately relaxed policy in the relay: the page loads the
+/// self-hosted widget (`script-src 'self'`), its stylesheet and the inline
+/// branding (`style-src 'self' 'unsafe-inline'`), a same-origin worker
+/// (`worker-src 'self'`), and fetches exactly one cross-origin resource — the
+/// challenge from the ALTCHA API at `connect_origin`. Everything else stays
+/// locked to `'none'`, and the form may only post back to the admin host.
+pub fn apply_demo_security_headers<B>(
+    response: &mut http::Response<B>,
+    connect_origin: &str,
+    include_hsts: bool,
+) {
+    let csp = format!(
+        "default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; \
+         img-src 'self' data:; font-src 'self'; worker-src 'self'; \
+         connect-src {connect_origin}; form-action 'self'; frame-ancestors 'none'; base-uri 'none'"
+    );
+    let headers = response.headers_mut();
+    headers.insert(
+        http::header::CONTENT_TYPE,
+        http::HeaderValue::from_static("text/html; charset=utf-8"),
+    );
+    if let Ok(value) = http::HeaderValue::from_str(&csp) {
+        headers.insert(http::header::CONTENT_SECURITY_POLICY, value);
+    }
     headers.insert(
         http::header::X_CONTENT_TYPE_OPTIONS,
         http::HeaderValue::from_static("nosniff"),

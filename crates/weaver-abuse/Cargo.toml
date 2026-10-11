@@ -13,10 +13,18 @@ test-util = []
 
 [dependencies]
 async-trait = { workspace = true }
+hex = { workspace = true }
+hmac = { workspace = true }
 http = { workspace = true }
+pbkdf2 = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+subtle = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
 weaver-abuse = { path = ".", features = ["test-util"] }
 proptest = { workspace = true }
 tokio = { workspace = true }
+altcha = "1"

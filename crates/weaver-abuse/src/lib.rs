@@ -16,17 +16,21 @@
 //!   through an injected [`BudgetStore`].
 //! * [`Surface`] / [`ViewId`] / [`Route`]: what was requested, and which budget
 //!   applies.
+//! * [`altcha`]: the proof-of-work engine — challenge creation, solution
+//!   verification, and atomic single-use consumption, exposed as a
+//!   [`verify_and_consume`] capability the protected application calls.
 //!
 //! # What the crate does not do
 //!
-//! * read time or randomness — the caller supplies `now_ms`;
-//! * talk to a database, tokio, or the network — that is [`BudgetStore`];
-//! * decide HTTP responses — the server maps [`Decision`];
-//! * prove work — proof-of-work is a later pass (WVR-136).
+//! * read time or randomness — the caller supplies `now_ms` and entropy;
+//! * talk to a database, tokio, or the network — that is [`BudgetStore`] and
+//!   [`ProofStore`];
+//! * decide HTTP responses — the server maps [`Decision`].
 #![forbid(clippy::disallowed_methods)]
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod altcha;
 mod context;
 mod gate;
 mod gcra;
@@ -42,6 +46,13 @@ mod surface;
 #[cfg(feature = "test-util")]
 pub mod testing;
 
+#[cfg(feature = "test-util")]
+pub use altcha::solve_challenge;
+pub use altcha::{
+    AltchaClient, AltchaError, Challenge, ConsumeKey, ConsumeOutcome, ConsumeRequest,
+    CreateRequest, Payload, ProofError, ProofStore, Verified, VerifyRequest, create_challenge,
+    verify_and_consume, verify_solution,
+};
 pub use context::RequestContext;
 pub use gate::{Admission, Gate, GateError};
 pub use gcra::{Charge, Gcra, Outcome, Quota, Rate, Snapshot};

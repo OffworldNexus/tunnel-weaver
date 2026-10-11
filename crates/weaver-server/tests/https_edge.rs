@@ -505,6 +505,7 @@ async fn spawn_admin_https_server(
         cert_manager: None,
         tunnel_registry: None,
         guard: Arc::new(weaver_abuse::Pipeline::scanner_only()),
+        altcha: None,
     };
 
     let token_clone = shutdown_token.clone();

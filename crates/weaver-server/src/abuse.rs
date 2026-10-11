@@ -20,7 +20,7 @@ use weaver_abuse::{
     ScannerPass, StoreError, StoreErrorPolicy, Surface, ViewId, fingerprint,
 };
 
-use crate::config::{BudgetConfig, Config};
+use crate::config::{AltchaConfig, BudgetConfig, Config};
 use crate::store::Store;
 
 /// The SQLite-backed budget store: typed `Store` methods, one transaction per
@@ -75,13 +75,18 @@ impl BudgetStore for DbStore {
 
 /// Build the relay safety pipeline.
 ///
-/// The scanner firewall pass is always present (the WAF is not optional); the
-/// budget pass is added only when `abuse` is configured and enabled.
+/// The scanner firewall pass is always present (the WAF is not optional). The
+/// budget pass is always present too: the ALTCHA API is always served and always
+/// budgeted, while the relay-web budget is opt-in via `abuse.enabled`.
 pub fn build(config: &Config, store: Store) -> Arc<Pipeline> {
     let mut passes: Vec<Box<dyn Pass>> = vec![Box::new(ScannerPass::default())];
 
+    let mut policies: Vec<Policy> = Vec::new();
+    let mut routes: Vec<(ViewId, Route)> = Vec::new();
+
+    // The relay's own web surface budget is opt-in.
     if let Some(abuse) = config.abuse.as_ref().filter(|abuse| abuse.enabled) {
-        let policies = PolicySet::new(vec![Policy {
+        policies.push(Policy {
             id: PolicyId::RELAY_WEB,
             budgets: vec![
                 Budget {
@@ -94,24 +99,76 @@ pub fn build(config: &Config, store: Store) -> Arc<Pipeline> {
                 },
             ],
             // The relay's own web surface favours availability: a broken store
-            // is served and logged, never a silent bypass. Sensitive policies
-            // added later default to `FailClosed`.
+            // is served and logged, never a silent bypass.
             on_store_error: StoreErrorPolicy::Degraded,
-        }]);
-        let routes = RouteTable::new(vec![(
+        });
+        routes.push((
             ViewId::RELAY_WEB,
             Route {
                 policy: PolicyId::RELAY_WEB,
                 cost: CostRule::Static(1),
             },
-        )]);
-        let gate = Gate::new(
-            DbStore::new(store),
-            policies,
-            secs_to_ms(abuse.retry_after_cap_secs),
-        );
-        passes.push(Box::new(BudgetPass::new(gate, routes)));
+        ));
     }
+
+    // WVR-136: the ALTCHA API is the relay's own service and is always served, so
+    // its budgets are always applied — one per endpoint, both fail-closed, so
+    // exhausting challenge issuance cannot spend the verification budget or fall
+    // through to unbudgeted work.
+    let altcha = config
+        .abuse
+        .as_ref()
+        .and_then(|abuse| abuse.altcha.clone())
+        .unwrap_or_else(AltchaConfig::builtin);
+    for (policy, view, budget) in [
+        (
+            PolicyId::ALTCHA_CHALLENGE,
+            ViewId::ALTCHA_CHALLENGE,
+            &altcha.challenge,
+        ),
+        (
+            PolicyId::ALTCHA_VERIFY,
+            ViewId::ALTCHA_VERIFY,
+            &altcha.verify,
+        ),
+    ] {
+        policies.push(Policy {
+            id: policy,
+            budgets: vec![
+                Budget {
+                    key: KeyKind::PeerHost,
+                    quota: quota(budget),
+                },
+                Budget {
+                    key: KeyKind::PeerNetwork,
+                    quota: quota(budget),
+                },
+            ],
+            on_store_error: StoreErrorPolicy::FailClosed,
+        });
+        routes.push((
+            view,
+            Route {
+                policy,
+                cost: CostRule::Weighted {
+                    base: 1,
+                    per_kib: 1,
+                },
+            },
+        ));
+    }
+
+    let retry_cap_secs = config
+        .abuse
+        .as_ref()
+        .map(|abuse| abuse.retry_after_cap_secs)
+        .unwrap_or(600);
+    let gate = Gate::new(
+        DbStore::new(store),
+        PolicySet::new(policies),
+        secs_to_ms(retry_cap_secs),
+    );
+    passes.push(Box::new(BudgetPass::new(gate, RouteTable::new(routes))));
 
     Arc::new(Pipeline::new(passes))
 }
@@ -210,7 +267,7 @@ impl Refusal {
                 policy: policy.as_str(),
                 retry_after_secs: ms_to_secs_ceil(retry_after_ms),
             },
-            // A challenge is not wired yet (WVR-136); treat as fail-closed.
+            // A challenge is not wired as a gate yet; treat as fail-closed.
             Decision::Unavailable { .. } | Decision::Challenge { .. } => Self::Unavailable,
         })
     }

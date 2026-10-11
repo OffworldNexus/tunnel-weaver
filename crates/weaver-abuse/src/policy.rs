@@ -17,6 +17,12 @@ impl PolicyId {
     /// The relay's own web surface (`admin`, tunnel apex, cleartext edge).
     pub const RELAY_WEB: PolicyId = PolicyId("relay-web");
 
+    /// The ALTCHA API's challenge-issuance endpoint.
+    pub const ALTCHA_CHALLENGE: PolicyId = PolicyId("altcha-challenge");
+
+    /// The ALTCHA API's solution-verification endpoint.
+    pub const ALTCHA_VERIFY: PolicyId = PolicyId("altcha-verify");
+
     /// Build a policy id from a static string.
     pub const fn new(id: &'static str) -> Self {
         Self(id)
@@ -41,6 +47,10 @@ impl ViewId {
     pub const RELAY_WEB: ViewId = ViewId("relay-web");
     /// Proxied tunnelled traffic, which has no budget by default.
     pub const TUNNEL: ViewId = ViewId("tunnel");
+    /// A challenge request to the ALTCHA API (tunnel apex).
+    pub const ALTCHA_CHALLENGE: ViewId = ViewId("altcha-challenge");
+    /// A verification request to the ALTCHA API (tunnel apex).
+    pub const ALTCHA_VERIFY: ViewId = ViewId("altcha-verify");
 
     /// Build a view id from a static string.
     pub const fn new(id: &'static str) -> Self {

@@ -502,3 +502,59 @@ fn test_configure_usage_flush_interval_round_trips() {
     });
     assert_eq!(config.usage_flush_interval_secs, 30);
 }
+
+#[test]
+fn test_altcha_clients_cli() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("altcha-cli.db");
+    let bin = env!("CARGO_BIN_EXE_weaver-server");
+
+    let run = |args: &[&str]| {
+        Command::new(bin)
+            .arg("--db")
+            .arg(&db_path)
+            .args(args)
+            .output()
+            .expect("spawn weaver-server")
+    };
+
+    // Creates the internal (admin) client and prints its secret once.
+    let out = run(&["altcha", "clients", "create", "--json"]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let created: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let public_key = created["public_key"].as_str().unwrap().to_string();
+    let secret = created["secret"].as_str().unwrap().to_string();
+    assert!(public_key.starts_with("ak_"));
+    assert_eq!(secret.len(), 64);
+    assert!(created["service_id"].is_null());
+
+    // A second internal client is refused (at most one may exist).
+    let out = run(&["altcha", "clients", "create", "--json"]);
+    assert!(!out.status.success());
+
+    // List never reveals the secret.
+    let out = run(&["altcha", "clients", "list", "--json"]);
+    let list: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let items = list.as_array().unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["public_key"], public_key);
+    assert!(items[0].get("secret").is_none());
+    assert_eq!(items[0]["revoked"], false);
+
+    // Rotate yields a different secret.
+    let out = run(&["altcha", "clients", "rotate", &public_key, "--json"]);
+    assert!(out.status.success());
+    let rotated: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_ne!(rotated["secret"].as_str().unwrap(), secret);
+
+    // Revoke, then the list marks it.
+    let out = run(&["altcha", "clients", "revoke", &public_key]);
+    assert!(out.status.success());
+    let out = run(&["altcha", "clients", "list", "--json"]);
+    let list: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(list[0]["revoked"], true);
+}

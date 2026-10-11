@@ -9,7 +9,9 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
+use bytes::Bytes;
 use http::{Method, Request, Response, StatusCode};
+use http_body_util::BodyExt;
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto::Builder;
@@ -50,6 +52,8 @@ pub struct HttpsEdgeConfig {
     pub tunnel_registry: Option<Arc<TunnelRegistry>>,
     /// The safety pipeline run at the request boundary (scanner + budget).
     pub guard: Arc<Pipeline>,
+    /// The ALTCHA proof-of-work runtime, when `abuse.altcha` is enabled.
+    pub altcha: Option<Arc<crate::altcha::AltchaRuntime>>,
 }
 
 impl std::fmt::Debug for HttpsEdgeConfig {
@@ -60,6 +64,7 @@ impl std::fmt::Debug for HttpsEdgeConfig {
             .field("has_cert_manager", &self.cert_manager.is_some())
             .field("has_tunnel_registry", &self.tunnel_registry.is_some())
             .field("passes", &self.guard.pass_names())
+            .field("altcha", &self.altcha.is_some())
             .finish()
     }
 }
@@ -83,6 +88,13 @@ fn refusal_response(refusal: Refusal, include_hsts: bool) -> Response<BoxBody> {
     refusal.apply(&mut resp);
     apply_security_headers(&mut resp, include_hsts);
     resp
+}
+
+/// Collect at most the body of a request whose handler needs it (the ALTCHA
+/// verify endpoints). A read error yields empty bytes; the handler then answers
+/// a malformed-request error.
+async fn collect_body(req: Request<hyper::body::Incoming>) -> Option<Bytes> {
+    req.into_body().collect().await.ok().map(|c| c.to_bytes())
 }
 
 pub use weaver_tokio::{set_tcp_nodelay, set_tcp_notsent_lowat};
@@ -188,8 +200,15 @@ pub async fn handle_https_request(
     };
 
     if let Some(surface) = surface {
+        // The ALTCHA API routes on the apex carry their own budgets, so the
+        // view is chosen before the guard runs.
+        let path = req.uri().path();
         let view = if surface.host == Host::Tunneled {
             ViewId::TUNNEL
+        } else if surface.host == Host::TunnelRoot && path == "/altcha/challenge" {
+            ViewId::ALTCHA_CHALLENGE
+        } else if surface.host == Host::TunnelRoot && path == "/altcha/verify" {
+            ViewId::ALTCHA_VERIFY
         } else {
             ViewId::RELAY_WEB
         };
@@ -236,6 +255,20 @@ pub async fn handle_https_request(
     if matches!(covering.map(|c| c.validation), Some(Validation::Http01)) {
         if let Some(mgr) = &config.cert_manager {
             mgr.note_visit(&host_lower);
+        }
+        // WVR-136: the built-in ALTCHA diagnostic page and its assets.
+        if let Some(altcha) = &config.altcha {
+            if req.method() == Method::GET && req.uri().path() == "/abuse/check" {
+                let query = req.uri().query().map(str::to_owned);
+                return Ok(crate::altcha::demo_page(altcha, query.as_deref(), include_hsts).await);
+            }
+            if req.method() == Method::GET && req.uri().path().starts_with("/abuse/check/assets/") {
+                return Ok(crate::altcha::demo_asset(req.uri().path(), include_hsts));
+            }
+            if req.method() == Method::POST && req.uri().path() == "/abuse/check/verify" {
+                let body = collect_body(req).await.unwrap_or_default();
+                return Ok(crate::altcha::demo_verify(altcha, body, include_hsts).await);
+            }
         }
         return Ok(static_host_response(&req, include_hsts));
     }
@@ -326,6 +359,25 @@ pub async fn handle_https_request(
                 .unwrap();
             apply_security_headers(&mut resp, include_hsts);
             return Ok(resp);
+        }
+
+        // WVR-136: the ALTCHA API, served as its own service on the apex.
+        if let Some(altcha) = &config.altcha {
+            if req.method() == Method::GET && req.uri().path() == "/altcha/challenge" {
+                let query = req.uri().query().map(str::to_owned);
+                return Ok(
+                    crate::altcha::api_challenge(altcha, query.as_deref(), include_hsts).await,
+                );
+            }
+            if req.method() == Method::POST && req.uri().path() == "/altcha/verify" {
+                let body = collect_body(req).await.unwrap_or_default();
+                return Ok(crate::altcha::api_verify(altcha, body, include_hsts).await);
+            }
+            if req.method() == Method::OPTIONS
+                && matches!(req.uri().path(), "/altcha/challenge" | "/altcha/verify")
+            {
+                return Ok(crate::altcha::api_preflight(altcha, include_hsts));
+            }
         }
 
         // Standard root domain HTTP endpoints
@@ -494,6 +546,7 @@ pub async fn run_https_server_with_registry(
             cert_manager: None,
             tunnel_registry,
             guard: Arc::new(Pipeline::scanner_only()),
+            altcha: None,
         },
         shutdown_token,
     )

@@ -5,10 +5,11 @@
 //! exercise the gate and the server's edge wiring without a database.
 
 use std::collections::HashMap;
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use async_trait::async_trait;
 
+use crate::altcha::{AltchaClient, ConsumeKey, ConsumeOutcome, ProofStore};
 use crate::gcra::{Charge, Gcra, Quota};
 use crate::key::{Key, KeyKind};
 use crate::policy::PolicyId;
@@ -133,5 +134,87 @@ impl BudgetStore for MemoryStore {
             decisions.push(Self::charge(entry, quota, cost, now_ms, retry_cap_ms));
         }
         Ok(decisions)
+    }
+}
+
+/// A single-process [`ProofStore`] for tests and examples.
+///
+/// Holds registered clients and their spent-proof markers in memory; markers
+/// expire on the next call past `expires_at_ms`. Cloning yields another handle
+/// to the same state, so a test can keep one handle to inspect what a pass
+/// consumed through another.
+#[derive(Clone, Default)]
+pub struct MemoryProofStore {
+    inner: Arc<ProofInner>,
+}
+
+#[derive(Default)]
+struct ProofInner {
+    clients: Mutex<HashMap<String, AltchaClient>>,
+    consumed: Mutex<HashMap<(String, String), i64>>,
+}
+
+impl MemoryProofStore {
+    /// An empty store.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Register (or replace) a client by its public key.
+    pub fn add_client(&self, client: AltchaClient) {
+        self.inner
+            .clients
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .insert(client.public_key.clone(), client);
+    }
+
+    /// Revoke a client, so `client()` no longer resolves it.
+    pub fn remove_client(&self, public_key: &str) {
+        self.inner
+            .clients
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .remove(public_key);
+    }
+
+    /// How many spent markers are currently held.
+    pub fn spent_count(&self) -> usize {
+        self.inner
+            .consumed
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .len()
+    }
+}
+
+#[async_trait]
+impl ProofStore for MemoryProofStore {
+    async fn client(&self, public_key: &str) -> Result<Option<AltchaClient>, StoreError> {
+        let clients = self
+            .inner
+            .clients
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        Ok(clients.get(public_key).cloned())
+    }
+
+    async fn consume(
+        &self,
+        key: ConsumeKey<'_>,
+        now_ms: i64,
+    ) -> Result<ConsumeOutcome, StoreError> {
+        let mut spent = self
+            .inner
+            .consumed
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        spent.retain(|_, expires_at| *expires_at > now_ms);
+        let id = (key.public_key.to_string(), key.nonce.to_string());
+        if spent.contains_key(&id) {
+            return Ok(ConsumeOutcome::AlreadySpent);
+        }
+        spent.insert(id, key.expires_at_ms);
+        Ok(ConsumeOutcome::Consumed)
     }
 }

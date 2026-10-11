@@ -5,8 +5,7 @@
 //! Passes are the collaboration point: one pass's finding becomes another's
 //! input (for example, an abuse signal raising the budget a later pass charges).
 //!
-//! The built-in passes are in [`crate::passes`]; proof-of-work (WVR-136) will
-//! add another that shares the same context.
+//! The built-in passes are in [`crate::passes`].
 
 use async_trait::async_trait;
 
@@ -33,7 +32,7 @@ pub enum Decision {
         /// Milliseconds to wait, already bounded by the configured cap.
         retry_after_ms: i64,
     },
-    /// A proof-of-work challenge is required (reserved for WVR-136).
+    /// A proof-of-work challenge is required (reserved for a future gate).
     Challenge {
         /// The policy that requires the challenge.
         policy: PolicyId,

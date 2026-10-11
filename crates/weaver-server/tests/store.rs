@@ -108,15 +108,15 @@ async fn test_store_open_runs_migrations_and_is_idempotent() {
         )
         .await;
         assert_eq!(count, 13);
-        assert_eq!(store.schema_version().await.expect("schema_version"), 2);
+        assert_eq!(store.schema_version().await.expect("schema_version"), 3);
     }
 
     // Re-open existing database: should succeed and not re-apply migrations
     {
         let store = Store::open(&db_path).await.expect("re-open failed");
         let migration_count: i64 = scalar(&store, "SELECT count(*) FROM seaql_migrations").await;
-        assert_eq!(migration_count, 2);
-        assert_eq!(store.schema_version().await.expect("schema_version"), 2);
+        assert_eq!(migration_count, 3);
+        assert_eq!(store.schema_version().await.expect("schema_version"), 3);
     }
 }
 
@@ -329,6 +329,7 @@ async fn test_config_validation_abuse_limits() {
             },
             retry_after_cap_secs: 120,
             bucket_ttl_secs: 3600,
+            altcha: None,
         }),
         ..sample_config()
     };
@@ -948,7 +949,7 @@ async fn test_migration_usage_round_trips() {
     // Roll every migration back, then re-apply. `m0001` creates the `usage`
     // table along with every other table, so a full rebuild is what proves
     // `down`/`up` are symmetric.
-    weaver_server::Migrator::down(store.db(), Some(2))
+    weaver_server::Migrator::down(store.db(), None)
         .await
         .expect("down");
     let usage_tables: i64 = scalar(
