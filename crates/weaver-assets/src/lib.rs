@@ -33,6 +33,16 @@ struct Forbidden<'a> {
     reason: &'a str,
 }
 
+#[derive(Template)]
+#[template(path = "throttled.html")]
+struct Throttled {
+    retry_after: u64,
+}
+
+#[derive(Template)]
+#[template(path = "unavailable.html")]
+struct Unavailable;
+
 /// Render the informational relay welcome page (not a live health check).
 pub fn render_welcome() -> String {
     render(Welcome)
@@ -52,6 +62,18 @@ pub fn render_bad_gateway(target: &str) -> String {
 /// Render the branded 403 page naming the firewall rule that fired.
 pub fn render_forbidden(reason: &str) -> String {
     render(Forbidden { reason })
+}
+
+/// Render the branded 429 page telling the caller when to retry.
+pub fn render_throttled(retry_after_secs: u64) -> String {
+    render(Throttled {
+        retry_after: retry_after_secs,
+    })
+}
+
+/// Render the branded 503 page for a temporarily unavailable limiter.
+pub fn render_unavailable() -> String {
+    render(Unavailable)
 }
 
 /// String-only templates have no fallible filters or custom Display values;
@@ -112,6 +134,8 @@ mod tests {
             (render_no_tunnel(), "404 Not Found"),
             (render_bad_gateway("localhost"), "502 Bad Gateway"),
             (render_forbidden("dotfile"), "403 Forbidden"),
+            (render_throttled(30), "429 Too Many Requests"),
+            (render_unavailable(), "503 Service Unavailable"),
         ] {
             assert!(html.contains(status));
             assert!(html.contains("<style>"));

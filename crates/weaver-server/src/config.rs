@@ -97,6 +97,13 @@ pub struct Config {
     /// trust model as the ACME EAB material and certificate private keys.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub email: Option<EmailConfig>,
+    /// Optional request-budget configuration for the relay's own web surface.
+    ///
+    /// Absent means the surface runs without a request budget (the default);
+    /// present means the `relay-web` policy is armed and validated by
+    /// [`Config::load`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub abuse: Option<AbuseConfig>,
 }
 
 /// Operator-supplied transactional-email settings.
@@ -151,6 +158,103 @@ impl std::fmt::Debug for EmailConfig {
             .field("secret", &self.secret.as_ref().map(|_| "[redacted]"))
             .finish()
     }
+}
+
+/// Operator-supplied abuse-protection settings (WVR-135).
+///
+/// Absent means the relay web surface runs with no request budget; present means
+/// the `relay-web` policy is armed. Two budgets run side by side: a restrictive
+/// per-host bucket and a laxer per-network backstop, so one abusive host is
+/// caught before whole subnets are.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AbuseConfig {
+    /// Whether the budget is enforced. A disabled block still validates.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Budget keyed on the client host (IPv4 `/32`, IPv6 `/64`).
+    #[serde(default = "default_peer_host_budget")]
+    pub peer_host: BudgetConfig,
+    /// Budget keyed on the surrounding network (IPv4 `/24`, IPv6 `/56`).
+    #[serde(default = "default_peer_network_budget")]
+    pub peer_network: BudgetConfig,
+    /// Upper bound on the surfaced `Retry-After`, in seconds.
+    #[serde(default = "default_retry_after_cap_secs")]
+    pub retry_after_cap_secs: u64,
+    /// Idle lifetime of a persisted bucket, in seconds, before the sweep drops it.
+    #[serde(default = "default_bucket_ttl_secs")]
+    pub bucket_ttl_secs: u64,
+}
+
+/// One token bucket's burst and refill.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BudgetConfig {
+    /// Maximum units available at once (the burst).
+    pub burst: u32,
+    /// Units replenished every `refill_per_secs`.
+    pub refill_units: u32,
+    /// The refill window, in seconds.
+    pub refill_per_secs: u64,
+}
+
+/// Returns the enabled-by-default flag for [`AbuseConfig`].
+fn default_true() -> bool {
+    true
+}
+
+/// Default per-host budget: a 30-request burst refilling at 30 per minute.
+fn default_peer_host_budget() -> BudgetConfig {
+    BudgetConfig {
+        burst: 30,
+        refill_units: 30,
+        refill_per_secs: 60,
+    }
+}
+
+/// Default per-network backstop: a 150-request burst refilling at 150 per minute.
+fn default_peer_network_budget() -> BudgetConfig {
+    BudgetConfig {
+        burst: 150,
+        refill_units: 150,
+        refill_per_secs: 60,
+    }
+}
+
+/// Default `Retry-After` bound, in seconds.
+fn default_retry_after_cap_secs() -> u64 {
+    600
+}
+
+/// Default idle lifetime for a persisted bucket, in seconds.
+fn default_bucket_ttl_secs() -> u64 {
+    3600
+}
+
+/// Rejects an armed [`AbuseConfig`] whose buckets could never admit anything.
+///
+/// A disabled block is never rejected; its numbers are not in play.
+fn validate_abuse_config(abuse: &AbuseConfig) -> Vec<String> {
+    let mut issues = Vec::new();
+    for (name, budget) in [
+        ("peer_host", &abuse.peer_host),
+        ("peer_network", &abuse.peer_network),
+    ] {
+        if budget.burst < 1 {
+            issues.push(format!("abuse.{name}.burst must be >= 1"));
+        }
+        if budget.refill_units < 1 {
+            issues.push(format!("abuse.{name}.refill_units must be >= 1"));
+        }
+        if budget.refill_per_secs < 1 {
+            issues.push(format!("abuse.{name}.refill_per_secs must be >= 1"));
+        }
+    }
+    if abuse.retry_after_cap_secs < 1 {
+        issues.push("abuse.retry_after_cap_secs must be >= 1".into());
+    }
+    if abuse.bucket_ttl_secs < 1 {
+        issues.push("abuse.bucket_ttl_secs must be >= 1".into());
+    }
+    issues
 }
 
 /// Default usage flush interval, in seconds.
@@ -297,6 +401,13 @@ impl Config {
         // disabled, while a present block must fully validate.
         if let Some(email) = &config.email {
             validation_issues.extend(crate::email::providers::validate_email_config(email));
+        }
+
+        // Abuse limits are opt-in; an armed block must be internally coherent.
+        if let Some(abuse) = &config.abuse
+            && abuse.enabled
+        {
+            validation_issues.extend(validate_abuse_config(abuse));
         }
 
         if !validation_issues.is_empty() {

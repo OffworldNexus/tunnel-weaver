@@ -4,6 +4,7 @@
 //! so the schema is portable across SQL backends without relying on
 //! backend-specific date/time types.
 
+pub mod abuse_bucket;
 pub mod acme_account;
 pub mod cert_event;
 pub mod certificate;

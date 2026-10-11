@@ -7,6 +7,7 @@
 //! URL to [`Store::connect`]. The handful of SQLite-only niceties (pragmas,
 //! file permissions, `VACUUM INTO` backups) are gated on the detected backend.
 
+pub mod abuse;
 pub mod entity;
 pub mod error;
 pub mod migration;

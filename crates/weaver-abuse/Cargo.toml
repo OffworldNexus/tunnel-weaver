@@ -1,0 +1,22 @@
+[package]
+name = "weaver-abuse"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+# Deterministic test fixtures (an in-memory `BudgetStore`). Shared with the
+# server's integration tests so both sides exercise the same store semantics.
+test-util = []
+
+[dependencies]
+async-trait = { workspace = true }
+http = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+weaver-abuse = { path = ".", features = ["test-util"] }
+proptest = { workspace = true }
+tokio = { workspace = true }

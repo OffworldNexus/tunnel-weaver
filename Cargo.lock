@@ -4427,6 +4427,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "weaver-abuse"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "http",
+ "proptest",
+ "thiserror",
+ "tokio",
+ "weaver-abuse",
+]
+
+[[package]]
 name = "weaver-assets"
 version = "0.1.0"
 dependencies = [
@@ -4507,6 +4519,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "weave",
+ "weaver-abuse",
  "weaver-assets",
  "weaver-mux",
  "weaver-proto",

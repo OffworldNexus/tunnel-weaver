@@ -1,0 +1,8 @@
+{% extends "base.html" %}
+{% block title %}Temporarily Unavailable{% endblock %}
+{% block tone %}page--danger{% endblock %}
+{% block icon %}!{% endblock %}
+{% block status %}503 Service Unavailable{% endblock %}
+{% block heading %}Temporarily unavailable.{% endblock %}
+{% block summary %}The relay could not check the request budget just now, so it refused the request rather than letting it through unchecked.{% endblock %}
+{% block guidance %}Please retry shortly.{% endblock %}

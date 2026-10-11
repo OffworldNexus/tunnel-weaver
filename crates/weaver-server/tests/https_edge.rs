@@ -497,12 +497,14 @@ async fn spawn_admin_https_server(
         relay_ips: Vec::new(),
         setup_complete: false,
         email: None,
+        abuse: None,
     };
     let config = HttpsEdgeConfig {
         managed: Arc::new(ManagedCerts::from_config(&cfg)),
         cert_resolver: None,
         cert_manager: None,
         tunnel_registry: None,
+        guard: Arc::new(weaver_abuse::Pipeline::scanner_only()),
     };
 
     let token_clone = shutdown_token.clone();

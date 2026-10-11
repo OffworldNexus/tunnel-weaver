@@ -33,6 +33,7 @@ fn create_valid_test_config(http_port: u16, https_port: u16) -> Config {
         relay_ips: Vec::new(),
         setup_complete: false,
         email: None,
+        abuse: None,
     }
 }
 

@@ -1,25 +1,28 @@
-//! Minimal, always-on request firewall for tunnelled hostnames.
+//! The scanner-probe ruleset: one layer of the safety middleware.
 //!
-//! Every hostname the relay issues a certificate for is published to
-//! Certificate Transparency logs and probed by mass scanners within seconds
-//! (`/.env`, `/.git/HEAD`, path traversal, framework-specific leaks). Those
-//! probes never belong to a legitimate application, so the edge refuses them
-//! itself with a branded `403` and the origin never sees them.
+//! `weaver-abuse` is the whole safety middleware; this module is just the
+//! catalogue of always-on rules that refuse mass-scanner probes. Every hostname
+//! the relay issues a certificate for is published to Certificate Transparency
+//! logs and probed within seconds (`/.env`, `/.git/HEAD`, path traversal,
+//! framework-specific leaks); those probes never belong to a legitimate
+//! application.
 //!
-//! The rules are deliberately narrow: they match only patterns that no sane
-//! web application serves publicly. Anything a real app might legitimately
-//! expose (an `/api`, a `/login`, a `/.well-known/…` directory) is left
-//! alone. This is not a substitute for visitor authentication (M4), nor for
-//! keeping service names out of CT in the first place (per-machine wildcard
-//! certs over DNS-01 once the relay serves its own zone — ADR 0007); it just
-//! takes the free hits away from the bots until those land.
+//! The rules are deliberately narrow: they match only patterns that no sane web
+//! application serves publicly. Anything a real app might legitimately expose
+//! (an `/api`, a `/login`, a `/.well-known/…` directory) is left alone. This is
+//! not a substitute for visitor authentication (M4), nor for keeping service
+//! names out of CT in the first place (per-machine wildcard certs over DNS-01 —
+//! ADR 0007); it just takes the free hits away from the bots until those land.
+//!
+//! [`crate::rule::ScannerRule`] wraps [`inspect`] as a [`crate::Rule`], and
+//! [`crate::passes::ScannerPass`] runs it inside the pipeline.
 
 use http::Method;
 
 /// Why a request was refused. Carried into the log line so an operator can
 /// see what the bots are after.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Verdict {
+pub enum ScanVerdict {
     /// Known-sensitive hidden file or directory targeted by scanners
     /// (`/.env`, `/.git/…`, `/.ssh/…`), except the `/.well-known/` namespace
     /// which is a legitimate public convention. Frontend tooling dot-dirs are
@@ -41,7 +44,7 @@ pub enum Verdict {
     Trace,
 }
 
-impl Verdict {
+impl ScanVerdict {
     /// Short stable token for logs and the `x-weaver-blocked` header.
     pub fn as_str(self) -> &'static str {
         match self {
@@ -57,9 +60,9 @@ impl Verdict {
 }
 
 /// Inspect a visitor request; `None` means "forward it".
-pub fn inspect(method: &Method, raw_path: &str) -> Option<Verdict> {
+pub fn inspect(method: &Method, raw_path: &str) -> Option<ScanVerdict> {
     if method == Method::TRACE {
-        return Some(Verdict::Trace);
+        return Some(ScanVerdict::Trace);
     }
     let path = raw_path.split(['?', '#']).next().unwrap_or("");
 
@@ -87,7 +90,7 @@ pub fn inspect(method: &Method, raw_path: &str) -> Option<Verdict> {
     // scalar tail.
     let (malformed, has_upper) = classify(decoded.as_bytes());
     if malformed {
-        return Some(Verdict::Malformed);
+        return Some(ScanVerdict::Malformed);
     }
 
     // Fold ASCII case only if the path actually has uppercase; this is the
@@ -123,7 +126,7 @@ pub fn inspect(method: &Method, raw_path: &str) -> Option<Verdict> {
         last = seg;
 
         if seg == ".." {
-            return Some(Verdict::Traversal);
+            return Some(ScanVerdict::Traversal);
         }
 
         // Only the hidden files and directories scanners actually fish for are
@@ -143,7 +146,7 @@ pub fn inspect(method: &Method, raw_path: &str) -> Option<Verdict> {
     }
 
     if dotfile {
-        return Some(Verdict::Dotfile);
+        return Some(ScanVerdict::Dotfile);
     }
 
     // Classify the final segment by its extension instead of scanning the
@@ -152,24 +155,24 @@ pub fn inspect(method: &Method, raw_path: &str) -> Option<Verdict> {
     // with no dot can only be a backup (`~`) or an SSH private key.
     if !last.is_empty() {
         if last.ends_with('~') {
-            return Some(Verdict::Leftover);
+            return Some(ScanVerdict::Leftover);
         }
         if last.ends_with("id_rsa") || last.ends_with("id_ed25519") {
-            return Some(Verdict::SecretMaterial);
+            return Some(ScanVerdict::SecretMaterial);
         }
         if let Some(dot) = last.rfind('.') {
             match &last[dot + 1..] {
                 // Editor swap files and backups.
                 "bak" | "backup" | "old" | "orig" | "save" | "swp" | "swo" | "tmp" | "dist" => {
-                    return Some(Verdict::Leftover);
+                    return Some(ScanVerdict::Leftover);
                 }
                 // Dumps and key material.
                 "sql" | "sqlite" | "sqlite3" | "db" | "pem" | "key" | "p12" | "pfx" | "jks"
                 | "keystore" | "ppk" | "htpasswd" | "htaccess" => {
-                    return Some(Verdict::SecretMaterial);
+                    return Some(ScanVerdict::SecretMaterial);
                 }
                 // `.sql.gz` is the only compressed dump we care about.
-                "gz" if last.ends_with(".sql.gz") => return Some(Verdict::SecretMaterial),
+                "gz" if last.ends_with(".sql.gz") => return Some(ScanVerdict::SecretMaterial),
                 _ => {}
             }
         }
@@ -219,7 +222,7 @@ pub fn inspect(method: &Method, raw_path: &str) -> Option<Verdict> {
                 | "config.yaml"
         )
     {
-        return Some(Verdict::DebugEndpoint);
+        return Some(ScanVerdict::DebugEndpoint);
     }
     // Every DEBUG_PAIRS key is one of these roots, so gate the pair scan on the
     // first segment and skip it for ordinary traffic.
@@ -230,7 +233,7 @@ pub fn inspect(method: &Method, raw_path: &str) -> Option<Verdict> {
         )
         && DEBUG_PAIRS.contains(&(first, second))
     {
-        return Some(Verdict::DebugEndpoint);
+        return Some(ScanVerdict::DebugEndpoint);
     }
 
     None
@@ -390,7 +393,7 @@ fn hex(b: u8) -> Option<u8> {
 mod tests {
     use super::*;
 
-    fn get(p: &str) -> Option<Verdict> {
+    fn get(p: &str) -> Option<ScanVerdict> {
         inspect(&Method::GET, p)
     }
 
@@ -408,7 +411,7 @@ mod tests {
             "/.vscode/sftp.json",
             "/.ssh/id_rsa",
         ] {
-            assert_eq!(get(p), Some(Verdict::Dotfile), "{p}");
+            assert_eq!(get(p), Some(ScanVerdict::Dotfile), "{p}");
         }
         for p in [
             "/../.env",
@@ -417,7 +420,10 @@ mod tests {
             "/x/..%2f..%2fetc/passwd",
         ] {
             assert!(
-                matches!(get(p), Some(Verdict::Traversal) | Some(Verdict::Dotfile)),
+                matches!(
+                    get(p),
+                    Some(ScanVerdict::Traversal) | Some(ScanVerdict::Dotfile)
+                ),
                 "{p}: {:?}",
                 get(p)
             );
@@ -428,7 +434,7 @@ mod tests {
             "/app.old",
             "/settings.py.swp",
         ] {
-            assert_eq!(get(p), Some(Verdict::Leftover), "{p}");
+            assert_eq!(get(p), Some(ScanVerdict::Leftover), "{p}");
         }
         for p in [
             "/dump.sql",
@@ -437,7 +443,7 @@ mod tests {
             "/server.key",
             "/cert.pem",
         ] {
-            assert_eq!(get(p), Some(Verdict::SecretMaterial), "{p}");
+            assert_eq!(get(p), Some(ScanVerdict::SecretMaterial), "{p}");
         }
         for p in [
             "/phpmyadmin/",
@@ -454,10 +460,10 @@ mod tests {
             "/ecp/Current/exporttool/x.application",
             "/config.json",
         ] {
-            assert_eq!(get(p), Some(Verdict::DebugEndpoint), "{p}");
+            assert_eq!(get(p), Some(ScanVerdict::DebugEndpoint), "{p}");
         }
-        assert_eq!(get("/a%00b"), Some(Verdict::Malformed));
-        assert_eq!(inspect(&Method::TRACE, "/"), Some(Verdict::Trace));
+        assert_eq!(get("/a%00b"), Some(ScanVerdict::Malformed));
+        assert_eq!(inspect(&Method::TRACE, "/"), Some(ScanVerdict::Trace));
     }
 
     /// OFF-96: the dotfile rule matches a curated risk list, not every
@@ -477,7 +483,7 @@ mod tests {
             "/.terraform/terraform.tfstate",
             "/deep/nested/.git/config",
         ] {
-            assert_eq!(get(p), Some(Verdict::Dotfile), "{p}");
+            assert_eq!(get(p), Some(ScanVerdict::Dotfile), "{p}");
         }
     }
 

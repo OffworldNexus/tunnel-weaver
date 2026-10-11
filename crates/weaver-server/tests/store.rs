@@ -37,6 +37,7 @@ fn sample_config() -> Config {
         relay_ips: Vec::new(),
         setup_complete: false,
         email: None,
+        abuse: None,
     }
 }
 
@@ -103,19 +104,19 @@ async fn test_store_open_runs_migrations_and_is_idempotent() {
         let store = Store::open(&db_path).await.expect("open failed");
         let count: i64 = scalar(
             &store,
-            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN ('config', 'acme_account', 'domains', 'certificates', 'cert_events', 'seaql_migrations', 'person', 'machine', 'machine_key', 'service', 'usage', 'challenge')",
+            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN ('config', 'acme_account', 'domains', 'certificates', 'cert_events', 'seaql_migrations', 'person', 'machine', 'machine_key', 'service', 'usage', 'challenge', 'abuse_bucket')",
         )
         .await;
-        assert_eq!(count, 12);
-        assert_eq!(store.schema_version().await.expect("schema_version"), 1);
+        assert_eq!(count, 13);
+        assert_eq!(store.schema_version().await.expect("schema_version"), 2);
     }
 
     // Re-open existing database: should succeed and not re-apply migrations
     {
         let store = Store::open(&db_path).await.expect("re-open failed");
         let migration_count: i64 = scalar(&store, "SELECT count(*) FROM seaql_migrations").await;
-        assert_eq!(migration_count, 1);
-        assert_eq!(store.schema_version().await.expect("schema_version"), 1);
+        assert_eq!(migration_count, 2);
+        assert_eq!(store.schema_version().await.expect("schema_version"), 2);
     }
 }
 
@@ -300,6 +301,80 @@ async fn test_config_validation_rules() {
     assert!(
         Config::load(&store).await.is_ok(),
         "tunnel under admin must be allowed"
+    );
+}
+
+#[tokio::test]
+async fn test_config_validation_abuse_limits() {
+    use weaver_server::config::{AbuseConfig, BudgetConfig};
+
+    let temp = TempDir::new().expect("tempdir");
+    let store = Store::open(temp.path().join("abuse.db"))
+        .await
+        .expect("open failed");
+
+    // A coherent armed block loads.
+    let ok = Config {
+        abuse: Some(AbuseConfig {
+            enabled: true,
+            peer_host: BudgetConfig {
+                burst: 5,
+                refill_units: 5,
+                refill_per_secs: 60,
+            },
+            peer_network: BudgetConfig {
+                burst: 50,
+                refill_units: 50,
+                refill_per_secs: 60,
+            },
+            retry_after_cap_secs: 120,
+            bucket_ttl_secs: 3600,
+        }),
+        ..sample_config()
+    };
+    store.save_config(&ok).await.expect("save succeeded");
+    assert!(Config::load(&store).await.is_ok());
+
+    // A zero burst can never admit anything and is rejected.
+    let bad = Config {
+        abuse: Some(AbuseConfig {
+            peer_host: BudgetConfig {
+                burst: 0,
+                refill_units: 5,
+                refill_per_secs: 60,
+            },
+            ..ok.abuse.clone().unwrap()
+        }),
+        ..ok.clone()
+    };
+    store.save_config(&bad).await.expect("save succeeded");
+    match Config::load(&store).await {
+        Err(ConfigError::ValidationFailed(issues)) => {
+            assert!(
+                issues.iter().any(|i| i.contains("abuse.peer_host.burst")),
+                "expected a peer_host.burst issue, got: {issues:?}"
+            );
+        }
+        res => panic!("Expected ValidationFailed, got: {res:?}"),
+    }
+
+    // A disabled block is never rejected: its numbers are not in play.
+    let disabled = Config {
+        abuse: Some(AbuseConfig {
+            enabled: false,
+            peer_host: BudgetConfig {
+                burst: 0,
+                refill_units: 0,
+                refill_per_secs: 0,
+            },
+            ..ok.abuse.clone().unwrap()
+        }),
+        ..ok.clone()
+    };
+    store.save_config(&disabled).await.expect("save succeeded");
+    assert!(
+        Config::load(&store).await.is_ok(),
+        "a disabled abuse block must not be validated"
     );
 }
 
@@ -870,10 +945,10 @@ async fn test_migration_usage_round_trips() {
     let db_path = temp.path().join("migrate.db");
     let store = Store::open(&db_path).await.expect("open");
 
-    // Roll the single migration back, then re-apply. `m0001` creates the
-    // `usage` table along with every other table, so a full rebuild is what
-    // proves `down`/`up` are symmetric.
-    weaver_server::Migrator::down(store.db(), Some(1))
+    // Roll every migration back, then re-apply. `m0001` creates the `usage`
+    // table along with every other table, so a full rebuild is what proves
+    // `down`/`up` are symmetric.
+    weaver_server::Migrator::down(store.db(), Some(2))
         .await
         .expect("down");
     let usage_tables: i64 = scalar(
