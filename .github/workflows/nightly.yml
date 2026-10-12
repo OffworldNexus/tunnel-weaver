@@ -73,6 +73,27 @@ jobs:
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2
 
+      # The server embeds the account SPA at compile time, and
+      # `weaver-assets/build.rs` refuses to build without it, so the SPA must be
+      # built before any `cargo build` that compiles `weaver-server`.
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 12.4.1
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: frontend/pnpm-lock.yaml
+
+      - name: Build the account SPA
+        run: |
+          cd frontend
+          pnpm install --frozen-lockfile
+          pnpm run build
+
       - name: Build release binaries (weaver-server and weave)
         run: cargo build --release -p weaver-server -p weave
 
