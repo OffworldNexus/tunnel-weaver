@@ -263,7 +263,8 @@ impl AltchaConfig {
 /// The account plane is always served, so this block only tunes it. Field
 /// defaults encode the agreed policy: a 12-character minimum, Django-compatible
 /// Argon2id work parameters, a 24-hour verification link, a 60-second resend
-/// cooldown, a 1-hour post-verification completion window, and a 30-day session.
+/// cooldown, a 1-hour post-verification completion window, a 1-hour
+/// password-reset link, and a 30-day session.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AccountConfig {
     /// Minimum accepted password length.
@@ -287,6 +288,9 @@ pub struct AccountConfig {
     /// How long a verified signup may finish setting a password, in seconds.
     #[serde(default = "default_account_completion_ttl_secs")]
     pub completion_ttl_secs: u64,
+    /// Password-reset link lifetime, in seconds.
+    #[serde(default = "default_account_reset_ttl_secs")]
+    pub reset_ttl_secs: u64,
     /// Browser-session lifetime, in seconds.
     #[serde(default = "default_account_session_ttl_secs")]
     pub session_ttl_secs: u64,
@@ -333,6 +337,7 @@ impl Default for AccountConfig {
             verification_ttl_secs: default_account_verification_ttl_secs(),
             resend_cooldown_secs: default_account_resend_cooldown_secs(),
             completion_ttl_secs: default_account_completion_ttl_secs(),
+            reset_ttl_secs: default_account_reset_ttl_secs(),
             session_ttl_secs: default_account_session_ttl_secs(),
             cookie_secure: true,
             hibp_url: default_account_hibp_url(),
@@ -378,6 +383,11 @@ fn default_account_resend_cooldown_secs() -> u64 {
 
 /// Default completion window after verification: 1 hour.
 fn default_account_completion_ttl_secs() -> u64 {
+    3_600
+}
+
+/// Default password-reset link lifetime: 1 hour.
+fn default_account_reset_ttl_secs() -> u64 {
     3_600
 }
 
@@ -627,6 +637,7 @@ fn validate_account_config(account: &AccountConfig) -> Vec<String> {
         ("verification_ttl_secs", account.verification_ttl_secs),
         ("resend_cooldown_secs", account.resend_cooldown_secs),
         ("completion_ttl_secs", account.completion_ttl_secs),
+        ("reset_ttl_secs", account.reset_ttl_secs),
         ("session_ttl_secs", account.session_ttl_secs),
         ("sweep_interval_secs", account.sweep_interval_secs),
     ] {

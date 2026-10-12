@@ -16,7 +16,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use thiserror::Error;
 
-pub use template::{Joke, Otp, Verification, Welcome};
+pub use template::{Joke, Otp, Reset, Verification, Welcome};
 
 use crate::config::EmailConfig;
 

@@ -17,7 +17,7 @@ use sea_orm::{
 
 use super::entity::{
     account, browser_session, email_identity, email_verification, password_credential,
-    pending_registration, verification_token,
+    password_reset_token, pending_registration, verification_token,
 };
 use super::{Store, StoreError};
 
@@ -76,6 +76,27 @@ pub enum ActivationOutcome {
     /// no credential was written and the existing account is returned so the
     /// caller can offer login without disclosing anything earlier.
     ExistingAccount(account::Model),
+}
+
+/// Caller-supplied fields for a newly minted password-reset token.
+#[derive(Debug, Clone)]
+pub struct NewPasswordResetToken {
+    /// SHA-256 digest (hex) of the raw token; the raw value is never stored.
+    pub token_digest: String,
+    pub issued_at: i64,
+    /// When the emailed link stops working.
+    pub expires_at: i64,
+}
+
+/// Everything the atomic password reset needs. The token is consumed in the
+/// same transaction that retires the old credential and kills every session.
+#[derive(Debug, Clone)]
+pub struct ResetRequest<'a> {
+    /// The reset token to consume now.
+    pub token_id: i32,
+    /// Argon2id PHC-encoded hash for the replacement credential.
+    pub encoded_hash: &'a str,
+    pub now: i64,
 }
 
 impl Store {
@@ -227,6 +248,85 @@ impl Store {
             .exec(&self.db)
             .await?;
         Ok(())
+    }
+
+    // ----- password-reset tokens -----
+
+    /// Issues a fresh reset token for an account, revoking that account's
+    /// outstanding unconsumed tokens first so only the latest link works.
+    pub async fn password_reset_token_issue(
+        &self,
+        account_id: i32,
+        new: NewPasswordResetToken,
+    ) -> Result<password_reset_token::Model, StoreError> {
+        let txn = self.db.begin().await?;
+        password_reset_token::Entity::update_many()
+            .col_expr(
+                password_reset_token::Column::RevokedAt,
+                Expr::value(Some(new.issued_at)),
+            )
+            .filter(password_reset_token::Column::AccountId.eq(account_id))
+            .filter(password_reset_token::Column::ConsumedAt.is_null())
+            .filter(password_reset_token::Column::RevokedAt.is_null())
+            .exec(&txn)
+            .await?;
+        let token = password_reset_token::ActiveModel {
+            account_id: Set(account_id),
+            token_digest: Set(new.token_digest),
+            issued_at: Set(new.issued_at),
+            expires_at: Set(new.expires_at),
+            ..Default::default()
+        }
+        .insert(&txn)
+        .await?;
+        txn.commit().await?;
+        Ok(token)
+    }
+
+    /// Resolves a reset token by its stored digest.
+    pub async fn password_reset_token_by_digest(
+        &self,
+        token_digest: &str,
+    ) -> Result<Option<password_reset_token::Model>, StoreError> {
+        Ok(password_reset_token::Entity::find()
+            .filter(password_reset_token::Column::TokenDigest.eq(token_digest))
+            .one(&self.db)
+            .await?)
+    }
+
+    /// The most recently issued reset token for an account, used to enforce the
+    /// resend cooldown.
+    pub async fn password_reset_token_latest_for_account(
+        &self,
+        account_id: i32,
+    ) -> Result<Option<password_reset_token::Model>, StoreError> {
+        Ok(password_reset_token::Entity::find()
+            .filter(password_reset_token::Column::AccountId.eq(account_id))
+            .order_by_desc(password_reset_token::Column::IssuedAt)
+            .order_by_desc(password_reset_token::Column::Id)
+            .one(&self.db)
+            .await?)
+    }
+
+    /// Consumes a reset token at most once. Returns `false` when it was already
+    /// consumed, revoked, or expired.
+    pub async fn password_reset_token_consume(
+        &self,
+        token_id: i32,
+        now: i64,
+    ) -> Result<bool, StoreError> {
+        let result = password_reset_token::Entity::update_many()
+            .col_expr(
+                password_reset_token::Column::ConsumedAt,
+                Expr::value(Some(now)),
+            )
+            .filter(password_reset_token::Column::Id.eq(token_id))
+            .filter(password_reset_token::Column::ConsumedAt.is_null())
+            .filter(password_reset_token::Column::RevokedAt.is_null())
+            .filter(password_reset_token::Column::ExpiresAt.gt(now))
+            .exec(&self.db)
+            .await?;
+        Ok(result.rows_affected == 1)
     }
 
     // ----- email identities -----
@@ -381,6 +481,76 @@ impl Store {
 
     // ----- password credentials -----
 
+    /// Atomically applies a password reset.
+    ///
+    /// In one transaction: consume the reset token (single-use; a replayed,
+    /// revoked or expired token is refused), retire the account's current
+    /// credential, write the replacement, and invalidate **every** live session
+    /// so a reset signs the user out everywhere. The conditional consume keeps
+    /// this safe under concurrency: at most one caller can spend a given token.
+    pub async fn account_reset_password(
+        &self,
+        req: ResetRequest<'_>,
+    ) -> Result<account::Model, StoreError> {
+        let txn = self.db.begin().await?;
+
+        let consumed = password_reset_token::Entity::update_many()
+            .col_expr(
+                password_reset_token::Column::ConsumedAt,
+                Expr::value(Some(req.now)),
+            )
+            .filter(password_reset_token::Column::Id.eq(req.token_id))
+            .filter(password_reset_token::Column::ConsumedAt.is_null())
+            .filter(password_reset_token::Column::RevokedAt.is_null())
+            .filter(password_reset_token::Column::ExpiresAt.gt(req.now))
+            .exec(&txn)
+            .await?;
+        if consumed.rows_affected == 0 {
+            txn.rollback().await?;
+            return Err(StoreError::Conflict(
+                "reset token is already spent, revoked, or expired".into(),
+            ));
+        }
+
+        let token = password_reset_token::Entity::find_by_id(req.token_id)
+            .one(&txn)
+            .await?
+            .ok_or_else(|| StoreError::Conflict("reset token vanished after consume".into()))?;
+        let account_id = token.account_id;
+
+        // Retire the current credential, preserving the append-only history.
+        password_credential::Entity::update_many()
+            .col_expr(
+                password_credential::Column::RetiredAt,
+                Expr::value(Some(req.now)),
+            )
+            .filter(password_credential::Column::AccountId.eq(account_id))
+            .filter(password_credential::Column::RetiredAt.is_null())
+            .exec(&txn)
+            .await?;
+
+        password_credential::Entity::insert(password_credential::ActiveModel {
+            account_id: Set(account_id),
+            encoded_hash: Set(req.encoded_hash.to_string()),
+            created_at: Set(req.now),
+            retired_at: Set(None),
+            ..Default::default()
+        })
+        .exec_without_returning(&txn)
+        .await?;
+
+        // A reset ends every existing session ("signed out everywhere").
+        invalidate_sessions_for_account(&txn, account_id, req.now).await?;
+
+        let account = account::Entity::find_by_id(account_id)
+            .one(&txn)
+            .await?
+            .ok_or_else(|| StoreError::Conflict("account missing during reset".into()))?;
+
+        txn.commit().await?;
+        Ok(account)
+    }
+
     /// The current (non-retired) password credential for an account.
     pub async fn password_current_for(
         &self,
@@ -443,6 +613,18 @@ impl Store {
         Ok(result.rows_affected == 1)
     }
 
+    /// Invalidates every live session for an account; returns the count.
+    ///
+    /// Used by the reset flow: changing a password must not leave other devices
+    /// authenticated against the retired credential.
+    pub async fn session_invalidate_all_for_account(
+        &self,
+        account_id: i32,
+        now: i64,
+    ) -> Result<u64, StoreError> {
+        invalidate_sessions_for_account(&self.db, account_id, now).await
+    }
+
     /// Deletes sessions that expired before `cutoff`; returns the count.
     pub async fn session_sweep(&self, cutoff: i64) -> Result<u64, StoreError> {
         let result = browser_session::Entity::delete_many()
@@ -464,6 +646,19 @@ impl Store {
             .await?;
         Ok(result.rows_affected)
     }
+
+    /// Deletes reset tokens that expired unconsumed before `cutoff`.
+    ///
+    /// Consumed/revoked rows are deliberately kept as provenance, matching
+    /// `verification_token_sweep`.
+    pub async fn password_reset_token_sweep(&self, cutoff: i64) -> Result<u64, StoreError> {
+        let result = password_reset_token::Entity::delete_many()
+            .filter(password_reset_token::Column::ConsumedAt.is_null())
+            .filter(password_reset_token::Column::ExpiresAt.lt(cutoff))
+            .exec(&self.db)
+            .await?;
+        Ok(result.rows_affected)
+    }
 }
 
 /// Marks a pending registration complete inside a caller's transaction.
@@ -481,4 +676,22 @@ async fn mark_pending_complete<C: sea_orm::ConnectionTrait>(
         .exec(conn)
         .await?;
     Ok(())
+}
+
+/// Invalidates every live session for an account inside a caller's transaction.
+async fn invalidate_sessions_for_account<C: sea_orm::ConnectionTrait>(
+    conn: &C,
+    account_id: i32,
+    now: i64,
+) -> Result<u64, StoreError> {
+    let result = browser_session::Entity::update_many()
+        .col_expr(
+            browser_session::Column::InvalidatedAt,
+            Expr::value(Some(now)),
+        )
+        .filter(browser_session::Column::AccountId.eq(account_id))
+        .filter(browser_session::Column::InvalidatedAt.is_null())
+        .exec(conn)
+        .await?;
+    Ok(result.rows_affected)
 }

@@ -3,7 +3,7 @@
 	import { loadAltcha } from '#lib/account/altcha';
 
 	/** The signed purpose the challenge is bound to. */
-	export let purpose: 'login' | 'signup';
+	export let purpose: 'login' | 'signup' | 'reset';
 	/** Called with the solved ALTCHA payload from the `verified` event. */
 	export let onSolved: (payload: string) => void = () => {};
 	/** Called when a previously solved proof has expired. */
@@ -110,13 +110,13 @@
 		<span class="altcha-state__dot" aria-hidden="true"></span>
 		<span>
 			{#if status === 'ready'}
-				Proof ready.
+				Ready to go.
 			{:else if status === 'solving'}
-				Verifying you're well-intentioned…
+				Just a moment…
 			{:else if status === 'error'}
-				We couldn't verify the proof.
+				Something went wrong.
 			{:else}
-				Preparing verification…
+				One moment…
 			{/if}
 		</span>
 		{#if status === 'error'}

@@ -1,34 +1,43 @@
 /**
- * App-wide transient notices: network failures, session expiry, confirmations.
+ * App-wide transient notices, surfaced as toasts.
  *
- * Notices live in a store so any route can raise one through the single
- * `<Notice>` renderer mounted in the layout, without owning that UI itself.
- * Each notice carries a monotonic id so the list can be keyed and dismissed
- * individually rather than cleared wholesale.
+ * Backed by Ark UI's Toast primitive (`@ark-ui/svelte`), which owns the queue,
+ * auto-dismiss timers, stacking, pause-on-hover and accessible semantics, so we
+ * do not hand-roll any of that. Callers keep the small imperative API below;
+ * the renderer is `<Toaster>`, mounted once in the layout.
  */
-import { writable } from 'svelte/store';
+import { createToaster } from '@ark-ui/svelte';
+import { tick } from 'svelte';
 
 export type NoticeKind = 'error' | 'success' | 'info';
 
-export interface Notice {
-	id: number;
-	kind: NoticeKind;
-	message: string;
-}
+/**
+ * The single toaster instance. Notices stack at the top of the account
+ * pages (where the content begins) and their countdown pauses while the tab is
+ * hidden, so a notice is never missed by an away user.
+ */
+export const toaster = createToaster({
+	placement: 'top',
+	overlap: true,
+	gap: 10,
+	// Without this, Ark UI's default per-type durations (2s for success) make
+	// confirmations too easy to miss.
+	duration: 6000,
+	removeDelay: 220,
+	pauseOnPageIdle: true,
+	offsets: '14px'
+});
 
-export const notices = writable<Notice[]>([]);
-
-let counter = 0;
-
-/** Push a notice onto the stack; the id lets the renderer key and dismiss it. */
+/**
+ * Raises a toast.
+ *
+ * Deferred by a tick: Ark UI's store flushes synchronously, and a page that
+ * raises a notice during its own initialisation (e.g. the signed-out notice on
+ * the sign-in page) would otherwise write to the store mid-render, re-entering
+ * Svelte's flush until the stack overflows.
+ */
 export function notify(kind: NoticeKind, message: string): void {
-	const id = ++counter;
-	notices.update((list) => [...list, { id, kind, message }]);
-}
-
-/** Remove a single notice by id. */
-export function dismiss(id: number): void {
-	notices.update((list) => list.filter((notice) => notice.id !== id));
+	void tick().then(() => toaster.create({ type: kind, title: message }));
 }
 
 /** Shared copy for an unreachable relay, so the wording stays consistent. */

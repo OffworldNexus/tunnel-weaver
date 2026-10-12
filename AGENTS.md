@@ -2,7 +2,7 @@
 
 ## Testing
 
-- Full suite (fast): `cargo test --workspace` (~10s warm, ~31s after a dep change, timeout 120000ms)
+- Full suite (fast): `cargo test --workspace` (~56s warm, timeout 180000ms)
 - CI-strength property tests: `PROPTEST_CASES=2000 PROPTEST_RNG_SEED=67 cargo test -p weaver-mux` (~70s, timeout 300000ms)
 - Ignored e2e suite: `cargo test --workspace -- --ignored` (~9s warm, timeout 60000ms)
 - Format check: `cargo fmt --check` (~1s, timeout 30000ms)
@@ -10,13 +10,19 @@
 - Dependency policy: `cargo deny check` (~2s, timeout 60000ms)
 - Always: quiet on success; dump failures only.
 - Fuzz crate compiles: `(cd fuzz && cargo check)` (~1s, timeout 60000ms)
+- SPA build (the account app's gate): `cd frontend && pnpm run build` (~3s,
+  timeout 180000ms) — must exit 0 and externalize the bootstrap (no inline
+  `<script>` in `build/index.html`).
+- Browser BDD (Cucumber + Playwright against the real server):
+  `cd e2e && pnpm test` (~21s, timeout 300000ms); one-time
+  `pnpm exec playwright install chromium`. It rebuilds
+  `weaver-server --example e2e_server` first, so stop any running copy of that
+  binary (a live one blocks the relink with `ETXTBSY`).
 - Conformance (nightly / PR to develop only, needs the DO droplet): h2spec
   and Autobahn run in `.github/workflows/nightly.yml`; allow-lists live in
   `ci/conformance/*-allowlist.txt`, one case per line with a justification.
-- Last measured: 2026-10-06, full suite 441 passed/0 failed (ignored suite
-  skipped; the `#[ignore = "e2e"]` cases are the Pebble wildcard/admin orders
-  and the Resend send, which skips unless `RESEND_API_KEY` and `WEAVER_E2E_EMAIL`
-  are set). (Prior: 2026-10-04, 388 passed.)
+- Last measured: 2026-10-12, full suite 546 passed/0 failed/4 ignored (56s),
+  SPA build 3s, e2e 8 scenarios passed (21s). (Prior: 2026-10-06, 441 passed.)
 
 ## Crate notes
 

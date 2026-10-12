@@ -25,7 +25,8 @@
 
 	<p class="lede">
 		An account already exists for {#if email}<strong>{email}</strong>{:else}that address{/if}. Sign
-		in to continue, or reset your password if you need a new one.
+		in to continue, or <a href={href('/forgot-password')}>reset your password</a> if you need a new
+		one.
 	</p>
 
 	<div class="actions">

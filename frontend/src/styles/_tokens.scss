@@ -13,7 +13,10 @@
 	--tw-well: #fefaf3;
 	--tw-text: #0b0604;
 	--tw-muted: #524943;
-	--tw-border: #cdc6bf;
+	/* The edge/border role. Figma's `--border` is mode-invariant (#897e76 in
+	   both themes); the lighter #cdc6bf is Figma's `muted` value in dark mode,
+	   which `--tw-muted` already carries. */
+	--tw-border: #897e76;
 	--tw-accent: #772a0a;
 	--tw-success: #4d5818;
 	--tw-danger: #a44039;

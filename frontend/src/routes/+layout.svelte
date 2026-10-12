@@ -1,7 +1,7 @@
 <script lang="ts">
 	import '../styles/global.scss';
 	import { config, ensureConfig } from '#lib/account/config';
-	import Notice from '#lib/ui/Notice.svelte';
+	import Toaster from '#lib/ui/Toaster.svelte';
 
 	// Warm the constants endpoint as soon as the shell mounts.
 	ensureConfig().catch(() => {
@@ -16,7 +16,7 @@
 </svelte:head>
 
 <a class="skip-link" href="#main">Skip to content</a>
-<Notice />
+<Toaster />
 
 <slot />
 

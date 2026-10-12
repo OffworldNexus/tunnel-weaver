@@ -125,6 +125,18 @@ impl AccountRuntime {
         )
     }
 
+    /// Builds the single-use password-reset link for a raw token.
+    ///
+    /// The token travels in the URL **fragment**, not the query string, so it is
+    /// never sent to the server and cannot leak through HTTP access logs (nor a
+    /// `Referer` header). The SPA reads it from `location.hash`.
+    pub fn reset_url(&self, raw_token: &str) -> String {
+        format!(
+            "{}/reset#token={raw_token}",
+            self.base_url.trim_end_matches('/')
+        )
+    }
+
     /// The absolute HTTPS URL of the signed-in account shell.
     pub fn account_url(&self) -> String {
         format!("{}/app", self.base_url.trim_end_matches('/'))

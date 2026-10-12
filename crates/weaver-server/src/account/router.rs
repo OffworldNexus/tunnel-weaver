@@ -28,9 +28,11 @@ use weaver_abuse::AltchaError;
 
 use crate::account::AccountRuntime;
 use crate::account::session::{self, CSRF_COOKIE, CSRF_HEADER, SESSION_COOKIE};
-use crate::email::{Mailbox, Verification, Welcome};
+use crate::email::{Mailbox, Reset, Verification, Welcome};
+use crate::store::StoreError;
 use crate::store::account::{
-    ActivationOutcome, ActivationRequest, NewPendingRegistration, NewVerificationToken,
+    ActivationOutcome, ActivationRequest, NewPasswordResetToken, NewPendingRegistration,
+    NewVerificationToken, ResetRequest,
 };
 use crate::store::entity::pending_registration;
 
@@ -42,6 +44,8 @@ const PURPOSE_REGISTRATION_COMPLETION: &str = "registration-completion";
 const ALTCHA_SIGNUP: &str = "signup";
 /// ALTCHA purpose for a login attempt.
 const ALTCHA_LOGIN: &str = "login";
+/// ALTCHA purpose for requesting a password reset.
+const ALTCHA_RESET: &str = "reset";
 
 /// Builds the account router with its shared state applied.
 pub fn router(runtime: Arc<AccountRuntime>) -> Router {
@@ -52,6 +56,9 @@ pub fn router(runtime: Arc<AccountRuntime>) -> Router {
         .route("/api/account/resend", post(resend))
         .route("/api/account/verify", post(verify_link))
         .route("/api/account/complete", post(complete))
+        .route("/api/account/reset/request", post(reset_request))
+        .route("/api/account/reset/check", post(reset_check))
+        .route("/api/account/reset/complete", post(reset_complete))
         .route("/api/account/login", post(login))
         .route("/api/account/me", get(me))
         .route("/api/account/logout", post(logout))
@@ -86,6 +93,24 @@ struct CompleteRequest {
 }
 
 #[derive(Deserialize)]
+struct ResetRequestBody {
+    email: String,
+    #[serde(default)]
+    altcha: String,
+}
+
+#[derive(Deserialize)]
+struct ResetCheckRequest {
+    token: String,
+}
+
+#[derive(Deserialize)]
+struct ResetCompleteRequest {
+    token: String,
+    password: String,
+}
+
+#[derive(Deserialize)]
 struct LoginRequest {
     email: String,
     password: String,
@@ -101,13 +126,17 @@ struct ChallengeQuery {
 
 // ----- handlers -------------------------------------------------------------
 
-/// `GET /api/account/altcha/challenge?purpose=signup|login` — issue a challenge
-/// for the relay's own internal client so the SPA never needs a client key.
+/// `GET /api/account/altcha/challenge?purpose=signup|login|reset` — issue a
+/// challenge for the relay's own internal client so the SPA never needs a client
+/// key.
 async fn altcha_challenge(
     State(rt): State<Arc<AccountRuntime>>,
     Query(params): Query<ChallengeQuery>,
 ) -> Response {
-    if !matches!(params.purpose.as_str(), ALTCHA_SIGNUP | ALTCHA_LOGIN) {
+    if !matches!(
+        params.purpose.as_str(),
+        ALTCHA_SIGNUP | ALTCHA_LOGIN | ALTCHA_RESET
+    ) {
         return err(StatusCode::BAD_REQUEST, "unknown proof-of-work purpose");
     }
     match rt
@@ -421,6 +450,218 @@ async fn complete(
     }
 }
 
+/// `POST /api/account/reset/request` — email a reset link, if an account exists.
+///
+/// The response is **identical** whether or not the address belongs to an
+/// account, and the work on the response path is identical too: we always
+/// resolve the address, always mint and digest a token, and always spend the
+/// same Argon2 verification.
+///
+/// Everything that only happens for a real account — the cooldown read, the
+/// token write, and above all the email-provider round-trip — is pushed onto a
+/// detached task. Awaiting the send here would make the response time (hundreds
+/// of milliseconds) a dead giveaway of whether the address has an account,
+/// defeating the equalizer above. So neither the body nor the timing can be
+/// used to probe for accounts.
+async fn reset_request(
+    State(rt): State<Arc<AccountRuntime>>,
+    headers: HeaderMap,
+    Json(req): Json<ResetRequestBody>,
+) -> Response {
+    if !origin_ok(&headers, &rt.base_url) {
+        return err(StatusCode::FORBIDDEN, "request refused");
+    }
+    let email = req.email.trim();
+    if !crate::email::is_valid_address(email) {
+        return err(StatusCode::BAD_REQUEST, "a valid email is required");
+    }
+    if let Some(response) = consume_altcha(&rt, &req.altcha, ALTCHA_RESET).await {
+        return response;
+    }
+    let now = unix_now();
+    let lookup = normalize_email(email);
+
+    // Resolve without disclosing. Both branches below do the same amount of
+    // work so an observer cannot learn whether the address exists.
+    let identity = rt.store.email_identity_find(&lookup).await.ok().flatten();
+    let account = match &identity {
+        Some(identity) => rt
+            .store
+            .account_by_id(identity.account_id)
+            .await
+            .ok()
+            .flatten(),
+        None => None,
+    };
+
+    // Mint a token and spend the Argon2 verification regardless of the outcome;
+    // the results are discarded on the no-account path. The verify mirrors
+    // `login`'s dummy-hash technique purely to equalize timing.
+    let raw = session::new_token();
+    let digest = session::token_hash(&raw);
+    let _ = rt.passwords.verify(email, &rt.dummy_hash);
+
+    // The account-only half runs detached, off the response path, so the reply
+    // is not delayed by (and does not reveal) a database write or an email
+    // send. `issue_and_send_reset` owns its own logging.
+    if let (Some(account), Some(identity)) = (account, identity) {
+        let rt = Arc::clone(&rt);
+        tokio::spawn(async move {
+            issue_and_send_reset(&rt, &account, &identity.email, &raw, digest, now).await;
+        });
+    }
+
+    // Identical body whether or not the address already belongs to an account.
+    json_ok(json!({ "status": "check_email" }))
+}
+
+/// The account-only half of a reset request, run detached from the response.
+///
+/// Applies the per-account cooldown, issues the single-use token and sends the
+/// link. Nothing here changes the HTTP response, which the caller has already
+/// sent: a cooldown or a failure must stay indistinguishable from any other
+/// request, so every outcome is only logged.
+async fn issue_and_send_reset(
+    rt: &AccountRuntime,
+    account: &crate::store::entity::account::Model,
+    email: &str,
+    raw: &str,
+    digest: String,
+    now: i64,
+) {
+    if account.state != "active" {
+        return;
+    }
+    let cooling_down = matches!(
+        rt.store
+            .password_reset_token_latest_for_account(account.id)
+            .await
+            .ok()
+            .flatten(),
+        Some(latest) if now - latest.issued_at < rt.config.resend_cooldown_secs as i64
+    );
+    if cooling_down {
+        return;
+    }
+    match rt
+        .store
+        .password_reset_token_issue(
+            account.id,
+            NewPasswordResetToken {
+                token_digest: digest,
+                issued_at: now,
+                expires_at: now + rt.config.reset_ttl_secs as i64,
+            },
+        )
+        .await
+    {
+        Ok(_) => {
+            if let Err(error) = send_reset(rt, &account.name, email, raw).await {
+                tracing::warn!(%error, "password reset email was not sent");
+            }
+        }
+        // A persistence failure must not disclose anything either.
+        Err(error) => {
+            tracing::warn!(%error, "password reset token was not issued");
+        }
+    }
+}
+
+/// `POST /api/account/reset/check` — resolve a reset link without consuming it.
+///
+/// Lets the "choose a new password" page render the verified address and detect
+/// a dead link before the user types anything. Never consumes the token.
+async fn reset_check(
+    State(rt): State<Arc<AccountRuntime>>,
+    headers: HeaderMap,
+    Json(req): Json<ResetCheckRequest>,
+) -> Response {
+    if !origin_ok(&headers, &rt.base_url) {
+        return err(StatusCode::FORBIDDEN, "request refused");
+    }
+    let now = unix_now();
+    let digest = session::token_hash(&req.token);
+    let token = rt
+        .store
+        .password_reset_token_by_digest(&digest)
+        .await
+        .ok()
+        .flatten()
+        .filter(|t| t.consumed_at.is_none() && t.revoked_at.is_none() && t.expires_at > now);
+    let Some(token) = token else {
+        return json_ok(json!({ "valid": false }));
+    };
+    match rt
+        .store
+        .email_identity_for_account(token.account_id)
+        .await
+        .ok()
+        .flatten()
+    {
+        Some(identity) => json_ok(json!({ "valid": true, "email": identity.email })),
+        None => json_ok(json!({ "valid": false })),
+    }
+}
+
+/// `POST /api/account/reset/complete` — set a new password from a reset link.
+///
+/// Consumes the token, replaces the credential and invalidates every session in
+/// one store transaction. Like `/complete`, it requires no ALTCHA (the token is
+/// the proof) and writes no session — the user signs in again afterwards.
+async fn reset_complete(
+    State(rt): State<Arc<AccountRuntime>>,
+    headers: HeaderMap,
+    Json(req): Json<ResetCompleteRequest>,
+) -> Response {
+    if !origin_ok(&headers, &rt.base_url) {
+        return err(StatusCode::FORBIDDEN, "request refused");
+    }
+    let now = unix_now();
+    let digest = session::token_hash(&req.token);
+    let Some(token) = rt
+        .store
+        .password_reset_token_by_digest(&digest)
+        .await
+        .ok()
+        .flatten()
+    else {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "this link is invalid or has already been used",
+        );
+    };
+    if token.consumed_at.is_some() || token.revoked_at.is_some() || token.expires_at <= now {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "this link has expired or has already been used",
+        );
+    }
+
+    if let Err(error) = rt.passwords.validate(&req.password).await {
+        return password_error_response(&rt, error);
+    }
+    let Ok(encoded_hash) = rt.passwords.hash(&req.password) else {
+        return err(StatusCode::SERVICE_UNAVAILABLE, "temporarily unavailable");
+    };
+
+    match rt
+        .store
+        .account_reset_password(ResetRequest {
+            token_id: token.id,
+            encoded_hash: &encoded_hash,
+            now,
+        })
+        .await
+    {
+        Ok(_) => json_ok(json!({ "outcome": "reset" })),
+        Err(StoreError::Conflict(_)) => err(
+            StatusCode::BAD_REQUEST,
+            "this link has expired or has already been used",
+        ),
+        Err(_) => err(StatusCode::SERVICE_UNAVAILABLE, "temporarily unavailable"),
+    }
+}
+
 /// `POST /api/account/login` — verify credentials and start a session.
 async fn login(
     State(rt): State<Arc<AccountRuntime>>,
@@ -666,6 +907,22 @@ async fn send_welcome(
     Ok(())
 }
 
+/// Composes and sends the password-reset email for an already-persisted token.
+/// `raw` is the plaintext token the recipient opens; it is never logged here.
+async fn send_reset(rt: &AccountRuntime, name: &str, email: &str, raw: &str) -> Result<(), String> {
+    let Some(mailer) = &rt.mailer else {
+        return Err("email is not configured".into());
+    };
+    let to = Mailbox::parse(email, Some(name.to_string())).map_err(|e| e.to_string())?;
+    let template = Reset {
+        reset_url: rt.reset_url(raw),
+        expires_in: human_duration(rt.config.reset_ttl_secs),
+    };
+    let email = mailer.compose(to, &template).map_err(|e| e.to_string())?;
+    mailer.send(&email).await.map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 /// Maps a password-policy failure onto a safe, user-facing response.
 fn password_error_response(
     rt: &AccountRuntime,
@@ -775,12 +1032,23 @@ fn normalize_email(email: &str) -> String {
     email.trim().to_lowercase()
 }
 
-/// A short human phrase for a lifetime, used in email copy.
+/// A short human phrase for a lifetime, used in email copy. Singular forms are
+/// used for exactly one unit (`"1 hour"`, not `"1 hours"`).
 fn human_duration(secs: u64) -> String {
     if secs >= 3600 && secs.is_multiple_of(3600) {
-        format!("{} hours", secs / 3600)
+        let hours = secs / 3600;
+        if hours == 1 {
+            "1 hour".to_string()
+        } else {
+            format!("{hours} hours")
+        }
     } else if secs >= 60 && secs.is_multiple_of(60) {
-        format!("{} minutes", secs / 60)
+        let minutes = secs / 60;
+        if minutes == 1 {
+            "1 minute".to_string()
+        } else {
+            format!("{minutes} minutes")
+        }
     } else {
         format!("{secs} seconds")
     }

@@ -281,6 +281,9 @@ pub async fn run_server(
                         if let Err(err) = store.verification_token_sweep(cutoff).await {
                             warn!(error = %err, "verification token sweep failed");
                         }
+                        if let Err(err) = store.password_reset_token_sweep(cutoff).await {
+                            warn!(error = %err, "password reset token sweep failed");
+                        }
                         if let Err(err) = store.session_sweep(cutoff).await {
                             warn!(error = %err, "session sweep failed");
                         }

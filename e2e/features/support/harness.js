@@ -184,3 +184,42 @@ export async function latestVerificationLink() {
       `${captured.map((message) => JSON.stringify(message.subject)).join(', ') || '<none>'}`
   );
 }
+
+/**
+ * Every `/reset#token=…` link captured so far, oldest first. The token lives in
+ * the URL *fragment* (WVR-41: it must never appear as a query parameter), so
+ * the pattern only matches the fragment form.
+ */
+const RESET_LINK_PATTERN = /https:\/\/localhost:\d+\/reset#token=[0-9a-f]+/g;
+
+/** All captured password-reset links. */
+export async function resetLinks() {
+  const captured = await messages();
+  const links = [];
+  for (const message of captured) {
+    const haystack = `${message.text}\n${message.html}`;
+    links.push(...(haystack.match(RESET_LINK_PATTERN) ?? []));
+  }
+  return links;
+}
+
+/**
+ * The most recent `/reset#token=…` link. The reset email is sent off the
+ * response path (to keep the request timing-blind), so this polls the mailbox
+ * instead of assuming the message has already been captured.
+ */
+export async function latestResetLink({ timeoutMs = 20_000 } = {}) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const links = await resetLinks();
+    if (links.length > 0) return links[links.length - 1];
+    if (Date.now() >= deadline) {
+      const captured = await messages();
+      throw new Error(
+        `No reset link found among ${captured.length} captured message(s): ` +
+          `${captured.map((message) => JSON.stringify(message.subject)).join(', ') || '<none>'}`
+      );
+    }
+    await delay(250);
+  }
+}

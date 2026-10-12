@@ -333,8 +333,95 @@ impl EmailTemplate for Verification {
     }
 }
 
-// --- The welcome template (WVR-36) -----------------------------------------
+// --- The password-reset template (WVR-41) ----------------------------------
 
+/// `reset.mjml`: the choose-a-new-password body.
+#[derive(Template)]
+#[template(path = "email/reset.mjml", escape = "html", ext = "mjml")]
+struct ResetMjml<'a> {
+    heading: &'a str,
+    intro: &'a str,
+    reset_url: &'a str,
+    expiry: &'a str,
+}
+
+/// `reset.txt`: the authored plain-text twin.
+#[derive(Template)]
+#[template(path = "email/reset.txt", escape = "none", ext = "txt")]
+struct ResetTxt<'a> {
+    heading: &'a str,
+    intro: &'a str,
+    reset_url: &'a str,
+    expiry: &'a str,
+    support_url: &'a str,
+}
+
+/// English copy for the reset template.
+const RESET_SUBJECT: &str = "Reset your password";
+const RESET_PREVIEW: &str = "Choose a new password for your Tunnel Weaver account.";
+const RESET_HEADING: &str = "Reset your password";
+const RESET_INTRO: &str =
+    "We received a request to reset your Tunnel Weaver password. Choose a new one to continue.";
+
+/// The password-reset email. `expires_in` is a short human phrase supplied by
+/// the caller (e.g. `"1 hour"`) so the copy always matches the token lifetime
+/// rather than duplicating it as a constant.
+#[derive(Debug, Clone)]
+pub struct Reset {
+    /// Absolute HTTPS link the recipient opens to choose a new password. The
+    /// raw token travels in the URL fragment, so it never reaches HTTP logs.
+    pub reset_url: String,
+    /// Human phrase describing the token lifetime.
+    pub expires_in: String,
+}
+
+impl Reset {
+    /// Stable template id.
+    pub const ID: &'static str = "reset";
+}
+
+impl EmailTemplate for Reset {
+    fn id(&self) -> &'static str {
+        Self::ID
+    }
+
+    fn render(&self, env: &TemplateEnv) -> Result<Rendered, RenderError> {
+        if !crate::email::is_trusted_https(&self.reset_url) {
+            return Err(RenderError::UntrustedUrl(self.reset_url.clone()));
+        }
+        let expiry = format!(
+            "This link expires in {}. If you didn't request a password reset, you can ignore this email.",
+            self.expires_in
+        );
+        let mjml_source = ResetMjml {
+            heading: RESET_HEADING,
+            intro: RESET_INTRO,
+            reset_url: &self.reset_url,
+            expiry: &expiry,
+        }
+        .render()
+        .map_err(|e| RenderError::Template(e.to_string()))?;
+        let html = render_base(RESET_SUBJECT, RESET_PREVIEW, &mjml_source, &env.support_url)?;
+
+        let text = ResetTxt {
+            heading: RESET_HEADING,
+            intro: RESET_INTRO,
+            reset_url: &self.reset_url,
+            expiry: &expiry,
+            support_url: &env.support_url,
+        }
+        .render()
+        .map_err(|e| RenderError::Template(e.to_string()))?;
+
+        Ok(Rendered {
+            subject: RESET_SUBJECT.to_string(),
+            text,
+            html,
+        })
+    }
+}
+
+// --- The welcome template (WVR-36) -----------------------------------------
 /// `welcome.mjml`: the account-ready body.
 #[derive(Template)]
 #[template(path = "email/welcome.mjml", escape = "html", ext = "mjml")]

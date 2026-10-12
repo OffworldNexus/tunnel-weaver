@@ -267,6 +267,11 @@ pub async fn handle_https_request(
             ViewId::ACCOUNT_LOGIN
         } else if surface.host == Host::Admin && path == "/api/account/resend" {
             ViewId::ACCOUNT_RESEND
+        } else if surface.host == Host::Admin && path == "/api/account/reset/request" {
+            // The reset request is an unauthenticated, email-keyed, enumeration-safe
+            // action: exactly the same situation as a verification resend, so it
+            // shares that budget rather than minting a new one.
+            ViewId::ACCOUNT_RESEND
         } else {
             ViewId::RELAY_WEB
         };
