@@ -3,11 +3,12 @@
   "private": true,
   "version": "0.0.0",
   "type": "module",
+  "packageManager": "pnpm@12.4.1",
   "description": "End-to-end BDD suite (Cucumber + Playwright) for the Tunnel Weaver account relay.",
   "scripts": {
-    "build:spa": "npm --prefix ../frontend ci && npm --prefix ../frontend run build",
+    "build:spa": "pnpm -C ../frontend install --frozen-lockfile && pnpm -C ../frontend run build",
     "build:example": "cargo build -p weaver-server --example e2e_server",
-    "test": "npm run build:example && cucumber-js",
+    "test": "pnpm run build:example && cucumber-js",
     "test:ci": "cucumber-js --format progress"
   },
   "devDependencies": {

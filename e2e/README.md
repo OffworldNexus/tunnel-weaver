@@ -27,35 +27,36 @@ The TLS certificate is self-signed, so Playwright runs with
 
 ## Prerequisites
 
-- Node.js 20+ and npm
+- Node.js 20+ and pnpm (pinned to 12.4.1 via `packageManager`;
+  `corepack enable` supplies it)
 - A Rust toolchain that can build the workspace
 - The account SPA built **before** the example, because the SPA is embedded into
   the server binary at compile time (`weaver-assets` `build.rs` reads
   `frontend/build`):
 
   ```bash
-  npm run build:spa        # cd ../frontend && npm ci && npm run build
+  pnpm run build:spa       # pnpm -C ../frontend install --frozen-lockfile && pnpm -C ../frontend run build
   ```
 
 ## Run it
 
 ```bash
 cd e2e
-npm install
-npx playwright install chromium        # add --with-deps on a bare Linux image
+pnpm install
+pnpm exec playwright install chromium  # add --with-deps on a bare Linux image
 
 # build the harness example, then run the suite
-npm test
+pnpm test
 ```
 
 Other scripts:
 
-| Command              | What it does                                              |
-| -------------------- | --------------------------------------------------------- |
-| `npm test`           | Build the `e2e_server` example, then run Cucumber.        |
-| `npm run test:ci`    | Run Cucumber only (assumes the example is already built). |
-| `npm run build:spa`  | Build the SvelteKit SPA into `frontend/build`.            |
-| `npm run build:example` | `cargo build -p weaver-server --example e2e_server`.   |
+| Command                | What it does                                              |
+| ---------------------- | --------------------------------------------------------- |
+| `pnpm test`            | Build the `e2e_server` example, then run Cucumber.        |
+| `pnpm run test:ci`     | Run Cucumber only (assumes the example is already built). |
+| `pnpm run build:spa`   | Build the SvelteKit SPA into `frontend/build`.            |
+| `pnpm run build:example` | `cargo build -p weaver-server --example e2e_server`.   |
 
 The World prefers the prebuilt binary at
 `target/debug/examples/e2e_server`; if it is missing, it falls back to
