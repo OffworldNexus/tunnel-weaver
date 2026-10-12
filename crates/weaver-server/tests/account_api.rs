@@ -154,6 +154,9 @@ struct Reply {
     status: StatusCode,
     headers: HeaderMap,
     body: serde_json::Value,
+    /// The body's byte length, before any JSON parsing (so binary and
+    /// compressed bodies can still be compared by size).
+    len: usize,
 }
 
 impl Reply {
@@ -207,6 +210,7 @@ async fn call(
         status,
         headers,
         body: parsed,
+        len: bytes.len(),
     }
 }
 
@@ -886,6 +890,84 @@ async fn reset_revokes_every_existing_session() {
     )
     .await;
     assert_eq!(fresh.status, StatusCode::OK, "{:?}", fresh.body);
+}
+
+/// A static asset is served in the pre-compressed variant the client accepts
+/// (built at compile time), and the shell negotiates too — so a browser
+/// downloads the embedded app and the ALTCHA widget compressed.
+#[tokio::test]
+async fn static_assets_are_served_pre_compressed() {
+    let fixture = setup().await;
+    // The widget asset has a stable (unversioned) path, so the test does not
+    // depend on this build's content hashes.
+    let path = "/assets/altcha/altcha.js";
+
+    let identity = call(&fixture.router, "GET", path, &[], None).await;
+    assert_eq!(identity.status, StatusCode::OK);
+    assert!(
+        identity.headers.get(header::CONTENT_ENCODING).is_none(),
+        "no Accept-Encoding means the identity bytes"
+    );
+    assert_eq!(
+        identity.headers.get(header::VARY).unwrap(),
+        "accept-encoding",
+        "a compressible asset must vary on the encoding"
+    );
+
+    let gzip = call(
+        &fixture.router,
+        "GET",
+        path,
+        &[("accept-encoding", "gzip, deflate, br".to_string())],
+        None,
+    )
+    .await;
+    assert_eq!(gzip.status, StatusCode::OK);
+    assert_eq!(gzip.headers.get(header::CONTENT_ENCODING).unwrap(), "gzip");
+    assert!(
+        gzip.len < identity.len,
+        "gzip ({}) should be smaller than identity ({})",
+        gzip.len,
+        identity.len
+    );
+
+    let zstd = call(
+        &fixture.router,
+        "GET",
+        path,
+        &[("accept-encoding", "gzip, zstd".to_string())],
+        None,
+    )
+    .await;
+    assert_eq!(zstd.status, StatusCode::OK);
+    assert_eq!(
+        zstd.headers.get(header::CONTENT_ENCODING).unwrap(),
+        "zstd",
+        "zstd wins when the client offers both"
+    );
+    assert!(
+        zstd.len <= gzip.len,
+        "zstd ({}) should be at least as small as gzip ({})",
+        zstd.len,
+        gzip.len
+    );
+
+    // The SPA shell (served for every deep link) negotiates as well, and stays
+    // uncached so a deploy is picked up immediately.
+    let shell = call(
+        &fixture.router,
+        "GET",
+        "/reset",
+        &[("accept-encoding", "zstd".to_string())],
+        None,
+    )
+    .await;
+    assert_eq!(shell.status, StatusCode::OK);
+    assert_eq!(shell.headers.get(header::CONTENT_ENCODING).unwrap(), "zstd");
+    assert_eq!(
+        shell.headers.get(header::CACHE_CONTROL).unwrap(),
+        "no-store"
+    );
 }
 
 /// An expired reset link is refused at serve time (the store also sweeps the

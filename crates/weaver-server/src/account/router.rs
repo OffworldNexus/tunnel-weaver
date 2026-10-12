@@ -752,7 +752,7 @@ async fn logout(State(rt): State<Arc<AccountRuntime>>, headers: HeaderMap) -> Re
 ///
 /// The app owns the admin host root, so `/` is the landing page and `_app/…`
 /// are its assets. Legacy `/account/…` links redirect to the root equivalent.
-async fn spa(State(_rt): State<Arc<AccountRuntime>>, uri: Uri) -> Response {
+async fn spa(State(_rt): State<Arc<AccountRuntime>>, headers: HeaderMap, uri: Uri) -> Response {
     let path = uri.path().trim_start_matches('/');
 
     // Unknown API paths must not fall through to the SPA shell.
@@ -776,33 +776,32 @@ async fn spa(State(_rt): State<Arc<AccountRuntime>>, uri: Uri) -> Response {
 
     // The vendored ALTCHA widget. Both a stable path (`assets/altcha/altcha.js`)
     // and the versioned demo path (`assets/altcha/<version>/altcha.js`) resolve
-    // to the same embedded bytes.
+    // to the same embedded bytes. The admin path is unversioned, so it is only
+    // revalidated, never cached immutably.
     if let Some(rest) = path.strip_prefix("assets/altcha/") {
         let candidate = weaver_assets::altcha_asset(rest).or_else(|| {
             rest.split_once('/')
                 .and_then(|(_, tail)| weaver_assets::altcha_asset(tail))
         });
-        if let Some((bytes, content_type)) = candidate {
-            return asset_response(bytes, content_type, false);
+        if let Some(asset) = candidate {
+            return asset_response(&headers, &asset, CACHE_REVALIDATE);
         }
         return err(StatusCode::NOT_FOUND, "not found");
     }
 
-    if let Some((bytes, content_type)) = weaver_assets::spa_asset(path) {
-        // Hashed assets are immutable; the shell is not.
-        let immutable = path.starts_with("_app/immutable/");
-        return asset_response(bytes, content_type, immutable);
+    if let Some(asset) = weaver_assets::spa_asset(path) {
+        // Content-hashed assets are immutable; the unhashed ones are not.
+        let cache = if path.starts_with("_app/immutable/") {
+            CACHE_IMMUTABLE
+        } else {
+            CACHE_REVALIDATE
+        };
+        return asset_response(&headers, &asset, cache);
     }
 
-    // History-route deep links and the root return the shell.
-    let mut response = Response::new(axum::body::Body::from(weaver_assets::spa_index().to_vec()));
-    let headers = response.headers_mut();
-    headers.insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("text/html; charset=utf-8"),
-    );
-    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-    response
+    // History-route deep links and the root return the shell, never stored so a
+    // deploy is picked up immediately.
+    asset_response(&headers, &weaver_assets::spa_index(), CACHE_NO_STORE)
 }
 
 // ----- helpers --------------------------------------------------------------
@@ -1011,19 +1010,44 @@ fn with_cookie(mut response: Response, cookie: String) -> Response {
     response
 }
 
-/// A static asset response, with an immutable cache when content-hashed.
-fn asset_response(bytes: &'static [u8], content_type: &'static str, immutable: bool) -> Response {
-    let mut response = Response::new(axum::body::Body::from(bytes));
-    let headers = response.headers_mut();
-    headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
-    headers.insert(
-        header::CACHE_CONTROL,
-        HeaderValue::from_static(if immutable {
-            "public, max-age=31536000, immutable"
-        } else {
-            "no-cache"
-        }),
+/// Cache policy for a content-hashed asset: eternal, because the URL changes
+/// whenever the bytes do.
+const CACHE_IMMUTABLE: &str = "public, max-age=31536000, immutable";
+/// Cache policy for a stable URL: revalidate before reuse.
+const CACHE_REVALIDATE: &str = "no-cache";
+/// Cache policy for the SPA shell: never store it, so a deploy takes effect at
+/// once.
+const CACHE_NO_STORE: &str = "no-store";
+
+/// A static asset response, serving the best variant the client accepts.
+/// `Vary: accept-encoding` is sent whenever the asset has a compressed variant,
+/// so shared caches key on the encoding rather than mixing the two.
+fn asset_response(
+    headers: &HeaderMap,
+    asset: &weaver_assets::Asset,
+    cache: &'static str,
+) -> Response {
+    let coding = weaver_assets::negotiate_encoding(
+        headers
+            .get(header::ACCEPT_ENCODING)
+            .and_then(|value| value.to_str().ok()),
+        asset,
     );
+    let mut response = Response::new(axum::body::Body::from(asset.encoded(coding)));
+    let out = response.headers_mut();
+    out.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static(asset.content_type),
+    );
+    out.insert(header::CACHE_CONTROL, HeaderValue::from_static(cache));
+    if asset.gzip.is_some() || asset.zstd.is_some() {
+        out.insert(header::VARY, HeaderValue::from_static("accept-encoding"));
+    }
+    if let Some(token) = coding.token()
+        && let Ok(value) = HeaderValue::from_str(token)
+    {
+        out.insert(header::CONTENT_ENCODING, value);
+    }
     response
 }
 
