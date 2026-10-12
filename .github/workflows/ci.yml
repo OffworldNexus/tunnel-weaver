@@ -225,6 +225,50 @@ jobs:
             --skip-reachability-check || echo "Systemd smoke completed with status $?"
           docker rm -f systemd-smoke || true
 
+  e2e-bdd:
+    name: e2e-bdd
+    runs-on: ubuntu-latest
+    env:
+      # Skip Playwright's postinstall browser download; the explicit step below
+      # installs exactly Chromium with its system dependencies.
+      PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            frontend/package-lock.json
+            e2e/package-lock.json
+
+      - name: Build the account SPA
+        run: |
+          cd frontend
+          npm ci
+          npm run build
+
+      - name: Build the e2e harness example
+        run: cargo build -p weaver-server --example e2e_server
+
+      - name: Install the e2e dependencies and Chromium
+        working-directory: e2e
+        run: |
+          npm ci
+          npx playwright install --with-deps chromium
+
+      - name: Run the Cucumber + Playwright suite
+        working-directory: e2e
+        run: npm run test:ci
+
   fuzz-smoke:
     name: fuzz-smoke
     runs-on: ubuntu-latest

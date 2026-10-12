@@ -1,0 +1,17 @@
+{
+  "name": "tunnel-weaver-e2e",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "description": "End-to-end BDD suite (Cucumber + Playwright) for the Tunnel Weaver account relay.",
+  "scripts": {
+    "build:spa": "npm --prefix ../frontend ci && npm --prefix ../frontend run build",
+    "build:example": "cargo build -p weaver-server --example e2e_server",
+    "test": "npm run build:example && cucumber-js",
+    "test:ci": "cucumber-js --format progress"
+  },
+  "devDependencies": {
+    "@cucumber/cucumber": "^11.3.0",
+    "playwright": "^1.55.0"
+  }
+}

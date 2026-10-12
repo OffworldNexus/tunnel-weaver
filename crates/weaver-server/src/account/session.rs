@@ -55,14 +55,23 @@ pub fn random_hex(bytes: usize) -> String {
     out
 }
 
-/// Returns the value of cookie `name` from a request's `Cookie` header.
+/// Returns the value of cookie `name` from a request's `Cookie` header(s).
+///
+/// HTTP/2 (RFC 7540 §8.1.2.5) lets a client split the `Cookie` header across
+/// several header fields, and Chromium does exactly that whenever it decides to
+/// group cookies differently. Every field must therefore be scanned, not just
+/// the first, or a cookie that lands in a later field is invisible.
 pub fn cookie(headers: &HeaderMap, name: &str) -> Option<String> {
-    let raw = headers.get(COOKIE)?.to_str().ok()?;
-    for part in raw.split(';') {
-        if let Some((key, value)) = part.trim().split_once('=')
-            && key == name
-        {
-            return Some(value.to_string());
+    for field in headers.get_all(COOKIE) {
+        let Ok(raw) = field.to_str() else {
+            continue;
+        };
+        for part in raw.split(';') {
+            if let Some((key, value)) = part.trim().split_once('=')
+                && key == name
+            {
+                return Some(value.to_string());
+            }
         }
     }
     None
@@ -175,6 +184,21 @@ mod tests {
         );
         assert_eq!(cookie(&headers, SESSION_COOKIE).as_deref(), Some("xyz"));
         assert_eq!(cookie(&headers, "missing"), None);
+    }
+
+    #[test]
+    fn cookie_split_across_http2_fields_is_parsed() {
+        // Chromium splits `Cookie` into one field per cookie group over HTTP/2;
+        // the session must be found even when it is not in the first field.
+        let mut headers = HeaderMap::new();
+        headers.append(COOKIE, "__Host-weaver_session=abc".parse().unwrap());
+        headers.append(
+            COOKIE,
+            "__Host-weaver_csrf=def; theme=dark".parse().unwrap(),
+        );
+        assert_eq!(cookie(&headers, SESSION_COOKIE).as_deref(), Some("abc"));
+        assert_eq!(cookie(&headers, CSRF_COOKIE).as_deref(), Some("def"));
+        assert_eq!(cookie(&headers, "theme").as_deref(), Some("dark"));
     }
 
     #[test]
