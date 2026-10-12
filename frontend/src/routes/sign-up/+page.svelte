@@ -11,14 +11,13 @@
 	import { goto } from '$app/navigation';
 	import { superForm } from 'sveltekit-superforms';
 	import { valibot } from 'sveltekit-superforms/adapters';
-	import { api, messageOf } from '#lib/api';
-	import { saveFlow } from '#lib/flow';
-	import { href } from '#lib/paths';
-	import { signUpSchema } from '#lib/schemas';
-	import Altcha from '#lib/Altcha.svelte';
-	import Brand from '#lib/Brand.svelte';
-	import Keycap from '#lib/Keycap.svelte';
-	import SiteFooter from '#lib/SiteFooter.svelte';
+	import { api, messageOf } from '#lib/account/api';
+	import { saveFlow } from '#lib/account/flow';
+	import { signUpSchema } from '#lib/account/schemas';
+	import { href } from '#lib/app/paths';
+	import Altcha from '#lib/account/Altcha.svelte';
+	import Keycap from '#lib/ui/Keycap.svelte';
+	import Page from '#lib/ui/Page.svelte';
 
 	let altchaPayload = '';
 	let proofReset = 0;
@@ -72,64 +71,60 @@
 	<title>Create account · Tunnel Weaver</title>
 </svelte:head>
 
-<div class="page">
-	<Brand center />
-	<main id="main" class="column" aria-labelledby="signup-title">
-		<h1 id="signup-title">Create your account</h1>
-		<p class="lede">A name and an email to get started.</p>
+<Page labelledby="signup-title">
+	<h1 id="signup-title">Create your account</h1>
+	<p class="lede">A name and an email to get started.</p>
 
-		<form class="form" method="POST" use:enhance novalidate>
-			<div class="field">
-				<label for="name">Name</label>
-				<input
-					id="name"
-					name="name"
-					type="text"
-					autocomplete="name"
-					placeholder="Your name"
-					bind:value={$form.name}
-					disabled={$submitting}
-					aria-invalid={$errors.name ? 'true' : undefined}
-				/>
-				{#if $errors.name}<p class="field__error" aria-live="polite">{$errors.name[0]}</p>{/if}
-			</div>
-
-			<div class="field">
-				<label for="email">Email</label>
-				<input
-					id="email"
-					name="email"
-					type="email"
-					autocomplete="username"
-					inputmode="email"
-					autocapitalize="none"
-					spellcheck="false"
-					placeholder="you@example.com"
-					bind:value={$form.email}
-					disabled={$submitting}
-					aria-invalid={$errors.email ? 'true' : undefined}
-				/>
-				{#if $errors.email}<p class="field__error" aria-live="polite">{$errors.email[0]}</p>{/if}
-			</div>
-
-			<!-- Proof-of-work gate: the submit stays disabled until a proof is solved. -->
-			<Altcha
-				purpose="signup"
-				resetSignal={proofReset}
-				onSolved={(payload) => (altchaPayload = payload)}
-				onExpired={() => (altchaPayload = '')}
+	<form class="form" method="POST" use:enhance novalidate>
+		<div class="field">
+			<label for="name">Name</label>
+			<input
+				id="name"
+				name="name"
+				type="text"
+				autocomplete="name"
+				placeholder="Your name"
+				bind:value={$form.name}
+				disabled={$submitting}
+				aria-invalid={$errors.name ? 'true' : undefined}
 			/>
+			{#if $errors.name}<p class="field__error" aria-live="polite">{$errors.name[0]}</p>{/if}
+		</div>
 
-			{#if $message}
-				<p class="notice-error" role="alert" aria-live="assertive">{$message}</p>
-			{/if}
+		<div class="field">
+			<label for="email">Email</label>
+			<input
+				id="email"
+				name="email"
+				type="email"
+				autocomplete="username"
+				inputmode="email"
+				autocapitalize="none"
+				spellcheck="false"
+				placeholder="you@example.com"
+				bind:value={$form.email}
+				disabled={$submitting}
+				aria-invalid={$errors.email ? 'true' : undefined}
+			/>
+			{#if $errors.email}<p class="field__error" aria-live="polite">{$errors.email[0]}</p>{/if}
+		</div>
 
-			<Keycap type="submit" loading={$submitting} disabled={!altchaPayload || $submitting} wide>
-				{$submitting ? 'Creating…' : 'Continue with email'}
-			</Keycap>
-		</form>
+		<!-- Proof-of-work gate: the submit stays disabled until a proof is solved. -->
+		<Altcha
+			purpose="signup"
+			resetSignal={proofReset}
+			onSolved={(payload) => (altchaPayload = payload)}
+			onExpired={() => (altchaPayload = '')}
+		/>
 
-		<p class="switch">Already have an account? <a href={href('/sign-in')}>Sign in</a></p>
-	</main>
-	<SiteFooter />
-</div>
+		{#if $message}
+			<p class="notice-error" role="alert" aria-live="assertive">{$message}</p>
+		{/if}
+
+		<Keycap type="submit" loading={$submitting} disabled={!altchaPayload || $submitting} wide>
+			{$submitting ? 'Creating…' : 'Continue with email'}
+		</Keycap>
+	</form>
+
+	<p class="switch">Already have an account? <a href={href('/sign-in')}>Sign in</a></p>
+</Page>

@@ -13,6 +13,14 @@ const valibotAdapter = new URL(
 ).pathname;
 
 export default defineConfig({
+	css: {
+		preprocessorOptions: {
+			scss: {
+				// Component styles can `@use 'mixins'` without deep relative paths.
+				loadPaths: ['src/styles']
+			}
+		}
+	},
 	resolve: {
 		alias: {
 			'sveltekit-superforms/adapters': valibotAdapter

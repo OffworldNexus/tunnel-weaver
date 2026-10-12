@@ -1,6 +1,6 @@
 <script lang="ts">
-	import { ensureConfig } from '#lib/config';
-	import { loadAltcha } from '#lib/altcha';
+	import { ensureConfig } from '#lib/account/config';
+	import { loadAltcha } from '#lib/account/altcha';
 
 	/** The signed purpose the challenge is bound to. */
 	export let purpose: 'login' | 'signup';
@@ -142,3 +142,72 @@
 		></altcha-widget>
 	{/if}
 </div>
+
+<style lang="scss">
+	.altcha {
+		display: flex;
+		flex-direction: column;
+		gap: 8px;
+		margin-top: 4px;
+	}
+
+	.altcha-state {
+		display: flex;
+		align-items: center;
+		gap: 8px;
+		color: var(--tw-muted);
+		font-size: 14px;
+	}
+
+	.altcha-state__dot {
+		width: 8px;
+		height: 8px;
+		flex: none;
+		border-radius: 50%;
+		background: var(--tw-muted);
+	}
+
+	.altcha-state[data-state='solving'] .altcha-state__dot {
+		background: var(--tw-focus);
+	}
+
+	.altcha-state[data-state='ready'] .altcha-state__dot {
+		background: var(--tw-success);
+	}
+
+	.altcha-state[data-state='error'] {
+		color: var(--tw-danger);
+	}
+
+	.altcha-state[data-state='error'] .altcha-state__dot {
+		background: var(--tw-danger);
+	}
+
+	/* The vendored widget is driven programmatically and rendered invisibly; the
+	   status line above is the only chrome the user sees. */
+	.altcha-widget {
+		position: absolute;
+		width: 1px;
+		height: 1px;
+		padding: 0;
+		margin: -1px;
+		overflow: hidden;
+		clip-path: inset(50%);
+		border: 0;
+		white-space: nowrap;
+	}
+
+	altcha-widget {
+		/* Blend the upstream widget into the relay's palette, in case its chrome
+		   is ever surfaced. */
+		display: block;
+		width: 100%;
+		max-width: 420px;
+		--altcha-border-radius: var(--tw-radius);
+		--altcha-border-color: var(--tw-border);
+		--altcha-color-base: var(--tw-well);
+		--altcha-color-base-content: var(--tw-text);
+		--altcha-color-primary: var(--tw-accent);
+		--altcha-max-width: 100%;
+	}
+</style>

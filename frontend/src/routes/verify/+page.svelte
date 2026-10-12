@@ -11,13 +11,12 @@
 	import { goto } from '$app/navigation';
 	import { page } from '$app/state';
 	import { onMount } from 'svelte';
-	import { api, messageOf } from '#lib/api';
-	import { loadFlow, saveFlow } from '#lib/flow';
-	import { networkError } from '#lib/notices';
-	import { href } from '#lib/paths';
-	import Brand from '#lib/Brand.svelte';
-	import Keycap from '#lib/Keycap.svelte';
-	import SiteFooter from '#lib/SiteFooter.svelte';
+	import { api, messageOf } from '#lib/account/api';
+	import { loadFlow, saveFlow } from '#lib/account/flow';
+	import { networkError } from '#lib/account/notices';
+	import { href } from '#lib/app/paths';
+	import Keycap from '#lib/ui/Keycap.svelte';
+	import Page from '#lib/ui/Page.svelte';
 
 	type VerifyOutcome =
 		| { outcome: 'set_password'; completion_token: string; name: string; email: string }
@@ -77,26 +76,22 @@
 	<title>Verify email · Tunnel Weaver</title>
 </svelte:head>
 
-<div class="page">
-	<Brand center />
-	<main id="main" class="column" aria-labelledby="verify-title">
-		<h1 id="verify-title">
-			{status === 'checking' ? 'Verifying your link' : 'This link no longer works'}
-		</h1>
+<Page labelledby="verify-title">
+	<h1 id="verify-title">
+		{status === 'checking' ? 'Verifying your link' : 'This link no longer works'}
+	</h1>
 
-		{#if status === 'checking'}
-			<p class="lede" aria-live="polite">One moment while we confirm your email address…</p>
-		{:else}
-			<p class="lede">{message}</p>
-			<div class="actions" style="margin-top:24px">
-				{#if canResend}
-					<Keycap wide href={href('/check-email')}>Request a new link</Keycap>
-				{/if}
-				<Keycap wide variant="ghost" href={href('/sign-up')}>Start again</Keycap>
-			</div>
-		{/if}
+	{#if status === 'checking'}
+		<p class="lede" aria-live="polite">One moment while we confirm your email address…</p>
+	{:else}
+		<p class="lede">{message}</p>
+		<div class="actions" style="margin-top:24px">
+			{#if canResend}
+				<Keycap wide href={href('/check-email')}>Request a new link</Keycap>
+			{/if}
+			<Keycap wide variant="ghost" href={href('/sign-up')}>Start again</Keycap>
+		</div>
+	{/if}
 
-		<p class="switch"><a href={href('/sign-in')}>Back to sign in</a></p>
-	</main>
-	<SiteFooter />
-</div>
+	<p class="switch"><a href={href('/sign-in')}>Back to sign in</a></p>
+</Page>

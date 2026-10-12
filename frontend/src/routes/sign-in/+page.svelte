@@ -9,15 +9,14 @@
 	import { goto } from '$app/navigation';
 	import { superForm } from 'sveltekit-superforms';
 	import { valibot } from 'sveltekit-superforms/adapters';
-	import { api, messageOf } from '#lib/api';
-	import { clearFlow, loadFlow, saveFlow } from '#lib/flow';
-	import { notify } from '#lib/notices';
-	import { href } from '#lib/paths';
-	import { signInSchema } from '#lib/schemas';
-	import Altcha from '#lib/Altcha.svelte';
-	import Brand from '#lib/Brand.svelte';
-	import Keycap from '#lib/Keycap.svelte';
-	import SiteFooter from '#lib/SiteFooter.svelte';
+	import { api, messageOf } from '#lib/account/api';
+	import { clearFlow, loadFlow, saveFlow } from '#lib/account/flow';
+	import { notify } from '#lib/account/notices';
+	import { signInSchema } from '#lib/account/schemas';
+	import { href } from '#lib/app/paths';
+	import Altcha from '#lib/account/Altcha.svelte';
+	import Keycap from '#lib/ui/Keycap.svelte';
+	import Page from '#lib/ui/Page.svelte';
 
 	const carried = loadFlow();
 	if (carried.notice) {
@@ -84,74 +83,70 @@
 	<title>Sign in · Tunnel Weaver</title>
 </svelte:head>
 
-<div class="page">
-	<Brand center />
-	<main id="main" class="column" aria-labelledby="signin-title">
-		<h1 id="signin-title">Sign in</h1>
-		<p class="lede">Your tunnels, devices and account.</p>
+<Page labelledby="signin-title">
+	<h1 id="signin-title">Sign in</h1>
+	<p class="lede">Your tunnels, devices and account.</p>
 
-		<form class="form" method="POST" use:enhance novalidate>
-			<div class="field">
-				<label for="email">Email</label>
-				<input
-					id="email"
-					name="email"
-					type="email"
-					autocomplete="username"
-					inputmode="email"
-					autocapitalize="none"
-					spellcheck="false"
-					placeholder="you@example.com"
-					bind:value={$form.email}
-					disabled={$submitting}
-					aria-invalid={$errors.email ? 'true' : undefined}
-				/>
-				{#if $errors.email}<p class="field__error" aria-live="polite">{$errors.email[0]}</p>{/if}
-			</div>
-
-			<div class="field">
-				<label for="password">Password</label>
-				<div class="field__row">
-					<input
-						id="password"
-						name="password"
-						type={showPassword ? 'text' : 'password'}
-						autocomplete="current-password"
-						placeholder="Your password"
-						bind:value={$form.password}
-						disabled={$submitting}
-						aria-invalid={$errors.password ? 'true' : undefined}
-					/>
-					<button
-						type="button"
-						class="toggle"
-						aria-pressed={showPassword}
-						on:click={() => (showPassword = !showPassword)}
-					>
-						{showPassword ? 'Hide password' : 'Show password'}
-					</button>
-				</div>
-				{#if $errors.password}<p class="field__error" aria-live="polite">{$errors.password[0]}</p>{/if}
-			</div>
-
-			<!-- Proof-of-work gate: the submit stays disabled until a proof is solved. -->
-			<Altcha
-				purpose="login"
-				resetSignal={proofReset}
-				onSolved={(payload) => (altchaPayload = payload)}
-				onExpired={() => (altchaPayload = '')}
+	<form class="form" method="POST" use:enhance novalidate>
+		<div class="field">
+			<label for="email">Email</label>
+			<input
+				id="email"
+				name="email"
+				type="email"
+				autocomplete="username"
+				inputmode="email"
+				autocapitalize="none"
+				spellcheck="false"
+				placeholder="you@example.com"
+				bind:value={$form.email}
+				disabled={$submitting}
+				aria-invalid={$errors.email ? 'true' : undefined}
 			/>
+			{#if $errors.email}<p class="field__error" aria-live="polite">{$errors.email[0]}</p>{/if}
+		</div>
 
-			{#if $message}
-				<p class="notice-error" role="alert" aria-live="assertive">{$message}</p>
-			{/if}
+		<div class="field">
+			<label for="password">Password</label>
+			<div class="field__row">
+				<input
+					id="password"
+					name="password"
+					type={showPassword ? 'text' : 'password'}
+					autocomplete="current-password"
+					placeholder="Your password"
+					bind:value={$form.password}
+					disabled={$submitting}
+					aria-invalid={$errors.password ? 'true' : undefined}
+				/>
+				<button
+					type="button"
+					class="toggle"
+					aria-pressed={showPassword}
+					on:click={() => (showPassword = !showPassword)}
+				>
+					{showPassword ? 'Hide password' : 'Show password'}
+				</button>
+			</div>
+			{#if $errors.password}<p class="field__error" aria-live="polite">{$errors.password[0]}</p>{/if}
+		</div>
 
-			<Keycap type="submit" loading={$submitting} disabled={!altchaPayload || $submitting} wide>
-				{$submitting ? 'Signing in…' : 'Sign in'}
-			</Keycap>
-		</form>
+		<!-- Proof-of-work gate: the submit stays disabled until a proof is solved. -->
+		<Altcha
+			purpose="login"
+			resetSignal={proofReset}
+			onSolved={(payload) => (altchaPayload = payload)}
+			onExpired={() => (altchaPayload = '')}
+		/>
 
-		<p class="switch"><a href={href('/sign-up')}>Create an account</a></p>
-	</main>
-	<SiteFooter />
-</div>
+		{#if $message}
+			<p class="notice-error" role="alert" aria-live="assertive">{$message}</p>
+		{/if}
+
+		<Keycap type="submit" loading={$submitting} disabled={!altchaPayload || $submitting} wide>
+			{$submitting ? 'Signing in…' : 'Sign in'}
+		</Keycap>
+	</form>
+
+	<p class="switch"><a href={href('/sign-up')}>Create an account</a></p>
+</Page>

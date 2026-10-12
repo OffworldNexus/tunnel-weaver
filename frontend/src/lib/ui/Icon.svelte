@@ -35,3 +35,11 @@
 		<path d="m9 12 2 2 4-4" />
 	{/if}
 </svg>
+
+<style lang="scss">
+	/* The icon's own size; containers only position it. */
+	.icon {
+		width: 24px;
+		height: 24px;
+	}
+</style>

@@ -1,0 +1,212 @@
+// Global stylesheet — the design system entry point.
+//
+// It only holds what is genuinely global: the tokens, a reset, the base
+// typography and the few primitives shared by unrelated routes (links, form
+// controls, the action row). Everything component- or route-specific lives in
+// that component's SFC `<style lang="scss">` block instead.
+//
+// Imported once, from the root layout.
+
+@use 'tokens';
+@use 'mixins' as *;
+
+// ---- reset ----------------------------------------------------------------
+
+*,
+*::before,
+*::after {
+	box-sizing: border-box;
+}
+
+html,
+body {
+	margin: 0;
+	min-height: 100%;
+}
+
+// ---- base typography ------------------------------------------------------
+
+body {
+	// The deck is the whole page background for the account pages.
+	background: var(--tw-deck);
+	color: var(--tw-text);
+	font: 400 16px/1.6 var(--tw-sans);
+	-webkit-font-smoothing: antialiased;
+	text-rendering: optimizeLegibility;
+}
+
+h1,
+h2,
+h3 {
+	margin: 0;
+	font-family: var(--tw-heading);
+	letter-spacing: -0.02em;
+}
+
+h1 {
+	font-size: 32px;
+	line-height: 40px;
+	font-weight: 700;
+	text-wrap: balance;
+}
+
+h2 {
+	font-size: 16px;
+	line-height: 1.5;
+}
+
+p {
+	margin: 0;
+}
+
+// ---- links & focus --------------------------------------------------------
+
+a {
+	color: var(--tw-accent);
+	text-decoration: none;
+}
+
+a:hover {
+	text-decoration: underline;
+}
+
+a:focus-visible,
+button:focus-visible,
+input:focus-visible,
+.linklike:focus-visible {
+	outline: 2px solid var(--tw-focus);
+	outline-offset: 2px;
+}
+
+.linklike {
+	border: 0;
+	padding: 0;
+	background: none;
+	color: var(--tw-accent);
+	font: inherit;
+	cursor: pointer;
+}
+
+.linklike:hover {
+	text-decoration: underline;
+}
+
+// ---- shared text primitives ----------------------------------------------
+
+.lede {
+	color: var(--tw-muted);
+	font-size: 16px;
+	margin-top: 12px;
+}
+
+.lede + .lede {
+	margin-top: 10px;
+}
+
+.hint {
+	margin: 0;
+	color: var(--tw-muted);
+	font-size: 14px;
+}
+
+.switch {
+	margin-top: 24px;
+	color: var(--tw-muted);
+	font-size: 16px;
+}
+
+// ---- shared form primitives ----------------------------------------------
+
+.form {
+	display: flex;
+	flex-direction: column;
+	gap: 20px;
+	margin-top: 24px;
+}
+
+.field {
+	display: flex;
+	flex-direction: column;
+	gap: 8px;
+}
+
+// Persistent label above the control.
+.field > label {
+	font-size: 16px;
+	font-weight: 700;
+	line-height: 1.4;
+}
+
+.field__row {
+	display: flex;
+	flex-direction: column;
+	gap: 8px;
+}
+
+.field input {
+	width: 100%;
+	height: 44px;
+	padding: 0 14px;
+	border: 1.5px solid var(--tw-border);
+	border-radius: var(--tw-radius);
+	background: var(--tw-well);
+	color: var(--tw-text);
+	font: 400 16px/1 var(--tw-sans);
+}
+
+.field input::placeholder {
+	color: var(--tw-muted);
+	opacity: 0.75;
+}
+
+.field input:focus {
+	outline: 2px solid var(--tw-focus);
+	outline-offset: 2px;
+	border-color: var(--tw-focus);
+}
+
+.field input:disabled {
+	opacity: 0.55;
+}
+
+// A readonly verified address: readable, but clearly not editable here.
+.field input[readonly] {
+	cursor: default;
+	color: var(--tw-muted);
+}
+
+.toggle {
+	align-self: flex-start;
+	min-height: 32px;
+	padding: 4px 0;
+	border: 0;
+	background: none;
+	color: var(--tw-accent);
+	font: 400 14px/1 var(--tw-sans);
+	cursor: pointer;
+}
+
+.toggle:hover {
+	text-decoration: underline;
+}
+
+.field__error,
+.notice-error {
+	margin: 0;
+	color: var(--tw-danger);
+	font-size: 14px;
+	font-weight: 700;
+}
+
+.field__error {
+	margin-top: 2px;
+}
+
+// ---- shared action row ----------------------------------------------------
+
+.actions {
+	display: flex;
+	flex-direction: column;
+	gap: 12px;
+	margin-top: 24px;
+}

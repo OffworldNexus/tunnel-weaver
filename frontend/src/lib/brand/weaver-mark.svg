@@ -1,5 +1,3 @@
-<!-- The approved geometric spectacled weaver (flat-colour master), copied
-     verbatim from crates/weaver-assets/templates/partials/weaver-mark.svg. -->
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="100 100 310 320" aria-hidden="true" focusable="false">
   <!-- Approved geometric spectacled weaver: flat-colour master. -->
   <path fill="#ffcf2e" d="M122 280 162 182C181 140 215 119 259 119c46 0 83 28 96 70l35 36-35 15-13 45 14 48c-29 49-82 79-141 63-54-15-89-60-93-116Z"/>

@@ -10,13 +10,12 @@
 
 	import { goto } from '$app/navigation';
 	import { onMount } from 'svelte';
-	import { api, messageOf } from '#lib/api';
-	import { networkError, notify, sessionExpired } from '#lib/notices';
-	import { href } from '#lib/paths';
-	import { csrfToken } from '#lib/session';
-	import Brand from '#lib/Brand.svelte';
-	import Keycap from '#lib/Keycap.svelte';
-	import SiteFooter from '#lib/SiteFooter.svelte';
+	import { api, messageOf } from '#lib/account/api';
+	import { networkError, notify, sessionExpired } from '#lib/account/notices';
+	import { csrfToken } from '#lib/account/session';
+	import { href } from '#lib/app/paths';
+	import Keycap from '#lib/ui/Keycap.svelte';
+	import Page from '#lib/ui/Page.svelte';
 
 	interface Me {
 		id: number | string;
@@ -95,59 +94,87 @@
 	<title>Your account · Tunnel Weaver</title>
 </svelte:head>
 
-<div class="page">
-	<Brand />
-	<main id="main" class="column" aria-labelledby="app-title">
-		<h1 id="app-title">Your account</h1>
+<Page center={false} labelledby="app-title">
+	<h1 id="app-title">Your account</h1>
 
-		{#if me}
-			<!-- Confirmed session: the identity the relay reported. -->
-			<p class="lede">
-				{me.name}{#if me.email}<span aria-hidden="true"> · </span>{me.email}{/if}
-			</p>
+	{#if me}
+		<!-- Confirmed session: the identity the relay reported. -->
+		<p class="lede">
+			{me.name}{#if me.email}<span aria-hidden="true"> · </span>{me.email}{/if}
+		</p>
 
-			<dl class="identity">
-				<div>
-					<dt>Name</dt>
-					<dd>{me.name}</dd>
-				</div>
-				<div>
-					<dt>Email</dt>
-					<dd>{me.email ?? '—'}</dd>
-				</div>
-				<div>
-					<dt>Account ID</dt>
-					<dd>{me.id}</dd>
-				</div>
-				<div>
-					<dt>Authentication</dt>
-					<dd aria-live="polite">{authStatus}</dd>
-				</div>
-			</dl>
-
-			{#if error}
-				<p class="notice-error" role="alert" aria-live="assertive" style="margin-top:20px">{error}</p>
-			{/if}
-
-			<div class="actions">
-				<Keycap type="button" loading={signingOut} onclick={signOut} wide>Sign out</Keycap>
-				<Keycap type="button" variant="ghost" loading={checking} onclick={check} wide>
-					Check authentication
-				</Keycap>
+		<dl class="identity">
+			<div>
+				<dt>Name</dt>
+				<dd>{me.name}</dd>
 			</div>
-		{:else}
-			<!-- Not confirmed (still checking, or the session was rejected): offer a retry. -->
-			<p class="lede" aria-live="polite">
-				{#if checking}Checking your session…{:else}You are not signed in.{/if}
-			</p>
-			{#if error}
-				<p class="notice-error" role="alert" aria-live="assertive">{error}</p>
-			{/if}
-			<div class="actions">
-				<Keycap type="button" loading={checking} onclick={check} wide>Check authentication</Keycap>
-				<Keycap wide variant="ghost" href={href('/sign-in')}>Back to sign in</Keycap>
+			<div>
+				<dt>Email</dt>
+				<dd>{me.email ?? '—'}</dd>
 			</div>
+			<div>
+				<dt>Account ID</dt>
+				<dd>{me.id}</dd>
+			</div>
+			<div>
+				<dt>Authentication</dt>
+				<dd aria-live="polite">{authStatus}</dd>
+			</div>
+		</dl>
+
+		{#if error}
+			<p class="notice-error" role="alert" aria-live="assertive" style="margin-top:20px">{error}</p>
 		{/if}
-	</main>
-	<SiteFooter />
-</div>
+
+		<div class="actions">
+			<Keycap type="button" loading={signingOut} onclick={signOut} wide>Sign out</Keycap>
+			<Keycap type="button" variant="ghost" loading={checking} onclick={check} wide>
+				Check authentication
+			</Keycap>
+		</div>
+	{:else}
+		<!-- Not confirmed (still checking, or the session was rejected): offer a retry. -->
+		<p class="lede" aria-live="polite">
+			{#if checking}Checking your session…{:else}You are not signed in.{/if}
+		</p>
+		{#if error}
+			<p class="notice-error" role="alert" aria-live="assertive">{error}</p>
+		{/if}
+		<div class="actions">
+			<Keycap type="button" loading={checking} onclick={check} wide>Check authentication</Keycap>
+			<Keycap wide variant="ghost" href={href('/sign-in')}>Back to sign in</Keycap>
+		</div>
+	{/if}
+</Page>
+
+<style lang="scss">
+	.identity {
+		display: grid;
+		gap: 0;
+		margin: 24px 0 0;
+		padding: 0;
+		border-top: 1.5px solid var(--tw-border);
+	}
+
+	.identity div {
+		display: flex;
+		justify-content: space-between;
+		gap: 16px;
+		padding: 12px 0;
+		border-bottom: 1.5px solid var(--tw-border);
+	}
+
+	.identity dt {
+		margin: 0;
+		color: var(--tw-muted);
+		font-size: 14px;
+		font-weight: 700;
+	}
+
+	.identity dd {
+		margin: 0;
+		font-weight: 700;
+		text-align: right;
+		overflow-wrap: anywhere;
+	}
+</style>
