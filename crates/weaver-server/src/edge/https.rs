@@ -265,6 +265,11 @@ pub async fn handle_https_request(
             ViewId::ACCOUNT_SIGNUP
         } else if surface.host == Host::Admin && path == "/api/account/login" {
             ViewId::ACCOUNT_LOGIN
+        } else if surface.host == Host::Admin && path == "/api/account/password" {
+            // A password change verifies a guessed credential behind a session, so
+            // it is the same guessing surface as a login attempt and shares that
+            // budget rather than minting a new one (WVR-50).
+            ViewId::ACCOUNT_LOGIN
         } else if surface.host == Host::Admin && path == "/api/account/resend" {
             ViewId::ACCOUNT_RESEND
         } else if surface.host == Host::Admin && path == "/api/account/reset/request" {

@@ -60,3 +60,18 @@ export function messageOf(data: unknown, fallback: string): string {
 	}
 	return fallback;
 }
+
+/**
+ * Extracts the `field` a refusal belongs to, when the relay scoped it to one
+ * input (WVR-50), so a form can place the message on that field. `null` means
+ * the refusal is form-wide.
+ */
+export function fieldOf(data: unknown): string | null {
+	if (data && typeof data === 'object' && 'field' in data) {
+		const value = (data as Record<string, unknown>).field;
+		if (typeof value === 'string' && value.trim().length > 0) {
+			return value;
+		}
+	}
+	return null;
+}

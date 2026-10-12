@@ -162,6 +162,28 @@ export async function messages() {
   return response.json();
 }
 
+/**
+ * The most recent captured message with an exact subject. Like the reset mail,
+ * the change notification is sent off the response path (WVR-50), so this polls
+ * the mailbox instead of assuming the message has already been captured.
+ */
+export async function latestMailBySubject(subject, { timeoutMs = 20_000 } = {}) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const captured = await messages();
+    for (let index = captured.length - 1; index >= 0; index -= 1) {
+      if (captured[index].subject === subject) return captured[index];
+    }
+    if (Date.now() >= deadline) {
+      throw new Error(
+        `No captured message with subject ${JSON.stringify(subject)} among ${captured.length}: ` +
+          `${captured.map((message) => JSON.stringify(message.subject)).join(', ') || '<none>'}`
+      );
+    }
+    await delay(250);
+  }
+}
+
 /** Drops every captured message. */
 export async function clearMail() {
   const response = await fetch(`${harness.mailUrl}/messages`, { method: 'DELETE' });

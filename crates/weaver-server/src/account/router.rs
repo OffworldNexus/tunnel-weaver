@@ -28,7 +28,7 @@ use weaver_abuse::AltchaError;
 
 use crate::account::AccountRuntime;
 use crate::account::session::{self, CSRF_COOKIE, CSRF_HEADER, SESSION_COOKIE};
-use crate::email::{Mailbox, Reset, Verification, Welcome};
+use crate::email::{Mailbox, PasswordChanged, Reset, Verification, Welcome};
 use crate::store::StoreError;
 use crate::store::account::{
     ActivationOutcome, ActivationRequest, NewPasswordResetToken, NewPendingRegistration,
@@ -62,6 +62,7 @@ pub fn router(runtime: Arc<AccountRuntime>) -> Router {
         .route("/api/account/login", post(login))
         .route("/api/account/me", get(me))
         .route("/api/account/logout", post(logout))
+        .route("/api/account/password", post(change_password))
         .fallback(spa)
         .with_state(runtime)
 }
@@ -116,6 +117,13 @@ struct LoginRequest {
     password: String,
     #[serde(default)]
     altcha: String,
+}
+
+#[derive(Deserialize)]
+struct ChangePasswordRequest {
+    /// Reauthentication: the account's current password.
+    current_password: String,
+    new_password: String,
 }
 
 #[derive(Deserialize)]
@@ -728,7 +736,19 @@ async fn me(State(rt): State<Arc<AccountRuntime>>, headers: HeaderMap) -> Respon
                 .ok()
                 .flatten()
                 .map(|identity| identity.email);
-            json_ok(json!({ "id": account.id, "name": account.name, "email": email }))
+            // Drives the Security page's "Password is set" state (WVR-50): a live
+            // credential exists for every email/password account today, but the
+            // flag keeps the panel honest once passkeys or SSO arrive.
+            let has_password = rt
+                .store
+                .password_current_for(account.id)
+                .await
+                .ok()
+                .flatten()
+                .is_some();
+            json_ok(
+                json!({ "id": account.id, "name": account.name, "email": email, "has_password": has_password }),
+            )
         }
         _ => err(StatusCode::UNAUTHORIZED, "not signed in"),
     }
@@ -746,6 +766,100 @@ async fn logout(State(rt): State<Arc<AccountRuntime>>, headers: HeaderMap) -> Re
         json_ok(json!({ "ok": true })),
         rt.sessions.clear_session_cookie(),
     )
+}
+
+/// `POST /api/account/password` — change the signed-in account's password.
+///
+/// Reauthentication is the point: the design contract requires it for every
+/// sensitive action, so the current password is verified before anything is
+/// written, exactly the way `/login` verifies it. The new password then passes
+/// the same policy and hashing as a reset, and the store rotates the credential
+/// and kills **every** session — including this one — so the change ends with a
+/// fresh sign-in, identical to a reset. The notification email is sent detached,
+/// after the write has committed.
+async fn change_password(
+    State(rt): State<Arc<AccountRuntime>>,
+    headers: HeaderMap,
+    Json(req): Json<ChangePasswordRequest>,
+) -> Response {
+    if !origin_ok(&headers, &rt.base_url) || !csrf_ok(&headers) {
+        return err(StatusCode::FORBIDDEN, "request refused");
+    }
+    let Some(raw) = session::cookie(&headers, SESSION_COOKIE) else {
+        return err(StatusCode::UNAUTHORIZED, "not signed in");
+    };
+    let now = unix_now();
+    let Ok(Some(account)) = rt.sessions.account(&raw, now).await else {
+        return err(StatusCode::UNAUTHORIZED, "not signed in");
+    };
+
+    // Reauthentication. A live credential is guaranteed for accounts that can
+    // sign in with a password, so its absence is a server-side inconsistency.
+    let stored = rt
+        .store
+        .password_current_for(account.id)
+        .await
+        .ok()
+        .flatten()
+        .map(|credential| credential.encoded_hash);
+    let Some(stored) = stored else {
+        return err(StatusCode::SERVICE_UNAVAILABLE, "temporarily unavailable");
+    };
+    if !rt.passwords.verify(&req.current_password, &stored) {
+        return field_error(
+            StatusCode::BAD_REQUEST,
+            FIELD_CURRENT_PASSWORD,
+            "that is not your current password",
+        );
+    }
+
+    if let Err(error) = rt.passwords.validate(&req.new_password).await {
+        let (status, message) = password_error(error, rt.passwords.min_length());
+        return field_error(status, FIELD_NEW_PASSWORD, &message);
+    }
+    let Ok(encoded_hash) = rt.passwords.hash(&req.new_password) else {
+        return err(StatusCode::SERVICE_UNAVAILABLE, "temporarily unavailable");
+    };
+
+    match rt
+        .store
+        .account_change_password(account.id, &encoded_hash, now)
+        .await
+    {
+        Ok(_) => {
+            // Off the response path, and only after the change committed — a
+            // notification must never describe a write that rolled back.
+            if let Some(identity) = rt
+                .store
+                .email_identity_for_account(account.id)
+                .await
+                .ok()
+                .flatten()
+            {
+                let rt = Arc::clone(&rt);
+                let name = account.name.clone();
+                let email = identity.email.clone();
+                tokio::spawn(async move {
+                    if let Err(error) = send_password_changed(&rt, &name, &email, now).await {
+                        tracing::warn!(%error, "password-changed email was not sent");
+                    }
+                });
+            }
+            // Every session is now dead, this one included: clear the cookie so
+            // the browser does not keep presenting a session that no longer
+            // exists, and let the SPA send the user to sign in again.
+            with_cookie(
+                json_ok(json!({ "outcome": "changed" })),
+                rt.sessions.clear_session_cookie(),
+            )
+        }
+        // No live credential left to rotate: a concurrent change won the race.
+        Err(StoreError::Conflict(_)) => err(
+            StatusCode::CONFLICT,
+            "this password has already been changed",
+        ),
+        Err(_) => err(StatusCode::SERVICE_UNAVAILABLE, "temporarily unavailable"),
+    }
 }
 
 /// Serves the embedded SPA shell and its assets, and the vendored ALTCHA widget.
@@ -922,29 +1036,74 @@ async fn send_reset(rt: &AccountRuntime, name: &str, email: &str, raw: &str) -> 
     Ok(())
 }
 
-/// Maps a password-policy failure onto a safe, user-facing response.
+/// Composes and sends the "your password was changed" notification (WVR-50).
+///
+/// Carries the event time and a link to the ordinary, unauthenticated recovery
+/// flow — never a pre-authorised action — so a recipient who does not recognise
+/// the change can act on it safely.
+async fn send_password_changed(
+    rt: &AccountRuntime,
+    name: &str,
+    email: &str,
+    now: i64,
+) -> Result<(), String> {
+    let Some(mailer) = &rt.mailer else {
+        return Err("email is not configured".into());
+    };
+    let to = Mailbox::parse(email, Some(name.to_string())).map_err(|e| e.to_string())?;
+    let template = PasswordChanged {
+        event_time: human_timestamp(now),
+        recovery_url: rt.password_recovery_url(),
+    };
+    let email = mailer.compose(to, &template).map_err(|e| e.to_string())?;
+    mailer.send(&email).await.map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// The password inputs a refusal can be attributed to (WVR-50), so the SPA can
+/// render the message on the offending field instead of form-wide.
+const FIELD_CURRENT_PASSWORD: &str = "current_password";
+const FIELD_NEW_PASSWORD: &str = "new_password";
+
+/// Maps a password-policy failure onto a status and a safe, user-facing message.
+///
+/// Split out from the response so a caller that knows which input failed can tag
+/// the refusal with a `field`, while the single-password endpoints keep their
+/// exact, field-less body.
+fn password_error(
+    error: crate::account::password::PasswordError,
+    min_length: usize,
+) -> (StatusCode, String) {
+    use crate::account::password::PasswordError;
+    match error {
+        PasswordError::TooShort { .. } => (
+            StatusCode::BAD_REQUEST,
+            format!("choose a password of at least {min_length} characters"),
+        ),
+        PasswordError::Breached => (
+            StatusCode::BAD_REQUEST,
+            "this password appears in a known breach; choose a different one".to_string(),
+        ),
+        PasswordError::BreachUnavailable(_) | PasswordError::Hash(_) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "temporarily unavailable; please try again".to_string(),
+        ),
+    }
+}
+
+/// Maps a password-policy failure onto a field-less response.
 fn password_error_response(
     rt: &AccountRuntime,
     error: crate::account::password::PasswordError,
 ) -> Response {
-    use crate::account::password::PasswordError;
-    match error {
-        PasswordError::TooShort { .. } => err(
-            StatusCode::BAD_REQUEST,
-            &format!(
-                "choose a password of at least {} characters",
-                rt.passwords.min_length()
-            ),
-        ),
-        PasswordError::Breached => err(
-            StatusCode::BAD_REQUEST,
-            "this password appears in a known breach; choose a different one",
-        ),
-        PasswordError::BreachUnavailable(_) | PasswordError::Hash(_) => err(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "temporarily unavailable; please try again",
-        ),
-    }
+    let (status, message) = password_error(error, rt.passwords.min_length());
+    err(status, &message)
+}
+
+/// A refusal tagged with the input it belongs to, so the SPA can place the
+/// message on that field. Additive to the body: `error` keeps its meaning.
+fn field_error(status: StatusCode, field: &str, message: &str) -> Response {
+    (status, Json(json!({ "error": message, "field": field }))).into_response()
 }
 
 /// A same-origin check for state-changing requests.
@@ -1076,6 +1235,20 @@ fn human_duration(secs: u64) -> String {
     } else {
         format!("{secs} seconds")
     }
+}
+
+/// A human, timezone-qualified instant for security copy (e.g.
+/// `2026-10-12 14:01 UTC`). The zone comes from the server, so the exact string
+/// is environment-dependent and must not be asserted literally in tests.
+fn human_timestamp(secs: i64) -> String {
+    let zoned = jiff::Timestamp::from_second(secs)
+        .map(|ts| ts.to_zoned(jiff::tz::TimeZone::system()))
+        .unwrap_or_else(|_| jiff::Zoned::now());
+    format!(
+        "{} {}",
+        zoned.strftime("%Y-%m-%d %H:%M"),
+        zoned.strftime("%Z")
+    )
 }
 
 /// Current Unix time in seconds.

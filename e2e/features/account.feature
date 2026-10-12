@@ -8,7 +8,7 @@ Feature: Account lifecycle
   Background:
     Given a unique email address for "Ada Lovelace"
 
-  Scenario: The full happy path from landing to a second sign-in
+  Scenario: The full happy path from landing through a password change to a fresh sign-in
     Given I open the landing page
     When I follow the "Create account" call to action
     And I create an account for "Ada Lovelace"
@@ -24,6 +24,22 @@ Feature: Account lifecycle
     Then I see the "Sign in" heading
     When I sign in with the password "correct-horse-battery-staple"
     Then I see the signed-in identity for "Ada Lovelace"
+    # WVR-50: appended to this journey — it already registers the account, signs
+    # in and lands on the shell where the Security nav lives, so the change is a
+    # continuation rather than a second registration. It also retitles the
+    # scenario, whose endpoint is now a third sign-in.
+    When I open the Security page
+    Then I see the "Security" heading
+    And I see the Password panel showing "Password is set"
+    When I follow the "Change password" link from the Password panel
+    Then I see the "Change your password" heading
+    And the change form asks only for the current and new password
+    When I change my password from "correct-horse-battery-staple" to "correct-horse-battery-staple-2"
+    Then I see the password change success notice
+    And I am signed out everywhere, this device included
+    When I sign in with the password "correct-horse-battery-staple-2"
+    Then I see the signed-in identity for "Ada Lovelace"
+    And the password change notification email is sent
 
   Scenario: Signing in with the wrong password is refused generically
     Given an account exists for "Ada Lovelace" with the password "correct-horse-battery-staple"
@@ -71,3 +87,20 @@ Feature: Account lifecycle
     Then I see the "Reset request accepted" heading
     And I see the acknowledgement that instructions will be emailed
     And no reset email is sent
+
+  # WVR-50: the one refusal worth a browser. The relay scopes a wrong current
+  # password to `field: "current_password"` and leaves the credential alone
+  # (crates/weaver-server/tests/account_api.rs); what only a browser can show is
+  # that the SPA renders the refusal on that very field and — unlike the success
+  # path — does not end the session.
+  Scenario: Changing the password with a wrong current password is refused on its field
+    Given an account exists for "Ada Lovelace" with the password "correct-horse-battery-staple"
+    When I sign in with the password "correct-horse-battery-staple"
+    Then I see the signed-in identity for "Ada Lovelace"
+    When I open the Security page
+    And I follow the "Change password" link from the Password panel
+    Then I see the "Change your password" heading
+    When I try to change my password from "definitely-not-my-password" to "correct-horse-battery-staple-2"
+    Then I see the change refusal on the current password field
+    When I open my account page
+    Then I see the signed-in identity for "Ada Lovelace"

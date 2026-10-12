@@ -58,6 +58,16 @@ export async function seeDefinition(page, text) {
   );
 }
 
+/** A labelled ARIA region — a `<section aria-labelledby>` named from its heading. */
+export async function seeRegion(page, name) {
+  await waitVisible(page, page.getByRole('region', { name, exact: true }), `region "${name}"`);
+}
+
+/** A form control carrying an exact accessible label. */
+export async function seeLabel(page, name) {
+  await waitVisible(page, page.getByLabel(name, { exact: true }), `field labelled "${name}"`);
+}
+
 /** Asserts a field's current value, failing with both values in the message. */
 export async function seeFieldValue(page, locator, expected, description) {
   await waitVisible(page, locator, description);

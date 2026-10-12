@@ -315,6 +315,11 @@ async fn full_lifecycle_signup_verify_login_logout() {
     assert_eq!(me.status, StatusCode::OK);
     assert_eq!(me.body["name"], "Rémy");
     assert_eq!(me.body["email"], "remy@example.com");
+    // WVR-50: the Security page's "Password is set" state is driven by this flag.
+    assert_eq!(
+        me.body["has_password"], true,
+        "a password account reports a live credential"
+    );
 
     // Logout requires the CSRF token.
     let no_csrf = call(
@@ -1063,4 +1068,334 @@ async fn reset_routes_refuse_cross_origin_requests() {
         before,
         "a refused request sends nothing"
     );
+}
+
+// ----- WVR-50: change password ---------------------------------------------
+
+/// Signs in and returns the (session, csrf) cookie pair the change flow needs.
+async fn sign_in(fixture: &Fixture, email: &str, password: &str) -> (String, String) {
+    let login = call(
+        &fixture.router,
+        "POST",
+        "/api/account/login",
+        &[],
+        Some(serde_json::json!({
+            "email": email,
+            "password": password,
+            "altcha": solved(&fixture.account, "login").await,
+        })),
+    )
+    .await;
+    assert_eq!(login.status, StatusCode::OK, "{:?}", login.body);
+    (
+        login
+            .cookie("__Host-weaver_session")
+            .expect("session cookie set"),
+        login.cookie("__Host-weaver_csrf").expect("csrf cookie set"),
+    )
+}
+
+/// Whether a password signs in (a fresh ALTCHA-guarded login attempt).
+async fn signs_in(fixture: &Fixture, email: &str, password: &str) -> bool {
+    call(
+        &fixture.router,
+        "POST",
+        "/api/account/login",
+        &[],
+        Some(serde_json::json!({
+            "email": email,
+            "password": password,
+            "altcha": solved(&fixture.account, "login").await,
+        })),
+    )
+    .await
+    .status
+        == StatusCode::OK
+}
+
+/// Posts a change-password request with the double-submit CSRF pair attached.
+async fn change_password(
+    fixture: &Fixture,
+    session: &str,
+    csrf: &str,
+    current: &str,
+    new: &str,
+) -> Reply {
+    call(
+        &fixture.router,
+        "POST",
+        "/api/account/password",
+        &[
+            (
+                "cookie",
+                format!("__Host-weaver_session={session}; __Host-weaver_csrf={csrf}"),
+            ),
+            ("x-csrf-token", csrf.to_string()),
+        ],
+        Some(serde_json::json!({ "current_password": current, "new_password": new })),
+    )
+    .await
+}
+
+/// The happy path: the credential is replaced, every session (the acting one
+/// included) is gone, the owner is notified, and only the new password works.
+#[tokio::test]
+async fn change_password_swaps_the_credential_and_signs_out_everywhere() {
+    let fixture = setup().await;
+    let email = "change@example.com";
+    register(&fixture, "Rémy", email, "correct horse battery").await;
+    let (session, csrf) = sign_in(&fixture, email, "correct horse battery").await;
+    let before = fixture.sent.lock().unwrap().len();
+
+    let reply = change_password(
+        &fixture,
+        &session,
+        &csrf,
+        "correct horse battery",
+        "a much better password",
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::OK, "{:?}", reply.body);
+    assert_eq!(reply.body["outcome"], "changed");
+    assert_eq!(
+        reply.cookie("__Host-weaver_session"),
+        Some(String::new()),
+        "the acting session's cookie is cleared in the reply"
+    );
+
+    // The acting session no longer authenticates.
+    let me = call(
+        &fixture.router,
+        "GET",
+        "/api/account/me",
+        &[("cookie", format!("__Host-weaver_session={session}"))],
+        None,
+    )
+    .await;
+    assert_eq!(
+        me.status,
+        StatusCode::UNAUTHORIZED,
+        "a change signs the user out everywhere"
+    );
+
+    assert!(
+        !signs_in(&fixture, email, "correct horse battery").await,
+        "the old password stops working"
+    );
+    assert!(
+        signs_in(&fixture, email, "a much better password").await,
+        "the new password works"
+    );
+
+    // The owner is told, off the response path.
+    wait_for_mail_count(&fixture.sent, before + 1).await;
+    let sent = fixture.sent.lock().unwrap();
+    let notification = sent.last().expect("a notification email");
+    assert_eq!(notification.subject, "Your password was changed");
+    assert!(
+        notification.text.contains("was changed on"),
+        "the notice carries the event time: {}",
+        notification.text
+    );
+}
+
+/// A wrong current password is refused on the field it belongs to, and nothing
+/// is touched: the session survives, the credential is unchanged, no mail.
+#[tokio::test]
+async fn change_password_refuses_a_wrong_current_password_without_side_effects() {
+    let fixture = setup().await;
+    let email = "wrong-current@example.com";
+    register(&fixture, "Rémy", email, "correct horse battery").await;
+    let (session, csrf) = sign_in(&fixture, email, "correct horse battery").await;
+    let before = fixture.sent.lock().unwrap().len();
+
+    let reply = change_password(
+        &fixture,
+        &session,
+        &csrf,
+        "not my password",
+        "a much better password",
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{:?}", reply.body);
+    assert_eq!(reply.body["field"], "current_password");
+    assert!(reply.body["error"].is_string());
+
+    let me = call(
+        &fixture.router,
+        "GET",
+        "/api/account/me",
+        &[("cookie", format!("__Host-weaver_session={session}"))],
+        None,
+    )
+    .await;
+    assert_eq!(
+        me.status,
+        StatusCode::OK,
+        "a refusal leaves the session alone"
+    );
+    assert!(
+        signs_in(&fixture, email, "correct horse battery").await,
+        "the credential is unchanged"
+    );
+    assert!(
+        !signs_in(&fixture, email, "a much better password").await,
+        "the rejected password was not applied"
+    );
+    assert_eq!(
+        fixture.sent.lock().unwrap().len(),
+        before,
+        "a refusal emails nothing"
+    );
+}
+
+/// A new password that fails the policy is refused on the new field, and the
+/// refusal leaves the credential (and the session) alone so a retry works.
+#[tokio::test]
+async fn change_password_enforces_the_password_policy() {
+    let fixture = setup().await;
+    let email = "change-policy@example.com";
+    register(&fixture, "Rémy", email, "correct horse battery").await;
+    let (session, csrf) = sign_in(&fixture, email, "correct horse battery").await;
+
+    let short = change_password(&fixture, &session, &csrf, "correct horse battery", "short").await;
+    assert_eq!(short.status, StatusCode::BAD_REQUEST, "{:?}", short.body);
+    assert_eq!(short.body["field"], "new_password");
+    assert!(
+        signs_in(&fixture, email, "correct horse battery").await,
+        "a policy refusal changes nothing"
+    );
+
+    let ok = change_password(
+        &fixture,
+        &session,
+        &csrf,
+        "correct horse battery",
+        "a much better password",
+    )
+    .await;
+    assert_eq!(ok.status, StatusCode::OK, "{:?}", ok.body);
+}
+
+/// A change ends *every* session: a second device signed in earlier is dead too.
+#[tokio::test]
+async fn change_password_revokes_a_second_session_too() {
+    let fixture = setup().await;
+    let email = "change-devices@example.com";
+    register(&fixture, "Rémy", email, "correct horse battery").await;
+    let (session, csrf) = sign_in(&fixture, email, "correct horse battery").await;
+    let (other, _) = sign_in(&fixture, email, "correct horse battery").await;
+    assert_ne!(session, other, "two distinct sessions");
+
+    let reply = change_password(
+        &fixture,
+        &session,
+        &csrf,
+        "correct horse battery",
+        "a much better password",
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::OK, "{:?}", reply.body);
+
+    for cookie in [&session, &other] {
+        let me = call(
+            &fixture.router,
+            "GET",
+            "/api/account/me",
+            &[("cookie", format!("__Host-weaver_session={cookie}"))],
+            None,
+        )
+        .await;
+        assert_eq!(
+            me.status,
+            StatusCode::UNAUTHORIZED,
+            "every session is revoked"
+        );
+    }
+}
+
+/// The endpoint is authenticated and CSRF-protected: like `logout`, the
+/// same-origin/CSRF guard runs first, and a well-formed request without a live
+/// session is refused as unauthenticated.
+#[tokio::test]
+async fn change_password_requires_a_session_and_a_same_origin_csrf_request() {
+    let fixture = setup().await;
+    let email = "change-guard@example.com";
+    register(&fixture, "Rémy", email, "correct horse battery").await;
+    let (session, csrf) = sign_in(&fixture, email, "correct horse battery").await;
+    let body = Some(serde_json::json!({
+        "current_password": "correct horse battery",
+        "new_password": "a much better password",
+    }));
+
+    // No cookies at all: the CSRF guard refuses before the session is examined,
+    // the same order `logout` uses.
+    let bare = call(
+        &fixture.router,
+        "POST",
+        "/api/account/password",
+        &[],
+        body.clone(),
+    )
+    .await;
+    assert_eq!(bare.status, StatusCode::FORBIDDEN, "{:?}", bare.body);
+
+    // A browser-declared cross-site fetch → 403.
+    let cross_site = call(
+        &fixture.router,
+        "POST",
+        "/api/account/password",
+        &[
+            ("sec-fetch-site", "cross-site".to_string()),
+            (
+                "cookie",
+                format!("__Host-weaver_session={session}; __Host-weaver_csrf={csrf}"),
+            ),
+            ("x-csrf-token", csrf.clone()),
+        ],
+        body.clone(),
+    )
+    .await;
+    assert_eq!(
+        cross_site.status,
+        StatusCode::FORBIDDEN,
+        "{:?}",
+        cross_site.body
+    );
+
+    // Same-origin but without the CSRF header → 403.
+    let no_csrf = call(
+        &fixture.router,
+        "POST",
+        "/api/account/password",
+        &[(
+            "cookie",
+            format!("__Host-weaver_session={session}; __Host-weaver_csrf={csrf}"),
+        )],
+        body.clone(),
+    )
+    .await;
+    assert_eq!(no_csrf.status, StatusCode::FORBIDDEN, "{:?}", no_csrf.body);
+
+    // A well-formed CSRF pair with no session cookie → 401 (not signed in).
+    let signed_out = call(
+        &fixture.router,
+        "POST",
+        "/api/account/password",
+        &[
+            ("cookie", format!("__Host-weaver_csrf={csrf}")),
+            ("x-csrf-token", csrf.clone()),
+        ],
+        body,
+    )
+    .await;
+    assert_eq!(
+        signed_out.status,
+        StatusCode::UNAUTHORIZED,
+        "{:?}",
+        signed_out.body
+    );
+
+    // None of the refusals changed the password.
+    assert!(signs_in(&fixture, email, "correct horse battery").await);
 }

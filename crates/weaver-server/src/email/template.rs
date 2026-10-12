@@ -421,6 +421,99 @@ impl EmailTemplate for Reset {
     }
 }
 
+// --- The password-changed notification template (WVR-50) -------------------
+
+/// `password-changed.mjml`: the security-notification body.
+#[derive(Template)]
+#[template(path = "email/password-changed.mjml", escape = "html", ext = "mjml")]
+struct PasswordChangedMjml<'a> {
+    heading: &'a str,
+    intro: &'a str,
+    recovery_url: &'a str,
+    support_url: &'a str,
+}
+
+/// `password-changed.txt`: the authored plain-text twin.
+#[derive(Template)]
+#[template(path = "email/password-changed.txt", escape = "none", ext = "txt")]
+struct PasswordChangedTxt<'a> {
+    heading: &'a str,
+    intro: &'a str,
+    recovery_url: &'a str,
+    support_url: &'a str,
+}
+
+/// English copy for the password-changed template.
+const PASSWORD_CHANGED_SUBJECT: &str = "Your password was changed";
+const PASSWORD_CHANGED_PREVIEW: &str = "If this wasn't you, here's what to do.";
+const PASSWORD_CHANGED_HEADING: &str = "Your password was changed";
+
+/// The "your password was changed" security notification (WVR-50).
+///
+/// Sent only *after* a change has committed — whether a reset or a signed-in
+/// change — so the copy can never describe an event that rolled back.
+/// `event_time` is a human phrase and must carry a timezone, per the brand
+/// contract (`docs/brand/emails/README.md`).
+#[derive(Debug, Clone)]
+pub struct PasswordChanged {
+    /// Human time of the change, timezone-qualified.
+    pub event_time: String,
+    /// Absolute HTTPS link to the normal password-recovery page. Recovery, not a
+    /// pre-authorised action, so a forwarded mail cannot be replayed into a
+    /// change.
+    pub recovery_url: String,
+}
+
+impl PasswordChanged {
+    /// Stable template id.
+    pub const ID: &'static str = "password-changed";
+}
+
+impl EmailTemplate for PasswordChanged {
+    fn id(&self) -> &'static str {
+        Self::ID
+    }
+
+    fn render(&self, env: &TemplateEnv) -> Result<Rendered, RenderError> {
+        if !crate::email::is_trusted_https(&self.recovery_url) {
+            return Err(RenderError::UntrustedUrl(self.recovery_url.clone()));
+        }
+        let intro = format!(
+            "The password for your Tunnel Weaver account was changed on {}.",
+            self.event_time
+        );
+        let mjml_source = PasswordChangedMjml {
+            heading: PASSWORD_CHANGED_HEADING,
+            intro: &intro,
+            recovery_url: &self.recovery_url,
+            support_url: &env.support_url,
+        }
+        .render()
+        .map_err(|e| RenderError::Template(e.to_string()))?;
+        let html = render_base(
+            PASSWORD_CHANGED_SUBJECT,
+            PASSWORD_CHANGED_PREVIEW,
+            &mjml_source,
+            &env.support_url,
+        )?;
+
+        let text = PasswordChangedTxt {
+            heading: PASSWORD_CHANGED_HEADING,
+            intro: &intro,
+            recovery_url: &self.recovery_url,
+            support_url: &env.support_url,
+        }
+        .render()
+        .map_err(|e| RenderError::Template(e.to_string()))?;
+
+        Ok(Rendered {
+            subject: PASSWORD_CHANGED_SUBJECT.to_string(),
+            text,
+            html,
+        })
+    }
+}
+
 // --- The welcome template (WVR-36) -----------------------------------------
 /// `welcome.mjml`: the account-ready body.
 #[derive(Template)]
@@ -590,5 +683,47 @@ mod tests {
         // The text twin is the existing tag-free `otp_body`.
         assert!(!rendered.text.contains('<'));
         assert!(rendered.text.contains("5 minutes"));
+    }
+
+    #[test]
+    fn password_changed_renders_the_event_and_both_links() {
+        let rendered = PasswordChanged {
+            event_time: "2026-10-12 14:01 UTC".into(),
+            recovery_url: "https://relay.example.org/forgot-password".into(),
+        }
+        .render(&env())
+        .unwrap();
+        // The event time and the recovery link are carried in both parts.
+        assert!(rendered.html.contains("2026-10-12 14:01 UTC"));
+        assert!(
+            rendered
+                .html
+                .contains("https://relay.example.org/forgot-password")
+        );
+        assert!(rendered.text.contains("2026-10-12 14:01 UTC"));
+        assert!(
+            rendered
+                .text
+                .contains("https://relay.example.org/forgot-password")
+        );
+        // Shared partials resolved and the footer's support link is present.
+        assert!(rendered.html.contains("TUNNEL WEAVER"));
+        assert!(rendered.html.contains("https://relay.example.org/support"));
+        assert!(rendered.html.contains("<html"));
+        assert!(!rendered.html.contains("mj-include"));
+        // A security notice is tag-free in plain text.
+        assert!(!rendered.text.contains('<'));
+        assert_eq!(rendered.subject, PASSWORD_CHANGED_SUBJECT);
+    }
+
+    #[test]
+    fn password_changed_rejects_an_untrusted_recovery_url() {
+        let err = PasswordChanged {
+            event_time: "2026-10-12 14:01 UTC".into(),
+            recovery_url: "http://relay.example.org/forgot-password".into(),
+        }
+        .render(&env())
+        .unwrap_err();
+        assert!(matches!(err, RenderError::UntrustedUrl(_)));
     }
 }
