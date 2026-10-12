@@ -1,0 +1,1298 @@
+/* Tunnel Weaver · account plane.
+   Ports the relay's canonical brand tokens and the Figma "primitives" frames:
+   a warm deck surface, a recessed well for inputs, and cut-corner keycaps that
+   rest on a pedestal. Light and dark follow the OS via prefers-color-scheme.
+   Native font stacks only — no downloads, so a broken tunnel still renders. */
+
+:root {
+	color-scheme: light dark;
+
+	--tw-bg: #cdc6bf;
+	--tw-deck: #e5e0d8;
+	--tw-well: #fefaf3;
+	--tw-text: #0b0604;
+	--tw-muted: #524943;
+	--tw-border: #cdc6bf;
+	--tw-accent: #772a0a;
+	--tw-success: #4d5818;
+	--tw-danger: #a44039;
+
+	/* Keycap · Confirm tier. The cap keeps the same fill in both themes; only
+	   the pedestal below it changes. */
+	--tw-confirm: #aebd68;
+	--tw-confirm-hover: #becb84;
+	--tw-on-confirm: #1e2500;
+	--tw-key-pedestal: #524943;
+	--tw-focus: #ba480d;
+	--tw-radius: 3px;
+
+	/* Exact stacks from https://modernfontstacks.com/: Neo-Grotesque for
+	   interface text, Geometric Humanist for headings, Monospace Code for
+	   technical values. */
+	--tw-sans: Inter, Roboto, 'Helvetica Neue', 'Arial Nova', 'Nimbus Sans', Arial, sans-serif;
+	--tw-heading: Avenir, Montserrat, Corbel, 'URW Gothic', source-sans-pro, sans-serif;
+	--tw-mono: ui-monospace, 'Cascadia Code', 'Source Code Pro', Menlo, Consolas, 'DejaVu Sans Mono',
+		monospace;
+}
+
+@media (prefers-color-scheme: dark) {
+	:root {
+		--tw-bg: #0b0604;
+		--tw-deck: #201a16;
+		--tw-well: #0b0604;
+		--tw-text: #fefaf3;
+		--tw-muted: #cdc6bf;
+		--tw-border: #897e76;
+		--tw-accent: #ffcf2e;
+		--tw-success: #cfd9a0;
+		--tw-danger: #ffb8af;
+		/* confirm colours stay the same in both themes */
+		--tw-key-pedestal: #0b0604;
+	}
+}
+
+*,
+*::before,
+*::after {
+	box-sizing: border-box;
+}
+
+html,
+body {
+	margin: 0;
+	min-height: 100%;
+}
+
+body {
+	/* The deck is the whole page background for the account pages. */
+	background: var(--tw-deck);
+	color: var(--tw-text);
+	font: 400 16px/1.6 var(--tw-sans);
+	-webkit-font-smoothing: antialiased;
+	text-rendering: optimizeLegibility;
+}
+
+h1,
+h2,
+h3 {
+	margin: 0;
+	font-family: var(--tw-heading);
+	letter-spacing: -0.02em;
+}
+
+h1 {
+	font-size: 32px;
+	line-height: 40px;
+	font-weight: 700;
+	text-wrap: balance;
+}
+
+h2 {
+	font-size: 16px;
+	line-height: 1.5;
+}
+
+p {
+	margin: 0;
+}
+
+/* ---- layout ------------------------------------------------------------- */
+
+.page {
+	width: 100%;
+	/* 100vh × 100vw landing / account shell. */
+	min-height: 100svh;
+	display: flex;
+	flex-direction: column;
+	align-items: center;
+	gap: clamp(28px, 5vh, 48px);
+	padding: clamp(28px, 6vh, 56px) 20px 0;
+}
+
+.column {
+	width: 100%;
+	max-width: 416px;
+}
+
+/* ---- brand -------------------------------------------------------------- */
+
+.brand {
+	display: flex;
+	align-items: center;
+	gap: 12px;
+	width: 100%;
+	max-width: 416px;
+}
+
+.brand--center {
+	justify-content: center;
+}
+
+/* The mark + wordmark link back to the landing page. */
+.brand__link {
+	display: inline-flex;
+	align-items: center;
+	gap: 12px;
+	color: inherit;
+	text-decoration: none;
+	border-radius: var(--tw-radius);
+	transition: opacity 120ms ease;
+}
+
+.brand__link:hover {
+	opacity: 0.8;
+	text-decoration: none;
+}
+
+.brand__mark {
+	width: 34px;
+	height: 35px;
+	flex: none;
+}
+
+.brand__mark svg {
+	display: block;
+	width: 100%;
+	height: 100%;
+}
+
+.brand__word {
+	font-family: var(--tw-heading);
+	font-size: 20px;
+	font-weight: 700;
+	letter-spacing: 0.01em;
+}
+
+/* ---- text --------------------------------------------------------------- */
+
+.lede {
+	color: var(--tw-muted);
+	font-size: 16px;
+	margin-top: 12px;
+}
+
+.lede + .lede {
+	margin-top: 10px;
+}
+
+.hint {
+	margin: 0;
+	color: var(--tw-muted);
+	font-size: 14px;
+}
+
+/* ---- links -------------------------------------------------------------- */
+
+a {
+	color: var(--tw-accent);
+	text-decoration: none;
+}
+
+a:hover {
+	text-decoration: underline;
+}
+
+a:focus-visible,
+button:focus-visible,
+input:focus-visible,
+.linklike:focus-visible {
+	outline: 2px solid var(--tw-focus);
+	outline-offset: 2px;
+}
+
+.linklike {
+	border: 0;
+	padding: 0;
+	background: none;
+	color: var(--tw-accent);
+	font: inherit;
+	cursor: pointer;
+}
+
+.linklike:hover {
+	text-decoration: underline;
+}
+
+.switch {
+	margin-top: 24px;
+	color: var(--tw-muted);
+	font-size: 16px;
+}
+
+/* ---- forms -------------------------------------------------------------- */
+
+.form {
+	display: flex;
+	flex-direction: column;
+	gap: 20px;
+	margin-top: 24px;
+}
+
+.field {
+	display: flex;
+	flex-direction: column;
+	gap: 8px;
+}
+
+/* Persistent label above the control. */
+.field > label {
+	font-size: 16px;
+	font-weight: 700;
+	line-height: 1.4;
+}
+
+.field__row {
+	display: flex;
+	flex-direction: column;
+	gap: 8px;
+}
+
+.field input {
+	width: 100%;
+	height: 44px;
+	padding: 0 14px;
+	border: 1.5px solid var(--tw-border);
+	border-radius: var(--tw-radius);
+	background: var(--tw-well);
+	color: var(--tw-text);
+	font: 400 16px/1 var(--tw-sans);
+}
+
+.field input::placeholder {
+	color: var(--tw-muted);
+	opacity: 0.75;
+}
+
+.field input:focus {
+	outline: 2px solid var(--tw-focus);
+	outline-offset: 2px;
+	border-color: var(--tw-focus);
+}
+
+.field input:disabled {
+	opacity: 0.55;
+}
+
+/* A readonly verified address: readable, but clearly not editable here. */
+.field input[readonly] {
+	cursor: default;
+	color: var(--tw-muted);
+}
+
+.check {
+	color: var(--tw-success);
+	font-weight: 700;
+}
+
+.toggle {
+	align-self: flex-start;
+	min-height: 32px;
+	padding: 4px 0;
+	border: 0;
+	background: none;
+	color: var(--tw-accent);
+	font: 400 14px/1 var(--tw-sans);
+	cursor: pointer;
+}
+
+.toggle:hover {
+	text-decoration: underline;
+}
+
+.field__error,
+.notice-error {
+	margin: 0;
+	color: var(--tw-danger);
+	font-size: 14px;
+	font-weight: 700;
+}
+
+.field__error {
+	margin-top: 2px;
+}
+
+/* ---- keycap buttons ----------------------------------------------------- */
+
+/* Keycap (Figma primitives): a 44px hit area holding a 34px cap that rests at
+   top:3px on a `--tw-key-pedestal` base at top:7px, with a 10px 45° cut on the
+   top-right. The border and the focus ring are each built from clipped layers,
+   so both follow the cut exactly — no CSS `border` (which `clip-path` would
+   clip away) and no `outline` (which draws a plain rounded rectangle). */
+.keycap {
+	position: relative;
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	min-height: 44px;
+	padding: 0 20px;
+	border: 0;
+	background: transparent;
+	color: var(--tw-on-confirm);
+	font: 700 16px/1.4 var(--tw-sans);
+	text-align: center;
+	text-decoration: none;
+	cursor: pointer;
+	isolation: isolate;
+}
+
+.keycap:hover {
+	text-decoration: none;
+}
+
+/* Decorative, identically-clipped layers behind the label. */
+.keycap__art {
+	position: absolute;
+	inset: 0;
+	pointer-events: none;
+}
+
+.keycap__pedestal {
+	position: absolute;
+	top: 7px;
+	left: 2px;
+	right: 2px;
+	height: 34px;
+	background: var(--tw-key-pedestal);
+	clip-path: polygon(0 0, calc(100% - 10px) 0, 100% 10px, 100% 100%, 0 100%);
+}
+
+/* The cap frame is filled with the edge colour; `.keycap__face` is inset by the
+   border width and its cut tightened so the 45° edge stays as thick as the
+   straight ones. */
+.keycap__cap {
+	position: absolute;
+	top: 3px;
+	left: 2px;
+	right: 2px;
+	height: 34px;
+	background: var(--tw-border);
+	clip-path: polygon(0 0, calc(100% - 10px) 0, 100% 10px, 100% 100%, 0 100%);
+	transition:
+		top 100ms ease,
+		background-color 100ms ease;
+}
+
+.keycap__face {
+	position: absolute;
+	inset: 1.5px;
+	background: var(--tw-deck);
+	clip-path: polygon(0 0, calc(100% - 9.1px) 0, 100% 9.1px, 100% 100%, 0 100%);
+	transition: background-color 100ms ease;
+}
+
+.keycap__label {
+	position: relative;
+	z-index: 1;
+}
+
+/* Confirm: a solid cap with a subtle bevel and no distinct border. */
+.keycap--primary .keycap__cap {
+	background: var(--tw-confirm);
+}
+
+.keycap--primary .keycap__face {
+	inset: 0;
+	background: var(--tw-confirm);
+	clip-path: polygon(0 0, calc(100% - 10px) 0, 100% 10px, 100% 100%, 0 100%);
+	box-shadow:
+		inset 0 1px 0 rgb(255 255 255 / 0.4),
+		inset 0 -1px 0 rgb(0 0 0 / 0.15);
+}
+
+.keycap--primary:hover .keycap__face {
+	background: var(--tw-confirm-hover);
+}
+
+/* Ghost: a 1.5px border that follows the cut, over the page surface. */
+.keycap--ghost {
+	color: var(--tw-text);
+}
+
+.keycap--ghost .keycap__face {
+	background: var(--tw-deck);
+}
+
+.keycap--ghost:hover .keycap__face {
+	background: color-mix(in srgb, var(--tw-text) 10%, var(--tw-deck));
+}
+
+/* Press: the cap travels 4px onto the pedestal (70ms hard stop). */
+.keycap:active .keycap__cap {
+	top: 7px;
+	transition-duration: 70ms;
+}
+
+/* Focus: a shaped 2px ring that follows the cut, drawn as a clipped ring (an
+   outer focus-coloured layer with the cap shape carved out of the middle). */
+.keycap__ring {
+	position: absolute;
+	top: 1px;
+	left: 0;
+	right: 0;
+	height: 38px;
+	background: var(--tw-focus);
+	clip-path: polygon(0 0, calc(100% - 11.17px) 0, 100% 11.17px, 100% 100%, 0 100%);
+	opacity: 0;
+	transition: opacity 90ms ease;
+}
+
+.keycap__ring-hole {
+	position: absolute;
+	inset: 2px;
+	background: var(--tw-deck);
+	clip-path: polygon(0 0, calc(100% - 10px) 0, 100% 10px, 100% 100%, 0 100%);
+}
+
+.keycap:focus-visible .keycap__ring {
+	opacity: 1;
+}
+
+/* The shaped ring is the focus indicator; suppress the generic rectangular
+   outline the base `:focus-visible` rule would otherwise draw. */
+.keycap:focus-visible {
+	outline: none;
+}
+
+/* Forced-colors users still need a visible indicator. */
+@media (forced-colors: active) {
+	.keycap:focus-visible {
+		outline: 2px solid CanvasText;
+		outline-offset: 3px;
+	}
+}
+
+.keycap--wide {
+	width: 100%;
+}
+
+/* Disabled / busy */
+.keycap:disabled,
+.keycap[aria-disabled='true'] {
+	cursor: not-allowed;
+	color: var(--tw-muted);
+}
+
+.keycap:disabled .keycap__pedestal,
+.keycap[aria-disabled='true'] .keycap__pedestal {
+	background: transparent;
+}
+
+.keycap:disabled .keycap__cap,
+.keycap[aria-disabled='true'] .keycap__cap {
+	background: var(--tw-border);
+}
+
+.keycap:disabled .keycap__face,
+.keycap[aria-disabled='true'] .keycap__face {
+	background: var(--tw-well);
+	box-shadow: none;
+}
+
+.keycap[aria-busy='true'] {
+	cursor: progress;
+}
+
+/* ---- actions ------------------------------------------------------------ */
+
+.actions {
+	display: flex;
+	flex-direction: column;
+	gap: 12px;
+	margin-top: 24px;
+}
+
+.actions--inline {
+	flex-direction: row;
+	flex-wrap: wrap;
+	align-items: center;
+}
+
+/* ---- panels / charts ---------------------------------------------------- */
+
+.panel {
+	margin-top: 24px;
+	padding: 14px 16px;
+	border: 1.5px solid var(--tw-border);
+	border-radius: var(--tw-radius);
+	background: var(--tw-well);
+	font-size: 16px;
+}
+
+.panel--success {
+	border-color: var(--tw-success);
+	color: var(--tw-success);
+}
+
+.checkbox-line {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	margin-top: 20px;
+	color: var(--tw-success);
+	font-weight: 700;
+}
+
+.identity {
+	display: grid;
+	gap: 0;
+	margin: 24px 0 0;
+	padding: 0;
+	border-top: 1.5px solid var(--tw-border);
+}
+
+.identity div {
+	display: flex;
+	justify-content: space-between;
+	gap: 16px;
+	padding: 12px 0;
+	border-bottom: 1.5px solid var(--tw-border);
+}
+
+.identity dt {
+	margin: 0;
+	color: var(--tw-muted);
+	font-size: 14px;
+	font-weight: 700;
+}
+
+.identity dd {
+	margin: 0;
+	font-weight: 700;
+	text-align: right;
+	overflow-wrap: anywhere;
+}
+
+/* password strength meter (guidance only) */
+.strength {
+	display: flex;
+	align-items: center;
+	gap: 10px;
+}
+
+.strength__track {
+	flex: 1;
+	height: 6px;
+	border-radius: 999px;
+	background: var(--tw-well);
+	border: 1.5px solid var(--tw-border);
+	overflow: hidden;
+}
+
+.strength__fill {
+	display: block;
+	height: 100%;
+	background: var(--tw-success);
+	transition: width 140ms ease;
+}
+
+.strength__fill[data-level='weak'] {
+	background: var(--tw-danger);
+}
+
+.strength__label {
+	min-width: 3.6rem;
+	text-align: right;
+	color: var(--tw-muted);
+	font-size: 14px;
+}
+
+/* ---- landing (product intro) -------------------------------------------- */
+
+.landing {
+	width: 100%;
+	min-height: 100svh;
+	display: flex;
+	flex-direction: column;
+	align-items: center;
+	overflow-x: clip;
+}
+
+.landing__main {
+	width: 100%;
+	display: flex;
+	flex-direction: column;
+	align-items: center;
+}
+
+/* top bar */
+.landing__top {
+	width: 100%;
+	max-width: 1120px;
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	gap: 16px;
+	padding: 18px clamp(20px, 5vw, 40px);
+}
+
+.landing__top .brand {
+	width: auto;
+	max-width: none;
+}
+
+.landing__nav {
+	display: flex;
+	align-items: center;
+	gap: 10px 22px;
+}
+
+.landing__nav-link {
+	color: var(--tw-text);
+	font-size: 15px;
+	font-weight: 700;
+}
+
+.landing__nav-link:hover {
+	color: var(--tw-accent);
+	text-decoration: none;
+}
+
+/* hero / jumbotron */
+.hero {
+	position: relative;
+	width: 100%;
+	/* A true full-viewport intro: exactly one viewport tall (with a `100vh`
+	   fallback for engines without `svh`), content centred inside it. */
+	min-height: 100vh;
+	min-height: 100svh;
+	display: flex;
+	flex-direction: column;
+	align-items: center;
+	justify-content: center;
+	text-align: center;
+	/* The whole block sizes against viewport *height* as well as width, so the
+	   art, headline and CTAs fit inside one viewport on short screens too. The
+	   extra bottom padding lifts the content slightly above dead centre so the
+	   two CTAs stay comfortably above the fold. */
+	gap: clamp(8px, 1.5vh, 20px);
+	padding: clamp(14px, 3vh, 44px) clamp(20px, 5vw, 40px) clamp(24px, 6vh, 88px);
+}
+
+.hero__art {
+	position: relative;
+	/* Fluid brand moment: grows with both width and available height, with a
+	   ceiling well above the old 220px so tall/large screens get generous art. */
+	width: min(56vw, 30vh, 340px);
+	aspect-ratio: 1;
+	display: grid;
+	place-items: center;
+	margin-bottom: clamp(2px, 0.8vh, 10px);
+	isolation: isolate;
+}
+
+/* Genuinely tall screens: let the art (and its tunnel frames) grow further. */
+@media (min-height: 900px) {
+	.hero__art {
+		width: min(56vw, 36vh, 440px);
+	}
+}
+
+.hero__glow {
+	position: absolute;
+	inset: -26%;
+	z-index: 0;
+	background: radial-gradient(
+		circle at 50% 50%,
+		color-mix(in srgb, var(--tw-confirm) 24%, transparent),
+		transparent 62%
+	);
+}
+
+/* CSS-only tunnel: concentric cut-corner frames (the keycap motif) that drift
+   slowly, weaving around the mark. No assets, no scripts. */
+.tunnel {
+	position: absolute;
+	inset: 0;
+	display: grid;
+	place-items: center;
+	animation: tunnel-weave 90s linear infinite;
+}
+
+.tunnel__ring {
+	position: absolute;
+	inset: 0;
+	/* A true ring (outer shape minus an inset inner hole) so the edge follows
+	   the 45° cut. A plain `border` would be clipped away on the diagonal. */
+	background: var(--tw-border);
+	clip-path: polygon(
+		evenodd,
+		0 0,
+		calc(100% - 22px) 0,
+		100% 22px,
+		100% 100%,
+		0 100%,
+		1.5px 1.5px,
+		calc(100% - 22.62px) 1.5px,
+		calc(100% - 1.5px) 22.62px,
+		calc(100% - 1.5px) calc(100% - 1.5px),
+		1.5px calc(100% - 1.5px)
+	);
+	transform: rotate(var(--ring-rotate, 0deg)) scale(var(--ring-scale, 1));
+}
+
+.tunnel__ring:nth-child(1) {
+	--ring-scale: 1;
+	--ring-rotate: 0deg;
+	opacity: 0.5;
+}
+
+.tunnel__ring:nth-child(2) {
+	--ring-scale: 0.86;
+	--ring-rotate: 12deg;
+	opacity: 0.42;
+}
+
+.tunnel__ring:nth-child(3) {
+	--ring-scale: 0.72;
+	--ring-rotate: -14deg;
+	opacity: 0.36;
+}
+
+.tunnel__ring:nth-child(4) {
+	--ring-scale: 0.58;
+	--ring-rotate: 22deg;
+	opacity: 0.3;
+}
+
+.tunnel__ring:nth-child(5) {
+	--ring-scale: 0.44;
+	--ring-rotate: -30deg;
+	opacity: 0.26;
+}
+
+.tunnel__ring:nth-child(6) {
+	--ring-scale: 0.3;
+	--ring-rotate: 40deg;
+	opacity: 0.22;
+}
+
+.hero__mark {
+	position: relative;
+	z-index: 2;
+	width: 42%;
+	filter: drop-shadow(0 14px 30px rgb(0 0 0 / 0.35));
+}
+
+.hero__mark svg {
+	display: block;
+	width: 100%;
+	height: auto;
+}
+
+.hero__eyebrow {
+	font-family: var(--tw-mono);
+	font-size: 13px;
+	letter-spacing: 0.3em;
+	text-transform: uppercase;
+	color: var(--tw-muted);
+}
+
+.hero__title {
+	font-size: clamp(30px, 5.4vw, min(6.4vh, 60px));
+	line-height: 1;
+	font-weight: 700;
+	letter-spacing: -0.035em;
+	max-width: 15ch;
+	text-wrap: balance;
+}
+
+.hero__lede {
+	max-width: 54ch;
+	color: var(--tw-muted);
+	font-size: clamp(15px, 1.9vh, 19px);
+	line-height: 1.55;
+}
+
+.hero__actions {
+	display: flex;
+	flex-wrap: wrap;
+	justify-content: center;
+	gap: 14px;
+	margin-top: 4px;
+}
+
+.hero__actions .keycap {
+	min-width: 196px;
+}
+
+.hero__tagline {
+	font-family: var(--tw-mono);
+	font-size: 14px;
+	color: var(--tw-muted);
+}
+
+/* Short viewports: shrink the art, headline and spacing a little further so the
+   whole hero — including both CTAs — still fits inside one viewport. */
+@media (max-height: 700px) {
+	.hero {
+		gap: clamp(6px, 1.2vh, 14px);
+		padding: clamp(12px, 2.4vh, 28px) clamp(20px, 5vw, 40px) clamp(18px, 4.5vh, 48px);
+	}
+
+	.hero__art {
+		width: min(40vw, 19vh, 180px);
+	}
+
+	.hero__title {
+		font-size: clamp(28px, 4.8vw, min(5.8vh, 46px));
+	}
+}
+
+@keyframes tunnel-weave {
+	from {
+		transform: rotate(0deg);
+	}
+	to {
+		transform: rotate(360deg);
+	}
+}
+
+/* sections */
+.section {
+	width: 100%;
+	max-width: 1120px;
+	padding: clamp(44px, 8vh, 88px) clamp(20px, 5vw, 40px);
+}
+
+.section-title {
+	font-size: clamp(24px, 3vw, 34px);
+	line-height: 1.1;
+	font-weight: 700;
+}
+
+.section-lede {
+	margin-top: 10px;
+	margin-bottom: clamp(22px, 4vh, 38px);
+	color: var(--tw-muted);
+	max-width: 60ch;
+}
+
+.cards {
+	list-style: none;
+	margin: 0;
+	padding: 0;
+	display: grid;
+	grid-template-columns: repeat(auto-fit, minmax(min(100%, 240px), 1fr));
+	gap: clamp(14px, 2vw, 22px);
+}
+
+/* ---- cut panel (reusable cut-corner surface) ---------------------------- */
+
+/* A cut-corner panel whose edge follows the 45° cut. Two clipped layers: the
+   root's ::before is the edge colour, ::after is the fill inset by the border
+   width, with its cut tightened so the diagonal edge stays as thick as the
+   straight ones. A plain `border` would be clipped away on the diagonal.
+   Override --cut / --cut-fill / --cut-edge / --cut-border per use. */
+.cut-panel {
+	position: relative;
+	isolation: isolate;
+	--cut: 16px;
+	--cut-border: 1.5px;
+	--cut-fill: var(--tw-well);
+	--cut-edge: var(--tw-border);
+	--cut-inner: calc(var(--cut) - 0.88px);
+}
+
+.cut-panel::before,
+.cut-panel::after {
+	content: '';
+	position: absolute;
+	pointer-events: none;
+}
+
+.cut-panel::before {
+	inset: 0;
+	z-index: -2;
+	background: var(--cut-edge);
+	clip-path: polygon(0 0, calc(100% - var(--cut)) 0, 100% var(--cut), 100% 100%, 0 100%);
+}
+
+.cut-panel::after {
+	inset: var(--cut-border);
+	z-index: -1;
+	background: var(--cut-fill);
+	clip-path: polygon(
+		0 0,
+		calc(100% - var(--cut-inner)) 0,
+		100% var(--cut-inner),
+		100% 100%,
+		0 100%
+	);
+}
+
+/* how it works */
+.step {
+	--cut: 16px;
+	--cut-fill: var(--tw-well);
+	display: flex;
+	flex-direction: column;
+	gap: 10px;
+	padding: 24px 22px 26px;
+}
+
+.step__num {
+	font-family: var(--tw-mono);
+	font-size: 13px;
+	font-weight: 700;
+	letter-spacing: 0.16em;
+	color: var(--tw-accent);
+}
+
+.step__title {
+	font-family: var(--tw-heading);
+	font-size: 19px;
+	font-weight: 700;
+	line-height: 1.25;
+}
+
+.step__text {
+	color: var(--tw-muted);
+	font-size: 15px;
+	line-height: 1.6;
+}
+
+/* benefits */
+.benefits {
+	grid-template-columns: repeat(auto-fit, minmax(min(100%, 220px), 1fr));
+}
+
+.benefit {
+	--cut: 12px;
+	--cut-fill: color-mix(in srgb, var(--tw-well) 55%, var(--tw-deck));
+	display: flex;
+	align-items: flex-start;
+	gap: 12px;
+	padding: 18px;
+}
+
+.benefit__icon {
+	display: grid;
+	place-items: center;
+	width: 34px;
+	height: 34px;
+	flex: none;
+	color: var(--tw-accent);
+}
+
+.benefit__icon .icon {
+	width: 24px;
+	height: 24px;
+}
+
+.benefit__title {
+	font-weight: 700;
+	line-height: 1.3;
+}
+
+.benefit__text {
+	margin-top: 4px;
+	color: var(--tw-muted);
+	font-size: 14px;
+	line-height: 1.5;
+}
+
+/* closing CTA */
+.closing {
+	width: 100%;
+	max-width: 1120px;
+	padding: 0 clamp(20px, 5vw, 40px) clamp(44px, 9vh, 96px);
+}
+
+.closing__panel {
+	--cut: 26px;
+	--cut-fill: var(--tw-well);
+	display: flex;
+	flex-direction: column;
+	align-items: center;
+	text-align: center;
+	gap: 16px;
+	padding: clamp(34px, 6vh, 60px) clamp(22px, 5vw, 56px);
+}
+
+.closing__title {
+	font-size: clamp(26px, 3.4vw, 40px);
+	line-height: 1.1;
+}
+
+.closing__text {
+	max-width: 46ch;
+	color: var(--tw-muted);
+}
+
+.closing__actions {
+	display: flex;
+	flex-wrap: wrap;
+	justify-content: center;
+	gap: 14px;
+	margin-top: 4px;
+}
+
+.closing__actions .keycap {
+	min-width: 180px;
+}
+
+/* ---- footer ------------------------------------------------------------- */
+
+.site-footer {
+	width: 100%;
+	margin-top: auto;
+	padding: 32px 20px 24px;
+	display: flex;
+	flex-wrap: wrap;
+	align-items: center;
+	justify-content: center;
+	gap: 10px 22px;
+	color: var(--tw-muted);
+	font-size: 14px;
+}
+
+.site-footer__brand {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: baseline;
+	justify-content: center;
+	gap: 4px 12px;
+	margin: 0;
+}
+
+.site-footer__word {
+	font-family: var(--tw-heading);
+	font-weight: 700;
+	color: var(--tw-text);
+}
+
+.site-footer__contact {
+	color: var(--tw-accent);
+	font-weight: 700;
+}
+
+/* ---- ALTCHA widget ------------------------------------------------------ */
+
+.altcha {
+	display: flex;
+	flex-direction: column;
+	gap: 8px;
+	margin-top: 4px;
+}
+
+.altcha-state {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	color: var(--tw-muted);
+	font-size: 14px;
+}
+
+.altcha-state__dot {
+	width: 8px;
+	height: 8px;
+	flex: none;
+	border-radius: 50%;
+	background: var(--tw-muted);
+}
+
+.altcha-state[data-state='solving'] .altcha-state__dot {
+	background: var(--tw-focus);
+}
+
+.altcha-state[data-state='ready'] .altcha-state__dot {
+	background: var(--tw-success);
+}
+
+.altcha-state[data-state='error'] {
+	color: var(--tw-danger);
+}
+
+.altcha-state[data-state='error'] .altcha-state__dot {
+	background: var(--tw-danger);
+}
+
+/* The vendored widget is driven programmatically and rendered invisibly; the
+   status line above is the only chrome the user sees. */
+.altcha-widget {
+	position: absolute;
+	width: 1px;
+	height: 1px;
+	padding: 0;
+	margin: -1px;
+	overflow: hidden;
+	clip-path: inset(50%);
+	border: 0;
+	white-space: nowrap;
+}
+
+altcha-widget {
+	/* Blend the upstream widget into the relay's palette, in case its chrome
+	   is ever surfaced. */
+	display: block;
+	width: 100%;
+	max-width: 420px;
+	--altcha-border-radius: var(--tw-radius);
+	--altcha-border-color: var(--tw-border);
+	--altcha-color-base: var(--tw-well);
+	--altcha-color-base-content: var(--tw-text);
+	--altcha-color-primary: var(--tw-accent);
+	--altcha-max-width: 100%;
+}
+
+/* ---- notices ------------------------------------------------------------ */
+
+.notices {
+	position: fixed;
+	inset: 14px 14px auto 14px;
+	z-index: 20;
+	display: flex;
+	flex-direction: column;
+	gap: 10px;
+	margin: 0 auto;
+	width: min(100%, 416px);
+	pointer-events: none;
+}
+
+.notice {
+	display: flex;
+	align-items: flex-start;
+	gap: 12px;
+	padding: 12px 14px;
+	border: 1.5px solid var(--tw-border);
+	border-radius: var(--tw-radius);
+	background: var(--tw-well);
+	pointer-events: auto;
+	font-size: 14px;
+}
+
+.notice--error {
+	border-color: var(--tw-danger);
+	color: var(--tw-danger);
+}
+
+.notice--success {
+	border-color: var(--tw-success);
+	color: var(--tw-success);
+}
+
+.notice__text {
+	flex: 1;
+}
+
+.notice__close {
+	border: 0;
+	background: none;
+	color: inherit;
+	font-size: 1.15rem;
+	line-height: 1;
+	cursor: pointer;
+	opacity: 0.7;
+}
+
+.notice__close:hover {
+	opacity: 1;
+}
+
+/* ---- skip link ---------------------------------------------------------- */
+
+.skip-link {
+	position: absolute;
+	left: 50%;
+	top: -60px;
+	transform: translateX(-50%);
+	z-index: 30;
+	padding: 10px 16px;
+	border-radius: 0 0 var(--tw-radius) var(--tw-radius);
+	background: var(--tw-text);
+	color: var(--tw-deck);
+	text-decoration: none;
+	transition: top 120ms ease;
+}
+
+.skip-link:focus {
+	top: 0;
+}
+
+@media (prefers-reduced-motion: reduce) {
+	.keycap__cap,
+	.keycap__face,
+	.keycap__ring {
+		transition: none;
+	}
+
+	.keycap:active .keycap__cap {
+		top: 3px;
+	}
+
+	.strength__fill {
+		transition: none;
+	}
+
+	.brand__link {
+		transition: none;
+	}
+
+	.skip-link {
+		transition: none;
+	}
+
+	.tunnel {
+		animation: none;
+	}
+}
+
+/* ---- responsive --------------------------------------------------------- */
+
+/* mobile: ≤640px — stack inline actions, full-width keycaps */
+@media (max-width: 640px) {
+	.page {
+		padding-top: 24px;
+	}
+
+	.actions--inline {
+		flex-direction: column;
+		align-items: stretch;
+	}
+
+	.actions--inline .keycap {
+		width: 100%;
+	}
+
+	.landing__top {
+		padding: 14px 20px;
+	}
+
+	/* The CTA lives in the hero on small screens; keep the bar quiet. */
+	.landing__nav .keycap {
+		display: none;
+	}
+
+	.hero {
+		/* Keep the full-viewport hero on phones too; the vh-based sizing fits it. */
+		padding-top: clamp(16px, 3vh, 32px);
+	}
+
+	.hero__actions {
+		width: 100%;
+		max-width: 320px;
+		flex-direction: column;
+		align-items: stretch;
+	}
+
+	.closing__actions {
+		width: 100%;
+		max-width: 320px;
+		flex-direction: column;
+		align-items: stretch;
+	}
+}
+
+/* tablet: 641–1023px */
+@media (min-width: 641px) and (max-width: 1023px) {
+	.page {
+		padding-top: clamp(36px, 7vh, 64px);
+	}
+}
+
+/* desktop: ≥1024px */
+@media (min-width: 1024px) {
+	.page {
+		gap: clamp(36px, 6vh, 56px);
+	}
+}

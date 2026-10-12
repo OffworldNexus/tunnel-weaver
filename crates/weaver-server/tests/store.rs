@@ -3,6 +3,9 @@ use std::path::PathBuf;
 
 use sea_orm::{ConnectionTrait, DbBackend, Statement};
 use tempfile::TempDir;
+use weaver_server::store::account::{
+    ActivationOutcome, ActivationRequest, NewPendingRegistration, NewVerificationToken,
+};
 use weaver_server::{Config, ConfigError, Store, StoreError};
 
 /// Runs a scalar query and returns the first column of the first row.
@@ -38,6 +41,7 @@ fn sample_config() -> Config {
         setup_complete: false,
         email: None,
         abuse: None,
+        account: Default::default(),
     }
 }
 
@@ -108,15 +112,15 @@ async fn test_store_open_runs_migrations_and_is_idempotent() {
         )
         .await;
         assert_eq!(count, 13);
-        assert_eq!(store.schema_version().await.expect("schema_version"), 3);
+        assert_eq!(store.schema_version().await.expect("schema_version"), 4);
     }
 
     // Re-open existing database: should succeed and not re-apply migrations
     {
         let store = Store::open(&db_path).await.expect("re-open failed");
         let migration_count: i64 = scalar(&store, "SELECT count(*) FROM seaql_migrations").await;
-        assert_eq!(migration_count, 3);
-        assert_eq!(store.schema_version().await.expect("schema_version"), 3);
+        assert_eq!(migration_count, 4);
+        assert_eq!(store.schema_version().await.expect("schema_version"), 4);
     }
 }
 
@@ -202,6 +206,7 @@ async fn test_config_validation_rules() {
     let invalid_google_config = Config {
         acme_provider: "google".into(),
         acme_fallback_providers: vec![],
+        account: Default::default(),
         ..sample_config()
     };
 
@@ -220,6 +225,7 @@ async fn test_config_validation_rules() {
     // Custom provider requires acme_directory
     let invalid_custom_config = Config {
         acme_provider: "custom".into(),
+        account: Default::default(),
         ..invalid_google_config.clone()
     };
     store
@@ -237,6 +243,7 @@ async fn test_config_validation_rules() {
     let invalid_email_config = Config {
         acme_provider: "letsencrypt".into(),
         admin_email: "not-an-email".into(),
+        account: Default::default(),
         ..invalid_google_config
     };
     store
@@ -254,6 +261,7 @@ async fn test_config_validation_rules() {
     // would hand the relay's own DNS to the zone the relay is meant to control.
     let nested_admin_config = Config {
         admin_domain: "relay.example.com".into(),
+        account: Default::default(),
         ..sample_config()
     };
     store
@@ -273,6 +281,7 @@ async fn test_config_validation_rules() {
     // Same name for both is equally unsafe.
     let same_name_config = Config {
         admin_domain: "example.com".into(),
+        account: Default::default(),
         ..sample_config()
     };
     store
@@ -292,6 +301,7 @@ async fn test_config_validation_rules() {
         admin_domain: "relay.example.net".into(),
         acme_provider: "letsencrypt".into(),
         admin_email: "admin@example.com".into(),
+        account: Default::default(),
         ..sample_config()
     };
     store
@@ -331,6 +341,7 @@ async fn test_config_validation_abuse_limits() {
             bucket_ttl_secs: 3600,
             altcha: None,
         }),
+        account: Default::default(),
         ..sample_config()
     };
     store.save_config(&ok).await.expect("save succeeded");
@@ -346,6 +357,7 @@ async fn test_config_validation_abuse_limits() {
             },
             ..ok.abuse.clone().unwrap()
         }),
+        account: Default::default(),
         ..ok.clone()
     };
     store.save_config(&bad).await.expect("save succeeded");
@@ -370,6 +382,7 @@ async fn test_config_validation_abuse_limits() {
             },
             ..ok.abuse.clone().unwrap()
         }),
+        account: Default::default(),
         ..ok.clone()
     };
     store.save_config(&disabled).await.expect("save succeeded");
@@ -416,6 +429,7 @@ async fn test_backup_creates_openable_database() {
     let store = Store::open(&original_db).await.expect("open failed");
     let config = Config {
         tunnel_domain: "backup.nexus.com".into(),
+        account: Default::default(),
         ..sample_config()
     };
     store.save_config(&config).await.expect("save failed");
@@ -968,4 +982,357 @@ async fn test_migration_usage_round_trips() {
     )
     .await;
     assert_eq!(usage_tables, 1, "up must recreate the usage table");
+}
+
+// ---------------------------------------------------------------------------
+// WVR-36: email attribution is atomic.
+//
+// These exercise the store boundary directly: a verified signup must land as an
+// atomic unit (account + identity + ownership history + one current credential),
+// one address must resolve to exactly one account even when two activations
+// race, and an account display name must never leak into the tunnel `person`
+// namespace.
+// ---------------------------------------------------------------------------
+
+/// Stages a verified signup and returns the ids needed to activate it:
+/// `(pending_registration_id, proof_token_id, completion_token_id)`.
+///
+/// The emailed link is followed (the proof token is consumed) and a fresh
+/// completion token is minted, mirroring signup → verify → complete.
+async fn stage_verified_signup(
+    store: &Store,
+    name: &str,
+    email: &str,
+    lookup_key: &str,
+    now: i64,
+) -> (i32, i32, i32) {
+    let pending = store
+        .pending_registration_create(NewPendingRegistration {
+            flow_id: format!("flow-{name}-{lookup_key}"),
+            name: name.to_string(),
+            email: email.to_string(),
+            lookup_key: lookup_key.to_string(),
+            created_at: now,
+            expires_at: now + 10_000,
+        })
+        .await
+        .expect("pending registration");
+
+    let proof = store
+        .verification_token_issue(
+            pending.id,
+            NewVerificationToken {
+                email_lookup_key: lookup_key.to_string(),
+                token_digest: format!("proof-{name}-{lookup_key}"),
+                purpose: "email-verification".to_string(),
+                issued_at: now,
+                expires_at: now + 10_000,
+            },
+        )
+        .await
+        .expect("proof token");
+    // The user clicked the emailed link; the proof token is spent before the
+    // completion window opens.
+    assert!(
+        store
+            .verification_token_consume(proof.id, now)
+            .await
+            .unwrap(),
+        "the proof token must be consumable"
+    );
+
+    let completion = store
+        .verification_token_issue(
+            pending.id,
+            NewVerificationToken {
+                email_lookup_key: lookup_key.to_string(),
+                token_digest: format!("completion-{name}-{lookup_key}"),
+                purpose: "registration-completion".to_string(),
+                issued_at: now,
+                expires_at: now + 10_000,
+            },
+        )
+        .await
+        .expect("completion token");
+
+    (pending.id, proof.id, completion.id)
+}
+
+/// Activates a staged signup through the store's atomic entry point.
+#[allow(clippy::too_many_arguments)]
+async fn activate(
+    store: &Store,
+    pending_registration_id: i32,
+    proof_token_id: i32,
+    consume_token_id: i32,
+    name: &str,
+    email: &str,
+    lookup_key: &str,
+    encoded_hash: &str,
+    now: i64,
+) -> ActivationOutcome {
+    store
+        .account_activate(ActivationRequest {
+            pending_registration_id,
+            consume_token_id,
+            proof_token_id,
+            name,
+            email,
+            lookup_key,
+            encoded_hash,
+            now,
+        })
+        .await
+        .expect("activation should succeed")
+}
+
+#[tokio::test]
+async fn test_account_activation_links_ownership_and_password_history() {
+    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+    use weaver_server::store::entity::{
+        email_verification, password_credential, verification_token,
+    };
+
+    let temp = TempDir::new().expect("tempdir");
+    let store = Store::open(temp.path().join("activate.db"))
+        .await
+        .expect("open failed");
+    let now = 1_000;
+    let hash = "$argon2id$v=19$m=8,t=1,p=1$c2FsdA$aGFzaA";
+
+    let (pending, proof, completion) =
+        stage_verified_signup(&store, "Rémy", "remy@example.com", "remy@example.com", now).await;
+    let outcome = activate(
+        &store,
+        pending,
+        proof,
+        completion,
+        "Rémy",
+        "remy@example.com",
+        "remy@example.com",
+        hash,
+        now,
+    )
+    .await;
+    let account = match outcome {
+        ActivationOutcome::Activated(account) => account,
+        other => panic!("expected a fresh activation, got {other:?}"),
+    };
+
+    // The address is claimed by this account and marked verified.
+    let identity = store
+        .email_identity_for_account(account.id)
+        .await
+        .unwrap()
+        .expect("one identity per account");
+    assert_eq!(identity.lookup_key, "remy@example.com");
+    assert_eq!(identity.verified_at, Some(now));
+    let found = store
+        .email_identity_find("remy@example.com")
+        .await
+        .unwrap()
+        .expect("address resolves to its account");
+    assert_eq!(found.account_id, account.id);
+
+    // The ownership history is a real row referencing the *consumed* proof
+    // token, not a boolean on the account.
+    let history = email_verification::Entity::find()
+        .filter(email_verification::Column::AccountId.eq(account.id))
+        .all(store.db())
+        .await
+        .unwrap();
+    assert_eq!(history.len(), 1, "exactly one initial verification row");
+    assert_eq!(history[0].email_identity_id, identity.id);
+    assert_eq!(history[0].token_id, proof, "history cites the proof token");
+    assert_eq!(history[0].verified_at, now);
+    let proof_token = verification_token::Entity::find_by_id(proof)
+        .one(store.db())
+        .await
+        .unwrap()
+        .expect("proof token survives as audit provenance");
+    assert!(
+        proof_token.consumed_at.is_some(),
+        "the proof token must be spent"
+    );
+
+    // Exactly one current credential, referencing the initial hash.
+    let credentials = password_credential::Entity::find()
+        .filter(password_credential::Column::AccountId.eq(account.id))
+        .all(store.db())
+        .await
+        .unwrap();
+    assert_eq!(credentials.len(), 1, "activation writes one credential");
+    assert_eq!(credentials[0].encoded_hash, hash);
+    assert!(credentials[0].retired_at.is_none(), "it is the current one");
+    let current = store
+        .password_current_for(account.id)
+        .await
+        .unwrap()
+        .expect("a current credential");
+    assert_eq!(current.encoded_hash, hash);
+
+    // The completion token is consumed by the same atomic step.
+    let completion_token = verification_token::Entity::find_by_id(completion)
+        .one(store.db())
+        .await
+        .unwrap()
+        .expect("completion token row");
+    assert!(
+        completion_token.consumed_at.is_some(),
+        "the completion token must be spent"
+    );
+}
+
+#[tokio::test]
+async fn test_concurrent_activation_of_one_address_has_one_owner() {
+    let temp = TempDir::new().expect("tempdir");
+    let store = Store::open(temp.path().join("race.db"))
+        .await
+        .expect("open failed");
+    let now = 1_000;
+    let lookup = "dupe@example.com";
+    let hash_first = "$argon2id$v=19$m=8,t=1,p=1$Zmlyc3Q$aGFzaA";
+    let hash_second = "$argon2id$v=19$m=8,t=1,p=1$c2Vjb25k$aGFzaA";
+
+    // Two racing signups for one address: distinct flows and tokens, same key.
+    let (p1, proof1, c1) = stage_verified_signup(&store, "First", lookup, lookup, now).await;
+    let (p2, proof2, c2) = stage_verified_signup(&store, "Second", lookup, lookup, now).await;
+
+    let (r1, r2) = tokio::join!(
+        activate(
+            &store, p1, proof1, c1, "First", lookup, lookup, hash_first, now
+        ),
+        activate(
+            &store,
+            p2,
+            proof2,
+            c2,
+            "Second",
+            lookup,
+            lookup,
+            hash_second,
+            now
+        ),
+    );
+
+    // Exactly one activation wins; the other confirms the existing account.
+    let (winner, existing_id) = match (r1, r2) {
+        (ActivationOutcome::Activated(winner), ActivationOutcome::ExistingAccount(existing)) => {
+            (winner, existing.id)
+        }
+        (ActivationOutcome::ExistingAccount(existing), ActivationOutcome::Activated(winner)) => {
+            (winner, existing.id)
+        }
+        other => panic!("expected one Activated and one ExistingAccount, got {other:?}"),
+    };
+    assert_eq!(
+        existing_id, winner.id,
+        "the loser hands back the real owner"
+    );
+
+    // At the database level there is exactly one account and one identity for
+    // the address; the loser's placeholder account was rolled back.
+    let accounts: i64 = scalar(&store, "SELECT count(*) FROM account").await;
+    assert_eq!(accounts, 1, "one address must yield one account");
+    let identities: i64 = scalar(&store, "SELECT count(*) FROM email_identity").await;
+    assert_eq!(identities, 1, "one address must yield one identity");
+
+    // The winner's credential is intact and unchanged; the loser wrote none.
+    let expected = if winner.name == "First" {
+        hash_first
+    } else {
+        hash_second
+    };
+    let current = store
+        .password_current_for(winner.id)
+        .await
+        .unwrap()
+        .expect("the winner has a credential");
+    assert_eq!(current.encoded_hash, expected);
+    let credentials: i64 = scalar(&store, "SELECT count(*) FROM password_credential").await;
+    assert_eq!(credentials, 1, "the loser must not write a credential");
+}
+
+#[tokio::test]
+async fn test_same_name_different_emails_and_account_person_separation() {
+    use sea_orm::EntityTrait;
+    use weaver_server::store::entity::person;
+
+    let temp = TempDir::new().expect("tempdir");
+    let store = Store::open(temp.path().join("names.db"))
+        .await
+        .expect("open failed");
+    let now = 1_000;
+    let hash = "$argon2id$v=19$m=8,t=1,p=1$c2FsdA$aGFzaA";
+
+    let (p1, proof1, c1) =
+        stage_verified_signup(&store, "Rémy", "a@example.com", "a@example.com", now).await;
+    let (p2, proof2, c2) =
+        stage_verified_signup(&store, "Rémy", "b@example.com", "b@example.com", now).await;
+
+    let first = match activate(
+        &store,
+        p1,
+        proof1,
+        c1,
+        "Rémy",
+        "a@example.com",
+        "a@example.com",
+        hash,
+        now,
+    )
+    .await
+    {
+        ActivationOutcome::Activated(account) => account,
+        other => panic!("expected activation for a@example.com, got {other:?}"),
+    };
+    let second = match activate(
+        &store,
+        p2,
+        proof2,
+        c2,
+        "Rémy",
+        "b@example.com",
+        "b@example.com",
+        hash,
+        now,
+    )
+    .await
+    {
+        ActivationOutcome::Activated(account) => account,
+        other => panic!("expected activation for b@example.com, got {other:?}"),
+    };
+
+    // Two distinct accounts may share one display name, Unicode preserved.
+    assert_ne!(first.id, second.id);
+    assert_eq!(first.name, "Rémy");
+    assert_eq!(second.name, "Rémy");
+
+    // Identity is resolved through the email, never the name.
+    assert_eq!(
+        store
+            .email_identity_find("a@example.com")
+            .await
+            .unwrap()
+            .unwrap()
+            .account_id,
+        first.id
+    );
+    assert_eq!(
+        store
+            .email_identity_find("b@example.com")
+            .await
+            .unwrap()
+            .unwrap()
+            .account_id,
+        second.id
+    );
+
+    // The account plane never touches the tunnel `person` namespace. The only
+    // row present is the migration's default PoC seed ("poc").
+    let people = person::Entity::find().all(store.db()).await.unwrap();
+    assert!(
+        people.iter().all(|p| p.name == "poc"),
+        "accounts must not add person rows: {people:?}"
+    );
 }

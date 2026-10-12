@@ -222,6 +222,7 @@ async fn test_pebble_e2e_issuance_and_lazy_ensure() {
         setup_complete: true,
         email: None,
         abuse: None,
+        account: Default::default(),
     });
 
     let dns_token = CancellationToken::new();
@@ -363,6 +364,7 @@ async fn test_pebble_e2e_tunnel_registration_and_proxying() {
         setup_complete: true,
         email: None,
         abuse: None,
+        account: Default::default(),
     });
 
     let dns_token = CancellationToken::new();

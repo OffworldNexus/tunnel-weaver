@@ -252,6 +252,7 @@ async fn spawn_test_relay(tunnel_domain: &str) -> TestRelay {
         setup_complete: false,
         email: None,
         abuse: None,
+        account: Default::default(),
     });
 
     let resolver = Arc::new(CertResolver::new(tunnel_domain));
@@ -2094,6 +2095,7 @@ async fn test_client_leaving_during_cert_issuance_does_not_leave_hostname_active
         setup_complete: false,
         email: None,
         abuse: None,
+        account: Default::default(),
     });
     let resolver = Arc::new(CertResolver::new(root));
     let cert_manager = CertManager::new(

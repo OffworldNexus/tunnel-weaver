@@ -1,0 +1,9 @@
+{{ heading }}
+
+{{ intro }}
+
+{{ account_url }}
+
+{{ footnote }}
+
+{{ support_url }}

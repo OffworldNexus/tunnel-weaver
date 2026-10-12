@@ -158,6 +158,49 @@ pub fn build(config: &Config, store: Store) -> Arc<Pipeline> {
         ));
     }
 
+    // WVR-36: the account plane is always served, so its budgets are always
+    // applied — one per action, all fail-closed. The per-registration resend
+    // cooldown is enforced in the handler; these budgets bound whole networks.
+    for (policy, view, budget) in [
+        (
+            PolicyId::ACCOUNT_SIGNUP,
+            ViewId::ACCOUNT_SIGNUP,
+            &config.account.signup,
+        ),
+        (
+            PolicyId::ACCOUNT_LOGIN,
+            ViewId::ACCOUNT_LOGIN,
+            &config.account.login,
+        ),
+        (
+            PolicyId::ACCOUNT_RESEND,
+            ViewId::ACCOUNT_RESEND,
+            &config.account.resend,
+        ),
+    ] {
+        policies.push(Policy {
+            id: policy,
+            budgets: vec![
+                Budget {
+                    key: KeyKind::PeerHost,
+                    quota: quota(budget),
+                },
+                Budget {
+                    key: KeyKind::PeerNetwork,
+                    quota: quota(budget),
+                },
+            ],
+            on_store_error: StoreErrorPolicy::FailClosed,
+        });
+        routes.push((
+            view,
+            Route {
+                policy,
+                cost: CostRule::Static(1),
+            },
+        ));
+    }
+
     let retry_cap_secs = config
         .abuse
         .as_ref()

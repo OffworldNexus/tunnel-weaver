@@ -260,7 +260,14 @@ pub async fn execute_install(
         .unwrap_or(false);
     // Abuse limits are operator-tuned and not part of the wizard; carry them
     // forward so a re-run of setup does not silently disarm the relay web budget.
-    let previous_abuse = existing_config.and_then(|existing| existing.abuse);
+    let previous_abuse = existing_config
+        .as_ref()
+        .and_then(|existing| existing.abuse.clone());
+    // Account tuning is likewise operator-owned; carry it forward too.
+    let previous_account = existing_config
+        .as_ref()
+        .map(|existing| existing.account.clone())
+        .unwrap_or_default();
 
     let root_ca_pem = match &gathered.acme_root_ca_path {
         Some(path) => match fs::read_to_string(path) {
@@ -298,6 +305,7 @@ pub async fn execute_install(
         // file) and written with the rest of the config.
         email: gathered.email.clone(),
         abuse: previous_abuse,
+        account: previous_account,
     };
 
     store

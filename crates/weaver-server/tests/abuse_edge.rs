@@ -59,6 +59,7 @@ fn sample_config(abuse: Option<AbuseConfig>) -> Config {
         setup_complete: false,
         email: None,
         abuse,
+        account: Default::default(),
     }
 }
 
@@ -297,6 +298,7 @@ async fn https_apex_is_throttled_but_health_is_exempt() {
             tunnel_registry: None,
             guard,
             altcha: None,
+            account: None,
         },
         token,
     ));

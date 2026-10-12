@@ -34,6 +34,7 @@ fn create_valid_test_config(http_port: u16, https_port: u16) -> Config {
         setup_complete: false,
         email: None,
         abuse: None,
+        account: Default::default(),
     }
 }
 

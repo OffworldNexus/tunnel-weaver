@@ -1,0 +1,16 @@
+<mjml lang="en">
+  <mj-include path="./partials/head.mjml" />
+  <mj-body width="600px" background-color="#fefaf3">
+    <mj-include path="./partials/header.mjml" />
+    <mj-section background-color="#ffffff">
+      <mj-column>
+        <mj-text mj-class="heading">{{heading}}</mj-text>
+        <mj-text>{{intro}}</mj-text>
+        <mj-button href="{{account_url}}">Open Tunnel Weaver</mj-button>
+        <mj-text mj-class="quiet">{{footnote}}</mj-text>
+        <mj-text mj-class="quiet">Button not working? <a href="{{account_url}}" style="color:#772a0a;text-decoration:underline;word-break:break-all;">{{account_url}}</a></mj-text>
+      </mj-column>
+    </mj-section>
+    <mj-include path="./partials/footer.mjml" />
+  </mj-body>
+</mjml>

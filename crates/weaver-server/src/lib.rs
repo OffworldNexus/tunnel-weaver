@@ -1,4 +1,5 @@
 pub mod abuse;
+pub mod account;
 pub mod altcha;
 pub mod cert;
 pub mod config;

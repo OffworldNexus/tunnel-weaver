@@ -88,3 +88,14 @@ jiff = { version = "0.2", default-features = false, features = ["std", "tz-syste
 futures-util = "0.3"
 tokio-tungstenite = { version = "0.26", default-features = false, features = ["handshake"] }
 rustls-platform-verifier = "0.7"
+# Account plane (WVR-36). An axum router is mounted inside the raw-hyper edge and
+# serves only the admin host's account namespace; the rest of the edge keeps its
+# existing hyper handling. Sessions/CSRF are hand-rolled inside that router so the
+# `browser_session` record maps 1:1 to the Store (see `account::session`).
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "json", "form", "query"] }
+# `ServiceExt::oneshot` is how the hyper edge drives the mounted axum router.
+tower = { version = "0.5", default-features = false, features = ["util"] }
+# Argon2id password hashing with the PHC encoded representation. SHA-1 is used
+# only for the Have I Been Pwned k-anonymity range query, never for storage.
+argon2 = "0.6"
+sha1 = "0.11"

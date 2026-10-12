@@ -72,6 +72,7 @@ fn sample_config() -> Config {
                 api_base_url: None,
             }),
         }),
+        account: Default::default(),
     }
 }
 
@@ -189,6 +190,7 @@ async fn start_edge_with_store(
             tunnel_registry: None,
             guard,
             altcha: Some(altcha),
+            account: None,
         },
         token,
     ));

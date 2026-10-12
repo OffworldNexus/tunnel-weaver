@@ -5,16 +5,23 @@
 //! backend-specific date/time types.
 
 pub mod abuse_bucket;
+pub mod account;
 pub mod acme_account;
 pub mod altcha_client;
 pub mod altcha_proof;
+pub mod browser_session;
 pub mod cert_event;
 pub mod certificate;
 pub mod challenge;
 pub mod config;
 pub mod domain;
+pub mod email_identity;
+pub mod email_verification;
 pub mod machine;
 pub mod machine_key;
+pub mod password_credential;
+pub mod pending_registration;
 pub mod person;
 pub mod service;
 pub mod usage;
+pub mod verification_token;

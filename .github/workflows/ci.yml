@@ -36,6 +36,19 @@ jobs:
         with:
           tool: cargo-deny
 
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Build the account SPA
+        run: |
+          cd frontend
+          npm ci
+          npm run build
+
       - name: Check formatting
         run: cargo fmt --check
 
@@ -71,6 +84,19 @@ jobs:
 
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Build the account SPA
+        run: |
+          cd frontend
+          npm ci
+          npm run build
 
       - name: Run tests
         run: |
@@ -115,6 +141,19 @@ jobs:
 
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Build the account SPA
+        run: |
+          cd frontend
+          npm ci
+          npm run build
 
       - name: Run e2e tests
         run: |
@@ -281,6 +320,20 @@ jobs:
         uses: taiki-e/install-action@v2
         with:
           tool: cross
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Build the account SPA
+        if: matrix.can_run
+        run: |
+          cd frontend
+          npm ci
+          npm run build
 
       - name: Build release binaries
         run: |

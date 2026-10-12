@@ -33,6 +33,7 @@ fn create_valid_test_config(
         setup_complete: false,
         email: None,
         abuse: None,
+        account: Default::default(),
     }
 }
 
@@ -304,7 +305,7 @@ async fn test_control_socket_daemon_suite() {
         assert_eq!(val["ok"], true);
         assert_eq!(val["tunnel_domain"], "weaver.test");
         assert_eq!(val["admin_domain"], "relay-admin.test");
-        assert_eq!(val["schema_version"], 3);
+        assert_eq!(val["schema_version"], 4);
         // The seeded tunnel wildcard reports issued; the admin certificate has
         // no stored row and is still pending, so it counts as ordering.
         assert_eq!(val["cert_counts"]["issued"], 1);
@@ -631,6 +632,7 @@ async fn test_cert_wait_streaming_failed_exit_4_and_renew_rate_limit() {
         setup_complete: false,
         email: None,
         abuse: None,
+        account: Default::default(),
     });
     store.save_config(&config).await.unwrap();
 

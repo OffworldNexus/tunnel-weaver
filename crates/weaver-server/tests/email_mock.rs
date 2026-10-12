@@ -233,6 +233,7 @@ async fn send_a_joke_binary_uses_the_mock_provider() {
         setup_complete: true,
         email: Some(resend_config(&endpoint, "sk_send_joke")),
         abuse: None,
+        account: Default::default(),
     };
     store.save_config(&config).await.unwrap();
     store.close().await.unwrap();
@@ -381,6 +382,7 @@ async fn send_a_joke_without_email_exits_nonzero() {
         setup_complete: true,
         email: None,
         abuse: None,
+        account: Default::default(),
     };
     store.save_config(&config).await.unwrap();
     store.close().await.unwrap();
