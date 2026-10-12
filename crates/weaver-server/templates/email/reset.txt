@@ -1,0 +1,9 @@
+{{ heading }}
+
+{{ intro }}
+
+{{ reset_url }}
+
+{{ expiry }}
+
+{{ support_url }}

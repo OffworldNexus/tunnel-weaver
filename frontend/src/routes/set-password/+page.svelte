@@ -15,6 +15,7 @@
 	import { ensureConfig } from '#lib/account/config';
 	import { loadFlow, saveFlow } from '#lib/account/flow';
 	import { setPasswordSchema } from '#lib/account/schemas';
+	import PasswordStrength from '#lib/account/PasswordStrength.svelte';
 	import { href } from '#lib/app/paths';
 	import Keycap from '#lib/ui/Keycap.svelte';
 	import Page from '#lib/ui/Page.svelte';
@@ -81,23 +82,6 @@
 	);
 
 	const { form, errors, message, submitting, enhance } = sf;
-
-	// A rough strength hint for the UI only; the relay keeps the real policy.
-	$: strength = strengthOf($form.password);
-
-	function strengthOf(value: string): { level: 'weak' | 'fair' | 'strong'; pct: number; label: string } {
-		let score = 0;
-		if (value.length >= 8) score++;
-		if (value.length >= 12) score++;
-		if (/[a-z]/.test(value) && /[A-Z]/.test(value)) score++;
-		if (/\d/.test(value)) score++;
-		if (/[^A-Za-z0-9]/.test(value)) score++;
-
-		if (value.length === 0) return { level: 'weak', pct: 0, label: '' };
-		if (score <= 2) return { level: 'weak', pct: 33, label: 'Weak' };
-		if (score === 3) return { level: 'fair', pct: 66, label: 'Fair' };
-		return { level: 'strong', pct: 100, label: 'Strong' };
-	}
 </script>
 
 <svelte:head>
@@ -128,34 +112,19 @@
 
 			<div class="field">
 				<label for="password">New password</label>
-				<div class="field__row">
-					<input
-						id="password"
-						name="password"
-						type={showPassword ? 'text' : 'password'}
-						autocomplete="new-password"
-						placeholder="Create a unique password"
-						bind:value={$form.password}
-						disabled={$submitting}
-						aria-invalid={$errors.password ? 'true' : undefined}
-						aria-describedby="password-hint"
-					/>
-					<button
-						type="button"
-						class="toggle"
-						aria-pressed={showPassword}
-						on:click={() => (showPassword = !showPassword)}
-					>
-						{showPassword ? 'Hide password' : 'Show password'}
-					</button>
-				</div>
+				<input
+					id="password"
+					name="password"
+					type={showPassword ? 'text' : 'password'}
+					autocomplete="new-password"
+					placeholder="Create a unique password"
+					bind:value={$form.password}
+					disabled={$submitting}
+					aria-invalid={$errors.password ? 'true' : undefined}
+					aria-describedby="password-hint"
+				/>
 
-				<div class="strength" aria-hidden="true">
-					<span class="strength__track">
-						<span class="strength__fill" data-level={strength.level} style={`width:${strength.pct}%`}></span>
-					</span>
-					<span class="strength__label">{strength.label}</span>
-				</div>
+				<PasswordStrength value={$form.password} />
 
 				{#if $errors.password}
 					<p class="field__error" aria-live="polite">{$errors.password[0]}</p>
@@ -165,6 +134,16 @@
 					Use at least {minLength} characters. A longer, unique passphrase beats a short,
 					complicated one.
 				</p>
+
+				<!-- Figma puts the show/hide link below the helper. -->
+				<button
+					type="button"
+					class="toggle"
+					aria-pressed={showPassword}
+					on:click={() => (showPassword = !showPassword)}
+				>
+					{showPassword ? 'Hide password' : 'Show password'}
+				</button>
 			</div>
 
 			{#if $message}
@@ -190,45 +169,5 @@
 	.check {
 		color: var(--tw-success);
 		font-weight: 700;
-	}
-
-	/* Password strength meter (guidance only). */
-	.strength {
-		display: flex;
-		align-items: center;
-		gap: 10px;
-	}
-
-	.strength__track {
-		flex: 1;
-		height: 6px;
-		border-radius: 999px;
-		background: var(--tw-well);
-		border: 1.5px solid var(--tw-border);
-		overflow: hidden;
-	}
-
-	.strength__fill {
-		display: block;
-		height: 100%;
-		background: var(--tw-success);
-		transition: width 140ms ease;
-	}
-
-	.strength__fill[data-level='weak'] {
-		background: var(--tw-danger);
-	}
-
-	.strength__label {
-		min-width: 3.6rem;
-		text-align: right;
-		color: var(--tw-muted);
-		font-size: 14px;
-	}
-
-	@media (prefers-reduced-motion: reduce) {
-		.strength__fill {
-			transition: none;
-		}
 	}
 </style>

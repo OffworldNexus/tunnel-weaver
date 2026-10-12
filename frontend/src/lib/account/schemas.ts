@@ -39,6 +39,11 @@ export const resendSchema = v.object({
 	flow: v.pipe(v.string(), v.nonEmpty())
 });
 
+/** The reset-request form: a bare address, like the sign-up step. */
+export const resetRequestSchema = v.object({
+	email: emailSchema
+});
+
 /**
  * The minimum length comes from `/api/account/config`, which may arrive after
  * the form is created, so it is read lazily through a getter.
@@ -60,3 +65,4 @@ export type SignInForm = v.InferOutput<typeof signInSchema>;
 export type SignUpForm = v.InferOutput<typeof signUpSchema>;
 export type SetPasswordForm = v.InferOutput<ReturnType<typeof setPasswordSchema>>;
 export type ResendForm = v.InferOutput<typeof resendSchema>;
+export type ResetRequestForm = v.InferOutput<typeof resetRequestSchema>;

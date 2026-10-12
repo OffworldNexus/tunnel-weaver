@@ -60,6 +60,12 @@ struct Fixture {
 }
 
 async fn setup() -> Fixture {
+    setup_with(|_| {}).await
+}
+
+/// Builds a fixture with the standard test config, letting `adjust` tweak the
+/// account policy (e.g. to disable the resend cooldown in a reset test).
+async fn setup_with(adjust: impl FnOnce(&mut AccountConfig)) -> Fixture {
     let dir = tempfile::tempdir().unwrap().keep();
     let store = Store::open(dir.join("account.db")).await.unwrap();
 
@@ -80,7 +86,7 @@ async fn setup() -> Fixture {
         sent: Arc::clone(&sent),
     });
 
-    let account_config = AccountConfig {
+    let mut account_config = AccountConfig {
         base_url: Some("https://admin.test".into()),
         cookie_secure: false,
         // Tiny Argon2 so tests stay fast.
@@ -89,6 +95,7 @@ async fn setup() -> Fixture {
         argon2_parallelism: 1,
         ..Default::default()
     };
+    adjust(&mut account_config);
     let account = AccountRuntime::with_breach(
         &account_config,
         "admin.test",
@@ -147,6 +154,9 @@ struct Reply {
     status: StatusCode,
     headers: HeaderMap,
     body: serde_json::Value,
+    /// The body's byte length, before any JSON parsing (so binary and
+    /// compressed bodies can still be compared by size).
+    len: usize,
 }
 
 impl Reply {
@@ -200,6 +210,7 @@ async fn call(
         status,
         headers,
         body: parsed,
+        len: bytes.len(),
     }
 }
 
@@ -563,4 +574,493 @@ async fn spa_shell_is_served_for_deep_links() {
     let legacy = call(&fixture.router, "GET", "/account/sign-in", &[], None).await;
     assert_eq!(legacy.status, StatusCode::FOUND);
     assert_eq!(legacy.headers.get(header::LOCATION).unwrap(), "/sign-in");
+}
+
+// ----- password reset (WVR-41) ---------------------------------------------
+
+/// Extracts the raw reset token from the last captured email. The reset link
+/// carries the token in the URL *fragment* (`/reset#token=…`), so it never
+/// reaches the server or its logs.
+fn last_reset_token(sent: &Mutex<Vec<Email>>) -> String {
+    let emails = sent.lock().unwrap();
+    let email = emails.last().expect("an email was sent");
+    email
+        .text
+        .split("#token=")
+        .nth(1)
+        .expect("the reset link carries its token in the fragment")
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .to_string()
+}
+
+/// Requests a reset link for an address (solving the reset PoW).
+async fn request_reset(fixture: &Fixture, email: &str) -> Reply {
+    let altcha = solved(&fixture.account, "reset").await;
+    call(
+        &fixture.router,
+        "POST",
+        "/api/account/reset/request",
+        &[],
+        Some(serde_json::json!({ "email": email, "altcha": altcha })),
+    )
+    .await
+}
+
+/// Waits (bounded) for the capture mailbox to reach `expected` messages. The
+/// reset request sends its email off the response path, so the mail lands after
+/// the HTTP reply.
+async fn wait_for_mail_count(sent: &Mutex<Vec<Email>>, expected: usize) {
+    for _ in 0..300 {
+        if sent.lock().unwrap().len() >= expected {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!(
+        "expected {expected} captured emails, got {}",
+        sent.lock().unwrap().len()
+    );
+}
+
+/// Requests a reset link and waits for the detached email, returning the
+/// response and the raw token from the link.
+async fn request_reset_and_token(fixture: &Fixture, email: &str) -> (Reply, String) {
+    let before = fixture.sent.lock().unwrap().len();
+    let reply = request_reset(fixture, email).await;
+    wait_for_mail_count(&fixture.sent, before + 1).await;
+    let token = last_reset_token(&fixture.sent);
+    (reply, token)
+}
+
+/// Completes a reset with a raw token and a new password.
+async fn complete_reset(fixture: &Fixture, token: &str, password: &str) -> Reply {
+    call(
+        &fixture.router,
+        "POST",
+        "/api/account/reset/complete",
+        &[],
+        Some(serde_json::json!({ "token": token, "password": password })),
+    )
+    .await
+}
+
+/// A reset request for an unknown address must be indistinguishable from one
+/// for a real account: same status, same body, and no email.
+#[tokio::test]
+async fn reset_request_is_indistinguishable_for_known_and_unknown() {
+    let fixture = setup().await;
+    register(
+        &fixture,
+        "Rémy",
+        "known@example.com",
+        "correct horse battery",
+    )
+    .await;
+    let before = fixture.sent.lock().unwrap().len();
+
+    let unknown = request_reset(&fixture, "nobody@example.com").await;
+    assert_eq!(unknown.status, StatusCode::OK, "{:?}", unknown.body);
+    assert_eq!(unknown.body["status"], "check_email");
+    assert_eq!(
+        fixture.sent.lock().unwrap().len(),
+        before,
+        "no email is sent for an unknown address"
+    );
+
+    let known = request_reset(&fixture, "known@example.com").await;
+    assert_eq!(known.status, StatusCode::OK, "{:?}", known.body);
+    assert_eq!(
+        known.body, unknown.body,
+        "the response must not reveal whether the account exists"
+    );
+    // The reset email is sent off the response path, so wait for it to land.
+    wait_for_mail_count(&fixture.sent, before + 1).await;
+    assert_eq!(
+        fixture.sent.lock().unwrap().len(),
+        before + 1,
+        "a reset email is sent for the real account"
+    );
+}
+
+/// Issuing a new reset token invalidates the previous one: only the latest link
+/// works. The cooldown is disabled so two requests can be made back to back.
+#[tokio::test]
+async fn reset_request_reissues_and_invalidates_previous() {
+    let fixture = setup_with(|cfg| cfg.resend_cooldown_secs = 0).await;
+    register(
+        &fixture,
+        "Rémy",
+        "reissue@example.com",
+        "correct horse battery",
+    )
+    .await;
+
+    let (_, first) = request_reset_and_token(&fixture, "reissue@example.com").await;
+    let (_, second) = request_reset_and_token(&fixture, "reissue@example.com").await;
+    assert_ne!(first, second, "a fresh token is minted");
+
+    let dead = complete_reset(&fixture, &first, "a brand new password").await;
+    assert_eq!(
+        dead.status,
+        StatusCode::BAD_REQUEST,
+        "the superseded link is refused: {:?}",
+        dead.body
+    );
+    let ok = complete_reset(&fixture, &second, "a brand new password").await;
+    assert_eq!(ok.status, StatusCode::OK, "{:?}", ok.body);
+    assert_eq!(ok.body["outcome"], "reset");
+}
+
+/// A reset link works exactly once.
+#[tokio::test]
+async fn reset_link_is_single_use() {
+    let fixture = setup().await;
+    register(
+        &fixture,
+        "Rémy",
+        "single@example.com",
+        "correct horse battery",
+    )
+    .await;
+    let (requested, token) = request_reset_and_token(&fixture, "single@example.com").await;
+    assert_eq!(requested.status, StatusCode::OK, "{:?}", requested.body);
+
+    let first = complete_reset(&fixture, &token, "a brand new password").await;
+    assert_eq!(first.status, StatusCode::OK, "{:?}", first.body);
+    let replay = complete_reset(&fixture, &token, "another new password").await;
+    assert_eq!(
+        replay.status,
+        StatusCode::BAD_REQUEST,
+        "a spent link is refused: {:?}",
+        replay.body
+    );
+}
+
+/// The non-consuming check resolves the link's email and detects dead links, and
+/// does not spend the token.
+#[tokio::test]
+async fn reset_check_reports_validity_without_consuming() {
+    let fixture = setup().await;
+    register(
+        &fixture,
+        "Rémy",
+        "check@example.com",
+        "correct horse battery",
+    )
+    .await;
+    let (_, token) = request_reset_and_token(&fixture, "check@example.com").await;
+
+    let valid = call(
+        &fixture.router,
+        "POST",
+        "/api/account/reset/check",
+        &[],
+        Some(serde_json::json!({ "token": token })),
+    )
+    .await;
+    assert_eq!(valid.status, StatusCode::OK, "{:?}", valid.body);
+    assert_eq!(valid.body["valid"], true);
+    assert_eq!(valid.body["email"], "check@example.com");
+
+    let bogus = call(
+        &fixture.router,
+        "POST",
+        "/api/account/reset/check",
+        &[],
+        Some(serde_json::json!({ "token": "not-a-real-token" })),
+    )
+    .await;
+    assert_eq!(bogus.status, StatusCode::OK);
+    assert_eq!(bogus.body["valid"], false);
+
+    // The check did not consume the token: the reset still completes.
+    let done = complete_reset(&fixture, &token, "a brand new password").await;
+    assert_eq!(done.status, StatusCode::OK, "{:?}", done.body);
+
+    let after = call(
+        &fixture.router,
+        "POST",
+        "/api/account/reset/check",
+        &[],
+        Some(serde_json::json!({ "token": token })),
+    )
+    .await;
+    assert_eq!(
+        after.body["valid"], false,
+        "a consumed link is no longer valid"
+    );
+}
+
+/// A weak password is refused, and the refusal does not consume the token.
+#[tokio::test]
+async fn reset_complete_enforces_password_policy() {
+    let fixture = setup().await;
+    register(
+        &fixture,
+        "Rémy",
+        "policy@example.com",
+        "correct horse battery",
+    )
+    .await;
+    let (_, token) = request_reset_and_token(&fixture, "policy@example.com").await;
+
+    let short = complete_reset(&fixture, &token, "short").await;
+    assert_eq!(short.status, StatusCode::BAD_REQUEST, "{:?}", short.body);
+
+    let ok = complete_reset(&fixture, &token, "a brand new password").await;
+    assert_eq!(ok.status, StatusCode::OK, "{:?}", ok.body);
+}
+
+/// A completed reset signs the user out everywhere: prior sessions die, the old
+/// password stops working, and the new one works.
+#[tokio::test]
+async fn reset_revokes_every_existing_session() {
+    let fixture = setup().await;
+    register(
+        &fixture,
+        "Rémy",
+        "revoke@example.com",
+        "correct horse battery",
+    )
+    .await;
+
+    let login = call(
+        &fixture.router,
+        "POST",
+        "/api/account/login",
+        &[],
+        Some(serde_json::json!({
+            "email": "revoke@example.com",
+            "password": "correct horse battery",
+            "altcha": solved(&fixture.account, "login").await,
+        })),
+    )
+    .await;
+    assert_eq!(login.status, StatusCode::OK, "{:?}", login.body);
+    let session = login
+        .cookie("__Host-weaver_session")
+        .expect("session cookie set");
+
+    let (_, token) = request_reset_and_token(&fixture, "revoke@example.com").await;
+    let done = complete_reset(&fixture, &token, "a brand new password").await;
+    assert_eq!(done.status, StatusCode::OK, "{:?}", done.body);
+
+    // The pre-reset session no longer authenticates.
+    let me = call(
+        &fixture.router,
+        "GET",
+        "/api/account/me",
+        &[("cookie", format!("__Host-weaver_session={session}"))],
+        None,
+    )
+    .await;
+    assert_eq!(
+        me.status,
+        StatusCode::UNAUTHORIZED,
+        "a reset signs the user out everywhere"
+    );
+
+    // The old password is gone; the new one signs in.
+    let old = call(
+        &fixture.router,
+        "POST",
+        "/api/account/login",
+        &[],
+        Some(serde_json::json!({
+            "email": "revoke@example.com",
+            "password": "correct horse battery",
+            "altcha": solved(&fixture.account, "login").await,
+        })),
+    )
+    .await;
+    assert_eq!(old.status, StatusCode::UNAUTHORIZED, "{:?}", old.body);
+
+    let fresh = call(
+        &fixture.router,
+        "POST",
+        "/api/account/login",
+        &[],
+        Some(serde_json::json!({
+            "email": "revoke@example.com",
+            "password": "a brand new password",
+            "altcha": solved(&fixture.account, "login").await,
+        })),
+    )
+    .await;
+    assert_eq!(fresh.status, StatusCode::OK, "{:?}", fresh.body);
+}
+
+/// A static asset is served in the pre-compressed variant the client accepts
+/// (built at compile time), and the shell negotiates too — so a browser
+/// downloads the embedded app and the ALTCHA widget compressed.
+#[tokio::test]
+async fn static_assets_are_served_pre_compressed() {
+    let fixture = setup().await;
+    // The widget asset has a stable (unversioned) path, so the test does not
+    // depend on this build's content hashes.
+    let path = "/assets/altcha/altcha.js";
+
+    let identity = call(&fixture.router, "GET", path, &[], None).await;
+    assert_eq!(identity.status, StatusCode::OK);
+    assert!(
+        identity.headers.get(header::CONTENT_ENCODING).is_none(),
+        "no Accept-Encoding means the identity bytes"
+    );
+    assert_eq!(
+        identity.headers.get(header::VARY).unwrap(),
+        "accept-encoding",
+        "a compressible asset must vary on the encoding"
+    );
+
+    let gzip = call(
+        &fixture.router,
+        "GET",
+        path,
+        &[("accept-encoding", "gzip, deflate, br".to_string())],
+        None,
+    )
+    .await;
+    assert_eq!(gzip.status, StatusCode::OK);
+    assert_eq!(gzip.headers.get(header::CONTENT_ENCODING).unwrap(), "gzip");
+    assert!(
+        gzip.len < identity.len,
+        "gzip ({}) should be smaller than identity ({})",
+        gzip.len,
+        identity.len
+    );
+
+    let zstd = call(
+        &fixture.router,
+        "GET",
+        path,
+        &[("accept-encoding", "gzip, zstd".to_string())],
+        None,
+    )
+    .await;
+    assert_eq!(zstd.status, StatusCode::OK);
+    assert_eq!(
+        zstd.headers.get(header::CONTENT_ENCODING).unwrap(),
+        "zstd",
+        "zstd wins when the client offers both"
+    );
+    assert!(
+        zstd.len <= gzip.len,
+        "zstd ({}) should be at least as small as gzip ({})",
+        zstd.len,
+        gzip.len
+    );
+
+    // The SPA shell (served for every deep link) negotiates as well, and stays
+    // uncached so a deploy is picked up immediately.
+    let shell = call(
+        &fixture.router,
+        "GET",
+        "/reset",
+        &[("accept-encoding", "zstd".to_string())],
+        None,
+    )
+    .await;
+    assert_eq!(shell.status, StatusCode::OK);
+    assert_eq!(shell.headers.get(header::CONTENT_ENCODING).unwrap(), "zstd");
+    assert_eq!(
+        shell.headers.get(header::CACHE_CONTROL).unwrap(),
+        "no-store"
+    );
+}
+
+/// An expired reset link is refused at serve time (the store also sweeps the
+/// row, but the completion route must reject it before it is ever re-issued).
+#[tokio::test]
+async fn reset_complete_rejects_an_expired_token() {
+    use sea_orm::sea_query::Expr;
+    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+    use weaver_server::store::entity::password_reset_token;
+
+    let fixture = setup().await;
+    register(
+        &fixture,
+        "Rémy",
+        "expired@example.com",
+        "correct horse battery",
+    )
+    .await;
+    let (_, token) = request_reset_and_token(&fixture, "expired@example.com").await;
+
+    // Age the link out: the harness has no controllable clock, so expire the row.
+    password_reset_token::Entity::update_many()
+        .col_expr(password_reset_token::Column::ExpiresAt, Expr::value(0i64))
+        .filter(password_reset_token::Column::ConsumedAt.is_null())
+        .exec(fixture.account.store.db())
+        .await
+        .unwrap();
+
+    let refused = complete_reset(&fixture, &token, "a brand new password").await;
+    assert_eq!(
+        refused.status,
+        StatusCode::BAD_REQUEST,
+        "an expired link is refused: {:?}",
+        refused.body
+    );
+
+    // The credential is untouched: the original password still signs in.
+    let login = call(
+        &fixture.router,
+        "POST",
+        "/api/account/login",
+        &[],
+        Some(serde_json::json!({
+            "email": "expired@example.com",
+            "password": "correct horse battery",
+            "altcha": solved(&fixture.account, "login").await,
+        })),
+    )
+    .await;
+    assert_eq!(
+        login.status,
+        StatusCode::OK,
+        "a refused expired link must not change the password"
+    );
+}
+
+/// The reset routes are same-origin only: a cross-site caller is refused before
+/// any work happens (no lookup, no token, no email).
+#[tokio::test]
+async fn reset_routes_refuse_cross_origin_requests() {
+    let fixture = setup().await;
+    let before = fixture.sent.lock().unwrap().len();
+
+    // A mismatched `Origin` is refused…
+    let request = call(
+        &fixture.router,
+        "POST",
+        "/api/account/reset/request",
+        &[("origin", "https://evil.example".to_string())],
+        Some(serde_json::json!({ "email": "nobody@example.com", "altcha": "irrelevant" })),
+    )
+    .await;
+    assert_eq!(request.status, StatusCode::FORBIDDEN, "{:?}", request.body);
+
+    // …as is a browser-declared cross-site fetch on the completion route.
+    let complete = call(
+        &fixture.router,
+        "POST",
+        "/api/account/reset/complete",
+        &[("sec-fetch-site", "cross-site".to_string())],
+        Some(serde_json::json!({ "token": "whatever", "password": "correct horse battery" })),
+    )
+    .await;
+    assert_eq!(
+        complete.status,
+        StatusCode::FORBIDDEN,
+        "{:?}",
+        complete.body
+    );
+
+    assert_eq!(
+        fixture.sent.lock().unwrap().len(),
+        before,
+        "a refused request sends nothing"
+    );
 }

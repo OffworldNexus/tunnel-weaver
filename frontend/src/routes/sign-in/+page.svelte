@@ -131,6 +131,8 @@
 			{#if $errors.password}<p class="field__error" aria-live="polite">{$errors.password[0]}</p>{/if}
 		</div>
 
+		<p class="forgot"><a href={href('/forgot-password')}>Forgot password?</a></p>
+
 		<!-- Proof-of-work gate: the submit stays disabled until a proof is solved. -->
 		<Altcha
 			purpose="login"

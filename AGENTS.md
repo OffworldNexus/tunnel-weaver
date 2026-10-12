@@ -2,7 +2,7 @@
 
 ## Testing
 
-- Full suite (fast): `cargo test --workspace` (~10s warm, ~31s after a dep change, timeout 120000ms)
+- Full suite (fast): `cargo test --workspace` (~72s warm, timeout 240000ms)
 - CI-strength property tests: `PROPTEST_CASES=2000 PROPTEST_RNG_SEED=67 cargo test -p weaver-mux` (~70s, timeout 300000ms)
 - Ignored e2e suite: `cargo test --workspace -- --ignored` (~9s warm, timeout 60000ms)
 - Format check: `cargo fmt --check` (~1s, timeout 30000ms)
@@ -10,13 +10,22 @@
 - Dependency policy: `cargo deny check` (~2s, timeout 60000ms)
 - Always: quiet on success; dump failures only.
 - Fuzz crate compiles: `(cd fuzz && cargo check)` (~1s, timeout 60000ms)
+- SPA build — a **prerequisite** for any `cargo build`/`test`/`clippy` that
+  compiles `weaver-server`, whose binary embeds the app (`weaver-assets/build.rs`
+  hard-fails while the `account-spa` feature is on and the output is missing):
+  `cd frontend && pnpm run build` (~3s, timeout 180000ms). Must exit 0 and
+  externalize the bootstrap (no inline `<script>` in `build/index.html`).
+- Browser BDD (Cucumber + Playwright against the real server):
+  `cd e2e && pnpm test` (~21s, timeout 300000ms); one-time
+  `pnpm exec playwright install chromium`. It rebuilds
+  `weaver-server --example e2e_server` first, so stop any running copy of that
+  binary (a live one blocks the relink with `ETXTBSY`).
 - Conformance (nightly / PR to develop only, needs the DO droplet): h2spec
   and Autobahn run in `.github/workflows/nightly.yml`; allow-lists live in
   `ci/conformance/*-allowlist.txt`, one case per line with a justification.
-- Last measured: 2026-10-06, full suite 441 passed/0 failed (ignored suite
-  skipped; the `#[ignore = "e2e"]` cases are the Pebble wildcard/admin orders
-  and the Resend send, which skips unless `RESEND_API_KEY` and `WEAVER_E2E_EMAIL`
-  are set). (Prior: 2026-10-04, 388 passed.)
+- Last measured: 2026-10-12, full suite 550 passed/0 failed/4 ignored (72s),
+  SPA build 3s, e2e 8 scenarios passed (22s). (Prior: 2026-10-12, 546 passed;
+  2026-10-06, 441 passed.)
 
 ## Crate notes
 
@@ -25,6 +34,15 @@
   raw SQL outside `store/`; add a typed `Store` method instead. SQLite-only
   behaviour (pragmas, `VACUUM INTO`, file perms) must be gated on
   `DbBackend::Sqlite` so a future `sqlx-postgres` feature needs no code change.
+
+- `weaver-assets` embeds the built account SPA (`frontend/build`) and the
+  vendored ALTCHA widget into the `weaver-server` binary at compile time, and
+  pre-compresses the compressible ones into gzip + zstd variants right there
+  (nothing is compressed per request; the edge picks a variant from
+  `Accept-Encoding` via `negotiate_encoding`). `weave` links the crate with the
+  feature off and carries no SPA bytes. The embed is mandatory while
+  `account-spa` is on, so build the SPA before compiling `weaver-server` (see
+  Testing).
 
 - The relay serves authoritative DNS (`src/dns/`, `hickory-proto`) for the
   tunnel domain `<root>` and one flat label beneath it. Hostnames are

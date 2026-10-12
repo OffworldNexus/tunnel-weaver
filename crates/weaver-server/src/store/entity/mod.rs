@@ -20,6 +20,7 @@ pub mod email_verification;
 pub mod machine;
 pub mod machine_key;
 pub mod password_credential;
+pub mod password_reset_token;
 pub mod pending_registration;
 pub mod person;
 pub mod service;

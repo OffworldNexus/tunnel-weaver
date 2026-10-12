@@ -533,8 +533,13 @@ pub async fn demo_page(
 /// `/abuse/check/assets/altcha/<version>/<file>`.
 ///
 /// The path carries the content version, so a mismatched (stale) version 404s
-/// and the browser fetches the current one; a match is served `immutable`.
-pub fn demo_asset(path: &str, include_hsts: bool) -> Response<BoxBody> {
+/// and the browser fetches the current one; a match is served `immutable`, in
+/// the gzip/zstd variant the client accepts (both are pre-built at compile time).
+pub fn demo_asset(
+    path: &str,
+    accept_encoding: Option<&str>,
+    include_hsts: bool,
+) -> Response<BoxBody> {
     let rest = path
         .strip_prefix("/abuse/check/assets/altcha/")
         .unwrap_or("");
@@ -542,17 +547,23 @@ pub fn demo_asset(path: &str, include_hsts: bool) -> Response<BoxBody> {
         Some((version, file)) if version == weaver_assets::altcha_asset_version() => file,
         _ => "",
     };
-    let Some((bytes, content_type)) = altcha_asset(file) else {
+    let Some(asset) = altcha_asset(file) else {
         return Response::builder()
             .status(StatusCode::NOT_FOUND)
             .body(full_body("404 Not Found\n"))
             .unwrap();
     };
-    let mut resp = Response::builder()
+    let coding = weaver_assets::negotiate_encoding(accept_encoding, &asset);
+    let mut builder = Response::builder()
         .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, content_type)
+        .header(header::CONTENT_TYPE, asset.content_type)
         .header(header::CACHE_CONTROL, "public, max-age=31536000, immutable")
-        .body(full_body(Bytes::from_static(bytes)))
+        .header(header::VARY, "accept-encoding");
+    if let Some(token) = coding.token() {
+        builder = builder.header(header::CONTENT_ENCODING, token);
+    }
+    let mut resp = builder
+        .body(full_body(Bytes::from_static(asset.encoded(coding))))
         .unwrap();
     apply_common_security_headers(&mut resp, include_hsts);
     resp

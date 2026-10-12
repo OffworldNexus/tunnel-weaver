@@ -11,8 +11,10 @@ import { setWorldConstructor, World } from '@cucumber/cucumber';
 import {
   clearMail as clearCapturedMail,
   harness,
+  latestResetLink as readLatestResetLink,
   latestVerificationLink as readLatestVerificationLink,
-  messages as readMessages
+  messages as readMessages,
+  resetLinks as readResetLinks
 } from './harness.js';
 
 export class WeaverWorld extends World {
@@ -28,11 +30,15 @@ export class WeaverWorld extends World {
     this.name = '';
     this.email = '';
     this.password = '';
+    /** The reset link taken from the capture mailbox (WVR-41). */
+    this.resetLink = '';
 
     // Bind mailbox helpers so they can be pulled off `this` in steps.
     this.messages = readMessages;
     this.clearMail = clearCapturedMail;
     this.latestVerificationLink = readLatestVerificationLink;
+    this.latestResetLink = readLatestResetLink;
+    this.resetLinks = readResetLinks;
   }
 
   /** An absolute URL for a route path (`/`, `/sign-up`, …). */

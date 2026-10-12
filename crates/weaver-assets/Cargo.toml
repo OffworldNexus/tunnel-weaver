@@ -16,3 +16,8 @@ account-spa = []
 [dependencies]
 askama = { workspace = true }
 http = { workspace = true }
+
+[build-dependencies]
+# Pre-compress the embedded assets at build time (see build.rs).
+flate2 = { workspace = true }
+zstd = { workspace = true }

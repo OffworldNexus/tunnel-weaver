@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use http::{Method, Request, Response, StatusCode};
+use http::{Method, Request, Response, StatusCode, header};
 use http_body_util::BodyExt;
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioExecutor, TokioIo};
@@ -267,6 +267,11 @@ pub async fn handle_https_request(
             ViewId::ACCOUNT_LOGIN
         } else if surface.host == Host::Admin && path == "/api/account/resend" {
             ViewId::ACCOUNT_RESEND
+        } else if surface.host == Host::Admin && path == "/api/account/reset/request" {
+            // The reset request is an unauthenticated, email-keyed, enumeration-safe
+            // action: exactly the same situation as a verification resend, so it
+            // shares that budget rather than minting a new one.
+            ViewId::ACCOUNT_RESEND
         } else {
             ViewId::RELAY_WEB
         };
@@ -322,7 +327,15 @@ pub async fn handle_https_request(
                 return Ok(crate::altcha::demo_page(altcha, query.as_deref(), include_hsts).await);
             }
             if req.method() == Method::GET && req.uri().path().starts_with("/abuse/check/assets/") {
-                return Ok(crate::altcha::demo_asset(req.uri().path(), include_hsts));
+                let accept_encoding = req
+                    .headers()
+                    .get(header::ACCEPT_ENCODING)
+                    .and_then(|value| value.to_str().ok());
+                return Ok(crate::altcha::demo_asset(
+                    req.uri().path(),
+                    accept_encoding,
+                    include_hsts,
+                ));
             }
             if req.method() == Method::POST && req.uri().path() == "/abuse/check/verify" {
                 let body = collect_body(req).await.unwrap_or_default();

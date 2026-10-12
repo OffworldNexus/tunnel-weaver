@@ -4,7 +4,8 @@ use std::path::PathBuf;
 use sea_orm::{ConnectionTrait, DbBackend, Statement};
 use tempfile::TempDir;
 use weaver_server::store::account::{
-    ActivationOutcome, ActivationRequest, NewPendingRegistration, NewVerificationToken,
+    ActivationOutcome, ActivationRequest, NewPasswordResetToken, NewPendingRegistration,
+    NewVerificationToken, ResetRequest,
 };
 use weaver_server::{Config, ConfigError, Store, StoreError};
 
@@ -112,15 +113,15 @@ async fn test_store_open_runs_migrations_and_is_idempotent() {
         )
         .await;
         assert_eq!(count, 13);
-        assert_eq!(store.schema_version().await.expect("schema_version"), 4);
+        assert_eq!(store.schema_version().await.expect("schema_version"), 5);
     }
 
     // Re-open existing database: should succeed and not re-apply migrations
     {
         let store = Store::open(&db_path).await.expect("re-open failed");
         let migration_count: i64 = scalar(&store, "SELECT count(*) FROM seaql_migrations").await;
-        assert_eq!(migration_count, 4);
-        assert_eq!(store.schema_version().await.expect("schema_version"), 4);
+        assert_eq!(migration_count, 5);
+        assert_eq!(store.schema_version().await.expect("schema_version"), 5);
     }
 }
 
@@ -1334,5 +1335,290 @@ async fn test_same_name_different_emails_and_account_person_separation() {
     assert!(
         people.iter().all(|p| p.name == "poc"),
         "accounts must not add person rows: {people:?}"
+    );
+}
+
+// ----- password reset (WVR-41) ---------------------------------------------
+
+/// Activates a fresh account for one address and returns its id, for the reset
+/// store tests.
+async fn activate_account(store: &Store, email: &str, now: i64) -> i32 {
+    let hash = "$argon2id$v=19$m=8,t=1,p=1$c2FsdA$aGFzaA";
+    let (pending, proof, completion) =
+        stage_verified_signup(store, "Rémy", email, email, now).await;
+    match activate(
+        store, pending, proof, completion, "Rémy", email, email, hash, now,
+    )
+    .await
+    {
+        ActivationOutcome::Activated(account) => account.id,
+        other => panic!("expected activation for {email}, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_issue_reset_token_revokes_outstanding() {
+    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+    use weaver_server::store::entity::password_reset_token;
+
+    let temp = TempDir::new().expect("tempdir");
+    let store = Store::open(temp.path().join("reset-issue.db"))
+        .await
+        .expect("open failed");
+    let now = 1_000;
+    let account_id = activate_account(&store, "reset@example.com", now).await;
+
+    let first = store
+        .password_reset_token_issue(
+            account_id,
+            NewPasswordResetToken {
+                token_digest: "digest-one".into(),
+                issued_at: now,
+                expires_at: now + 3_600,
+            },
+        )
+        .await
+        .expect("first reset token");
+    let second = store
+        .password_reset_token_issue(
+            account_id,
+            NewPasswordResetToken {
+                token_digest: "digest-two".into(),
+                issued_at: now + 10,
+                expires_at: now + 3_610,
+            },
+        )
+        .await
+        .expect("second reset token");
+
+    let rows = password_reset_token::Entity::find()
+        .filter(password_reset_token::Column::AccountId.eq(account_id))
+        .all(store.db())
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 2, "history is preserved, not overwritten");
+    let earlier = rows.iter().find(|r| r.id == first.id).unwrap();
+    assert!(
+        earlier.revoked_at.is_some(),
+        "the earlier token is revoked when a new one is issued"
+    );
+    let latest = rows.iter().find(|r| r.id == second.id).unwrap();
+    assert!(
+        latest.revoked_at.is_none() && latest.consumed_at.is_none(),
+        "only the latest token is live"
+    );
+}
+
+#[tokio::test]
+async fn test_account_reset_password_supersedes_and_revokes() {
+    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder};
+    use weaver_server::store::entity::{
+        browser_session, password_credential, password_reset_token,
+    };
+
+    let temp = TempDir::new().expect("tempdir");
+    let store = Store::open(temp.path().join("reset-apply.db"))
+        .await
+        .expect("open failed");
+    let now = 1_000;
+    let account_id = activate_account(&store, "reset2@example.com", now).await;
+
+    // Two live sessions before the reset (e.g. laptop and phone).
+    store
+        .session_create(account_id, "session-one", now, now + 100_000)
+        .await
+        .unwrap();
+    store
+        .session_create(account_id, "session-two", now, now + 100_000)
+        .await
+        .unwrap();
+
+    let token = store
+        .password_reset_token_issue(
+            account_id,
+            NewPasswordResetToken {
+                token_digest: "digest-apply".into(),
+                issued_at: now,
+                expires_at: now + 3_600,
+            },
+        )
+        .await
+        .expect("reset token");
+
+    let new_hash = "$argon2id$v=19$m=8,t=1,p=1$bmV3$aGFzaA";
+    let reset_now = now + 5;
+    store
+        .account_reset_password(ResetRequest {
+            token_id: token.id,
+            encoded_hash: new_hash,
+            now: reset_now,
+        })
+        .await
+        .expect("reset applies");
+
+    // Append-only history: the old credential is retired, the new one is current.
+    let credentials = password_credential::Entity::find()
+        .filter(password_credential::Column::AccountId.eq(account_id))
+        .order_by_asc(password_credential::Column::Id)
+        .all(store.db())
+        .await
+        .unwrap();
+    assert_eq!(credentials.len(), 2, "history is append-only");
+    assert_eq!(
+        credentials[0].retired_at,
+        Some(reset_now),
+        "the old credential is retired"
+    );
+    assert!(
+        credentials[1].retired_at.is_none(),
+        "the new credential is current"
+    );
+    assert_eq!(credentials[1].encoded_hash, new_hash);
+    let current = store
+        .password_current_for(account_id)
+        .await
+        .unwrap()
+        .expect("a current credential");
+    assert_eq!(current.encoded_hash, new_hash);
+
+    // A reset signs the user out everywhere: every session is invalidated.
+    let sessions = browser_session::Entity::find()
+        .filter(browser_session::Column::AccountId.eq(account_id))
+        .all(store.db())
+        .await
+        .unwrap();
+    assert_eq!(sessions.len(), 2);
+    assert!(
+        sessions.iter().all(|s| s.invalidated_at == Some(reset_now)),
+        "every session is invalidated by a reset"
+    );
+
+    // The token is consumed in the same transaction.
+    let stored = password_reset_token::Entity::find_by_id(token.id)
+        .one(store.db())
+        .await
+        .unwrap()
+        .expect("token row survives");
+    assert_eq!(stored.consumed_at, Some(reset_now));
+}
+
+#[tokio::test]
+async fn test_reset_token_is_single_use() {
+    let temp = TempDir::new().expect("tempdir");
+    let store = Store::open(temp.path().join("reset-single.db"))
+        .await
+        .expect("open failed");
+    let now = 1_000;
+    let account_id = activate_account(&store, "reset3@example.com", now).await;
+    let token = store
+        .password_reset_token_issue(
+            account_id,
+            NewPasswordResetToken {
+                token_digest: "digest-single".into(),
+                issued_at: now,
+                expires_at: now + 3_600,
+            },
+        )
+        .await
+        .unwrap();
+    let hash = "$argon2id$v=19$m=8,t=1,p=1$YQ$aGFzaA";
+
+    store
+        .account_reset_password(ResetRequest {
+            token_id: token.id,
+            encoded_hash: hash,
+            now,
+        })
+        .await
+        .expect("the first reset succeeds");
+    let replay = store
+        .account_reset_password(ResetRequest {
+            token_id: token.id,
+            encoded_hash: hash,
+            now: now + 1,
+        })
+        .await;
+    assert!(
+        matches!(replay, Err(StoreError::Conflict(_))),
+        "a spent token is refused: {replay:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_reset_token_sweep_removes_only_expired_unconsumed() {
+    let temp = TempDir::new().expect("tempdir");
+    let store = Store::open(temp.path().join("reset-sweep.db"))
+        .await
+        .expect("open failed");
+    let now = 1_000;
+    let account_id = activate_account(&store, "reset4@example.com", now).await;
+
+    // Expired and unconsumed — the only row the sweep should remove.
+    store
+        .password_reset_token_issue(
+            account_id,
+            NewPasswordResetToken {
+                token_digest: "expired".into(),
+                issued_at: now,
+                expires_at: now + 10,
+            },
+        )
+        .await
+        .unwrap();
+    // Still live (and revoked by the later issue, which the sweep ignores).
+    store
+        .password_reset_token_issue(
+            account_id,
+            NewPasswordResetToken {
+                token_digest: "live".into(),
+                issued_at: now,
+                expires_at: now + 10_000,
+            },
+        )
+        .await
+        .unwrap();
+    // Expired but consumed: kept as provenance.
+    let consumed = store
+        .password_reset_token_issue(
+            account_id,
+            NewPasswordResetToken {
+                token_digest: "consumed".into(),
+                issued_at: now,
+                expires_at: now + 10,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(
+        store
+            .password_reset_token_consume(consumed.id, now)
+            .await
+            .unwrap()
+    );
+
+    let removed = store.password_reset_token_sweep(now + 1_000).await.unwrap();
+    assert_eq!(removed, 1, "only the expired unconsumed row is swept");
+    assert!(
+        store
+            .password_reset_token_by_digest("expired")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .password_reset_token_by_digest("live")
+            .await
+            .unwrap()
+            .is_some(),
+        "a live token survives the sweep"
+    );
+    assert!(
+        store
+            .password_reset_token_by_digest("consumed")
+            .await
+            .unwrap()
+            .is_some(),
+        "a consumed row survives as provenance"
     );
 }
