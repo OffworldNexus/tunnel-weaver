@@ -8,6 +8,7 @@
 //! file permissions, `VACUUM INTO` backups) are gated on the detected backend.
 
 pub mod abuse;
+pub mod account;
 pub mod altcha;
 pub mod entity;
 pub mod error;

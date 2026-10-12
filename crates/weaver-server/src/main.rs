@@ -782,6 +782,7 @@ async fn main() {
                 setup_complete: true,
                 email: None,
                 abuse: None,
+                account: Default::default(),
             };
 
             match email_decision {

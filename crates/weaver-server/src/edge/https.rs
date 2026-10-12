@@ -54,6 +54,8 @@ pub struct HttpsEdgeConfig {
     pub guard: Arc<Pipeline>,
     /// The ALTCHA proof-of-work runtime, when `abuse.altcha` is enabled.
     pub altcha: Option<Arc<crate::altcha::AltchaRuntime>>,
+    /// The account plane (WVR-36), served on the admin host only.
+    pub account: Option<Arc<crate::account::AccountRuntime>>,
 }
 
 impl std::fmt::Debug for HttpsEdgeConfig {
@@ -65,6 +67,7 @@ impl std::fmt::Debug for HttpsEdgeConfig {
             .field("has_tunnel_registry", &self.tunnel_registry.is_some())
             .field("passes", &self.guard.pass_names())
             .field("altcha", &self.altcha.is_some())
+            .field("account", &self.account.is_some())
             .finish()
     }
 }
@@ -95,6 +98,55 @@ fn refusal_response(refusal: Refusal, include_hsts: bool) -> Response<BoxBody> {
 /// a malformed-request error.
 async fn collect_body(req: Request<hyper::body::Incoming>) -> Option<Bytes> {
     req.into_body().collect().await.ok().map(|c| c.to_bytes())
+}
+
+/// Bridge a hyper request into the account plane's axum router and map the
+/// response back, applying the account surface's security headers.
+///
+/// The router is rebuilt per request (cheap: a small route table) so the raw
+/// hyper edge keeps ownership of the boundary and no shared mutable state
+/// crosses it. HTML responses get the SPA CSP; everything else gets the shared
+/// JSON/asset headers, which do not touch `Content-Type`.
+async fn serve_account(
+    account: &Arc<crate::account::AccountRuntime>,
+    req: Request<hyper::body::Incoming>,
+    include_hsts: bool,
+) -> Response<BoxBody> {
+    use tower::ServiceExt as _;
+
+    let router = crate::account::router::router(account.clone());
+    let (parts, body) = req.into_parts();
+    let request = Request::from_parts(parts, axum::body::Body::new(body));
+    let response = match router.oneshot(request).await {
+        Ok(response) => response,
+        Err(never) => match never {},
+    };
+    let (parts, body) = response.into_parts();
+    // Account responses are small (JSON, HTML, modest assets); buffer them so the
+    // boxed body stays `Send + Sync`, which the edge's unified body type requires.
+    let bytes = match body.collect().await {
+        Ok(collected) => collected.to_bytes(),
+        Err(_) => {
+            let mut resp = Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .body(full_body("500 Internal Server Error\n"))
+                .unwrap();
+            apply_security_headers(&mut resp, include_hsts);
+            return resp;
+        }
+    };
+    let mut response = Response::from_parts(parts, full_body(bytes));
+    let is_html = response
+        .headers()
+        .get(http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.starts_with("text/html"));
+    if is_html {
+        weaver_assets::apply_spa_security_headers(&mut response, include_hsts);
+    } else {
+        weaver_assets::apply_common_security_headers(&mut response, include_hsts);
+    }
+    response
 }
 
 pub use weaver_tokio::{set_tcp_nodelay, set_tcp_notsent_lowat};
@@ -209,6 +261,12 @@ pub async fn handle_https_request(
             ViewId::ALTCHA_CHALLENGE
         } else if surface.host == Host::TunnelRoot && path == "/altcha/verify" {
             ViewId::ALTCHA_VERIFY
+        } else if surface.host == Host::Admin && path == "/api/account/signup" {
+            ViewId::ACCOUNT_SIGNUP
+        } else if surface.host == Host::Admin && path == "/api/account/login" {
+            ViewId::ACCOUNT_LOGIN
+        } else if surface.host == Host::Admin && path == "/api/account/resend" {
+            ViewId::ACCOUNT_RESEND
         } else {
             ViewId::RELAY_WEB
         };
@@ -250,8 +308,9 @@ pub async fn handle_https_request(
     }
 
     // The relay's own (admin) hostname is outside the tunnel zone and is served
-    // by its own single-name HTTP-01 certificate. It gets the same welcome/health
-    // surface as the apex but never the tunnel WebSocket endpoint.
+    // by its own single-name HTTP-01 certificate. It hosts the account plane
+    // (the SvelteKit app at the root) and the ALTCHA diagnostic; it never gets
+    // the tunnel WebSocket endpoint.
     if matches!(covering.map(|c| c.validation), Some(Validation::Http01)) {
         if let Some(mgr) = &config.cert_manager {
             mgr.note_visit(&host_lower);
@@ -269,6 +328,16 @@ pub async fn handle_https_request(
                 let body = collect_body(req).await.unwrap_or_default();
                 return Ok(crate::altcha::demo_verify(altcha, body, include_hsts).await);
             }
+        }
+        // The plain health endpoint stays Rust-owned.
+        if req.method() == Method::GET && req.uri().path() == "/healthz" {
+            return Ok(static_host_response(&req, include_hsts));
+        }
+        // WVR-36: everything else on the admin host is the SvelteKit account
+        // plane — the landing page at `/`, the auth routes, the account API and
+        // the vendored ALTCHA widget.
+        if let Some(account) = &config.account {
+            return Ok(serve_account(account, req, include_hsts).await);
         }
         return Ok(static_host_response(&req, include_hsts));
     }
@@ -547,6 +616,7 @@ pub async fn run_https_server_with_registry(
             tunnel_registry,
             guard: Arc::new(Pipeline::scanner_only()),
             altcha: None,
+            account: None,
         },
         shutdown_token,
     )

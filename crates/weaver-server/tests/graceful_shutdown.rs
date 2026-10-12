@@ -31,6 +31,7 @@ fn create_valid_test_config(
         setup_complete: false,
         email: None,
         abuse: None,
+        account: Default::default(),
     }
 }
 

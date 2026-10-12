@@ -241,6 +241,55 @@ pub async fn run_server(
             }
         })
     };
+
+    // WVR-36: the account plane. It is always served on the admin host. The
+    // mailer is optional: when email is not configured, signup still records the
+    // pending registration and the user can resend once mail is set up.
+    let support_url = format!("https://{}", config.admin_domain);
+    let mailer = match crate::email::mailer_from_config(config.email.as_ref(), &support_url) {
+        Ok(mailer) => Some(mailer),
+        Err(crate::email::MailerError::NotConfigured) => None,
+        Err(err) => {
+            return Err(ServerError::Activation(format!(
+                "Failed to initialize the account mailer: {err}"
+            )));
+        }
+    };
+    let account = crate::account::AccountRuntime::from_config(
+        &config.account,
+        &config.admin_domain,
+        store.clone(),
+        altcha.clone(),
+        mailer,
+    )
+    .map_err(|e| ServerError::Activation(format!("Failed to initialize the account plane: {e}")))?;
+    let account_sweep = {
+        let store = store.clone();
+        let interval = config.account.sweep_interval_secs.max(1);
+        let token = shutdown_token.clone();
+        info!(
+            interval_secs = interval,
+            "account token/session sweep running"
+        );
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(interval));
+            loop {
+                tokio::select! {
+                    _ = token.cancelled() => break,
+                    _ = ticker.tick() => {
+                        let cutoff = crate::abuse::unix_ms() / 1000;
+                        if let Err(err) = store.verification_token_sweep(cutoff).await {
+                            warn!(error = %err, "verification token sweep failed");
+                        }
+                        if let Err(err) = store.session_sweep(cutoff).await {
+                            warn!(error = %err, "session sweep failed");
+                        }
+                    }
+                }
+            }
+        })
+    };
+
     let http_token = shutdown_token.clone();
     let challenge_responders: Vec<Arc<dyn ChallengeResponder>> =
         vec![Arc::new(Http01Solver::new(Arc::new(store.clone())))];
@@ -266,6 +315,7 @@ pub async fn run_server(
             tunnel_registry: Some(tunnel_registry),
             guard: guard.clone(),
             altcha: Some(altcha.clone()),
+            account: Some(account.clone()),
         },
         https_token,
     ));
@@ -380,6 +430,7 @@ pub async fn run_server(
             let _ = task.await;
         }
         let _ = altcha_task.await;
+        let _ = account_sweep.await;
         let _ = futures_util::future::join_all(dns_tasks).await;
     };
 

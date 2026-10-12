@@ -498,6 +498,7 @@ async fn spawn_admin_https_server(
         setup_complete: false,
         email: None,
         abuse: None,
+        account: Default::default(),
     };
     let config = HttpsEdgeConfig {
         managed: Arc::new(ManagedCerts::from_config(&cfg)),
@@ -506,6 +507,7 @@ async fn spawn_admin_https_server(
         tunnel_registry: None,
         guard: Arc::new(weaver_abuse::Pipeline::scanner_only()),
         altcha: None,
+        account: None,
     };
 
     let token_clone = shutdown_token.clone();

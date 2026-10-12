@@ -65,6 +65,19 @@ pub fn create_self_signed_server_config(
     tunnel_domain: &str,
 ) -> Result<Arc<ServerConfig>, TlsError> {
     let sans = vec![tunnel_domain.to_string(), format!("*.{tunnel_domain}")];
+    create_self_signed_server_config_for(sans)
+}
+
+/// Generates an in-memory self-signed certificate for an explicit SAN list and
+/// builds a static `rustls::ServerConfig` (ALPN `h2` and `http/1.1`).
+///
+/// A string that parses as an IP address becomes an IP SAN (`127.0.0.1`),
+/// anything else a DNS SAN (`localhost`). Kept as the single place the DER key
+/// material is converted into a `rustls` config, so callers that need a
+/// non-tunnel SAN set (e.g. a localhost development edge) do not re-implement it.
+pub fn create_self_signed_server_config_for(
+    sans: Vec<String>,
+) -> Result<Arc<ServerConfig>, TlsError> {
     let certified_key = generate_simple_self_signed(sans)?;
 
     let cert_der = certified_key.cert.der().to_vec();

@@ -23,6 +23,15 @@ impl PolicyId {
     /// The ALTCHA API's solution-verification endpoint.
     pub const ALTCHA_VERIFY: PolicyId = PolicyId("altcha-verify");
 
+    /// Starting an email signup (admin host account plane).
+    pub const ACCOUNT_SIGNUP: PolicyId = PolicyId("account-signup");
+
+    /// A credential login attempt (admin host account plane).
+    pub const ACCOUNT_LOGIN: PolicyId = PolicyId("account-login");
+
+    /// Resending a verification link (admin host account plane).
+    pub const ACCOUNT_RESEND: PolicyId = PolicyId("account-resend");
+
     /// Build a policy id from a static string.
     pub const fn new(id: &'static str) -> Self {
         Self(id)
@@ -51,6 +60,12 @@ impl ViewId {
     pub const ALTCHA_CHALLENGE: ViewId = ViewId("altcha-challenge");
     /// A verification request to the ALTCHA API (tunnel apex).
     pub const ALTCHA_VERIFY: ViewId = ViewId("altcha-verify");
+    /// Starting an email signup (admin host account plane).
+    pub const ACCOUNT_SIGNUP: ViewId = ViewId("account-signup");
+    /// A credential login attempt (admin host account plane).
+    pub const ACCOUNT_LOGIN: ViewId = ViewId("account-login");
+    /// Resending a verification link (admin host account plane).
+    pub const ACCOUNT_RESEND: ViewId = ViewId("account-resend");
 
     /// Build a view id from a static string.
     pub const fn new(id: &'static str) -> Self {

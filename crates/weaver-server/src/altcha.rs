@@ -116,6 +116,48 @@ impl AltchaRuntime {
         }))
     }
 
+    /// Verify and consume an ALTCHA payload for a consumer, returning the
+    /// engine's result.
+    ///
+    /// This is the account plane's entry point into the WVR-136 engine: it
+    /// resolves the client named inside the payload and consumes the proof
+    /// exactly once. Whether a refusal should block the caller's action is the
+    /// caller's decision, not the engine's.
+    pub async fn verify_payload(
+        &self,
+        client: &str,
+        payload: &Payload,
+        purpose: &str,
+        flow: &str,
+    ) -> Result<Verified, AltchaError> {
+        verify_and_consume(
+            &self.proof,
+            ConsumeRequest {
+                client,
+                payload,
+                purpose,
+                flow,
+                now_ms: crate::abuse::unix_ms(),
+            },
+        )
+        .await
+    }
+
+    /// Issue a challenge for the relay's own internal client, bound to
+    /// `purpose`/`flow`.
+    ///
+    /// The account SPA is one of the relay's own consumers, so it never needs to
+    /// know a client key: this resolves the auto-provisioned internal client
+    /// itself. Returns `None` when no internal client exists yet.
+    pub async fn challenge_for_internal_client(
+        &self,
+        purpose: &str,
+        flow: &str,
+    ) -> Option<weaver_abuse::Challenge> {
+        let model = self.store.altcha_internal_client().await.ok().flatten()?;
+        Some(self.challenge(&model_to_client(model), purpose, flow))
+    }
+
     /// Build a challenge for `client`, bound to `purpose`/`flow`.
     fn challenge(
         &self,
@@ -667,7 +709,7 @@ fn verify_result_response(
 ///
 /// Tolerant of the Base64 alphabets/padding the widget may emit; the size cap is
 /// enforced by the caller before this runs.
-fn decode_payload(encoded: &str) -> Option<Payload> {
+pub fn decode_payload(encoded: &str) -> Option<Payload> {
     use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD};
     let bytes = STANDARD
         .decode(encoded)

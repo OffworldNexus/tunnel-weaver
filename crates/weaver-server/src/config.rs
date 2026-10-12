@@ -104,6 +104,13 @@ pub struct Config {
     /// [`Config::load`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub abuse: Option<AbuseConfig>,
+    /// Account-plane tuning (WVR-36).
+    ///
+    /// The account plane is always served — it is the relay's own product
+    /// surface — so this block only tunes it. Every field has a built-in
+    /// default, so an absent block is exactly [`AccountConfig::default`].
+    #[serde(default)]
+    pub account: AccountConfig,
 }
 
 /// Operator-supplied transactional-email settings.
@@ -248,6 +255,171 @@ impl AltchaConfig {
             sweep_interval_secs: default_altcha_sweep_secs(),
             api_base_url: None,
         }
+    }
+}
+
+/// Operator-supplied account-plane tuning (WVR-36).
+///
+/// The account plane is always served, so this block only tunes it. Field
+/// defaults encode the agreed policy: a 12-character minimum, Django-compatible
+/// Argon2id work parameters, a 24-hour verification link, a 60-second resend
+/// cooldown, a 1-hour post-verification completion window, and a 30-day session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccountConfig {
+    /// Minimum accepted password length.
+    #[serde(default = "default_account_min_password_length")]
+    pub min_password_length: usize,
+    /// Argon2id memory cost, in KiB.
+    #[serde(default = "default_account_argon2_memory_kib")]
+    pub argon2_memory_kib: u32,
+    /// Argon2id iteration count.
+    #[serde(default = "default_account_argon2_iterations")]
+    pub argon2_iterations: u32,
+    /// Argon2id parallelism (lanes).
+    #[serde(default = "default_account_argon2_parallelism")]
+    pub argon2_parallelism: u32,
+    /// Verification-link lifetime, in seconds.
+    #[serde(default = "default_account_verification_ttl_secs")]
+    pub verification_ttl_secs: u64,
+    /// Minimum seconds between verification resends for one registration.
+    #[serde(default = "default_account_resend_cooldown_secs")]
+    pub resend_cooldown_secs: u64,
+    /// How long a verified signup may finish setting a password, in seconds.
+    #[serde(default = "default_account_completion_ttl_secs")]
+    pub completion_ttl_secs: u64,
+    /// Browser-session lifetime, in seconds.
+    #[serde(default = "default_account_session_ttl_secs")]
+    pub session_ttl_secs: u64,
+    /// Whether session cookies carry the `Secure` attribute. Disable only for
+    /// local plain-HTTP development, where browsers drop `Secure` cookies.
+    #[serde(default = "default_true")]
+    pub cookie_secure: bool,
+    /// Base URL of the Have I Been Pwned k-anonymity range API.
+    #[serde(default = "default_account_hibp_url")]
+    pub hibp_url: String,
+    /// How often expired tokens and sessions are swept, in seconds.
+    #[serde(default = "default_account_sweep_interval_secs")]
+    pub sweep_interval_secs: u64,
+    /// Per-network budget for starting a signup.
+    #[serde(default = "default_account_signup_budget")]
+    pub signup: BudgetConfig,
+    /// Per-network budget for login attempts.
+    #[serde(default = "default_account_login_budget")]
+    pub login: BudgetConfig,
+    /// Per-network budget for verification resends.
+    #[serde(default = "default_account_resend_budget")]
+    pub resend: BudgetConfig,
+    /// Public support address shown in the app footer as a `mailto:` link.
+    ///
+    /// Defaults to the configured mailer's `From` address when unset. When
+    /// neither exists the footer renders no contact link.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub support_email: Option<String>,
+    /// Public base URL of the account plane, used to build email links.
+    ///
+    /// Defaults to `https://<admin_domain>`. Set for non-standard deployments or
+    /// a local endpoint in tests.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+}
+
+impl Default for AccountConfig {
+    fn default() -> Self {
+        Self {
+            min_password_length: default_account_min_password_length(),
+            argon2_memory_kib: default_account_argon2_memory_kib(),
+            argon2_iterations: default_account_argon2_iterations(),
+            argon2_parallelism: default_account_argon2_parallelism(),
+            verification_ttl_secs: default_account_verification_ttl_secs(),
+            resend_cooldown_secs: default_account_resend_cooldown_secs(),
+            completion_ttl_secs: default_account_completion_ttl_secs(),
+            session_ttl_secs: default_account_session_ttl_secs(),
+            cookie_secure: true,
+            hibp_url: default_account_hibp_url(),
+            sweep_interval_secs: default_account_sweep_interval_secs(),
+            signup: default_account_signup_budget(),
+            login: default_account_login_budget(),
+            resend: default_account_resend_budget(),
+            support_email: None,
+            base_url: None,
+        }
+    }
+}
+
+/// Default minimum password length.
+fn default_account_min_password_length() -> usize {
+    12
+}
+
+/// Default Argon2id memory cost (100 MiB), matching Django's default.
+fn default_account_argon2_memory_kib() -> u32 {
+    102_400
+}
+
+/// Default Argon2id iteration count, matching Django's default.
+fn default_account_argon2_iterations() -> u32 {
+    2
+}
+
+/// Default Argon2id parallelism, matching Django's default.
+fn default_account_argon2_parallelism() -> u32 {
+    8
+}
+
+/// Default verification-link lifetime: 24 hours.
+fn default_account_verification_ttl_secs() -> u64 {
+    86_400
+}
+
+/// Default resend cooldown: 60 seconds.
+fn default_account_resend_cooldown_secs() -> u64 {
+    60
+}
+
+/// Default completion window after verification: 1 hour.
+fn default_account_completion_ttl_secs() -> u64 {
+    3_600
+}
+
+/// Default session lifetime: 30 days.
+fn default_account_session_ttl_secs() -> u64 {
+    2_592_000
+}
+
+/// Default breach-check endpoint.
+fn default_account_hibp_url() -> String {
+    "https://api.pwnedpasswords.com/range".to_string()
+}
+
+/// Default account sweep interval: 1 hour.
+fn default_account_sweep_interval_secs() -> u64 {
+    3_600
+}
+
+/// Default signup budget: a 10-request burst refilling at 10 per 10 minutes.
+fn default_account_signup_budget() -> BudgetConfig {
+    BudgetConfig {
+        burst: 10,
+        refill_units: 10,
+        refill_per_secs: 600,
+    }
+}
+
+/// Default login budget: a 30-request burst refilling at 30 per 10 minutes.
+fn default_account_login_budget() -> BudgetConfig {
+    BudgetConfig {
+        burst: 30,
+        refill_units: 30,
+        refill_per_secs: 600,
+    }
+}
+
+/// Default resend budget: a 20-request burst refilling at 20 per 10 minutes.
+fn default_account_resend_budget() -> BudgetConfig {
+    BudgetConfig {
+        burst: 20,
+        refill_units: 20,
+        refill_per_secs: 600,
     }
 }
 
@@ -435,6 +607,54 @@ pub fn domain_split_issue(admin_domain: &str, tunnel_domain: &str) -> Option<Str
     None
 }
 
+/// Rejects account tuning whose work parameters or lifetimes could not admit
+/// anything. The account plane is always armed, so this is always checked.
+fn validate_account_config(account: &AccountConfig) -> Vec<String> {
+    let mut issues = Vec::new();
+    if account.min_password_length < 8 {
+        issues.push("account.min_password_length must be >= 8".into());
+    }
+    if account.argon2_memory_kib < 8 {
+        issues.push("account.argon2_memory_kib must be >= 8".into());
+    }
+    if account.argon2_iterations < 1 {
+        issues.push("account.argon2_iterations must be >= 1".into());
+    }
+    if account.argon2_parallelism < 1 {
+        issues.push("account.argon2_parallelism must be >= 1".into());
+    }
+    for (name, value) in [
+        ("verification_ttl_secs", account.verification_ttl_secs),
+        ("resend_cooldown_secs", account.resend_cooldown_secs),
+        ("completion_ttl_secs", account.completion_ttl_secs),
+        ("session_ttl_secs", account.session_ttl_secs),
+        ("sweep_interval_secs", account.sweep_interval_secs),
+    ] {
+        if value < 1 {
+            issues.push(format!("account.{name} must be >= 1"));
+        }
+    }
+    for (name, budget) in [
+        ("signup", &account.signup),
+        ("login", &account.login),
+        ("resend", &account.resend),
+    ] {
+        if budget.burst < 1 {
+            issues.push(format!("account.{name}.burst must be >= 1"));
+        }
+        if budget.refill_units < 1 {
+            issues.push(format!("account.{name}.refill_units must be >= 1"));
+        }
+        if budget.refill_per_secs < 1 {
+            issues.push(format!("account.{name}.refill_per_secs must be >= 1"));
+        }
+    }
+    if account.hibp_url.trim().is_empty() {
+        issues.push("account.hibp_url must not be empty".into());
+    }
+    issues
+}
+
 impl Config {
     /// Loads and validates configuration from the store.
     pub async fn load(store: &Store) -> Result<Self, ConfigError> {
@@ -554,6 +774,9 @@ impl Config {
         {
             validation_issues.extend(validate_abuse_config(abuse));
         }
+
+        // Account tuning is always armed, so it is always validated.
+        validation_issues.extend(validate_account_config(&config.account));
 
         if !validation_issues.is_empty() {
             return Err(ConfigError::ValidationFailed(validation_issues));

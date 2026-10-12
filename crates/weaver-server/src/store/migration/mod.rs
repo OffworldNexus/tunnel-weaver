@@ -11,6 +11,7 @@ use sea_orm_migration::prelude::*;
 mod m0001_init;
 mod m0002_abuse;
 mod m0003_altcha;
+mod m0004_account;
 
 /// The ordered list of every migration known to this binary.
 pub struct Migrator;
@@ -22,6 +23,7 @@ impl MigratorTrait for Migrator {
             Box::new(m0001_init::Migration),
             Box::new(m0002_abuse::Migration),
             Box::new(m0003_altcha::Migration),
+            Box::new(m0004_account::Migration),
         ]
     }
 }

@@ -36,6 +36,24 @@ jobs:
         with:
           tool: cargo-deny
 
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 12.4.1
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: frontend/pnpm-lock.yaml
+
+      - name: Build the account SPA
+        run: |
+          cd frontend
+          pnpm install --frozen-lockfile
+          pnpm run build
+
       - name: Check formatting
         run: cargo fmt --check
 
@@ -71,6 +89,24 @@ jobs:
 
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 12.4.1
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: frontend/pnpm-lock.yaml
+
+      - name: Build the account SPA
+        run: |
+          cd frontend
+          pnpm install --frozen-lockfile
+          pnpm run build
 
       - name: Run tests
         run: |
@@ -115,6 +151,24 @@ jobs:
 
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 12.4.1
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: frontend/pnpm-lock.yaml
+
+      - name: Build the account SPA
+        run: |
+          cd frontend
+          pnpm install --frozen-lockfile
+          pnpm run build
 
       - name: Run e2e tests
         run: |
@@ -185,6 +239,55 @@ jobs:
             --acme-root-ca /tmp/pebble.pem \
             --skip-reachability-check || echo "Systemd smoke completed with status $?"
           docker rm -f systemd-smoke || true
+
+  e2e-bdd:
+    name: e2e-bdd
+    runs-on: ubuntu-latest
+    env:
+      # Skip Playwright's postinstall browser download; the explicit step below
+      # installs exactly Chromium with its system dependencies.
+      PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 12.4.1
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: |
+            frontend/pnpm-lock.yaml
+            e2e/pnpm-lock.yaml
+
+      - name: Build the account SPA
+        run: |
+          cd frontend
+          pnpm install --frozen-lockfile
+          pnpm run build
+
+      - name: Build the e2e harness example
+        run: cargo build -p weaver-server --example e2e_server
+
+      - name: Install the e2e dependencies and Chromium
+        working-directory: e2e
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm exec playwright install --with-deps chromium
+
+      - name: Run the Cucumber + Playwright suite
+        working-directory: e2e
+        run: pnpm run test:ci
 
   fuzz-smoke:
     name: fuzz-smoke
@@ -281,6 +384,24 @@ jobs:
         uses: taiki-e/install-action@v2
         with:
           tool: cross
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 12.4.1
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: frontend/pnpm-lock.yaml
+
+      - name: Build the account SPA
+        run: |
+          cd frontend
+          pnpm install --frozen-lockfile
+          pnpm run build
 
       - name: Build release binaries
         run: |
