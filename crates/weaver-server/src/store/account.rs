@@ -518,34 +518,41 @@ impl Store {
             .ok_or_else(|| StoreError::Conflict("reset token vanished after consume".into()))?;
         let account_id = token.account_id;
 
-        // Retire the current credential, preserving the append-only history.
-        password_credential::Entity::update_many()
-            .col_expr(
-                password_credential::Column::RetiredAt,
-                Expr::value(Some(req.now)),
-            )
-            .filter(password_credential::Column::AccountId.eq(account_id))
-            .filter(password_credential::Column::RetiredAt.is_null())
-            .exec(&txn)
-            .await?;
+        let account = match rotate_credential(&txn, account_id, req.encoded_hash, req.now).await {
+            Ok(account) => account,
+            Err(err) => {
+                txn.rollback().await?;
+                return Err(err);
+            }
+        };
 
-        password_credential::Entity::insert(password_credential::ActiveModel {
-            account_id: Set(account_id),
-            encoded_hash: Set(req.encoded_hash.to_string()),
-            created_at: Set(req.now),
-            retired_at: Set(None),
-            ..Default::default()
-        })
-        .exec_without_returning(&txn)
-        .await?;
+        txn.commit().await?;
+        Ok(account)
+    }
 
-        // A reset ends every existing session ("signed out everywhere").
-        invalidate_sessions_for_account(&txn, account_id, req.now).await?;
+    /// Atomically applies an authenticated password change (WVR-50).
+    ///
+    /// The caller has already proved the account's current password, so this is
+    /// the reset body without the token consume: retire the live credential,
+    /// write the replacement, and end **every** session — including the one that
+    /// made the request, so the user signs in again with the new password. Both
+    /// paths share `rotate_credential`, so a change and a reset cannot drift in
+    /// what they guarantee.
+    pub async fn account_change_password(
+        &self,
+        account_id: i32,
+        encoded_hash: &str,
+        now: i64,
+    ) -> Result<account::Model, StoreError> {
+        let txn = self.db.begin().await?;
 
-        let account = account::Entity::find_by_id(account_id)
-            .one(&txn)
-            .await?
-            .ok_or_else(|| StoreError::Conflict("account missing during reset".into()))?;
+        let account = match rotate_credential(&txn, account_id, encoded_hash, now).await {
+            Ok(account) => account,
+            Err(err) => {
+                txn.rollback().await?;
+                return Err(err);
+            }
+        };
 
         txn.commit().await?;
         Ok(account)
@@ -676,6 +683,55 @@ async fn mark_pending_complete<C: sea_orm::ConnectionTrait>(
         .exec(conn)
         .await?;
     Ok(())
+}
+
+/// Retires an account's current credential, writes the replacement, and ends
+/// every live session — the shared body of the reset and change-password paths,
+/// so the two cannot diverge in what they guarantee.
+///
+/// The retire step is conditional on the row still being live and is required to
+/// affect exactly one row: if it does not, the account has no credential to
+/// rotate and the caller's transaction is abandoned. That also closes the race
+/// where two concurrent changes both pass their (out-of-transaction) check of the
+/// current password — only one can retire the credential, the other is refused.
+async fn rotate_credential<C: sea_orm::ConnectionTrait>(
+    conn: &C,
+    account_id: i32,
+    encoded_hash: &str,
+    now: i64,
+) -> Result<account::Model, StoreError> {
+    let retired = password_credential::Entity::update_many()
+        .col_expr(
+            password_credential::Column::RetiredAt,
+            Expr::value(Some(now)),
+        )
+        .filter(password_credential::Column::AccountId.eq(account_id))
+        .filter(password_credential::Column::RetiredAt.is_null())
+        .exec(conn)
+        .await?;
+    if retired.rows_affected != 1 {
+        return Err(StoreError::Conflict(
+            "account has no live password credential to rotate".into(),
+        ));
+    }
+
+    password_credential::Entity::insert(password_credential::ActiveModel {
+        account_id: Set(account_id),
+        encoded_hash: Set(encoded_hash.to_string()),
+        created_at: Set(now),
+        retired_at: Set(None),
+        ..Default::default()
+    })
+    .exec_without_returning(conn)
+    .await?;
+
+    // A credential change ends every existing session ("signed out everywhere").
+    invalidate_sessions_for_account(conn, account_id, now).await?;
+
+    account::Entity::find_by_id(account_id)
+        .one(conn)
+        .await?
+        .ok_or_else(|| StoreError::Conflict("account missing during credential rotation".into()))
 }
 
 /// Invalidates every live session for an account inside a caller's transaction.

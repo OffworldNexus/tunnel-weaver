@@ -172,3 +172,83 @@ export async function expectNoResetLink(world, { graceMs = 3_000 } = {}) {
     );
   }
 }
+
+// --- password change (WVR-50) -----------------------------------------------
+
+/**
+ * Follows a link by its exact accessible name. Keycap links are built from
+ * layered pedestal/ring/cap/face spans, which defeat Playwright's stability
+ * check, so the click is forced (same caveat as the sign-in keycap).
+ */
+export async function followLink(world, name) {
+  const link = world.page.getByRole('link', { name, exact: true });
+  await link.waitFor({ state: 'visible' });
+  await link.click({ force: true });
+}
+
+/**
+ * Opens the Security page from the signed-in shell. The Account nav's
+ * "Security" entry is a plain link; the `/app/security` h1 shares its name, so
+ * the locator is pinned to the link role.
+ */
+export async function openSecurity(world) {
+  await world.page.getByRole('navigation', { name: 'Account' }).waitFor({ state: 'visible' });
+  await followLink(world, 'Security');
+  await assert.seeHeading(world.page, 'Security');
+}
+
+/** Follows the Password panel's "Change password" keycap link. */
+export async function followChangePassword(world) {
+  await followLink(world, 'Change password');
+  await assert.seeHeading(world.page, 'Change your password');
+}
+
+/**
+ * Fills the change form. Labels are matched exactly: a bare `Password` would be
+ * ambiguous, and a loose one could be satisfied by a live region's name.
+ */
+async function fillChangeForm(world, { current, next }) {
+  await assert.seeHeading(world.page, 'Change your password');
+  await world.page.getByLabel('Current password', { exact: true }).fill(current);
+  await world.page.getByLabel('New password', { exact: true }).fill(next);
+}
+
+/**
+ * Submits the change form without assuming an outcome, so both the success and
+ * the refusal leg can share it. The submit keycap's label flips to "Saving…"
+ * mid-flight, so the click is forced rather than re-resolved.
+ */
+export async function submitPasswordChange(world, { current, next }) {
+  await fillChangeForm(world, { current, next });
+  await world.page
+    .getByRole('button', { name: 'Change password', exact: true })
+    .click({ force: true });
+}
+
+/**
+ * Changes the password successfully. The relay ends every session — this one
+ * included — so the SPA lands on sign-in carrying the success notice.
+ */
+export async function changePassword(world, { current, next }) {
+  await submitPasswordChange(world, { current, next });
+  await assert.seeHeading(world.page, 'Sign in');
+}
+
+/**
+ * Proves the acting session is gone too: the signed-in shell can no longer be
+ * reached, and the guard returns the browser to sign-in. Assert the path rather
+ * than the live region, which the sign-in page consumes on render.
+ */
+export async function expectSignedOutEverywhere(world) {
+  await world.page.goto(world.url('/app'));
+  await world.page.waitForURL(/\/sign-in(\?.*)?$/, { timeout: 20_000 });
+  await assert.seeHeading(world.page, 'Sign in');
+}
+
+/**
+ * Waits for the change-notification email. It is sent off the response path, so
+ * the read polls the capture mailbox (mirroring `takeResetLink`).
+ */
+export async function expectPasswordChangedMail(world) {
+  await world.latestMailBySubject('Your password was changed');
+}

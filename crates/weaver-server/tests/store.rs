@@ -1502,6 +1502,115 @@ async fn test_account_reset_password_supersedes_and_revokes() {
     assert_eq!(stored.consumed_at, Some(reset_now));
 }
 
+/// WVR-50: an authenticated password change carries the reset's guarantees —
+/// append-only credential history and every session ended — without a token.
+#[tokio::test]
+async fn test_account_change_password_supersedes_and_revokes() {
+    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder};
+    use weaver_server::store::entity::{browser_session, password_credential};
+
+    let temp = TempDir::new().expect("tempdir");
+    let store = Store::open(temp.path().join("change-apply.db"))
+        .await
+        .expect("open failed");
+    let now = 1_000;
+    let account_id = activate_account(&store, "change1@example.com", now).await;
+
+    // Two live sessions: the device making the change, and another.
+    store
+        .session_create(account_id, "change-session-one", now, now + 100_000)
+        .await
+        .unwrap();
+    store
+        .session_create(account_id, "change-session-two", now, now + 100_000)
+        .await
+        .unwrap();
+
+    let new_hash = "$argon2id$v=19$m=8,t=1,p=1$Y2hhbmdl$aGFzaA";
+    let changed_now = now + 7;
+    store
+        .account_change_password(account_id, new_hash, changed_now)
+        .await
+        .expect("change applies");
+
+    // Append-only history: the old credential is retired, the new one is current.
+    let credentials = password_credential::Entity::find()
+        .filter(password_credential::Column::AccountId.eq(account_id))
+        .order_by_asc(password_credential::Column::Id)
+        .all(store.db())
+        .await
+        .unwrap();
+    assert_eq!(credentials.len(), 2, "history is append-only");
+    assert_eq!(
+        credentials[0].retired_at,
+        Some(changed_now),
+        "the old credential is retired"
+    );
+    assert!(
+        credentials[1].retired_at.is_none(),
+        "the new credential is current"
+    );
+    assert_eq!(credentials[1].encoded_hash, new_hash);
+    let current = store
+        .password_current_for(account_id)
+        .await
+        .unwrap()
+        .expect("a current credential");
+    assert_eq!(current.encoded_hash, new_hash);
+
+    // A change signs the user out everywhere, the acting session included.
+    let sessions = browser_session::Entity::find()
+        .filter(browser_session::Column::AccountId.eq(account_id))
+        .all(store.db())
+        .await
+        .unwrap();
+    assert_eq!(sessions.len(), 2);
+    assert!(
+        sessions
+            .iter()
+            .all(|s| s.invalidated_at == Some(changed_now)),
+        "every session is invalidated by a password change"
+    );
+}
+
+/// With no live credential to rotate, a change is refused rather than silently
+/// leaving two current credentials. This is the guard that also settles the race
+/// between two concurrent changes.
+#[tokio::test]
+async fn test_account_change_password_refuses_without_a_live_credential() {
+    use sea_orm::sea_query::Expr;
+    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+    use weaver_server::store::entity::password_credential;
+
+    let temp = TempDir::new().expect("tempdir");
+    let store = Store::open(temp.path().join("change-empty.db"))
+        .await
+        .expect("open failed");
+    let now = 1_000;
+    let account_id = activate_account(&store, "change2@example.com", now).await;
+
+    // Retire the credential directly, so the account has none to rotate.
+    password_credential::Entity::update_many()
+        .col_expr(
+            password_credential::Column::RetiredAt,
+            Expr::value(Some(now)),
+        )
+        .filter(password_credential::Column::AccountId.eq(account_id))
+        .exec(store.db())
+        .await
+        .unwrap();
+
+    let error = store
+        .account_change_password(
+            account_id,
+            "$argon2id$v=19$m=8,t=1,p=1$bm9uZQ$aGFzaA",
+            now + 1,
+        )
+        .await
+        .expect_err("no live credential to rotate");
+    assert!(matches!(error, StoreError::Conflict(_)), "{error:?}");
+}
+
 #[tokio::test]
 async fn test_reset_token_is_single_use() {
     let temp = TempDir::new().expect("tempdir");

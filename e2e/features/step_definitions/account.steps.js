@@ -9,11 +9,16 @@
 import { Given, When, Then } from '@cucumber/cucumber';
 import * as assert from '../support/assertions.js';
 import {
+  changePassword,
   createAccount,
   expectNoResetLink,
+  expectPasswordChangedMail,
+  expectSignedOutEverywhere,
+  followChangePassword,
   followForgotPassword,
   openResetLink,
   openResetRequestPage,
+  openSecurity,
   openVerificationLink,
   registerAccount,
   reopenResetLink,
@@ -22,6 +27,7 @@ import {
   setPassword,
   signIn,
   signOut,
+  submitPasswordChange,
   takeResetLink
 } from '../support/flow.js';
 
@@ -141,4 +147,76 @@ When('I open the same reset link again', async function () {
 
 Then('no reset email is sent', async function () {
   await expectNoResetLink(this);
+});
+
+// --- password change (WVR-50) ------------------------------------------------
+
+When('I open the Security page', async function () {
+  await openSecurity(this);
+});
+
+Then('I see the Password panel showing {string}', async function (state) {
+  await assert.seeRegion(this.page, 'Password');
+  await assert.seeLink(this.page, 'Change password');
+  await assert.seeText(this.page, state);
+  // `seeText` matches a case-insensitive substring, so "Password is set" is also
+  // satisfied by "No password is set". Compare the panel's own lines, dropping
+  // the aria-hidden ✓ decoration, so the state is pinned exactly.
+  const lines = (await this.page.getByRole('region', { name: 'Password' }).innerText())
+    .split('\n')
+    .map((line) => line.replace('\u2713', '').trim());
+  if (!lines.includes(state)) {
+    throw new Error(
+      `Expected the Password panel to show "${state}", but it showed: ` +
+        `${lines.filter(Boolean).join(' | ')}`
+    );
+  }
+});
+
+When('I follow the "Change password" link from the Password panel', async function () {
+  await followChangePassword(this);
+});
+
+Then('the change form asks only for the current and new password', async function () {
+  await assert.seeLabel(this.page, 'Current password');
+  await assert.seeLabel(this.page, 'New password');
+  // The delivered design has no repeat field, so nothing may match a
+  // confirmation control.
+  const confirm = await this.page.getByLabel(/confirm/i).count();
+  if (confirm !== 0) {
+    throw new Error(
+      `Expected no confirmation field on the change form, but ${confirm} control(s) matched /confirm/i.`
+    );
+  }
+});
+
+When('I change my password from {string} to {string}', async function (current, next) {
+  await changePassword(this, { current, next });
+});
+
+Then('I see the password change success notice', async function () {
+  await assert.seeText(
+    this.page,
+    'Your password has been changed. Sign in with your new password.'
+  );
+});
+
+Then('I am signed out everywhere, this device included', async function () {
+  await expectSignedOutEverywhere(this);
+});
+
+Then('the password change notification email is sent', async function () {
+  await expectPasswordChangedMail(this);
+});
+
+When('I try to change my password from {string} to {string}', async function (current, next) {
+  await submitPasswordChange(this, { current, next });
+});
+
+Then('I see the change refusal on the current password field', async function () {
+  await assert.seeAlert(this.page, 'that is not your current password');
+});
+
+When('I open my account page', async function () {
+  await this.open('/app');
 });

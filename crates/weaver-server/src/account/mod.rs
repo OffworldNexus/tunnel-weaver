@@ -141,4 +141,13 @@ impl AccountRuntime {
     pub fn account_url(&self) -> String {
         format!("{}/app", self.base_url.trim_end_matches('/'))
     }
+
+    /// The absolute HTTPS URL of the normal password-recovery page.
+    ///
+    /// Linked from the "your password was changed" notification so a recipient
+    /// who does not recognise the change lands on the ordinary, unauthenticated
+    /// recovery flow — never a pre-authorised action.
+    pub fn password_recovery_url(&self) -> String {
+        format!("{}/forgot-password", self.base_url.trim_end_matches('/'))
+    }
 }

@@ -2,7 +2,7 @@
 
 ## Testing
 
-- Full suite (fast): `cargo test --workspace` (~72s warm, timeout 240000ms)
+- Full suite (fast): `cargo test --workspace` (~100s, timeout 240000ms)
 - CI-strength property tests: `PROPTEST_CASES=2000 PROPTEST_RNG_SEED=67 cargo test -p weaver-mux` (~70s, timeout 300000ms)
 - Ignored e2e suite: `cargo test --workspace -- --ignored` (~9s warm, timeout 60000ms)
 - Format check: `cargo fmt --check` (~1s, timeout 30000ms)
@@ -16,16 +16,20 @@
   `cd frontend && pnpm run build` (~3s, timeout 180000ms). Must exit 0 and
   externalize the bootstrap (no inline `<script>` in `build/index.html`).
 - Browser BDD (Cucumber + Playwright against the real server):
-  `cd e2e && pnpm test` (~21s, timeout 300000ms); one-time
+  `cd e2e && pnpm test` (~23s, timeout 300000ms); one-time
   `pnpm exec playwright install chromium`. It rebuilds
   `weaver-server --example e2e_server` first, so stop any running copy of that
   binary (a live one blocks the relink with `ETXTBSY`).
+- Not a gate: `pnpm -C frontend run check` (svelte-check) fails repo-wide, even
+  on a clean tree — `.svelte-kit/tsconfig.json` is never generated, so every
+  `#lib/*` import reports "cannot find module" (~50 errors). Use `cargo
+  clippy` + the SPA build instead.
 - Conformance (nightly / PR to develop only, needs the DO droplet): h2spec
   and Autobahn run in `.github/workflows/nightly.yml`; allow-lists live in
   `ci/conformance/*-allowlist.txt`, one case per line with a justification.
-- Last measured: 2026-10-12, full suite 550 passed/0 failed/4 ignored (72s),
-  SPA build 3s, e2e 8 scenarios passed (22s). (Prior: 2026-10-12, 546 passed;
-  2026-10-06, 441 passed.)
+- Last measured: 2026-10-12 (after WVR-50), full suite 559 passed/0 failed/4
+  ignored (100s), SPA build 3s, e2e 9 scenarios/85 steps passed (23s).
+  (Prior: 2026-10-12, 550 passed (72s); 546 passed; 2026-10-06, 441 passed.)
 
 ## Crate notes
 

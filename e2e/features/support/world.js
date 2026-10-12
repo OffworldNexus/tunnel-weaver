@@ -11,6 +11,7 @@ import { setWorldConstructor, World } from '@cucumber/cucumber';
 import {
   clearMail as clearCapturedMail,
   harness,
+  latestMailBySubject as readLatestMailBySubject,
   latestResetLink as readLatestResetLink,
   latestVerificationLink as readLatestVerificationLink,
   messages as readMessages,
@@ -38,6 +39,7 @@ export class WeaverWorld extends World {
     this.clearMail = clearCapturedMail;
     this.latestVerificationLink = readLatestVerificationLink;
     this.latestResetLink = readLatestResetLink;
+    this.latestMailBySubject = readLatestMailBySubject;
     this.resetLinks = readResetLinks;
   }
 

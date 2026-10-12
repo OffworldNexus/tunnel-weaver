@@ -66,3 +66,31 @@ export type SignUpForm = v.InferOutput<typeof signUpSchema>;
 export type SetPasswordForm = v.InferOutput<ReturnType<typeof setPasswordSchema>>;
 export type ResendForm = v.InferOutput<typeof resendSchema>;
 export type ResetRequestForm = v.InferOutput<typeof resetRequestSchema>;
+
+/**
+ * The change-password form (WVR-50): the current password for reauthentication,
+ * and the new one.
+ *
+ * Deliberately **no confirmation field**: this would be the only account form
+ * asking for one (set-password and reset both take a single new password), and
+ * the strength meter plus the show/hide toggle make a repeat unnecessary. The
+ * relay validates the same policy authoritatively.
+ */
+export function changePasswordSchema(minLength: () => number) {
+	return v.object({
+		current_password: v.pipe(
+			v.string('Enter your current password.'),
+			v.nonEmpty('Enter your current password.')
+		),
+		new_password: v.pipe(
+			v.string('Choose a new password.'),
+			v.check(
+				(value) => value.length >= minLength(),
+				() => `Use at least ${minLength()} characters.`
+			),
+			v.maxLength(1024, 'That password is too long.')
+		)
+	});
+}
+
+export type ChangePasswordForm = v.InferOutput<ReturnType<typeof changePasswordSchema>>;
