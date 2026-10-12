@@ -398,7 +398,6 @@ jobs:
           cache-dependency-path: frontend/pnpm-lock.yaml
 
       - name: Build the account SPA
-        if: matrix.can_run
         run: |
           cd frontend
           pnpm install --frozen-lockfile
