@@ -1,6 +1,10 @@
 <script lang="ts">
 	import Keycap from '#lib/ui/Keycap.svelte';
+	import Icon from '#lib/ui/Icon.svelte';
 	import { href } from '#lib/app/paths';
+
+	/** The public source repository; the only off-site link on the landing page. */
+	const repoUrl = 'https://github.com/OffworldNexus/tunnel-weaver';
 </script>
 
 <!-- Closing CTA: repeat the primary action at the end of the page. -->
@@ -13,6 +17,9 @@
 		<div class="closing__actions">
 			<Keycap href={href('/sign-up')}>Create account</Keycap>
 			<Keycap variant="ghost" href={href('/sign-in')}>Sign in</Keycap>
+			<Keycap variant="ghost" href={repoUrl} target="_blank" rel="noopener noreferrer">
+				<span class="closing__cta"><Icon name="github" />Get on GitHub</span>
+			</Keycap>
 		</div>
 	</div>
 </section>
@@ -56,6 +63,21 @@
 
 	.closing__actions :global(.keycap) {
 		min-width: 180px;
+	}
+
+	/* Icon + label inside the GitHub keycap; the slot contents are compiled here,
+	   so this wrapper is in this component's scope. */
+	.closing__cta {
+		display: inline-flex;
+		align-items: center;
+		gap: 8px;
+	}
+
+	/* The Icon component sets its own 24px size, which would outweigh the label;
+	   the extra `.closing__cta` class keeps this override specific enough. */
+	.closing__cta :global(svg) {
+		width: 20px;
+		height: 20px;
 	}
 
 	@media (max-width: 640px) {

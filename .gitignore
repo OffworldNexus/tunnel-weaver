@@ -15,3 +15,6 @@
 *~
 .DS_Store
 Thumbs.db
+
+# Playwright MCP scratch output (tooling byproduct)
+.playwright-mcp/

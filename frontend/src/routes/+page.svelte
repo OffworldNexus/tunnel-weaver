@@ -8,14 +8,17 @@
 	 * sections are landing-only, so they live alongside this page in `_landing/`.
 	 */
 
-	import { href } from '#lib/app/paths';
 	import Brand from '#lib/brand/Brand.svelte';
 	import Keycap from '#lib/ui/Keycap.svelte';
+	import Icon from '#lib/ui/Icon.svelte';
 	import SiteFooter from '#lib/ui/SiteFooter.svelte';
 	import Hero from './_landing/Hero.svelte';
 	import Steps from './_landing/Steps.svelte';
 	import Benefits from './_landing/Benefits.svelte';
 	import Closing from './_landing/Closing.svelte';
+
+	/** The public source repository; the only off-site link on the landing page. */
+	const repoUrl = 'https://github.com/OffworldNexus/tunnel-weaver';
 </script>
 
 <svelte:head>
@@ -27,13 +30,18 @@
 </svelte:head>
 
 <div class="landing">
-	<!-- Top bar: brand (links home) plus the two account entry points. -->
+	<!-- Top bar: brand (links home) on the left; the off-site repo link is the
+	     only action in the top-right. The account CTAs live in the hero. -->
 	<div class="landing__top">
 		<Brand />
-		<nav class="landing__nav" aria-label="Account">
-			<a class="landing__nav-link" href={href('/sign-in')}>Sign in</a>
-			<Keycap variant="ghost" href={href('/sign-up')}>Create account</Keycap>
-		</nav>
+		<div class="landing__actions">
+			<Keycap variant="ghost" href={repoUrl} target="_blank" rel="noopener noreferrer">
+				<span class="landing__github">
+					<Icon name="github" />
+					<span class="landing__github-label">Get on GitHub</span>
+				</span>
+			</Keycap>
+		</div>
 	</div>
 
 	<main id="main" class="landing__main">
@@ -80,31 +88,55 @@
 		max-width: none;
 	}
 
-	.landing__nav {
+	/* The right-hand cluster holds only the off-site repo link; the account CTAs
+	   live in the hero. */
+	.landing__actions {
 		display: flex;
 		align-items: center;
-		gap: 10px 22px;
+		gap: 10px 12px;
 	}
 
-	.landing__nav-link {
-		color: var(--tw-text);
-		font-size: 15px;
-		font-weight: 700;
+	/* Icon + label inside the GitHub keycap; the slot contents are compiled here. */
+	.landing__github {
+		display: inline-flex;
+		align-items: center;
+		gap: 8px;
+		white-space: nowrap;
 	}
 
-	.landing__nav-link:hover {
-		color: var(--tw-accent);
-		text-decoration: none;
+	/* The Icon component sets its own 24px size, which would outweigh the label;
+	   the extra `.landing__github` class keeps this override specific enough. */
+	.landing__github :global(svg) {
+		width: 20px;
+		height: 20px;
+	}
+
+	/* On narrow/medium widths the repo link collapses to just its mark, so the bar
+	   never squeezes the wordmark. The label is clipped rather than removed, so
+	   the link keeps its accessible name. */
+	@media (max-width: 768px) {
+		.landing__github-label {
+			position: absolute;
+			width: 1px;
+			height: 1px;
+			padding: 0;
+			margin: -1px;
+			overflow: hidden;
+			clip-path: inset(50%);
+			border: 0;
+			white-space: nowrap;
+		}
+
+		/* A tighter cap so the icon-only control reads as a compact button. */
+		.landing__actions > :global(.keycap) {
+			padding: 0 14px;
+		}
 	}
 
 	@media (max-width: 640px) {
 		.landing__top {
 			padding: 14px 20px;
-		}
-
-		/* The CTA lives in the hero on small screens; keep the bar quiet. */
-		.landing__nav :global(.keycap) {
-			display: none;
+			gap: 10px;
 		}
 	}
 </style>

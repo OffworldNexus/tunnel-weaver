@@ -6,6 +6,9 @@
 	export let wide = false;
 	/** When set, the keycap renders as a link instead of a button. */
 	export let href: string | undefined = undefined;
+	/** Link attributes, applied only when `href` renders an anchor (e.g. external links). */
+	export let target: '_self' | '_blank' | '_parent' | '_top' | undefined = undefined;
+	export let rel: string | undefined = undefined;
 	export let onclick: ((event: MouseEvent) => void) | undefined = undefined;
 
 	$: isLink = typeof href === 'string' && href.length > 0;
@@ -20,6 +23,8 @@
 	this={isLink ? 'a' : 'button'}
 	class={classes}
 	href={isLink ? href : undefined}
+	target={isLink ? target : undefined}
+	rel={isLink ? rel : undefined}
 	type={isLink ? undefined : type}
 	{onclick}
 	disabled={isLink ? undefined : deactivated}
