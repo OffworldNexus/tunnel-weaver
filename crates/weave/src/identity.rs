@@ -53,7 +53,8 @@ mod tests {
 
     #[test]
     fn dev_key_matches_seeded_relay_key() {
-        // Mirrors the `machine_key` row seeded by the relay's initial migration.
+        // The tests enrol this key as `poc`'s machine `laptop`; the value is
+        // pinned so the seed and the expected fingerprint can never drift apart.
         let expected: [u8; 32] = [
             0x9b, 0x01, 0x7a, 0xbe, 0x25, 0x0e, 0x5b, 0x63, 0xf6, 0x81, 0x7a, 0x84, 0xec, 0x9c,
             0x7b, 0x75, 0x98, 0xb1, 0x1f, 0xc8, 0x00, 0x56, 0xec, 0xe2, 0x9e, 0x06, 0xb8, 0xaa,

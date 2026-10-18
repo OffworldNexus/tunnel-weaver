@@ -26,7 +26,7 @@ fn now_unix() -> i64 {
 /// Route information for a registered tunnel service.
 #[derive(Clone)]
 pub struct TunnelRoute {
-    /// Fully-qualified hostname (e.g. "web.laptop.poc.example.com").
+    /// Fully-qualified hostname (e.g. "poc-laptop-web.example.com").
     pub hostname: String,
     /// Registered service name (e.g. "web").
     pub service: String,

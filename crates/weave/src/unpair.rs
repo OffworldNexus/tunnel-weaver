@@ -52,8 +52,8 @@ pub async fn run_unpair(admin_host: Option<&str>, local_only: bool) -> Result<()
 
     if local_only {
         ui::warn(&format!(
-            "Forgetting {host} without asking it: the machine stays authorised there \
-             until it is revoked in the relay's web UI."
+            "Forgetting {host} without asking it: the machine stays authorised there. \
+             Revoke it with `weave unpair {host}`, or ask the relay's operator to remove it."
         ));
     } else {
         revoke_on_relay(&host, &relay.key_id).await?;

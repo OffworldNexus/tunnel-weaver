@@ -1,8 +1,10 @@
 //! TLS HTTPS edge server.
 //!
 //! Terminates TLS connections, validates SNI and Host headers, serves root welcome pages,
-//! health checks, WebSocket upgrades for the tunnel client on `GET /_weaver/connect`,
-//! proxies incoming visitor requests to registered tunnels, and returns branded 404s.
+//! health checks, WebSocket upgrades for the tunnel client on `GET /_weaver/connect`
+//! (on the tunnel root and the admin host), the machine pairing channel and API on the
+//! admin host, proxies incoming visitor requests to registered tunnels, and returns
+//! branded 404s.
 
 use std::convert::Infallible;
 use std::net::{IpAddr, SocketAddr};

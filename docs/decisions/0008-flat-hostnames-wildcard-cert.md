@@ -168,3 +168,28 @@ a lifecycle event and (outside the existing backoff) triggers issuance when the
 covering certificate is missing or inside its renewal window. This shortens the
 worst case after an outage; the 12 h loop remains the floor.
 
+## Amendment: the admin host is the client's single entry point
+
+Pairing changed what the admin host is used for. It was the relay's own
+welcome/health/account endpoint; it is now also a complete *client* entry
+point:
+
+- `/_weaver/connect` — the tunnel WebSocket — is served on the admin host as
+  well as on the tunnel root. A client dials the admin host it paired with and
+  the host it presents becomes the mux handshake `server_name` on both sides.
+- `/api/account/pair/channel` (a `weaver-pair-v1` WebSocket) and the
+  `/api/account/pair/{lookup,accept,reject}` browser API are served here too.
+  The pairing channel is unauthenticated and gated by ALTCHA proof of work
+  (purpose `pair`) plus the `account-pair` budget.
+
+This does **not** weaken the certificate split. `CertResolver` still maps the
+exact admin SNI to the admin certificate and the apex/first-label tunnel SNI to
+the wildcard, never cross-matching: a tunnel WebSocket dialled at the admin
+host is authenticated by the admin certificate (it is an HTTPS request to
+`<admin>`), while visitor traffic to a tunnel hostname is authenticated by the
+wildcard. The tunnel root therefore no longer needs to be known by clients, but
+it remains served for visitors and for any client that reaches it. Admin hosts
+are normalised (lowercased, trailing dot stripped, default `:443` dropped)
+before use, because the relay compares the presented name byte for byte; see
+ADR 0011 for the client-side policy.
+

@@ -1,4 +1,5 @@
-//! Control stream protocol types for service registration and lifecycle.
+//! Control stream protocol types for service registration, revocation and
+//! lifecycle.
 
 use serde::{Deserialize, Serialize};
 
@@ -72,8 +73,8 @@ impl ControlHead {
         }
     }
 
-    /// Relay-side check of a decoded head: protocol version in range and
-    /// service name well-formed.
+    /// Relay-side check of a decoded head: protocol version in range, and —
+    /// for [`ControlHead::Register`] — the service name well-formed.
     pub fn validate(&self) -> Result<(), RefusalCode> {
         match self {
             Self::Register {

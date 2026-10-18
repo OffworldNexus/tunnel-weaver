@@ -3,11 +3,14 @@
 //! This crate defines *what* travels on the mux streams shared by the
 //! `weave` client and the `weaver-server` relay, and *how the mux should
 //! treat it* ([`policy`]). It knows nothing about sockets, tokio, identities
-//! or hostnames.
+//! or hostnames — with one deliberate exception, [`pair`], the enrolment
+//! schema, which names a key id and a raw hostname and travels as JSON off the
+//! mux.
 //!
 //! # Conventions
 //!
 //! * Every stream's first message is a postcard-encoded [`Head`].
+//!   [`pair`] is the exception: it is JSON.
 //! * Control streams: client sends `Head::Control`, relay answers with one
 //!   [`ControlReply`]; the stream then stays open for the registration's
 //!   lifetime.
