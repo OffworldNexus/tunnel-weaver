@@ -50,6 +50,18 @@ pub enum SignerSpec {
     Dev,
 }
 
+impl SignerSpec {
+    /// The signer `weave start` uses for a paired relay: its recorded tpmd key,
+    /// or — test builds only, with `--dev-signer` — the development key.
+    pub fn for_relay(key_id: String, #[cfg(feature = "dev-signer")] dev_signer: bool) -> Self {
+        #[cfg(feature = "dev-signer")]
+        if dev_signer {
+            return Self::Dev;
+        }
+        Self::Tpmd { key_id }
+    }
+}
+
 /// Builds the mux signer the handshake will use.
 ///
 /// The tpmd key is *resumed*, never provisioned: `weave start` must sign with
@@ -871,5 +883,22 @@ impl StreamHandler for ProxyHandler {
             }
             Event::StreamOpened { .. } | Event::Closed { .. } => {}
         }
+    }
+}
+
+#[cfg(all(test, feature = "dev-signer"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dev_signer_flag_selects_the_dev_key() {
+        assert!(matches!(
+            SignerSpec::for_relay("p256:aa".into(), true),
+            SignerSpec::Dev
+        ));
+        assert!(matches!(
+            SignerSpec::for_relay("p256:aa".into(), false),
+            SignerSpec::Tpmd { key_id } if key_id == "p256:aa"
+        ));
     }
 }

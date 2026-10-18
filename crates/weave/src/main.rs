@@ -38,6 +38,22 @@ enum Commands {
     Unpair(UnpairArgs),
     /// List the relays this machine is paired with, or change the default.
     Relays(RelaysArgs),
+    /// Test-only: record a relay that has enrolled the development key
+    /// (`weaver-server dev-enrol`), for `weave start --dev-signer`.
+    #[cfg(feature = "dev-signer")]
+    #[command(hide = true)]
+    DevEnrol(DevEnrolArgs),
+}
+
+#[cfg(feature = "dev-signer")]
+#[derive(Args, Debug)]
+struct DevEnrolArgs {
+    /// The relay's admin host.
+    #[arg(value_name = "ADMIN-HOST")]
+    admin_host: String,
+    /// The machine id the relay's `dev-enrol` printed.
+    #[arg(value_name = "MACHINE-ID")]
+    machine_id: i32,
 }
 
 #[derive(Args, Debug)]
@@ -83,6 +99,11 @@ struct StartArgs {
     /// Add request and response headers to the per-request log.
     #[arg(long)]
     verbose: bool,
+
+    /// Test-only: sign with the built-in development key instead of tpmd.
+    #[cfg(feature = "dev-signer")]
+    #[arg(long, hide = true)]
+    dev_signer: bool,
 }
 
 #[derive(Args, Debug)]
@@ -157,6 +178,8 @@ async fn main() {
                 relays::run_set_default(&admin_host).await
             }
         },
+        #[cfg(feature = "dev-signer")]
+        Commands::DevEnrol(args) => run_dev_enrol(args).await,
     };
     if let Err(err) = result {
         ui::report(err.as_ref());
@@ -204,9 +227,11 @@ async fn run_start(args: StartArgs) -> Result<(), Box<dyn std::error::Error + Se
     let opts = start::StartOptions {
         specs,
         server: relay.admin_host,
-        signer: start::SignerSpec::Tpmd {
-            key_id: relay.key_id,
-        },
+        signer: start::SignerSpec::for_relay(
+            relay.key_id,
+            #[cfg(feature = "dev-signer")]
+            args.dev_signer,
+        ),
         insecure_root_ca: args.insecure_root_ca,
         insecure_targets: args.insecure_target,
         preserve_host: args.preserve_host,
@@ -227,4 +252,21 @@ async fn run_pair(args: PairArgs) -> Result<(), Box<dyn std::error::Error + Send
         insecure_root_ca: args.insecure_root_ca,
     })
     .await
+}
+
+#[cfg(feature = "dev-signer")]
+async fn run_dev_enrol(args: DevEnrolArgs) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let store = store::Store::open_default().await?;
+    let relay = weave::identity::dev_enrol(&store, &args.admin_host, args.machine_id).await?;
+    let default = if relay.is_default {
+        " (default relay)"
+    } else {
+        ""
+    };
+    ui::success(&format!(
+        "Recorded the development key on {} as machine {}{default}",
+        ui::accent(ui::Stream::Out, &relay.admin_host),
+        relay.machine_id
+    ));
+    Ok(())
 }

@@ -43,6 +43,16 @@ pub enum Commands {
     #[command(hide = true, name = "send-a-joke")]
     SendAJoke(Box<SendAJokeArgs>),
 
+    /// Test-only affordance for the nightly workflow: enrols weave's built-in
+    /// development key as a machine, so CI can open tunnels without pairing.
+    ///
+    /// Creates (or reuses) a login-less account and its person, and the machine
+    /// holding the development Ed25519 key. Safe to run more than once. Prints
+    /// `{"machine_id": .., "person": .., "machine": ..}` on stdout. Never run it
+    /// on a relay anyone uses: the development key's seed is public.
+    #[command(hide = true, name = "dev-enrol")]
+    DevEnrol(Box<DevEnrolArgs>),
+
     /// Displays runtime server status, listeners, and certificate counts.
     Status {
         /// Outputs the status response as raw JSON.
@@ -590,6 +600,18 @@ pub struct SendAJokeArgs {
     pub email_endpoint: Option<String>,
 }
 
+/// Arguments for the hidden `dev-enrol` nightly-workflow verb.
+#[derive(Args, Debug, Clone)]
+pub struct DevEnrolArgs {
+    /// The person slug to enrol the development key under.
+    #[arg(long, value_name = "SLUG", default_value = weaver_server::dev_enrol::DEFAULT_PERSON)]
+    pub person: String,
+
+    /// The machine name to give the development key.
+    #[arg(long, value_name = "NAME", default_value = weaver_server::dev_enrol::DEFAULT_MACHINE)]
+    pub machine: String,
+}
+
 #[tokio::main]
 async fn main() {
     let version: &'static str = Box::leak(
@@ -871,6 +893,13 @@ async fn main() {
             let code = handle_send_a_joke(*args, db_path).await;
             std::process::exit(code);
         }
+        Commands::DevEnrol(args) => {
+            let db_path = cli
+                .db
+                .unwrap_or_else(|| PathBuf::from("/var/lib/weaver/weaver.db"));
+            let code = handle_dev_enrol(*args, db_path).await;
+            std::process::exit(code);
+        }
         Commands::Status { json } => {
             let socket_path = cli
                 .socket
@@ -995,6 +1024,39 @@ async fn main() {
                 .unwrap_or_else(|| PathBuf::from("/var/lib/weaver/weaver.db"));
             let code = handle_altcha(command, db_path).await;
             std::process::exit(code);
+        }
+    }
+}
+
+/// Enrols the development key and prints what was enrolled as one JSON line.
+async fn handle_dev_enrol(args: DevEnrolArgs, db_path: PathBuf) -> i32 {
+    let store = match Store::open(&db_path).await {
+        Ok(store) => store,
+        Err(err) => {
+            eprintln!(
+                "{} Failed to open database at {}: {err}",
+                "✗ Error:".red().bold(),
+                db_path.display()
+            );
+            return 1;
+        }
+    };
+    let result = weaver_server::dev_enrol::enrol(&store, &args.person, &args.machine).await;
+    let _ = store.close().await;
+    match result {
+        Ok(enrolled) => match serde_json::to_string(&enrolled) {
+            Ok(json) => {
+                println!("{json}");
+                0
+            }
+            Err(err) => {
+                eprintln!("{} {err}", "✗ Error:".red().bold());
+                1
+            }
+        },
+        Err(err) => {
+            eprintln!("{} {err}", "✗ Error:".red().bold());
+            1
         }
     }
 }

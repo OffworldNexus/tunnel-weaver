@@ -806,19 +806,32 @@ impl Store {
         Ok(result.rows_affected)
     }
 
-    /// Creates an active account named `name` with its person of the same
-    /// name, for tests that need an identity without the signup flow.
-    #[cfg(any(test, feature = "test-util"))]
-    pub async fn create_test_person(&self, name: &str) -> Result<person::Model, StoreError> {
-        let account = entity::account::ActiveModel {
+    /// Creates an active account with no email identity and no password, so
+    /// nobody can ever sign in to it.
+    ///
+    /// Only for identities created outside the signup flow: tests, and the
+    /// nightly's `dev-enrol` affordance.
+    pub async fn create_account_without_login(
+        &self,
+        name: &str,
+    ) -> Result<entity::account::Model, StoreError> {
+        let now = unix_secs();
+        Ok(entity::account::ActiveModel {
             name: Set(name.to_string()),
             state: Set("active".to_string()),
-            created_at: Set(0),
-            activated_at: Set(0),
+            created_at: Set(now),
+            activated_at: Set(now),
             ..Default::default()
         }
         .insert(&self.db)
-        .await?;
+        .await?)
+    }
+
+    /// Creates an account named `name` with its person of the same name, for
+    /// tests that need an identity without the signup flow.
+    #[cfg(any(test, feature = "test-util"))]
+    pub async fn create_test_person(&self, name: &str) -> Result<person::Model, StoreError> {
+        let account = self.create_account_without_login(name).await?;
         self.create_person(account.id, name).await
     }
 

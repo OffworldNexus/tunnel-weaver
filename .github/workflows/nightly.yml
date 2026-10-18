@@ -94,8 +94,15 @@ jobs:
           pnpm install --frozen-lockfile
           pnpm run build
 
+      # `weave` is built with `dev-signer`: a runner has no tpmd key agent and
+      # no browser to approve a pairing, so the tunnel client signs with the
+      # built-in development key, which the relay enrols via `dev-enrol` below.
+      # Two invocations because cargo unifies features within one: the feature
+      # stays scoped to the `weave` binary.
       - name: Build release binaries (weaver-server and weave)
-        run: cargo build --release -p weaver-server -p weave
+        run: |
+          cargo build --release -p weaver-server
+          cargo build --release -p weave --features dev-signer
 
       # Real-provider email e2e. The test skips unless RESEND_API_KEY and
       # WEAVER_E2E_EMAIL are configured, so PRs without the secrets stay green.
@@ -319,6 +326,27 @@ jobs:
                --email admin@$TARGET_DOMAIN \
                --acme-provider letsencrypt-staging"
 
+      # Stand-in for a browser pairing: the relay enrols the development key as
+      # person `poc`, machine `laptop` (so tunnels are `poc-laptop-<service>`),
+      # and the runner's `weave` records the matching relay row. The client
+      # dials the relay's admin host, never the tunnel domain.
+      - name: Enrol the development key (relay and client)
+        run: |
+          IP="${{ steps.droplet.outputs.ip }}"
+          ADMIN_DOMAIN="${{ steps.domain.outputs.admin_domain }}"
+
+          # As the service user, so SQLite's -wal/-shm files never end up owned
+          # by root under the running relay.
+          ENROLMENT=$(ssh -o StrictHostKeyChecking=no -i ~/.ssh/id_nightly root@"$IP" \
+            "runuser -u weaver -- /usr/local/bin/weaver-server dev-enrol --db /var/lib/weaver/weaver.db")
+          echo "Relay enrolment: $ENROLMENT"
+          MACHINE_ID=$(printf '%s' "$ENROLMENT" | python3 -c 'import json, sys; print(json.load(sys.stdin)["machine_id"])')
+
+          # An isolated client store for every later `weave` step.
+          WEAVE_DATA_DIR="$RUNNER_TEMP/weave-data"
+          echo "WEAVE_DATA_DIR=$WEAVE_DATA_DIR" >> "$GITHUB_ENV"
+          WEAVE_DATA_DIR="$WEAVE_DATA_DIR" ./target/release/weave dev-enrol "$ADMIN_DOMAIN" "$MACHINE_ID"
+
       - name: Verify issued certificate and HTTPS endpoint
         run: |
           IP="${{ steps.droplet.outputs.ip }}"
@@ -338,6 +366,7 @@ jobs:
         run: |
           IP="${{ steps.droplet.outputs.ip }}"
           TARGET_DOMAIN="${{ steps.domain.outputs.full_domain }}"
+          ADMIN_DOMAIN="${{ steps.domain.outputs.admin_domain }}"
 
           # Download Let's Encrypt Staging CA certificate bundle
           mkdir -p /tmp/certs
@@ -350,8 +379,10 @@ jobs:
           mkdir -p /tmp/origin && echo "hello from origin" > /tmp/origin/hello
           (cd /tmp/origin && python3 -m http.server 18080 --bind 127.0.0.1 > /tmp/origin.log 2>&1 &)
 
-          echo "Starting weave start client against $TARGET_DOMAIN:443..."
-          ./target/release/weave start web=18080 --server "$TARGET_DOMAIN" --insecure-root-ca /tmp/certs/staging-ca.pem > /tmp/weave.log 2>&1 &
+          # The client dials the relay's admin host; the tunnel itself is
+          # served under the tunnel domain ($TARGET_DOMAIN).
+          echo "Starting weave start client against $ADMIN_DOMAIN:443..."
+          ./target/release/weave start web=18080 --dev-signer --server "$ADMIN_DOMAIN" --insecure-root-ca /tmp/certs/staging-ca.pem > /tmp/weave.log 2>&1 &
           WEAVE_PID=$!
 
           TUNNEL_HOST="poc-laptop-web.$TARGET_DOMAIN"
@@ -473,6 +504,7 @@ jobs:
         continue-on-error: true
         run: |
           TARGET_DOMAIN="${{ steps.domain.outputs.full_domain }}"
+          ADMIN_DOMAIN="${{ steps.domain.outputs.admin_domain }}"
           WS_HOST="poc-laptop-ws.$TARGET_DOMAIN"
 
           # Echo origin: Python `websockets`, which implements the close
@@ -485,7 +517,7 @@ jobs:
           cat /tmp/ws-origin.log
 
           # Add the ws service on its own client (the web one is still up).
-          ./target/release/weave start ws=19000 --server "$TARGET_DOMAIN" --insecure-root-ca /tmp/certs/staging-ca.pem --quiet > /tmp/weave-ws.log 2>&1 &
+          ./target/release/weave start ws=19000 --dev-signer --server "$ADMIN_DOMAIN" --insecure-root-ca /tmp/certs/staging-ca.pem --quiet > /tmp/weave-ws.log 2>&1 &
           WS_WEAVE_PID=$!
           for i in $(seq 1 60); do
             if curl -s -o /dev/null --cacert /tmp/certs/staging-ca.pem "https://$WS_HOST/" ; then break; fi
@@ -545,9 +577,10 @@ jobs:
           WEAVE_PID=$(cat /tmp/weave.pid)
           echo "Stopping weave client (PID $WEAVE_PID)..."
           # The client may already be gone: the WebSocket step starts a second
-          # `weave start` with the same hard-coded PoC identity, which the relay
-          # treats as superseding this one. Either way the tunnel is gone, which
-          # is what the 404 check below verifies, so a missing PID is fine.
+          # `weave start` signed by the same development key — the same machine
+          # (`poc`/`laptop`) — which the relay may treat as superseding this
+          # connection. Either way the tunnel is gone, which is what the 404
+          # check below verifies, so a missing PID is fine.
           kill -INT "$WEAVE_PID" 2>/dev/null || true
           wait "$WEAVE_PID" 2>/dev/null || true
 
