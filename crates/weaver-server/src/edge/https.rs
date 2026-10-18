@@ -54,7 +54,7 @@ pub struct HttpsEdgeConfig {
     pub guard: Arc<Pipeline>,
     /// The ALTCHA proof-of-work runtime, when `abuse.altcha` is enabled.
     pub altcha: Option<Arc<crate::altcha::AltchaRuntime>>,
-    /// The account plane (WVR-36), served on the admin host only.
+    /// The account plane, served on the admin host only.
     pub account: Option<Arc<crate::account::AccountRuntime>>,
 }
 
@@ -150,6 +150,93 @@ async fn serve_account(
 }
 
 pub use weaver_tokio::{set_tcp_nodelay, set_tcp_notsent_lowat};
+
+/// Serves `GET /_weaver/connect`: the tunnel WebSocket.
+///
+/// Reached on the tunnel root *and* on the admin host. A client only ever knows
+/// the admin host it paired with, so it dials that; the host it presents becomes
+/// the mux handshake name on both sides, and the client is never required to
+/// know — or guess — any other address.
+fn tunnel_upgrade(
+    req: &mut Request<hyper::body::Incoming>,
+    config: &HttpsEdgeConfig,
+    include_hsts: bool,
+    server_name: &str,
+) -> Response<BoxBody> {
+    if req.method() != Method::GET {
+        let mut resp = Response::builder()
+            .status(StatusCode::METHOD_NOT_ALLOWED)
+            .body(full_body("405 Method Not Allowed\n"))
+            .unwrap();
+        apply_security_headers(&mut resp, include_hsts);
+        return resp;
+    }
+
+    let ws_proto = req
+        .headers()
+        .get("sec-websocket-protocol")
+        .and_then(|v| v.to_str().ok());
+    if ws_proto != Some("weaver-mux-v1") {
+        let mut resp = Response::builder()
+            .status(StatusCode::BAD_REQUEST)
+            .body(full_body(
+                "400 Bad Request: Sec-WebSocket-Protocol must be weaver-mux-v1\n",
+            ))
+            .unwrap();
+        apply_security_headers(&mut resp, include_hsts);
+        return resp;
+    }
+
+    let Some(key) = req
+        .headers()
+        .get("sec-websocket-key")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned)
+    else {
+        let mut resp = Response::builder()
+            .status(StatusCode::BAD_REQUEST)
+            .body(full_body("400 Bad Request: Missing Sec-WebSocket-Key\n"))
+            .unwrap();
+        apply_security_headers(&mut resp, include_hsts);
+        return resp;
+    };
+
+    let accept = tokio_tungstenite::tungstenite::handshake::derive_accept_key(key.as_bytes());
+    let on_upgrade = hyper::upgrade::on(&mut *req);
+
+    if let Some(reg) = &config.tunnel_registry {
+        let reg = Arc::clone(reg);
+        let name = server_name.to_string();
+        tokio::spawn(async move {
+            match on_upgrade.await {
+                Ok(upgraded) => {
+                    let io = TokioIo::new(upgraded);
+                    let ws_stream = tokio_tungstenite::WebSocketStream::from_raw_socket(
+                        io,
+                        tokio_tungstenite::tungstenite::protocol::Role::Server,
+                        None,
+                    )
+                    .await;
+                    crate::tunnel::spawn_tunnel_connection(ws_stream, reg, name);
+                }
+                Err(err) => {
+                    debug!(error = %err, "WebSocket upgrade failed");
+                }
+            }
+        });
+    }
+
+    let mut resp = Response::builder()
+        .status(StatusCode::SWITCHING_PROTOCOLS)
+        .header(http::header::CONNECTION, "Upgrade")
+        .header(http::header::UPGRADE, "websocket")
+        .header("Sec-WebSocket-Accept", accept)
+        .header("Sec-WebSocket-Protocol", "weaver-mux-v1")
+        .body(empty_body())
+        .unwrap();
+    apply_security_headers(&mut resp, include_hsts);
+    resp
+}
 
 /// Dispatches an HTTPS request based on SNI and Host header validation.
 ///
@@ -268,10 +355,18 @@ pub async fn handle_https_request(
         } else if surface.host == Host::Admin && path == "/api/account/password" {
             // A password change verifies a guessed credential behind a session, so
             // it is the same guessing surface as a login attempt and shares that
-            // budget rather than minting a new one (WVR-50).
+            // budget rather than minting a new one.
             ViewId::ACCOUNT_LOGIN
         } else if surface.host == Host::Admin && path == "/api/account/resend" {
             ViewId::ACCOUNT_RESEND
+        } else if surface.host == Host::Admin && path == weaver_proto::pair::PAIR_CHANNEL_PATH {
+            // The pairing channel charges the pairing budget itself, once the
+            // proof of work is in: a throttled machine is told so on the
+            // channel rather than by a bare 429 on the upgrade.
+            ViewId::RELAY_WEB
+        } else if surface.host == Host::Admin && path.starts_with("/api/account/pair/") {
+            // The pairing browser API, behind its own fail-closed budget.
+            ViewId::ACCOUNT_PAIR
         } else if surface.host == Host::Admin && path == "/api/account/reset/request" {
             // The reset request is an unauthenticated, email-keyed, enumeration-safe
             // action: exactly the same situation as a verification resend, so it
@@ -317,15 +412,19 @@ pub async fn handle_https_request(
         }
     }
 
-    // The relay's own (admin) hostname is outside the tunnel zone and is served
-    // by its own single-name HTTP-01 certificate. It hosts the account plane
-    // (the SvelteKit app at the root) and the ALTCHA diagnostic; it never gets
-    // the tunnel WebSocket endpoint.
+    // The tunnel WebSocket, on the tunnel root *or* the admin host. Doing this
+    // before the host split keeps one code path for the upgrade.
+    let on_tunnel_endpoint = matches!(covering.map(|c| c.validation), Some(Validation::Http01))
+        || config.managed.tunnel_domain() == Some(host_lower.as_str());
+    if on_tunnel_endpoint && req.uri().path() == "/_weaver/connect" {
+        return Ok(tunnel_upgrade(&mut req, &config, include_hsts, &host_lower));
+    }
+
     if matches!(covering.map(|c| c.validation), Some(Validation::Http01)) {
         if let Some(mgr) = &config.cert_manager {
             mgr.note_visit(&host_lower);
         }
-        // WVR-136: the built-in ALTCHA diagnostic page and its assets.
+        // The built-in ALTCHA diagnostic page and its assets.
         if let Some(altcha) = &config.altcha {
             if req.method() == Method::GET && req.uri().path() == "/abuse/check" {
                 let query = req.uri().query().map(str::to_owned);
@@ -351,7 +450,99 @@ pub async fn handle_https_request(
         if req.method() == Method::GET && req.uri().path() == "/healthz" {
             return Ok(static_host_response(&req, include_hsts));
         }
-        // WVR-36: everything else on the admin host is the SvelteKit account
+        // The pairing channel: a WebSocket the machine opens before it has any
+        // identity, so it is unauthenticated; it is gated by a proof of work and
+        // the pairing budget. Handled on the raw edge because the account
+        // router buffers response bodies and would strip the 101.
+        if req.uri().path() == weaver_proto::pair::PAIR_CHANNEL_PATH {
+            if req.method() != Method::GET {
+                let mut resp = Response::builder()
+                    .status(StatusCode::METHOD_NOT_ALLOWED)
+                    .body(full_body("405 Method Not Allowed\n"))
+                    .unwrap();
+                apply_security_headers(&mut resp, include_hsts);
+                return Ok(resp);
+            }
+            let ws_proto = req
+                .headers()
+                .get("sec-websocket-protocol")
+                .and_then(|v| v.to_str().ok());
+            if ws_proto != Some(weaver_proto::pair::PAIR_SUBPROTOCOL) {
+                let mut resp = Response::builder()
+                    .status(StatusCode::BAD_REQUEST)
+                    .body(full_body(
+                        "400 Bad Request: Sec-WebSocket-Protocol must be weaver-pair-v1\n",
+                    ))
+                    .unwrap();
+                apply_security_headers(&mut resp, include_hsts);
+                return Ok(resp);
+            }
+            let Some(key) = req
+                .headers()
+                .get("sec-websocket-key")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned)
+            else {
+                let mut resp = Response::builder()
+                    .status(StatusCode::BAD_REQUEST)
+                    .body(full_body("400 Bad Request: Missing Sec-WebSocket-Key\n"))
+                    .unwrap();
+                apply_security_headers(&mut resp, include_hsts);
+                return Ok(resp);
+            };
+
+            if let Some(account) = &config.account {
+                let accept =
+                    tokio_tungstenite::tungstenite::handshake::derive_accept_key(key.as_bytes());
+                let on_upgrade = hyper::upgrade::on(&mut req);
+                let account = Arc::clone(account);
+                let peer = crate::account::pairing::Peer {
+                    guard: Arc::clone(&config.guard),
+                    addr: remote_addr,
+                };
+                tokio::spawn(async move {
+                    match on_upgrade.await {
+                        Ok(upgraded) => {
+                            let io = TokioIo::new(upgraded);
+                            let ws_stream = tokio_tungstenite::WebSocketStream::from_raw_socket(
+                                io,
+                                tokio_tungstenite::tungstenite::protocol::Role::Server,
+                                Some(crate::account::pairing::channel_config()),
+                            )
+                            .await;
+                            crate::account::pairing::serve_channel(ws_stream, account, peer).await;
+                        }
+                        Err(err) => {
+                            debug!(error = %err, "pairing WebSocket upgrade failed");
+                        }
+                    }
+                });
+
+                let mut resp = Response::builder()
+                    .status(StatusCode::SWITCHING_PROTOCOLS)
+                    .header(http::header::CONNECTION, "Upgrade")
+                    .header(http::header::UPGRADE, "websocket")
+                    .header("Sec-WebSocket-Accept", accept)
+                    .header(
+                        "Sec-WebSocket-Protocol",
+                        weaver_proto::pair::PAIR_SUBPROTOCOL,
+                    )
+                    .body(empty_body())
+                    .unwrap();
+                apply_security_headers(&mut resp, include_hsts);
+                return Ok(resp);
+            }
+
+            // No account plane on this relay, so there is nothing to pair with.
+            let mut resp = Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .body(full_body("404 Not Found\n"))
+                .unwrap();
+            apply_security_headers(&mut resp, include_hsts);
+            return Ok(resp);
+        }
+
+        // Everything else on the admin host is the SvelteKit account
         // plane — the landing page at `/`, the auth routes, the account API and
         // the vendored ALTCHA widget.
         if let Some(account) = &config.account {
@@ -364,91 +555,7 @@ pub async fn handle_https_request(
         if let Some(mgr) = &config.cert_manager {
             mgr.note_visit(&host_lower);
         }
-        // Handle WebSocket upgrade endpoint GET /_weaver/connect on root domain
-        if req.uri().path() == "/_weaver/connect" {
-            if req.method() != Method::GET {
-                let mut resp = Response::builder()
-                    .status(StatusCode::METHOD_NOT_ALLOWED)
-                    .body(full_body("405 Method Not Allowed\n"))
-                    .unwrap();
-                apply_security_headers(&mut resp, include_hsts);
-                return Ok(resp);
-            }
-
-            let ws_proto = req
-                .headers()
-                .get("sec-websocket-protocol")
-                .and_then(|v| v.to_str().ok());
-            if ws_proto != Some("weaver-mux-v1") {
-                let mut resp = Response::builder()
-                    .status(StatusCode::BAD_REQUEST)
-                    .body(full_body(
-                        "400 Bad Request: Sec-WebSocket-Protocol must be weaver-mux-v1\n",
-                    ))
-                    .unwrap();
-                apply_security_headers(&mut resp, include_hsts);
-                return Ok(resp);
-            }
-
-            let key = match req
-                .headers()
-                .get("sec-websocket-key")
-                .and_then(|v| v.to_str().ok())
-            {
-                Some(k) => k,
-                None => {
-                    let mut resp = Response::builder()
-                        .status(StatusCode::BAD_REQUEST)
-                        .body(full_body("400 Bad Request: Missing Sec-WebSocket-Key\n"))
-                        .unwrap();
-                    apply_security_headers(&mut resp, include_hsts);
-                    return Ok(resp);
-                }
-            };
-
-            let accept =
-                tokio_tungstenite::tungstenite::handshake::derive_accept_key(key.as_bytes());
-            let on_upgrade = hyper::upgrade::on(&mut req);
-
-            if let Some(ref reg) = config.tunnel_registry {
-                let reg = Arc::clone(reg);
-                let root = config
-                    .managed
-                    .tunnel_domain()
-                    .unwrap_or_default()
-                    .to_string();
-                tokio::spawn(async move {
-                    match on_upgrade.await {
-                        Ok(upgraded) => {
-                            let io = TokioIo::new(upgraded);
-                            let ws_stream = tokio_tungstenite::WebSocketStream::from_raw_socket(
-                                io,
-                                tokio_tungstenite::tungstenite::protocol::Role::Server,
-                                None,
-                            )
-                            .await;
-                            crate::tunnel::spawn_tunnel_connection(ws_stream, reg, root);
-                        }
-                        Err(err) => {
-                            debug!(error = %err, "WebSocket upgrade failed");
-                        }
-                    }
-                });
-            }
-
-            let mut resp = Response::builder()
-                .status(StatusCode::SWITCHING_PROTOCOLS)
-                .header(http::header::CONNECTION, "Upgrade")
-                .header(http::header::UPGRADE, "websocket")
-                .header("Sec-WebSocket-Accept", accept)
-                .header("Sec-WebSocket-Protocol", "weaver-mux-v1")
-                .body(empty_body())
-                .unwrap();
-            apply_security_headers(&mut resp, include_hsts);
-            return Ok(resp);
-        }
-
-        // WVR-136: the ALTCHA API, served as its own service on the apex.
+        // The ALTCHA API, served as its own service on the apex.
         if let Some(altcha) = &config.altcha {
             if req.method() == Method::GET && req.uri().path() == "/altcha/challenge" {
                 let query = req.uri().query().map(str::to_owned);

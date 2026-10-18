@@ -22,7 +22,7 @@ async fn hello_with_version(client_max: u16) -> (Frame, Pair) {
         version: client_max,
         key_id: signer.key_id(),
         nonce_c,
-        sig: signer.sign(&msg).unwrap(),
+        sig: signer.sign(&msg).await.unwrap(),
     };
     let frame = Frame {
         stream_id: 0,

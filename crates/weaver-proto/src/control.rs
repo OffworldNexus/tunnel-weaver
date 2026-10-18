@@ -37,6 +37,16 @@ pub enum ControlHead {
         /// label; see [`ControlHead::register`] and [`is_valid_dns_label`].
         service: String,
     },
+    /// Revoke this machine: delete the key this connection authenticated with,
+    /// and everything that made it reachable.
+    ///
+    /// No extra proof is needed or possible — the mux handshake already proved
+    /// possession of the device key, which is exactly the authority to revoke
+    /// it. This is how `weave unpair` makes unpairing bilateral.
+    Revoke {
+        /// Application protocol version the client speaks.
+        proto_version: u16,
+    },
 }
 
 impl ControlHead {
@@ -55,6 +65,13 @@ impl ControlHead {
         })
     }
 
+    /// Build a `Revoke` head for this build's protocol version.
+    pub fn revoke() -> Self {
+        Self::Revoke {
+            proto_version: crate::PROTOCOL_VERSION,
+        }
+    }
+
     /// Relay-side check of a decoded head: protocol version in range and
     /// service name well-formed.
     pub fn validate(&self) -> Result<(), RefusalCode> {
@@ -69,6 +86,7 @@ impl ControlHead {
                 }
                 Ok(())
             }
+            Self::Revoke { proto_version } => crate::accept_protocol_version(*proto_version),
         }
     }
 }
@@ -148,6 +166,9 @@ pub enum ControlReply {
         /// Current state.
         state: CertStatus,
     },
+    /// The machine was revoked: its key, services and hostnames are gone, and
+    /// the relay closes the connection.
+    Revoked,
 }
 
 /// Certificate lifecycle as seen by the client. Mirrors the relay's cert

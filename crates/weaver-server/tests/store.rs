@@ -109,19 +109,19 @@ async fn test_store_open_runs_migrations_and_is_idempotent() {
         let store = Store::open(&db_path).await.expect("open failed");
         let count: i64 = scalar(
             &store,
-            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN ('config', 'acme_account', 'domains', 'certificates', 'cert_events', 'seaql_migrations', 'person', 'machine', 'machine_key', 'service', 'usage', 'challenge', 'abuse_bucket')",
+            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN ('config', 'acme_account', 'domains', 'certificates', 'cert_events', 'seaql_migrations', 'person', 'machine', 'machine_key_log', 'service', 'usage', 'challenge', 'abuse_bucket')",
         )
         .await;
         assert_eq!(count, 13);
-        assert_eq!(store.schema_version().await.expect("schema_version"), 5);
+        assert_eq!(store.schema_version().await.expect("schema_version"), 1);
     }
 
     // Re-open existing database: should succeed and not re-apply migrations
     {
         let store = Store::open(&db_path).await.expect("re-open failed");
         let migration_count: i64 = scalar(&store, "SELECT count(*) FROM seaql_migrations").await;
-        assert_eq!(migration_count, 5);
-        assert_eq!(store.schema_version().await.expect("schema_version"), 5);
+        assert_eq!(migration_count, 1);
+        assert_eq!(store.schema_version().await.expect("schema_version"), 1);
     }
 }
 
@@ -460,22 +460,20 @@ async fn test_auth_persistence_and_identity_resolution() {
 
     // Identities are never created implicitly: enrol a person, a machine, and
     // a key explicitly, then resolve that custom key.
-    let alice = store.create_person("Alice").await.expect("create person");
+    let alice = store
+        .create_test_person("Alice")
+        .await
+        .expect("create person");
     assert_eq!(alice.name, "alice");
 
+    let alice_key = KeyId::Ed25519([0x42; 32]);
     let desktop = store
-        .create_machine(alice.id, "Workstation")
+        .create_machine(alice.id, "Workstation", &alice_key)
         .await
         .expect("create machine");
     assert_eq!(desktop.name, "workstation");
     assert_eq!(desktop.person_id, alice.id);
-
-    let alice_key = KeyId::Ed25519([0x42; 32]);
-    let mkey = store
-        .add_machine_key(desktop.id, &alice_key)
-        .await
-        .expect("add key");
-    assert_eq!(mkey.machine_id, desktop.id);
+    assert_eq!(desktop.key_id, format!("ed25519:{}", "42".repeat(32)));
 
     let resolver = StoreIdentityResolver::new(store.clone());
     let id = resolver.identity(&alice_key).await.expect("resolve alice");
@@ -839,25 +837,29 @@ async fn test_naming_rules_reject_invalid_names() {
     for bad in ["", "has-dash", "under_score", "Upper!", &"a".repeat(16)] {
         assert!(
             matches!(
-                store.create_person(bad).await,
+                store.create_person(1, bad).await,
                 Err(StoreError::InvalidName(_))
             ),
             "person {bad:?} must be rejected"
         );
     }
 
-    let alice = store.create_person("alice").await.unwrap();
+    let alice = store.create_test_person("alice").await.unwrap();
+    let key = KeyId::Ed25519([0x33; 32]);
     for bad in ["", "has-dash", "under_score", "Upper!", &"a".repeat(16)] {
         assert!(
             matches!(
-                store.create_machine(alice.id, bad).await,
+                store.create_machine(alice.id, bad, &key).await,
                 Err(StoreError::InvalidName(_))
             ),
             "machine {bad:?} must be rejected"
         );
     }
 
-    let laptop = store.create_machine(alice.id, "laptop").await.unwrap();
+    let laptop = store
+        .create_machine(alice.id, "laptop", &key)
+        .await
+        .unwrap();
     // Service names allow dashes between alphanumeric runs but not leading,
     // trailing, doubled, or non-alphanumeric characters.
     for bad in [
@@ -887,8 +889,6 @@ async fn test_naming_rules_reject_invalid_names() {
 
     // A declared service is keyed by the flat hostname and validated at the
     // store boundary too (an invalid service never reaches persistence).
-    let key = KeyId::Ed25519([0x33; 32]);
-    store.add_machine_key(laptop.id, &key).await.unwrap();
     assert!(matches!(
         store
             .register_declared_service(&key, "alice-laptop-x.example.com", "a--b")
@@ -904,10 +904,12 @@ async fn test_recompute_domain_names_after_machine_rename() {
     use weaver_mux::KeyId;
 
     let store = Store::connect("sqlite::memory:").await.expect("connect");
-    let alice = store.create_person("alice").await.unwrap();
-    let laptop = store.create_machine(alice.id, "laptop").await.unwrap();
+    let alice = store.create_test_person("alice").await.unwrap();
     let key = KeyId::Ed25519([0x44; 32]);
-    store.add_machine_key(laptop.id, &key).await.unwrap();
+    let laptop = store
+        .create_machine(alice.id, "laptop", &key)
+        .await
+        .unwrap();
 
     store
         .register_declared_service(&key, "alice-laptop-web.example.com", "web")
@@ -961,8 +963,7 @@ async fn test_migration_usage_round_trips() {
     let db_path = temp.path().join("migrate.db");
     let store = Store::open(&db_path).await.expect("open");
 
-    // Roll every migration back, then re-apply. `m0001` creates the `usage`
-    // table along with every other table, so a full rebuild is what proves
+    // Roll the schema back, then re-apply: a full rebuild is what proves
     // `down`/`up` are symmetric.
     weaver_server::Migrator::down(store.db(), None)
         .await
@@ -986,7 +987,7 @@ async fn test_migration_usage_round_trips() {
 }
 
 // ---------------------------------------------------------------------------
-// WVR-36: email attribution is atomic.
+// Email attribution is atomic.
 //
 // These exercise the store boundary directly: a verified signup must land as an
 // atomic unit (account + identity + ownership history + one current credential),
@@ -1329,16 +1330,16 @@ async fn test_same_name_different_emails_and_account_person_separation() {
         second.id
     );
 
-    // The account plane never touches the tunnel `person` namespace. The only
-    // row present is the migration's default PoC seed ("poc").
+    // The account plane never touches the tunnel `person` namespace: only
+    // pairing creates a person.
     let people = person::Entity::find().all(store.db()).await.unwrap();
     assert!(
-        people.iter().all(|p| p.name == "poc"),
+        people.is_empty(),
         "accounts must not add person rows: {people:?}"
     );
 }
 
-// ----- password reset (WVR-41) ---------------------------------------------
+// ----- password reset ---------------------------------------------
 
 /// Activates a fresh account for one address and returns its id, for the reset
 /// store tests.
@@ -1502,7 +1503,7 @@ async fn test_account_reset_password_supersedes_and_revokes() {
     assert_eq!(stored.consumed_at, Some(reset_now));
 }
 
-/// WVR-50: an authenticated password change carries the reset's guarantees —
+/// An authenticated password change carries the reset's guarantees —
 /// append-only credential history and every session ended — without a token.
 #[tokio::test]
 async fn test_account_change_password_supersedes_and_revokes() {
@@ -1730,4 +1731,348 @@ async fn test_reset_token_sweep_removes_only_expired_unconsumed() {
             .is_some(),
         "a consumed row survives as provenance"
     );
+}
+
+// ---------------------------------------------------------------------------
+// One person per account, one key per machine, and the key log.
+// ---------------------------------------------------------------------------
+
+/// Activates a fresh account named `name` through the real signup path.
+async fn activated(
+    store: &Store,
+    name: &str,
+    email: &str,
+) -> weaver_server::store::entity::account::Model {
+    let now = 1_800_000_000;
+    let (pending, proof, completion) = stage_verified_signup(store, name, email, email, now).await;
+    match activate(
+        store,
+        pending,
+        proof,
+        completion,
+        name,
+        email,
+        email,
+        "$argon2id$v=19$m=8,t=1,p=1$c2FsdA$aGFzaA",
+        now,
+    )
+    .await
+    {
+        ActivationOutcome::Activated(account) => account,
+        other => panic!("expected activation, got {other:?}"),
+    }
+}
+
+/// Every key log row of a machine, oldest first.
+async fn key_log(
+    store: &Store,
+    machine_id: i32,
+) -> Vec<weaver_server::store::entity::machine_key_log::Model> {
+    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder};
+    use weaver_server::store::entity::machine_key_log;
+    machine_key_log::Entity::find()
+        .filter(machine_key_log::Column::MachineId.eq(machine_id))
+        .order_by_asc(machine_key_log::Column::Id)
+        .all(store.db())
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn test_pairing_names_follow_the_account() {
+    use weaver_mux::KeyId;
+    use weaver_server::account::pairing;
+
+    let dir = TempDir::new().unwrap();
+    let store = Store::open(dir.path().join("pairing.db")).await.unwrap();
+    let account = activated(&store, "Rémy Sanchez", "remy@example.com").await;
+
+    // The proposal folds accents, lowercases and strips everything else.
+    let slug = pairing::propose_person_slug(&store, &account)
+        .await
+        .unwrap();
+    assert_eq!(slug, "remysanchez");
+    let person = store.create_person(account.id, &slug).await.unwrap();
+    assert_eq!(person.account_id, account.id);
+    assert_eq!(
+        store.person_by_account(account.id).await.unwrap(),
+        Some(person.clone())
+    );
+
+    // A taken slug is uniquified for the next account with the same name.
+    let namesake = activated(&store, "Rémy Sanchez", "other@example.com").await;
+    assert_eq!(
+        pairing::propose_person_slug(&store, &namesake)
+            .await
+            .unwrap(),
+        "remysanchez2"
+    );
+
+    // Machine names come from the hostname, uniquified per person.
+    let laptop = pairing::unique_machine_name(&store, Some(&person), "Rémys-Laptop.local")
+        .await
+        .unwrap();
+    assert_eq!(laptop, "remyslaptoploca");
+    store
+        .create_machine(person.id, &laptop, &KeyId::Ed25519([1; 32]))
+        .await
+        .unwrap();
+    assert_eq!(
+        pairing::unique_machine_name(&store, Some(&person), "Rémys-Laptop.local")
+            .await
+            .unwrap(),
+        "remyslaptoploc2"
+    );
+    // A person that does not exist yet has no machines to collide with.
+    assert_eq!(
+        pairing::unique_machine_name(&store, None, "Rémys-Laptop.local")
+            .await
+            .unwrap(),
+        "remyslaptoploca"
+    );
+}
+
+#[tokio::test]
+async fn test_an_account_has_one_person_and_takes_it_along() {
+    use sea_orm::EntityTrait;
+    use weaver_mux::KeyId;
+    use weaver_server::store::entity::{account, machine, person, service};
+
+    let store = Store::connect("sqlite::memory:").await.unwrap();
+    let alice = store.create_test_person("alice").await.unwrap();
+    assert!(
+        matches!(
+            store.create_person(alice.account_id, "alice2").await,
+            Err(StoreError::Db(_))
+        ),
+        "a second person for one account must be refused"
+    );
+    assert!(
+        matches!(
+            store.create_person(9_999, "ghost").await,
+            Err(StoreError::Db(_))
+        ),
+        "a person needs an existing account"
+    );
+
+    let laptop = store
+        .create_machine(alice.id, "laptop", &KeyId::Ed25519([7; 32]))
+        .await
+        .unwrap();
+    store.get_or_create_service(laptop.id, "web").await.unwrap();
+
+    account::Entity::delete_by_id(alice.account_id)
+        .exec(store.db())
+        .await
+        .unwrap();
+    assert!(
+        person::Entity::find()
+            .all(store.db())
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        machine::Entity::find()
+            .all(store.db())
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        service::Entity::find()
+            .all(store.db())
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn test_a_key_identifies_exactly_one_machine() {
+    use weaver_mux::KeyId;
+
+    let store = Store::connect("sqlite::memory:").await.unwrap();
+    let alice = store.create_test_person("alice").await.unwrap();
+    let bob = store.create_test_person("bob").await.unwrap();
+    let key = KeyId::P256([2; 33]);
+
+    let laptop = store
+        .create_machine(alice.id, "laptop", &key)
+        .await
+        .unwrap();
+    let (person, machine) = store.machine_by_key(&key).await.unwrap().unwrap();
+    assert_eq!((person.id, machine.id), (alice.id, laptop.id));
+
+    // The same key cannot become a second machine, not even another person's.
+    assert!(matches!(
+        store.create_machine(bob.id, "desktop", &key).await,
+        Err(StoreError::Db(_))
+    ));
+    assert!(matches!(
+        store.create_machine(alice.id, "desktop", &key).await,
+        Err(StoreError::Db(_))
+    ));
+    // Nor can another machine be moved onto it.
+    let other = store
+        .create_machine(bob.id, "desktop", &KeyId::P256([3; 33]))
+        .await
+        .unwrap();
+    assert!(matches!(
+        store.replace_machine_key(other.id, &key).await,
+        Err(StoreError::Db(_))
+    ));
+    assert_eq!(
+        store.machine_by_id(other.id).await.unwrap().unwrap().key_id,
+        other.key_id,
+        "a refused replacement changes nothing"
+    );
+    // Creating the machine opened exactly one log row.
+    let log = key_log(&store, laptop.id).await;
+    assert_eq!(log.len(), 1);
+    assert_eq!(log[0].key_id, laptop.key_id);
+    assert_eq!(log[0].person_id, alice.id);
+    assert_eq!(log[0].retired_at, None);
+}
+
+#[tokio::test]
+async fn test_replacing_a_key_moves_the_machine_and_logs_it() {
+    use weaver_mux::KeyId;
+
+    let store = Store::connect("sqlite::memory:").await.unwrap();
+    let alice = store.create_test_person("alice").await.unwrap();
+    let old = KeyId::P256([2; 33]);
+    let new = KeyId::P256([3; 33]);
+    let laptop = store
+        .create_machine(alice.id, "laptop", &old)
+        .await
+        .unwrap();
+    store
+        .register_declared_service(&old, "alice-laptop-web.example.com", "web")
+        .await
+        .unwrap();
+
+    let moved = store.replace_machine_key(laptop.id, &new).await.unwrap();
+    assert_eq!((moved.id, moved.name.as_str()), (laptop.id, "laptop"));
+    assert!(store.machine_by_key(&old).await.unwrap().is_none());
+    assert_eq!(
+        store.machine_by_key(&new).await.unwrap().unwrap().1.id,
+        laptop.id
+    );
+    // Services and hostnames stay with the machine.
+    let domain = store
+        .get_domain("alice-laptop-web.example.com")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(domain.service_id.is_some());
+
+    let log = key_log(&store, laptop.id).await;
+    assert_eq!(log.len(), 2);
+    assert_eq!(log[0].key_id, laptop.key_id);
+    assert!(log[0].retired_at.is_some());
+    assert_eq!(log[0].retired_reason.as_deref(), Some("replaced"));
+    assert_eq!(log[1].key_id, moved.key_id);
+    assert_eq!(log[1].retired_at, None);
+
+    assert!(matches!(
+        store
+            .replace_machine_key(9_999, &KeyId::P256([4; 33]))
+            .await,
+        Err(StoreError::Conflict(_))
+    ));
+}
+
+#[tokio::test]
+async fn test_revoking_deletes_the_machine_but_keeps_its_log() {
+    use sea_orm::EntityTrait;
+    use weaver_mux::KeyId;
+    use weaver_server::store::entity::service;
+
+    let store = Store::connect("sqlite::memory:").await.unwrap();
+    let alice = store.create_test_person("alice").await.unwrap();
+    let key = KeyId::P256([5; 33]);
+    let laptop = store
+        .create_machine(alice.id, "laptop", &key)
+        .await
+        .unwrap();
+    store
+        .register_declared_service(&key, "alice-laptop-web.example.com", "web")
+        .await
+        .unwrap();
+
+    let revoked = store.revoke_machine(&key).await.unwrap().unwrap();
+    assert_eq!(revoked.id, laptop.id);
+    assert!(store.machine_by_key(&key).await.unwrap().is_none());
+    assert!(store.machine_by_id(laptop.id).await.unwrap().is_none());
+    assert!(
+        service::Entity::find()
+            .all(store.db())
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    // The name is free again.
+    assert!(
+        store
+            .get_machine_by_name(alice.id, "laptop")
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    let log = key_log(&store, laptop.id).await;
+    assert_eq!(log.len(), 1, "the log outlives the machine");
+    assert_eq!(log[0].retired_reason.as_deref(), Some("revoked"));
+    assert!(log[0].retired_at.is_some());
+
+    // Revoking again is the goal state, not an error.
+    assert!(store.revoke_machine(&key).await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn test_key_log_sweep_drops_only_retired_rows_past_the_cutoff() {
+    use sea_orm::sea_query::Expr;
+    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+    use weaver_mux::KeyId;
+    use weaver_server::store::entity::machine_key_log;
+
+    let store = Store::connect("sqlite::memory:").await.unwrap();
+    let alice = store.create_test_person("alice").await.unwrap();
+    let laptop = store
+        .create_machine(alice.id, "laptop", &KeyId::P256([2; 33]))
+        .await
+        .unwrap();
+    store
+        .replace_machine_key(laptop.id, &KeyId::P256([3; 33]))
+        .await
+        .unwrap();
+    store
+        .replace_machine_key(laptop.id, &KeyId::P256([4; 33]))
+        .await
+        .unwrap();
+    // Backdate everything: the two retired rows to t=100 and t=300, and the
+    // current key's row to t=0, so age alone would sweep it.
+    let log = key_log(&store, laptop.id).await;
+    for (row, retired) in log.iter().zip([Some(100_i64), Some(300), None]) {
+        machine_key_log::Entity::update_many()
+            .col_expr(machine_key_log::Column::AddedAt, Expr::value(0_i64))
+            .col_expr(machine_key_log::Column::RetiredAt, Expr::value(retired))
+            .filter(machine_key_log::Column::Id.eq(row.id))
+            .exec(store.db())
+            .await
+            .unwrap();
+    }
+
+    assert_eq!(store.sweep_machine_key_log(100).await.unwrap(), 0);
+    assert_eq!(store.sweep_machine_key_log(200).await.unwrap(), 1);
+    assert_eq!(store.sweep_machine_key_log(i64::MAX).await.unwrap(), 1);
+    let left = key_log(&store, laptop.id).await;
+    assert_eq!(left.len(), 1, "the current key's row is never swept");
+    assert_eq!(left[0].retired_at, None);
+    assert_eq!(left[0].key_id, log[2].key_id);
+
+    // The sweep the relay runs uses the configured retention.
+    let account = weaver_server::config::AccountConfig::default();
+    assert_eq!(account.key_log_cutoff(365 * 86_400 + 5), 5);
 }

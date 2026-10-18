@@ -32,6 +32,7 @@ use thiserror::Error;
 
 pub mod control;
 pub mod http;
+pub mod pair;
 pub mod policy;
 pub mod reset;
 

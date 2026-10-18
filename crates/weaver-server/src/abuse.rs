@@ -177,6 +177,11 @@ pub fn build(config: &Config, store: Store) -> Arc<Pipeline> {
             ViewId::ACCOUNT_RESEND,
             &config.account.resend,
         ),
+        (
+            PolicyId::ACCOUNT_PAIR,
+            ViewId::ACCOUNT_PAIR,
+            &config.account.pair,
+        ),
     ] {
         policies.push(Policy {
             id: policy,

@@ -12,7 +12,6 @@
 //! piped output is plain, stable, and greppable. `--verbose` appends the
 //! request and response headers, indented under the line.
 
-use std::io::IsTerminal;
 use std::time::Duration;
 
 use crossterm::style::{Attribute, Color, Stylize};
@@ -22,6 +21,8 @@ use crossterm::style::{Attribute, Color, Stylize};
 pub struct LogStyle {
     /// Emit ANSI colours.
     pub color: bool,
+    /// Wrap public URLs in OSC 8 hyperlinks.
+    pub links: bool,
     /// Terminal width in columns, if known; paths are truncated to fit.
     pub width: Option<u16>,
     /// Suppress the per-request log entirely.
@@ -33,15 +34,16 @@ pub struct LogStyle {
 impl LogStyle {
     /// Detect colour support and width from the environment.
     pub fn detect(quiet: bool, verbose: bool) -> Self {
-        let tty = std::io::stdout().is_terminal();
-        let color = tty && std::env::var_os("NO_COLOR").is_none();
+        let caps = crate::ui::caps(crate::ui::Stream::Out);
+        let tty = caps.tty;
         let width = if tty {
             crossterm::terminal::size().ok().map(|(w, _)| w)
         } else {
             None
         };
         Self {
-            color,
+            color: caps.color,
+            links: caps.links,
             width,
             quiet,
             verbose,
@@ -52,6 +54,7 @@ impl LogStyle {
     pub fn plain(width: Option<u16>) -> Self {
         Self {
             color: false,
+            links: false,
             width,
             quiet: false,
             verbose: false,
@@ -142,19 +145,26 @@ fn method_color(method: &str) -> Color {
     }
 }
 
-/// Render the registration banner: `service  https://…/  →  target`.
+/// Render the registration banner: `✔ service  https://…/  →  target`.
 pub fn registered_line(style: &LogStyle, service: &str, url: &str, target: &str) -> String {
+    let icon = paint(style, crate::ui::OK, Color::Green, true);
     let svc = paint(style, service, service_color(service), true);
-    let url = paint(style, url, Color::Green, false);
+    let shown = paint(style, url, Color::Green, false);
+    let shown = if style.links {
+        crate::ui::osc8(url, &shown)
+    } else {
+        shown
+    };
     let arrow = paint(style, "\u{2192}", Color::DarkGrey, false);
-    format!("{svc}  {url}  {arrow}  {target}")
+    format!("{icon} {svc}  {shown}  {arrow}  {target}")
 }
 
 /// Render the refusal line for a service that failed to register.
 pub fn refused_line(style: &LogStyle, service: &str, message: &str) -> String {
+    let icon = paint(style, crate::ui::FAIL, Color::Red, true);
     let svc = paint(style, service, service_color(service), true);
     let tag = paint(style, "refused", Color::Red, true);
-    format!("{svc}  {tag}  {message}")
+    format!("{icon} {svc}  {tag}  {message}")
 }
 
 /// Render a certificate transition (non-TTY fallback for the footer).
@@ -167,9 +177,15 @@ pub fn cert_line(style: &LogStyle, service: &str, state: weaver_proto::CertStatu
     } else {
         Color::Yellow
     };
-    let tag = paint(style, "cert", Color::DarkGrey, false);
+    let icon = match state {
+        weaver_proto::CertStatus::Issued | weaver_proto::CertStatus::Renewing => crate::ui::OK,
+        weaver_proto::CertStatus::Failed => crate::ui::FAIL,
+        weaver_proto::CertStatus::Pending | weaver_proto::CertStatus::Ordering => "\u{25CC}",
+    };
+    let icon = paint(style, icon, color, true);
+    let tag = paint(style, "certificate", Color::DarkGrey, false);
     let st = paint(style, state.label(), color, true);
-    format!("{svc}  {tag} {st}")
+    format!("{icon} {svc}  {tag} {st}")
 }
 
 /// Render one request line. Returns `None` when the style is quiet.

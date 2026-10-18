@@ -36,6 +36,7 @@ clap = { workspace = true }
 async-trait = { workspace = true }
 comfy-table = { workspace = true }
 crossterm = { workspace = true }
+ed25519-dalek = { workspace = true }
 futures-util = { workspace = true }
 http = { workspace = true }
 http-body-util = { workspace = true }
@@ -49,6 +50,7 @@ jiff = { workspace = true }
 lettre = { workspace = true }
 libc = { workspace = true }
 mrml = { workspace = true }
+p256 = { workspace = true }
 rand = { workspace = true }
 rcgen = { workspace = true }
 sea-orm = { workspace = true }
@@ -77,10 +79,9 @@ weaver-tokio = { workspace = true }
 
 [dev-dependencies]
 weaver-server = { path = ".", features = ["test-util"] }
-ed25519-dalek = { workspace = true }
 hyper = { workspace = true, features = ["client"] }
 hyper-util = { workspace = true, features = ["client", "client-legacy"] }
 mailparse = "0.18"
-weave = { path = "../weave" }
+weave = { path = "../weave", features = ["dev-signer"] }
 weaver-abuse = { workspace = true, features = ["test-util"] }
 weaver-mux = { workspace = true, features = ["test-util"] }

@@ -1,4 +1,4 @@
-//! End-to-end tests for the account plane (WVR-36).
+//! End-to-end tests for the account plane.
 //!
 //! These drive the account axum router directly (no TLS), exercising the same
 //! handlers the hyper edge mounts: signup → email verification → password →
@@ -57,6 +57,8 @@ struct Fixture {
     router: Router,
     account: Arc<AccountRuntime>,
     sent: Arc<Mutex<Vec<Email>>>,
+    /// The relay's safety pipeline, built from the same account tuning.
+    guard: Arc<weaver_abuse::Pipeline>,
 }
 
 async fn setup() -> Fixture {
@@ -96,6 +98,13 @@ async fn setup_with(adjust: impl FnOnce(&mut AccountConfig)) -> Fixture {
         ..Default::default()
     };
     adjust(&mut account_config);
+    let guard = weaver_server::abuse::build(
+        &Config {
+            account: account_config.clone(),
+            ..config
+        },
+        store.clone(),
+    );
     let account = AccountRuntime::with_breach(
         &account_config,
         "admin.test",
@@ -109,6 +118,7 @@ async fn setup_with(adjust: impl FnOnce(&mut AccountConfig)) -> Fixture {
         router: router(account.clone()),
         account,
         sent,
+        guard,
     }
 }
 
@@ -267,7 +277,7 @@ async fn register(fixture: &Fixture, name: &str, email: &str, password: &str) {
     assert_eq!(reply.body["outcome"], "activated");
 }
 
-/// The authoritative end-to-end happy path (WVR-36): signup → emailed link →
+/// The authoritative end-to-end happy path: signup → emailed link →
 /// initial password → login → signed-in identity → logout → login again.
 #[tokio::test]
 async fn full_lifecycle_signup_verify_login_logout() {
@@ -315,7 +325,7 @@ async fn full_lifecycle_signup_verify_login_logout() {
     assert_eq!(me.status, StatusCode::OK);
     assert_eq!(me.body["name"], "Rémy");
     assert_eq!(me.body["email"], "remy@example.com");
-    // WVR-50: the Security page's "Password is set" state is driven by this flag.
+    // The Security page's "Password is set" state is driven by this flag.
     assert_eq!(
         me.body["has_password"], true,
         "a password account reports a live credential"
@@ -359,7 +369,7 @@ async fn full_lifecycle_signup_verify_login_logout() {
     .await;
     assert_eq!(after.status, StatusCode::UNAUTHORIZED);
 
-    // WVR-36: logging in again after logout succeeds with the same credentials,
+    // Logging in again after logout succeeds with the same credentials,
     // and the fresh session authenticates. This proves logout retires the
     // session rather than poisoning the account (login rotates the token).
     let altcha = solved(&fixture.account, "login").await;
@@ -581,7 +591,7 @@ async fn spa_shell_is_served_for_deep_links() {
     assert_eq!(legacy.headers.get(header::LOCATION).unwrap(), "/sign-in");
 }
 
-// ----- password reset (WVR-41) ---------------------------------------------
+// ----- password reset ---------------------------------------------
 
 /// Extracts the raw reset token from the last captured email. The reset link
 /// carries the token in the URL *fragment* (`/reset#token=…`), so it never
@@ -1070,7 +1080,7 @@ async fn reset_routes_refuse_cross_origin_requests() {
     );
 }
 
-// ----- WVR-50: change password ---------------------------------------------
+// ----- change password -----------------------------------------------------
 
 /// Signs in and returns the (session, csrf) cookie pair the change flow needs.
 async fn sign_in(fixture: &Fixture, email: &str, password: &str) -> (String, String) {
@@ -1398,4 +1408,574 @@ async fn change_password_requires_a_session_and_a_same_origin_csrf_request() {
 
     // None of the refusals changed the password.
     assert!(signs_in(&fixture, email, "correct horse battery").await);
+}
+
+// ----- pairing --------------------------------------------------------------
+//
+// The CLI side is a real WebSocket over an in-memory duplex pipe, served by the
+// same `serve_channel` the edge spawns; it solves the relay's proof of work
+// with the engine's test solver. The browser side is the account router.
+
+use tokio::io::DuplexStream;
+use tokio_tungstenite::WebSocketStream;
+use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::protocol::Role;
+use weaver_mux::KeyId;
+use weaver_proto::pair::{
+    self, Begin, FailureCode, LookupResponse, Proposed, ServerMessage, Target,
+};
+use weaver_server::account::pairing;
+
+/// A device key: a real P-256 public key.
+fn device_key(seed: u64) -> KeyId {
+    use weaver_mux::auth::Signer as _;
+    weaver_mux::testing::P256TestSigner::from_seed(seed).key_id()
+}
+
+/// The CLI end of a pairing channel.
+struct Cli {
+    ws: WebSocketStream<DuplexStream>,
+}
+
+impl Cli {
+    /// Opens a channel against the fixture's relay.
+    async fn open(fixture: &Fixture) -> Self {
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let account = Arc::clone(&fixture.account);
+        let peer = pairing::Peer {
+            guard: Arc::clone(&fixture.guard),
+            addr: SocketAddr::from(([192, 0, 2, 7], 40_000)),
+        };
+        tokio::spawn(async move {
+            let ws = WebSocketStream::from_raw_socket(
+                server,
+                Role::Server,
+                Some(pairing::channel_config()),
+            )
+            .await;
+            pairing::serve_channel(ws, account, peer).await;
+        });
+        Self {
+            ws: WebSocketStream::from_raw_socket(client, Role::Client, None).await,
+        }
+    }
+
+    async fn recv(&mut self) -> ServerMessage {
+        use futures_util::StreamExt as _;
+        loop {
+            let message = tokio::time::timeout(std::time::Duration::from_secs(30), self.ws.next())
+                .await
+                .expect("the relay answers")
+                .expect("the channel is open")
+                .expect("a WebSocket message");
+            if let Message::Text(text) = message {
+                return pair::decode_json(&text).expect("a server message");
+            }
+        }
+    }
+
+    async fn send_text(&mut self, text: String) {
+        use futures_util::SinkExt as _;
+        self.ws.send(Message::Text(text.into())).await.unwrap();
+    }
+
+    async fn challenge(&mut self) -> Challenge {
+        match self.recv().await {
+            ServerMessage::Challenge { challenge } => challenge,
+            other => panic!("the relay must speak first with a challenge, got {other:?}"),
+        }
+    }
+
+    async fn begin(&mut self, proof: Payload, key_id: KeyId, target: Target) {
+        let begin = Begin {
+            proof,
+            key_id,
+            target,
+        };
+        self.send_text(pair::encode_json(&begin).unwrap()).await;
+    }
+
+    /// Challenge, solve, `Begin`: the relay's next message.
+    async fn pair(fixture: &Fixture, key_id: KeyId, target: Target) -> (Self, ServerMessage) {
+        let mut cli = Self::open(fixture).await;
+        let challenge = cli.challenge().await;
+        let proof = solve(challenge).await;
+        cli.begin(proof, key_id, target).await;
+        let next = cli.recv().await;
+        (cli, next)
+    }
+
+    /// Like [`Cli::pair`], expecting a handle.
+    async fn handle(fixture: &Fixture, key_id: KeyId, target: Target) -> (Self, String) {
+        match Self::pair(fixture, key_id, target).await {
+            (cli, ServerMessage::Handle { handle }) => (cli, handle),
+            (_, other) => panic!("expected a handle, got {other:?}"),
+        }
+    }
+}
+
+async fn solve(challenge: Challenge) -> Payload {
+    tokio::task::spawn_blocking(move || Payload {
+        solution: solve_challenge(&challenge),
+        challenge,
+    })
+    .await
+    .unwrap()
+}
+
+/// A signed-in browser.
+struct Browser {
+    session: String,
+    csrf: String,
+}
+
+impl Browser {
+    async fn new(fixture: &Fixture, name: &str, email: &str) -> Self {
+        register(fixture, name, email, "correct horse battery").await;
+        let (session, csrf) = sign_in(fixture, email, "correct horse battery").await;
+        Self { session, csrf }
+    }
+
+    async fn post(&self, fixture: &Fixture, path: &str, body: serde_json::Value) -> Reply {
+        call(
+            &fixture.router,
+            "POST",
+            path,
+            &[
+                (
+                    "cookie",
+                    format!(
+                        "__Host-weaver_session={}; __Host-weaver_csrf={}",
+                        self.session, self.csrf
+                    ),
+                ),
+                ("x-csrf-token", self.csrf.clone()),
+            ],
+            Some(body),
+        )
+        .await
+    }
+
+    async fn lookup(&self, fixture: &Fixture, handle: &str) -> LookupResponse {
+        let reply = self
+            .post(
+                fixture,
+                pair::PAIR_LOOKUP_PATH,
+                serde_json::json!({ "handle": handle }),
+            )
+            .await;
+        assert_eq!(reply.status, StatusCode::OK, "{:?}", reply.body);
+        serde_json::from_value(reply.body).expect("a lookup response")
+    }
+
+    async fn accept(&self, fixture: &Fixture, body: serde_json::Value) -> serde_json::Value {
+        let reply = self.post(fixture, pair::PAIR_ACCEPT_PATH, body).await;
+        assert_eq!(reply.status, StatusCode::OK, "{:?}", reply.body);
+        reply.body
+    }
+
+    async fn reject(&self, fixture: &Fixture, handle: &str) -> serde_json::Value {
+        let reply = self
+            .post(
+                fixture,
+                pair::PAIR_REJECT_PATH,
+                serde_json::json!({ "handle": handle }),
+            )
+            .await;
+        assert_eq!(reply.status, StatusCode::OK, "{:?}", reply.body);
+        reply.body
+    }
+}
+
+fn failure(message: ServerMessage) -> FailureCode {
+    match message {
+        ServerMessage::Failed { code, .. } => code,
+        other => panic!("expected a failure, got {other:?}"),
+    }
+}
+
+/// Pairs a new machine for `browser`'s account and returns its id.
+async fn pair_new(
+    fixture: &Fixture,
+    browser: &Browser,
+    key_id: KeyId,
+    person_slug: Option<&str>,
+) -> i32 {
+    let (mut cli, handle) = Cli::handle(
+        fixture,
+        key_id,
+        Target::New {
+            hostname: "laptop".into(),
+        },
+    )
+    .await;
+    let reply = browser
+        .accept(
+            fixture,
+            serde_json::json!({ "handle": handle, "person_slug": person_slug }),
+        )
+        .await;
+    assert_eq!(reply, serde_json::json!({ "ok": true }));
+    match cli.recv().await {
+        ServerMessage::Approved { machine_id, .. } => machine_id,
+        other => panic!("expected approval, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn pairing_proves_work_before_anything_else() {
+    let fixture = setup().await;
+    let browser = Browser::new(&fixture, "Alice", "alice@example.com").await;
+    let paired = device_key(1);
+    pair_new(&fixture, &browser, paired, Some("alice")).await;
+
+    // A wrong solution for an already-paired key: the proof is what is
+    // refused, so the channel says nothing about the key.
+    let mut cli = Cli::open(&fixture).await;
+    let challenge = cli.challenge().await;
+    let mut proof = solve(challenge).await;
+    proof.solution.counter = proof.solution.counter.wrapping_add(1);
+    cli.begin(proof, paired, Target::Existing { machine_id: 9_999 })
+        .await;
+    assert_eq!(failure(cli.recv().await), FailureCode::BadProof);
+
+    // A proof solved for another channel's challenge is not this channel's.
+    let mut other = Cli::open(&fixture).await;
+    let foreign = solve(other.challenge().await).await;
+    let mut cli = Cli::open(&fixture).await;
+    let _ours = cli.challenge().await;
+    cli.begin(
+        foreign,
+        device_key(2),
+        Target::New {
+            hostname: "x".into(),
+        },
+    )
+    .await;
+    assert_eq!(failure(cli.recv().await), FailureCode::BadProof);
+
+    // With a good proof, the known key is reported as paired.
+    let (_cli, next) = Cli::pair(
+        &fixture,
+        paired,
+        Target::New {
+            hostname: "x".into(),
+        },
+    )
+    .await;
+    assert_eq!(failure(next), FailureCode::AlreadyPaired);
+
+    // Garbage instead of a `Begin`.
+    let mut cli = Cli::open(&fixture).await;
+    let _ = cli.challenge().await;
+    cli.send_text("{\"nope\":1}".into()).await;
+    assert_eq!(failure(cli.recv().await), FailureCode::BadRequest);
+
+    assert!(fixture.account.pairings.is_empty());
+}
+
+#[tokio::test]
+async fn pairing_refuses_malformed_keys_after_the_proof() {
+    let fixture = setup().await;
+    let (_cli, next) = Cli::pair(
+        &fixture,
+        KeyId::P256([0x07; 33]),
+        Target::New {
+            hostname: "laptop".into(),
+        },
+    )
+    .await;
+    assert_eq!(failure(next), FailureCode::BadKey);
+}
+
+#[tokio::test]
+async fn pairing_charges_the_pairing_budget_once_the_proof_is_in() {
+    let fixture = setup_with(|account| {
+        account.pair = weaver_server::config::BudgetConfig {
+            burst: 1,
+            refill_units: 1,
+            refill_per_secs: 3_600,
+        };
+    })
+    .await;
+    let (_first, _) = Cli::handle(
+        &fixture,
+        device_key(1),
+        Target::New {
+            hostname: "a".into(),
+        },
+    )
+    .await;
+    let (_second, next) = Cli::pair(
+        &fixture,
+        device_key(2),
+        Target::New {
+            hostname: "b".into(),
+        },
+    )
+    .await;
+    assert_eq!(failure(next), FailureCode::Throttled);
+}
+
+#[tokio::test]
+async fn pairing_a_new_machine_creates_the_person_and_the_machine() {
+    let fixture = setup().await;
+    let browser = Browser::new(&fixture, "Rémy Sanchez", "remy@example.com").await;
+    let key = device_key(1);
+    let (mut cli, handle) = Cli::handle(
+        &fixture,
+        key,
+        Target::New {
+            hostname: "Rémys-MacBook-Pro.local".into(),
+        },
+    )
+    .await;
+
+    assert_eq!(
+        browser.lookup(&fixture, &handle).await,
+        LookupResponse::Waiting {
+            fingerprint: pairing::fingerprint(&key),
+            account: "Rémy Sanchez".into(),
+            person: Proposed {
+                name: "remysanchez".into(),
+                is_new: true
+            },
+            machine: Proposed {
+                name: "remysmacbookpro".into(),
+                is_new: true
+            },
+        }
+    );
+
+    // A new person needs a name; the request keeps waiting until it has one.
+    let refused = browser
+        .accept(&fixture, serde_json::json!({ "handle": handle }))
+        .await;
+    assert_eq!(refused["ok"], false);
+    assert!(refused["message"].as_str().unwrap().contains("person name"));
+    let refused = browser
+        .accept(
+            &fixture,
+            serde_json::json!({ "handle": handle, "person_slug": "Not-Valid" }),
+        )
+        .await;
+    assert_eq!(refused["ok"], false);
+    assert!(matches!(
+        browser.lookup(&fixture, &handle).await,
+        LookupResponse::Waiting { .. }
+    ));
+
+    let accepted = browser
+        .accept(
+            &fixture,
+            serde_json::json!({ "handle": handle, "person_slug": "remy", "machine_name": "Mac Book" }),
+        )
+        .await;
+    assert_eq!(accepted, serde_json::json!({ "ok": true }));
+    let ServerMessage::Approved {
+        machine_id,
+        person,
+        machine,
+    } = cli.recv().await
+    else {
+        panic!("expected approval");
+    };
+    assert_eq!((person.as_str(), machine.as_str()), ("remy", "macbook"));
+
+    let store = &fixture.account.store;
+    let (owner, paired) = store.machine_by_key(&key).await.unwrap().unwrap();
+    assert_eq!((owner.name.as_str(), paired.id), ("remy", machine_id));
+
+    // The handle is spent.
+    assert_eq!(
+        browser.lookup(&fixture, &handle).await,
+        LookupResponse::Gone
+    );
+
+    // The second machine reuses the person, which can no longer be renamed here.
+    let (mut cli, handle) = Cli::handle(
+        &fixture,
+        device_key(2),
+        Target::New {
+            hostname: "macbook".into(),
+        },
+    )
+    .await;
+    let LookupResponse::Waiting {
+        person, machine, ..
+    } = browser.lookup(&fixture, &handle).await
+    else {
+        panic!("expected a waiting pairing");
+    };
+    assert_eq!(
+        (person, machine),
+        (
+            Proposed {
+                name: "remy".into(),
+                is_new: false
+            },
+            Proposed {
+                name: "macbook2".into(),
+                is_new: true
+            }
+        )
+    );
+    let refused = browser
+        .accept(
+            &fixture,
+            serde_json::json!({ "handle": handle, "person_slug": "other" }),
+        )
+        .await;
+    assert_eq!(refused["ok"], false);
+    let accepted = browser
+        .accept(&fixture, serde_json::json!({ "handle": handle }))
+        .await;
+    assert_eq!(accepted, serde_json::json!({ "ok": true }));
+    assert!(matches!(
+        cli.recv().await,
+        ServerMessage::Approved { machine, .. } if machine == "macbook2"
+    ));
+}
+
+#[tokio::test]
+async fn pairing_an_existing_machine_moves_it_onto_the_new_key() {
+    let fixture = setup().await;
+    let browser = Browser::new(&fixture, "Alice", "alice@example.com").await;
+    let old = device_key(1);
+    let machine_id = pair_new(&fixture, &browser, old, Some("alice")).await;
+
+    let new = device_key(2);
+    let (mut cli, handle) = Cli::handle(&fixture, new, Target::Existing { machine_id }).await;
+    let LookupResponse::Waiting {
+        person, machine, ..
+    } = browser.lookup(&fixture, &handle).await
+    else {
+        panic!("expected a waiting pairing");
+    };
+    assert_eq!(
+        (person, machine),
+        (
+            Proposed {
+                name: "alice".into(),
+                is_new: false
+            },
+            Proposed {
+                name: "laptop".into(),
+                is_new: false
+            }
+        )
+    );
+    let refused = browser
+        .accept(
+            &fixture,
+            serde_json::json!({ "handle": handle, "machine_name": "renamed" }),
+        )
+        .await;
+    assert_eq!(refused["ok"], false, "an existing machine keeps its name");
+
+    let accepted = browser
+        .accept(&fixture, serde_json::json!({ "handle": handle }))
+        .await;
+    assert_eq!(accepted, serde_json::json!({ "ok": true }));
+    assert_eq!(
+        cli.recv().await,
+        ServerMessage::Approved {
+            machine_id,
+            person: "alice".into(),
+            machine: "laptop".into()
+        }
+    );
+    let store = &fixture.account.store;
+    assert!(store.machine_by_key(&old).await.unwrap().is_none());
+    assert_eq!(
+        store.machine_by_key(&new).await.unwrap().unwrap().1.id,
+        machine_id
+    );
+}
+
+#[tokio::test]
+async fn pairing_someone_elses_machine_is_refused() {
+    let fixture = setup().await;
+    let alice = Browser::new(&fixture, "Alice", "alice@example.com").await;
+    let alice_key = device_key(1);
+    let machine_id = pair_new(&fixture, &alice, alice_key, Some("alice")).await;
+    let mallory = Browser::new(&fixture, "Mallory", "mallory@example.com").await;
+
+    // Mallory's browser is told it is not hers, and cannot accept it anyway.
+    let (mut cli, handle) =
+        Cli::handle(&fixture, device_key(2), Target::Existing { machine_id }).await;
+    assert_eq!(
+        mallory.lookup(&fixture, &handle).await,
+        LookupResponse::NotYourMachine
+    );
+    let refused = mallory
+        .accept(
+            &fixture,
+            serde_json::json!({ "handle": handle, "person_slug": "mallory" }),
+        )
+        .await;
+    assert_eq!(refused["ok"], false);
+    let refused = mallory
+        .accept(&fixture, serde_json::json!({ "handle": handle }))
+        .await;
+    assert_eq!(refused["ok"], false);
+    assert_eq!(failure(cli.recv().await), FailureCode::NotYourMachine);
+    assert_eq!(
+        fixture
+            .account
+            .store
+            .machine_by_key(&alice_key)
+            .await
+            .unwrap()
+            .unwrap()
+            .1
+            .id,
+        machine_id,
+        "alice's machine keeps its key"
+    );
+
+    // A machine id that does not exist looks exactly the same.
+    let (_cli, handle) = Cli::handle(
+        &fixture,
+        device_key(3),
+        Target::Existing { machine_id: 9_999 },
+    )
+    .await;
+    assert_eq!(
+        alice.lookup(&fixture, &handle).await,
+        LookupResponse::NotYourMachine
+    );
+}
+
+#[tokio::test]
+async fn pairing_rejected_in_the_browser_tells_the_cli() {
+    let fixture = setup().await;
+    let browser = Browser::new(&fixture, "Alice", "alice@example.com").await;
+    let (mut cli, handle) = Cli::handle(
+        &fixture,
+        device_key(1),
+        Target::New {
+            hostname: "laptop".into(),
+        },
+    )
+    .await;
+    assert_eq!(
+        browser.reject(&fixture, &handle).await,
+        serde_json::json!({ "ok": true })
+    );
+    assert_eq!(failure(cli.recv().await), FailureCode::Rejected);
+    assert_eq!(
+        browser.lookup(&fixture, &handle).await,
+        LookupResponse::Gone
+    );
+    assert_eq!(browser.reject(&fixture, &handle).await["ok"], false);
+    assert!(
+        fixture
+            .account
+            .store
+            .machine_by_key(&device_key(1))
+            .await
+            .unwrap()
+            .is_none()
+    );
 }

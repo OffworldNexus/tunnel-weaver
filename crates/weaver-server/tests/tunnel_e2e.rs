@@ -18,7 +18,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::time::sleep;
 use tokio_rustls::TlsConnector;
 use tokio_util::sync::CancellationToken;
-use weave::{ServiceSpec, StartOptions, Target};
+use weave::{ServiceSpec, SignerSpec, StartOptions, Target};
 use weaver_proto::control::RefusalCode;
 use weaver_server::cert::resolver::CertResolver;
 use weaver_server::cert::{CertManager, SystemClock};
@@ -31,6 +31,16 @@ use weaver_server::tunnel::{Identity, StoreIdentityResolver, derive_hostname};
 fn client_dev_key() -> weaver_mux::KeyId {
     use weaver_mux::auth::Signer as _;
     weave::Ed25519Signer::dev().key_id()
+}
+
+/// Enrols the development key as `poc`'s machine `laptop`, the identity the
+/// tests derive hostnames from.
+async fn enrol_dev_key(store: &Store) {
+    let poc = store.create_test_person("poc").await.unwrap();
+    store
+        .create_machine(poc.id, "laptop", &client_dev_key())
+        .await
+        .unwrap();
 }
 
 /// A trivial in-process HTTP/1.1 origin used by the proxy e2e tests. It
@@ -127,6 +137,7 @@ fn start_options_multi(
             })
             .collect(),
         server,
+        signer: SignerSpec::Dev,
         insecure_root_ca: Some(ca.to_path_buf()),
         insecure_targets: Vec::new(),
         preserve_host: Vec::new(),
@@ -233,6 +244,7 @@ async fn spawn_test_relay(tunnel_domain: &str) -> TestRelay {
 
     let temp_db = NamedTempFile::new().unwrap();
     let store = Arc::new(Store::open(temp_db.path()).await.unwrap());
+    enrol_dev_key(&store).await;
 
     let config = Arc::new(Config {
         tunnel_domain: tunnel_domain.to_string(),
@@ -2077,6 +2089,7 @@ async fn test_client_leaving_during_cert_issuance_does_not_leave_hostname_active
     let root = "localhost";
     let temp_db = NamedTempFile::new().unwrap();
     let store = Arc::new(Store::open(temp_db.path()).await.unwrap());
+    enrol_dev_key(&store).await;
     let config = Arc::new(Config {
         tunnel_domain: root.to_string(),
         admin_domain: "relay-admin.test".to_string(),
@@ -2210,11 +2223,11 @@ async fn test_store_backed_auth_and_service_domain_persistence() {
 
     // 3. Verify service was persisted under the connecting machine in SQLite
     let resolved = store
-        .resolve_key(&client_dev_key())
+        .machine_by_key(&client_dev_key())
         .await
         .unwrap()
-        .expect("seeded dev key must resolve");
-    let (_pers, mach, _k) = resolved;
+        .expect("enrolled dev key must resolve");
+    let (_pers, mach) = resolved;
 
     let svc_record = service::Entity::find()
         .filter(service::Column::MachineId.eq(mach.id))
@@ -2334,4 +2347,48 @@ async fn test_metering_attributes_traffic_per_service() {
     web_origin.token.cancel();
     api_origin.token.cancel();
     let _ = client_task.await;
+}
+
+/// Revoking over the mux deletes the machine, which is what makes unpairing
+/// bilateral.
+///
+/// The authority is the handshake: the device key asks to withdraw itself, so no
+/// separate credential is needed. This drives the same `revoke_with_signer` the
+/// `weave unpair` command uses, with the in-memory development key.
+#[tokio::test]
+async fn test_revoke_over_the_mux_deletes_the_machine() {
+    let relay = spawn_test_relay("localhost").await;
+
+    // The development key is enrolled, so it resolves before the revoke and
+    // must not afterwards.
+    assert!(
+        relay
+            .store
+            .machine_by_key(&client_dev_key())
+            .await
+            .unwrap()
+            .is_some(),
+        "the development key must be enrolled before the revoke"
+    );
+
+    let edge = format!("localhost:{}", relay.addr.port());
+    weave::revoke_with_signer(
+        &edge,
+        Some(&relay.ca_pem_path),
+        Box::new(weave::Ed25519Signer::dev()),
+    )
+    .await
+    .expect("revoke over the mux");
+
+    assert!(
+        relay
+            .store
+            .machine_by_key(&client_dev_key())
+            .await
+            .unwrap()
+            .is_none(),
+        "the machine must no longer be authorised after the revoke"
+    );
+
+    relay.shutdown_token.cancel();
 }

@@ -67,8 +67,7 @@ pub struct Config {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub acme_fallback_providers: Vec<String>,
     /// How often the usage meter flushes closed minute buckets, in seconds.
-    /// Defaults to 60; `#[serde(default)]` lets configs stored before
-    /// metering existed keep loading.
+    /// Defaults to 60.
     #[serde(default = "default_usage_flush_interval")]
     pub usage_flush_interval_secs: u64,
     /// The relay's own public IPv4/IPv6 addresses.
@@ -104,7 +103,7 @@ pub struct Config {
     /// [`Config::load`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub abuse: Option<AbuseConfig>,
-    /// Account-plane tuning (WVR-36).
+    /// Account-plane tuning.
     ///
     /// The account plane is always served — it is the relay's own product
     /// surface — so this block only tunes it. Every field has a built-in
@@ -117,9 +116,9 @@ pub struct Config {
 ///
 /// Field names are deliberately provider-neutral: the catalog in
 /// [`crate::email::providers`] maps them onto each provider's auth scheme and
-/// request body. All fields are optional at the type level so a config stored
-/// before a field existed still deserialises; [`Config::load`] enforces the
-/// per-provider requirements.
+/// request body. Each provider needs a different subset, so every field but the
+/// provider and sender is optional at the type level; [`Config::load`] enforces
+/// the per-provider requirements.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct EmailConfig {
     /// Catalog provider id (e.g. "resend", "smtp").
@@ -167,7 +166,7 @@ impl std::fmt::Debug for EmailConfig {
     }
 }
 
-/// Operator-supplied abuse-protection settings (WVR-135).
+/// Operator-supplied abuse-protection settings.
 ///
 /// Absent means the relay web surface runs with no request budget; present means
 /// the `relay-web` policy is armed. Two budgets run side by side: a restrictive
@@ -190,7 +189,7 @@ pub struct AbuseConfig {
     /// Idle lifetime of a persisted bucket, in seconds, before the sweep drops it.
     #[serde(default = "default_bucket_ttl_secs")]
     pub bucket_ttl_secs: u64,
-    /// Optional ALTCHA proof-of-work tuning (WVR-136).
+    /// Optional ALTCHA proof-of-work tuning.
     ///
     /// The ALTCHA API is always served; this block only tunes its budgets and
     /// client defaults. Absent, the built-in defaults apply.
@@ -198,7 +197,7 @@ pub struct AbuseConfig {
     pub altcha: Option<AltchaConfig>,
 }
 
-/// Operator-supplied ALTCHA proof-of-work tuning (WVR-136).
+/// Operator-supplied ALTCHA proof-of-work tuning.
 ///
 /// The ALTCHA API is always served — it is the relay's own service, not an
 /// optional feature — so this block only tunes it. Every field has a built-in
@@ -258,7 +257,7 @@ impl AltchaConfig {
     }
 }
 
-/// Operator-supplied account-plane tuning (WVR-36).
+/// Operator-supplied account-plane tuning.
 ///
 /// The account plane is always served, so this block only tunes it. Field
 /// defaults encode the agreed policy: a 12-character minimum, Django-compatible
@@ -313,6 +312,19 @@ pub struct AccountConfig {
     /// Per-network budget for verification resends.
     #[serde(default = "default_account_resend_budget")]
     pub resend: BudgetConfig,
+    /// Per-network budget for opening a pending pairing and its browser API.
+    ///
+    /// Opening a pending pairing is unauthenticated, so it is bounded like a
+    /// signup even though it costs a socket rather than a row.
+    #[serde(default = "default_account_pair_budget")]
+    pub pair: BudgetConfig,
+    /// How long a retired machine key stays in the key log, in days.
+    ///
+    /// The log is an audit trail only; the periodic sweep (on
+    /// `sweep_interval_secs`) drops rows retired longer ago than this. Rows of
+    /// keys still in use are never dropped.
+    #[serde(default = "default_account_key_log_retention_days")]
+    pub key_log_retention_days: u64,
     /// Public support address shown in the app footer as a `mailto:` link.
     ///
     /// Defaults to the configured mailer's `From` address when unset. When
@@ -345,9 +357,22 @@ impl Default for AccountConfig {
             signup: default_account_signup_budget(),
             login: default_account_login_budget(),
             resend: default_account_resend_budget(),
+            pair: default_account_pair_budget(),
+            key_log_retention_days: default_account_key_log_retention_days(),
             support_email: None,
             base_url: None,
         }
+    }
+}
+
+impl AccountConfig {
+    /// The key log sweep cutoff at `now` (Unix seconds): rows retired before it
+    /// are past retention.
+    pub fn key_log_cutoff(&self, now: i64) -> i64 {
+        let retention = i64::try_from(self.key_log_retention_days)
+            .unwrap_or(i64::MAX)
+            .saturating_mul(86_400);
+        now.saturating_sub(retention)
     }
 }
 
@@ -431,6 +456,23 @@ fn default_account_resend_budget() -> BudgetConfig {
         refill_units: 20,
         refill_per_secs: 600,
     }
+}
+
+/// Default pairing budget: a 20-request burst refilling at 20 per 10 minutes.
+///
+/// Pairing is a rare, deliberate act; the budget only has to stop a machine
+/// from opening pending pairings in a loop.
+fn default_account_pair_budget() -> BudgetConfig {
+    BudgetConfig {
+        burst: 20,
+        refill_units: 20,
+        refill_per_secs: 600,
+    }
+}
+
+/// Default key log retention: one year.
+fn default_account_key_log_retention_days() -> u64 {
+    365
 }
 
 /// One token bucket's burst and refill.
@@ -640,6 +682,7 @@ fn validate_account_config(account: &AccountConfig) -> Vec<String> {
         ("reset_ttl_secs", account.reset_ttl_secs),
         ("session_ttl_secs", account.session_ttl_secs),
         ("sweep_interval_secs", account.sweep_interval_secs),
+        ("key_log_retention_days", account.key_log_retention_days),
     ] {
         if value < 1 {
             issues.push(format!("account.{name} must be >= 1"));
@@ -649,6 +692,7 @@ fn validate_account_config(account: &AccountConfig) -> Vec<String> {
         ("signup", &account.signup),
         ("login", &account.login),
         ("resend", &account.resend),
+        ("pair", &account.pair),
     ] {
         if budget.burst < 1 {
             issues.push(format!("account.{name}.burst must be >= 1"));
@@ -794,5 +838,42 @@ impl Config {
         }
 
         Ok(config)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn key_log_retention_defaults_to_a_year() {
+        let account = AccountConfig::default();
+        assert_eq!(account.key_log_retention_days, 365);
+        assert_eq!(account.key_log_cutoff(400 * 86_400), 35 * 86_400);
+        let absent: AccountConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(absent.key_log_retention_days, 365);
+    }
+
+    #[test]
+    fn key_log_retention_must_be_positive() {
+        let account = AccountConfig {
+            key_log_retention_days: 0,
+            ..AccountConfig::default()
+        };
+        assert!(
+            validate_account_config(&account)
+                .iter()
+                .any(|issue| issue == "account.key_log_retention_days must be >= 1")
+        );
+        assert!(validate_account_config(&AccountConfig::default()).is_empty());
+    }
+
+    #[test]
+    fn huge_retention_does_not_overflow() {
+        let account = AccountConfig {
+            key_log_retention_days: u64::MAX,
+            ..AccountConfig::default()
+        };
+        assert_eq!(account.key_log_cutoff(1_000), 1_000 - i64::MAX);
     }
 }

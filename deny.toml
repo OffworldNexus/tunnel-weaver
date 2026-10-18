@@ -24,3 +24,6 @@ wildcards = "allow"
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+# The tpmd local key agent (WVR-13): `weave` links `tpmd-client` from its own
+# repository rather than a crate registry.
+allow-git = ["https://github.com/OffworldNexus/tpmd"]

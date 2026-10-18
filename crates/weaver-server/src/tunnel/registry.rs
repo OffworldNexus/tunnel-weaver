@@ -182,6 +182,19 @@ impl TunnelRegistry {
         Arc::clone(&self.cert_manager)
     }
 
+    /// Revokes the machine `key_id` belongs to.
+    ///
+    /// The connection that asks is authenticated by that very key, so no
+    /// further authority is needed or possible. Idempotent: a key that is
+    /// already unauthorised is the goal state, not an error.
+    pub async fn revoke_machine(&self, key_id: KeyId) -> Result<(), String> {
+        self.store
+            .revoke_machine(&key_id)
+            .await
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+
     pub async fn register_service(
         &self,
         key_id: KeyId,

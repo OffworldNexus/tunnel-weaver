@@ -414,7 +414,7 @@ impl Connection {
         use FrameType as T;
         if frame.stream_id == 0 {
             return match frame.frame_type {
-                T::Challenge => self.on_challenge(frame),
+                T::Challenge => self.on_challenge(frame).await,
                 T::Hello => self.on_hello(now, frame).await,
                 T::Welcome => self.on_welcome(now, frame),
                 T::Reject => self.on_reject(frame),
@@ -451,7 +451,7 @@ impl Connection {
 
     // --- handshake ------------------------------------------------------
 
-    fn on_challenge(&mut self, frame: Frame) -> Result<(), ProtocolError> {
+    async fn on_challenge(&mut self, frame: Frame) -> Result<(), ProtocolError> {
         if self.hs != HandshakeState::AwaitChallenge {
             return Err(ProtocolError::StateViolation("unexpected CHALLENGE"));
         }
@@ -468,7 +468,7 @@ impl Connection {
             self.cfg.channel_binding.as_ref(),
         );
         let key_id = signer.key_id();
-        let sig = match signer.sign(&msg) {
+        let sig = match signer.sign(&msg).await {
             Ok(sig) => sig,
             Err(e) => {
                 // We cannot authenticate; tell the peer we are leaving and

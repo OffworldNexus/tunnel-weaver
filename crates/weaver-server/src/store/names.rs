@@ -72,6 +72,87 @@ pub fn flat_hostname(person: &str, machine: &str, service: &str, root: &str) -> 
     )
 }
 
+/// Folds one character to the ASCII letter a slug should carry, or `None` to
+/// drop it.
+///
+/// A deliberately small table rather than a transliteration dependency: the
+/// only thing that matters is that `Rémy` becomes `remy`, not `rmy`. Input is
+/// expected to be already lowercased.
+fn fold_ascii(c: char) -> Option<char> {
+    match c {
+        'a'..='z' | '0'..='9' => Some(c),
+        'à' | 'á' | 'â' | 'ã' | 'ä' | 'å' | 'ā' | 'ă' | 'ą' => Some('a'),
+        'ç' | 'ć' | 'č' => Some('c'),
+        'è' | 'é' | 'ê' | 'ë' | 'ē' | 'ĕ' | 'ė' | 'ę' | 'ě' => Some('e'),
+        'ì' | 'í' | 'î' | 'ï' | 'ī' | 'į' => Some('i'),
+        'ñ' | 'ń' | 'ň' => Some('n'),
+        'ò' | 'ó' | 'ô' | 'õ' | 'ö' | 'ø' | 'ō' | 'ő' => Some('o'),
+        'ù' | 'ú' | 'û' | 'ü' | 'ū' | 'ů' | 'ű' | 'ų' => Some('u'),
+        'ý' | 'ÿ' => Some('y'),
+        'ß' => Some('s'),
+        'æ' => Some('a'),
+        'œ' => Some('o'),
+        _ => None,
+    }
+}
+
+/// Normalises arbitrary text into the `^[a-z0-9]{1,15}$` shape a person or
+/// machine name must take.
+///
+/// Lowercases, folds common accented Latin letters to ASCII, drops everything
+/// else (dashes, dots, spaces, punctuation) and truncates to the label limit.
+/// Input that yields nothing falls back to `fallback`.
+pub fn slugify(raw: &str, fallback: &str) -> String {
+    let mut out = String::with_capacity(PERSON_MACHINE_MAX);
+    for c in raw.to_lowercase().chars() {
+        if let Some(folded) = fold_ascii(c) {
+            out.push(folded);
+            if out.len() == PERSON_MACHINE_MAX {
+                break;
+            }
+        }
+    }
+    if out.is_empty() {
+        fallback.to_string()
+    } else {
+        out
+    }
+}
+
+/// The proposed person slug for an account display name.
+pub fn slugify_person(display_name: &str) -> String {
+    slugify(display_name, "person")
+}
+
+/// The proposed machine name for a raw hostname, e.g.
+/// `Rémys-MacBook-Pro.local` → `remysmacbookpro`.
+pub fn slugify_machine(raw_hostname: &str) -> String {
+    slugify(raw_hostname, "machine")
+}
+
+/// Returns `base`, or the first `<truncated base><n>` (with `n >= 2`) that
+/// `taken` reports as free.
+///
+/// The suffix is a bare digit appended *after* truncation, so every candidate is
+/// still `^[a-z0-9]{1,15}$` and — crucially — contains no dash, which would
+/// break the flat label's split on the first two dashes.
+pub fn uniquify(base: &str, mut taken: impl FnMut(&str) -> bool) -> String {
+    if !taken(base) {
+        return base.to_string();
+    }
+    let mut n: u32 = 2;
+    loop {
+        let suffix = n.to_string();
+        let keep = PERSON_MACHINE_MAX.saturating_sub(suffix.len());
+        let mut candidate: String = base.chars().take(keep).collect();
+        candidate.push_str(&suffix);
+        if !taken(&candidate) {
+            return candidate;
+        }
+        n = n.saturating_add(1);
+    }
+}
+
 /// True if `name` is a label the authoritative responder owns and no entity
 /// may shadow: the apex itself, or `_acme-challenge.<root>`.
 ///
@@ -121,6 +202,39 @@ mod tests {
             flat_hostname("Poc", "Laptop", "My-Web", "Example.COM"),
             "poc-laptop-my-web.example.com"
         );
+    }
+
+    #[test]
+    fn slugify_person_and_machine() {
+        assert_eq!(slugify_person("Rémy Sanchez"), "remysanchez");
+        assert_eq!(
+            slugify_machine("Rémys-MacBook-Pro.local"),
+            "remysmacbookpro"
+        );
+        assert_eq!(slugify_person("Éléonore"), "eleonore");
+        assert_eq!(slugify_person(""), "person");
+        assert_eq!(slugify_machine("---"), "machine");
+        assert_eq!(slugify_person(&"x".repeat(40)), "x".repeat(15));
+        // Whatever goes in, a valid name comes out.
+        for raw in ["Rémy", "", "---", "ù", "日本語", "a.b-c d/e"] {
+            assert!(is_valid_person_or_machine(&slugify_person(raw)));
+            assert!(is_valid_person_or_machine(&slugify_machine(raw)));
+        }
+    }
+
+    #[test]
+    fn uniquify_appends_digits_without_dashes() {
+        let taken = |n: &str| n == "laptop" || n == "laptop2";
+        assert_eq!(uniquify("web", taken), "web");
+        assert_eq!(uniquify("laptop", taken), "laptop3");
+
+        // A full-length base truncates to make room for the suffix, and the
+        // result stays within the 15-character limit and dash-free.
+        let long = "a".repeat(15);
+        let only_long = |n: &str| n == long;
+        let next = uniquify(&long, only_long);
+        assert_eq!(next, format!("{}2", "a".repeat(14)));
+        assert!(is_valid_person_or_machine(&next));
     }
 
     #[test]

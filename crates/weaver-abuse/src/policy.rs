@@ -32,6 +32,9 @@ impl PolicyId {
     /// Resending a verification link (admin host account plane).
     pub const ACCOUNT_RESEND: PolicyId = PolicyId("account-resend");
 
+    /// The pairing channel and its browser API (admin host, WVR-13).
+    pub const ACCOUNT_PAIR: PolicyId = PolicyId("account-pair");
+
     /// Build a policy id from a static string.
     pub const fn new(id: &'static str) -> Self {
         Self(id)
@@ -66,6 +69,8 @@ impl ViewId {
     pub const ACCOUNT_LOGIN: ViewId = ViewId("account-login");
     /// Resending a verification link (admin host account plane).
     pub const ACCOUNT_RESEND: ViewId = ViewId("account-resend");
+    /// The pairing channel and its browser API (admin host, WVR-13).
+    pub const ACCOUNT_PAIR: ViewId = ViewId("account-pair");
 
     /// Build a view id from a static string.
     pub const fn new(id: &'static str) -> Self {

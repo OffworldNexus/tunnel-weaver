@@ -253,8 +253,11 @@ mod tests {
         // A service client needs a real service row for the foreign key.
         use crate::store::entity::service;
         use sea_orm::{ActiveModelTrait, Set};
-        let person = store.create_person("alice").await.unwrap();
-        let machine = store.create_machine(person.id, "laptop").await.unwrap();
+        let person = store.create_test_person("alice").await.unwrap();
+        let machine = store
+            .create_machine(person.id, "laptop", &weaver_mux::KeyId::Ed25519([1; 32]))
+            .await
+            .unwrap();
         let service = service::ActiveModel {
             machine_id: Set(machine.id),
             name: Set("web".into()),

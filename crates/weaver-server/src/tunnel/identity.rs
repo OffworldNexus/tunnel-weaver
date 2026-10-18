@@ -53,7 +53,8 @@ impl Verifier for ResolverVerifier {
     }
 }
 
-/// Store-backed identity resolver querying `person`, `machine`, and `machine_key`.
+/// Store-backed identity resolver: a key is whichever machine holds it in
+/// `machine.key_id`, and nothing else is consulted.
 #[derive(Clone)]
 pub struct StoreIdentityResolver {
     store: Store,
@@ -71,15 +72,15 @@ impl IdentityResolver for StoreIdentityResolver {
         // Serve the key *stored* for this identity, not the bytes the peer
         // claimed: the lookup already matched on the canonical key id, and
         // `weaver_mux::auth::verify` additionally rejects any mismatch.
-        let (_, _, machine_key) = self.store.resolve_key(key_id).await.ok()??;
-        match crate::store::parse_key_id(&machine_key.key_id)? {
+        let (_, machine) = self.store.machine_by_key(key_id).await.ok()??;
+        match crate::store::parse_key_id(&machine.key_id)? {
             KeyId::Ed25519(bytes) => Some(PublicKey::Ed25519(bytes)),
             KeyId::P256(bytes) => Some(PublicKey::P256(bytes)),
         }
     }
 
     async fn identity(&self, key_id: &KeyId) -> Option<Identity> {
-        let Ok(Some((pers, mach, _))) = self.store.resolve_key(key_id).await else {
+        let Ok(Some((pers, mach))) = self.store.machine_by_key(key_id).await else {
             return None;
         };
         Some(Identity {

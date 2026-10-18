@@ -51,8 +51,8 @@ pub struct StatusFooter {
 }
 
 impl StatusFooter {
-    /// Create the footer for `services` (name → target). Reserves the scroll
-    /// region immediately when on a TTY.
+    /// Create the footer for `services` (name → target). Nothing is drawn
+    /// until [`StatusFooter::install`].
     pub fn new(style: LogStyle, services: impl IntoIterator<Item = (String, String)>) -> Self {
         let rows: BTreeMap<String, ServiceRow> = services
             .into_iter()
@@ -67,19 +67,18 @@ impl StatusFooter {
                 )
             })
             .collect();
-        let mut footer = Self {
+        Self {
             rows,
             style,
             active: false,
             reserved: 0,
-        };
-        footer.install();
-        footer
+        }
     }
 
-    /// Reserve the bottom rows. No-op when stdout is not a terminal.
-    fn install(&mut self) {
-        if !std::io::stdout().is_terminal() || self.rows.is_empty() {
+    /// Reserve the bottom rows. No-op when stdout is not a terminal, or when
+    /// already installed.
+    pub fn install(&mut self) {
+        if self.active || !std::io::stdout().is_terminal() || self.rows.is_empty() {
             return;
         }
         let Ok((_, height)) = crossterm::terminal::size() else {
@@ -231,17 +230,6 @@ impl StatusFooter {
                 },
             ),
         };
-        let paint = |s: &str, c: Color, bold: bool| -> String {
-            if !self.style.color {
-                return s.to_string();
-            }
-            let st = s.with(c);
-            if bold {
-                st.attribute(Attribute::Bold).to_string()
-            } else {
-                st.to_string()
-            }
-        };
         let link = match (&row.state, &row.url) {
             (RowState::Refused(msg), _) => msg.clone(),
             (_, Some(url)) => url.clone(),
@@ -263,6 +251,39 @@ impl StatusFooter {
             .map(|w| w.saturating_sub(fixed).max(8))
             .unwrap_or(usize::MAX);
         let link = truncate_middle(&link, link_w);
+        // The visible text may be truncated; the hyperlink target never is.
+        let href = match (&row.state, &row.url) {
+            (RowState::Refused(_), _) | (_, None) => None,
+            (_, Some(url)) if self.style.links => Some(url.as_str()),
+            _ => None,
+        };
+        self.finish_row(dot, color, name, name_w, &label, &link, href, row)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn finish_row(
+        &self,
+        dot: &str,
+        color: Color,
+        name: &str,
+        name_w: usize,
+        label: &str,
+        link: &str,
+        href: Option<&str>,
+        row: &ServiceRow,
+    ) -> String {
+        let paint = |s: &str, c: Color, bold: bool| -> String {
+            if !self.style.color {
+                return s.to_string();
+            }
+            let st = s.with(c);
+            if bold {
+                st.attribute(Attribute::Bold).to_string()
+            } else {
+                st.to_string()
+            }
+        };
+        let arrow = "\u{2192}";
 
         // Public link in the service's own hue (it *is* the service's
         // identity), label in the state colour, local target muted: the eye
@@ -270,6 +291,11 @@ impl StatusFooter {
         let link_color = match row.state {
             RowState::Refused(_) => Color::Red,
             _ => crate::log::service_color(name),
+        };
+        let link = paint(link, link_color, false);
+        let link = match href {
+            Some(url) => crate::ui::osc8(url, &link),
+            None => link,
         };
         format!(
             "{} {}  {}  {}  {}  {}",
@@ -280,7 +306,7 @@ impl StatusFooter {
                 true
             ),
             paint(&format!("{label:<11}"), color, false),
-            paint(&link, link_color, false),
+            link,
             paint(arrow, Color::DarkGrey, false),
             paint(&row.target, Color::DarkGrey, false),
         )

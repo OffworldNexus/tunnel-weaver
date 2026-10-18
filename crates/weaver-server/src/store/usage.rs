@@ -276,9 +276,9 @@ mod tests {
     #[tokio::test]
     async fn upsert_increments_and_rejects_out_of_range() {
         let store = Store::connect("sqlite::memory:").await.expect("connect");
-        let alice = store.create_person("Alice").await.expect("person");
+        let alice = store.create_test_person("Alice").await.expect("person");
         let laptop = store
-            .create_machine(alice.id, "Laptop")
+            .create_machine(alice.id, "Laptop", &weaver_mux::KeyId::Ed25519([1; 32]))
             .await
             .expect("machine");
         let svc = store
@@ -349,9 +349,9 @@ mod tests {
     #[tokio::test]
     async fn query_filters_and_open_ms_inversion() {
         let store = Store::connect("sqlite::memory:").await.expect("connect");
-        let alice = store.create_person("Alice").await.expect("person");
+        let alice = store.create_test_person("Alice").await.expect("person");
         let laptop = store
-            .create_machine(alice.id, "Laptop")
+            .create_machine(alice.id, "Laptop", &weaver_mux::KeyId::Ed25519([1; 32]))
             .await
             .expect("machine");
         let web = store

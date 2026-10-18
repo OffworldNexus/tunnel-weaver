@@ -11,9 +11,10 @@
 	import { valibot } from 'sveltekit-superforms/adapters';
 	import { api, messageOf } from '#lib/account/api';
 	import { clearFlow, loadFlow, saveFlow } from '#lib/account/flow';
+	import { loadPairing } from '#lib/account/pairing';
 	import { notify } from '#lib/account/notices';
 	import { signInSchema } from '#lib/account/schemas';
-	import { href } from '#lib/app/paths';
+	import { href, safeNext } from '#lib/app/paths';
 	import Altcha from '#lib/account/Altcha.svelte';
 	import Keycap from '#lib/ui/Keycap.svelte';
 	import Page from '#lib/ui/Page.svelte';
@@ -50,8 +51,12 @@
 						}
 					});
 					if (res.ok && res.data?.ok) {
+						// Return where the person was headed: `/pair` when a pairing
+						// detour sent them here (across tabs, so read the shared store,
+						// not the tab-scoped flow), else the account shell.
+						const next = loadPairing().next;
 						clearFlow();
-						await goto(href('/app'));
+						await goto(href(safeNext(next)));
 						return;
 					}
 					sf.message.set(

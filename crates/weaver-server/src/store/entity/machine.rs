@@ -1,4 +1,9 @@
 //! `machine` table: client machines belonging to a person.
+//!
+//! A machine holds exactly one key, and the key alone identifies it: `key_id`
+//! is unique, so resolving a connecting key is a single indexed lookup.
+//! Replacing a machine's key overwrites `key_id` in place; the history of keys
+//! lives in the write-only `machine_key_log`.
 
 use sea_orm::entity::prelude::*;
 
@@ -10,6 +15,9 @@ pub struct Model {
     pub person_id: i32,
     pub name: String,
     pub created_at: i64,
+    /// The machine's public key, canonical text form (`p256:<hex>`).
+    #[sea_orm(unique)]
+    pub key_id: String,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
@@ -21,8 +29,6 @@ pub enum Relation {
         on_delete = "Cascade"
     )]
     Person,
-    #[sea_orm(has_many = "super::machine_key::Entity")]
-    MachineKeys,
     #[sea_orm(has_many = "super::service::Entity")]
     Services,
 }
@@ -30,12 +36,6 @@ pub enum Relation {
 impl Related<super::person::Entity> for Entity {
     fn to() -> RelationDef {
         Relation::Person.def()
-    }
-}
-
-impl Related<super::machine_key::Entity> for Entity {
-    fn to() -> RelationDef {
-        Relation::MachineKeys.def()
     }
 }
 

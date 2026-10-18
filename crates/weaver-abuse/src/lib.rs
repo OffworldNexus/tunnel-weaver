@@ -51,7 +51,7 @@ pub use altcha::solve_challenge;
 pub use altcha::{
     AltchaClient, AltchaError, Challenge, ConsumeKey, ConsumeOutcome, ConsumeRequest,
     CreateRequest, Payload, ProofError, ProofStore, Verified, VerifyRequest, create_challenge,
-    verify_and_consume, verify_solution,
+    try_solve_challenge, verify_and_consume, verify_solution,
 };
 pub use context::RequestContext;
 pub use gate::{Admission, Gate, GateError};

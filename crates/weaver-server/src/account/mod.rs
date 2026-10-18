@@ -1,4 +1,4 @@
-//! The account plane (WVR-36): signup, email verification, password, login and
+//! The account plane: signup, email verification, password, login and
 //! logout.
 //!
 //! Served from the admin host only, behind an axum router mounted inside the
@@ -8,6 +8,7 @@
 //! The plane is always on; [`crate::config::AccountConfig`] only tunes it. The
 //! runtime is built once at startup and shared through the edge config.
 
+pub mod pairing;
 pub mod password;
 pub mod router;
 pub mod session;
@@ -30,6 +31,9 @@ pub struct AccountRuntime {
     pub passwords: Arc<Passwords>,
     pub sessions: Sessions,
     pub config: AccountConfig,
+    /// The in-memory registry of pending pairings. Not persisted: a
+    /// pending pairing lives only as long as the CLI's channel.
+    pub pairings: pairing::Pairings,
     /// Absolute HTTPS base URL of the account plane (e.g. `https://admin.host`).
     pub base_url: String,
     /// A precomputed hash verified against when no account matches, so login
@@ -111,6 +115,7 @@ impl AccountRuntime {
             passwords: Arc::new(passwords),
             sessions,
             config: config.clone(),
+            pairings: pairing::Pairings::new(),
             base_url,
             dummy_hash,
             support_email,

@@ -305,7 +305,7 @@ async fn test_control_socket_daemon_suite() {
         assert_eq!(val["ok"], true);
         assert_eq!(val["tunnel_domain"], "weaver.test");
         assert_eq!(val["admin_domain"], "relay-admin.test");
-        assert_eq!(val["schema_version"], 5);
+        assert_eq!(val["schema_version"], 1);
         // The seeded tunnel wildcard reports issued; the admin certificate has
         // no stored row and is still pending, so it counts as ordering.
         assert_eq!(val["cert_counts"]["issued"], 1);
@@ -814,8 +814,11 @@ async fn test_usage_control_verb_and_cli() {
     );
 
     // Seed one service and drive the manager's own loop so open time accrues.
-    let alice = store.create_person("Alice").await.unwrap();
-    let laptop = store.create_machine(alice.id, "laptop").await.unwrap();
+    let alice = store.create_test_person("Alice").await.unwrap();
+    let laptop = store
+        .create_machine(alice.id, "laptop", &weaver_mux::KeyId::Ed25519([1; 32]))
+        .await
+        .unwrap();
     let web = store.get_or_create_service(laptop.id, "web").await.unwrap();
 
     let metering = Arc::new(MeteringManager::new(

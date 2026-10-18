@@ -184,6 +184,91 @@ export async function latestMailBySubject(subject, { timeoutMs = 20_000 } = {}) 
   }
 }
 
+// ----- pairing seed ---------------------------------------------------------
+
+/**
+ * Seeds a pending pairing and returns its handle (64 hex characters).
+ *
+ * Test-only endpoint on the capture-mail harness: it lets the browser half of
+ * pairing run without a CLI or a key agent. The harness stands in for the CLI's
+ * channel, so what the terminal would have received is readable afterwards with
+ * {@link pairingOutcome}.
+ *
+ * `target` is `{ machine: '<hostname>' }` for a new machine, or
+ * `{ machineId: <id> }` for an existing machine moving onto a new key.
+ */
+/** A fresh fabricated key byte per seed: a real pairing mints a new key each time. */
+let seedKey = 0;
+
+function nextSeedKey() {
+  seedKey += 1;
+  return ((seedKey - 1) % 254) + 1;
+}
+
+export async function seedPairing(target) {
+  const query = new URLSearchParams({ key: String(nextSeedKey()) });
+  if (target.machineId !== undefined) query.set('machine_id', String(target.machineId));
+  else query.set('machine', target.machine);
+  const response = await fetch(`${harness.mailUrl}/pair/seed?${query}`, { method: 'POST' });
+  if (!response.ok) {
+    throw new Error(`POST ${harness.mailUrl}/pair/seed failed with ${response.status}`);
+  }
+  const body = await response.json();
+  if (typeof body.handle !== 'string' || body.handle.length === 0) {
+    throw new Error(`The pairing seed returned no handle: ${JSON.stringify(body)}`);
+  }
+  if (typeof body.fingerprint !== 'string' || body.fingerprint.length === 0) {
+    throw new Error(`The pairing seed returned no fingerprint: ${JSON.stringify(body)}`);
+  }
+  return { handle: body.handle, fingerprint: body.fingerprint };
+}
+
+/**
+ * The message the seeded "terminal" received on its channel, once one arrived.
+ *
+ * Polls until the relay has sent an outcome (`approved` or `failed`), since the
+ * verdict travels to the channel asynchronously after the browser's request.
+ */
+export async function pairingOutcome(handle) {
+  const deadline = Date.now() + 10_000;
+  for (;;) {
+    const response = await fetch(
+      `${harness.mailUrl}/pair/outcome?handle=${encodeURIComponent(handle)}`
+    );
+    if (!response.ok) {
+      throw new Error(`GET ${harness.mailUrl}/pair/outcome failed with ${response.status}`);
+    }
+    const body = await response.json();
+    if (body.state !== 'pending') return body;
+    if (Date.now() >= deadline) {
+      throw new Error('The terminal never received an outcome for this pairing.');
+    }
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+}
+
+/**
+ * The URL the CLI prints for a handle, built by the product itself.
+ *
+ * The harness builds it with the same `weave::pair::pairing_url` the CLI calls,
+ * so a scenario opens the exact link the terminal prints. A scenario that
+ * hand-built the fragment would validate the test's assumption instead of the
+ * product's contract — and pass while the product was broken.
+ */
+export async function pairingUrl(handle) {
+  const response = await fetch(
+    `${harness.mailUrl}/pair/link?handle=${encodeURIComponent(handle)}`
+  );
+  if (!response.ok) {
+    throw new Error(`GET ${harness.mailUrl}/pair/link failed with ${response.status}`);
+  }
+  const body = await response.json();
+  if (typeof body.url !== 'string' || body.url.length === 0) {
+    throw new Error(`The pair link returned no URL: ${JSON.stringify(body)}`);
+  }
+  return body.url;
+}
+
 /** Drops every captured message. */
 export async function clearMail() {
   const response = await fetch(`${harness.mailUrl}/messages`, { method: 'DELETE' });

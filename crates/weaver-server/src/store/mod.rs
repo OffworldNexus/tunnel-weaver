@@ -22,7 +22,7 @@ use std::time::Duration;
 use sea_orm::sea_query::{Expr, OnConflict};
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectOptions, ConnectionTrait, Database, DatabaseConnection,
-    DbBackend, EntityTrait, QueryFilter, QueryOrder, QuerySelect, Set, Statement,
+    DbBackend, EntityTrait, QueryFilter, QueryOrder, QuerySelect, Set, Statement, TransactionTrait,
 };
 use sea_orm_migration::MigratorTrait;
 
@@ -31,8 +31,8 @@ pub use migration::Migrator;
 
 use crate::config::{Config, ConfigError};
 use entity::{
-    acme_account, cert_event, certificate, challenge, config, domain, machine, machine_key, person,
-    service,
+    acme_account, cert_event, certificate, challenge, config, domain, machine, machine_key_log,
+    person, service,
 };
 use weaver_mux::KeyId;
 
@@ -579,23 +579,28 @@ impl Store {
         Ok(())
     }
 
-    // ----- auth: person, machine, machine_key, service -----
+    // ----- auth: person, machine, key log, service -----
 
-    /// Explicitly creates a new person. Returns an error if the name already exists.
-    pub async fn create_person(&self, name: &str) -> Result<person::Model, StoreError> {
+    /// Creates the person of an account.
+    ///
+    /// An account has exactly one person: a second one for the same account, or
+    /// a name already in use, is refused by the unique indexes and surfaces as
+    /// [`StoreError::Db`].
+    pub async fn create_person(
+        &self,
+        account_id: i32,
+        name: &str,
+    ) -> Result<person::Model, StoreError> {
         let lower = name.to_ascii_lowercase();
         if !names::is_valid_person_or_machine(&lower) {
             return Err(StoreError::InvalidName(format!(
                 "person '{name}' must match ^[a-z0-9]{{1,15}}$"
             )));
         }
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64;
         let new_person = person::ActiveModel {
             name: Set(lower),
-            created_at: Set(now),
+            account_id: Set(account_id),
+            created_at: Set(unix_secs()),
             ..Default::default()
         };
         Ok(new_person.insert(&self.db).await?)
@@ -613,11 +618,52 @@ impl Store {
             .await?)
     }
 
-    /// Explicitly creates a new machine under a person. Returns an error if the machine name already exists for that person.
+    /// Fetches the person of an account, if it has one yet.
+    pub async fn person_by_account(
+        &self,
+        account_id: i32,
+    ) -> Result<Option<person::Model>, StoreError> {
+        Ok(person::Entity::find()
+            .filter(person::Column::AccountId.eq(account_id))
+            .one(&self.db)
+            .await?)
+    }
+
+    /// Every person name, for slug uniqueness.
+    ///
+    /// Person slugs are globally unique (they are the zone's first label), so
+    /// the uniqueness probe needs the whole set. It is small: one row per
+    /// person, not per machine.
+    pub async fn list_person_names(&self) -> Result<Vec<String>, StoreError> {
+        Ok(person::Entity::find()
+            .all(&self.db)
+            .await?
+            .into_iter()
+            .map(|p| p.name)
+            .collect())
+    }
+
+    /// A person's machine names, for the per-person machine uniqueness rule.
+    pub async fn list_machine_names(&self, person_id: i32) -> Result<Vec<String>, StoreError> {
+        Ok(machine::Entity::find()
+            .filter(machine::Column::PersonId.eq(person_id))
+            .all(&self.db)
+            .await?
+            .into_iter()
+            .map(|m| m.name)
+            .collect())
+    }
+
+    /// Creates a machine under a person, holding `key_id`, and opens its key
+    /// log row.
+    ///
+    /// A name already used by the person, or a key already held by any machine,
+    /// is refused by the unique indexes and surfaces as [`StoreError::Db`].
     pub async fn create_machine(
         &self,
         person_id: i32,
         name: &str,
+        key_id: &KeyId,
     ) -> Result<machine::Model, StoreError> {
         let lower = name.to_ascii_lowercase();
         if !names::is_valid_person_or_machine(&lower) {
@@ -625,17 +671,26 @@ impl Store {
                 "machine '{name}' must match ^[a-z0-9]{{1,15}}$"
             )));
         }
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64;
-        let new_machine = machine::ActiveModel {
+        let now = unix_secs();
+        let key = format_key_id(key_id);
+        let txn = self.db.begin().await?;
+        let created = machine::ActiveModel {
             person_id: Set(person_id),
             name: Set(lower),
             created_at: Set(now),
+            key_id: Set(key.clone()),
             ..Default::default()
-        };
-        Ok(new_machine.insert(&self.db).await?)
+        }
+        .insert(&txn)
+        .await?;
+        open_key_log(&txn, &created, now).await?;
+        txn.commit().await?;
+        Ok(created)
+    }
+
+    /// Fetches a machine by its id.
+    pub async fn machine_by_id(&self, id: i32) -> Result<Option<machine::Model>, StoreError> {
+        Ok(machine::Entity::find_by_id(id).one(&self.db).await?)
     }
 
     /// Fetches a machine by person ID and lowercase name.
@@ -652,51 +707,119 @@ impl Store {
             .await?)
     }
 
-    /// Associates an authorized public key identifier with a machine.
+    /// Resolves a key to the machine holding it and that machine's person.
     ///
-    /// Keys are only ever enrolled explicitly — there is no implicit
-    /// creation at authentication time, so a duplicate `key_id` is an error.
-    pub async fn add_machine_key(
+    /// This is the identity path: it reads `machine.key_id` and nothing else.
+    pub async fn machine_by_key(
         &self,
-        machine_id: i32,
         key_id: &KeyId,
-    ) -> Result<machine_key::Model, StoreError> {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64;
-        let new_key = machine_key::ActiveModel {
-            machine_id: Set(machine_id),
-            key_id: Set(format_key_id(key_id)),
-            created_at: Set(now),
-            ..Default::default()
+    ) -> Result<Option<(person::Model, machine::Model)>, StoreError> {
+        let Some((mach, Some(pers))) = machine::Entity::find()
+            .filter(machine::Column::KeyId.eq(format_key_id(key_id)))
+            .find_also_related(person::Entity)
+            .one(&self.db)
+            .await?
+        else {
+            return Ok(None);
         };
-        Ok(new_key.insert(&self.db).await?)
+        Ok(Some((pers, mach)))
     }
 
-    /// Resolves an incoming `KeyId` to its registered `(person, machine, machine_key)` tuple.
-    pub async fn resolve_key(
+    /// Moves a machine onto a new key: the old key stops working at once.
+    ///
+    /// In one transaction: `machine.key_id` is overwritten, the old key's log
+    /// row is closed as replaced, and a row is opened for the new one. The
+    /// machine keeps its id, name, services and hostnames. A key already held
+    /// by another machine is refused by the unique index ([`StoreError::Db`]);
+    /// an unknown machine is [`StoreError::Conflict`].
+    pub async fn replace_machine_key(
+        &self,
+        machine_id: i32,
+        new_key: &KeyId,
+    ) -> Result<machine::Model, StoreError> {
+        let now = unix_secs();
+        let txn = self.db.begin().await?;
+        let Some(current) = machine::Entity::find_by_id(machine_id).one(&txn).await? else {
+            txn.rollback().await?;
+            return Err(StoreError::Conflict(format!(
+                "no machine with id {machine_id}"
+            )));
+        };
+        close_key_log(
+            &txn,
+            current.id,
+            &current.key_id,
+            machine_key_log::REASON_REPLACED,
+            now,
+        )
+        .await?;
+        let mut active: machine::ActiveModel = current.into();
+        active.key_id = Set(format_key_id(new_key));
+        let updated = active.update(&txn).await?;
+        open_key_log(&txn, &updated, now).await?;
+        txn.commit().await?;
+        Ok(updated)
+    }
+
+    /// Revokes the machine holding `key_id`: deletes it — cascading to its
+    /// services, so its hostnames stop being owned — and closes its key log row
+    /// as revoked, atomically.
+    ///
+    /// The name is freed, so a later pairing may propose it again. Returns the
+    /// revoked machine, or `None` when the key was not held by any machine
+    /// (already revoked: the goal state).
+    pub async fn revoke_machine(
         &self,
         key_id: &KeyId,
-    ) -> Result<Option<(person::Model, machine::Model, machine_key::Model)>, StoreError> {
-        let key_str = format_key_id(key_id);
-        let Some((mkey, Some(mach))) = machine_key::Entity::find()
-            .filter(machine_key::Column::KeyId.eq(&key_str))
-            .find_also_related(machine::Entity)
-            .one(&self.db)
+    ) -> Result<Option<machine::Model>, StoreError> {
+        let now = unix_secs();
+        let txn = self.db.begin().await?;
+        let Some(found) = machine::Entity::find()
+            .filter(machine::Column::KeyId.eq(format_key_id(key_id)))
+            .one(&txn)
             .await?
         else {
+            txn.rollback().await?;
             return Ok(None);
         };
+        machine::Entity::delete_by_id(found.id).exec(&txn).await?;
+        close_key_log(
+            &txn,
+            found.id,
+            &found.key_id,
+            machine_key_log::REASON_REVOKED,
+            now,
+        )
+        .await?;
+        txn.commit().await?;
+        Ok(Some(found))
+    }
 
-        let Some(pers) = person::Entity::find_by_id(mach.person_id)
-            .one(&self.db)
-            .await?
-        else {
-            return Ok(None);
-        };
+    /// Deletes key log rows retired before `cutoff` (Unix seconds). Rows of
+    /// current keys are never deleted, however old.
+    pub async fn sweep_machine_key_log(&self, cutoff: i64) -> Result<u64, StoreError> {
+        let result = machine_key_log::Entity::delete_many()
+            .filter(machine_key_log::Column::RetiredAt.is_not_null())
+            .filter(machine_key_log::Column::RetiredAt.lt(cutoff))
+            .exec(&self.db)
+            .await?;
+        Ok(result.rows_affected)
+    }
 
-        Ok(Some((pers, mach, mkey)))
+    /// Creates an active account named `name` with its person of the same
+    /// name, for tests that need an identity without the signup flow.
+    #[cfg(any(test, feature = "test-util"))]
+    pub async fn create_test_person(&self, name: &str) -> Result<person::Model, StoreError> {
+        let account = entity::account::ActiveModel {
+            name: Set(name.to_string()),
+            state: Set("active".to_string()),
+            created_at: Set(0),
+            activated_at: Set(0),
+            ..Default::default()
+        }
+        .insert(&self.db)
+        .await?;
+        self.create_person(account.id, name).await
     }
 
     /// Fetches an existing service by machine ID and lowercase name, or creates a new one.
@@ -768,7 +891,7 @@ impl Store {
     /// it to `hostname`.
     ///
     /// This never enrols identities: the person and machine behind `key_id`
-    /// must already exist (they are resolved from `machine_key`), otherwise
+    /// must already exist (they are resolved from `machine.key_id`), otherwise
     /// [`StoreError::KeyNotEnrolled`] is returned. Declaring the same service
     /// twice is idempotent — the existing `service` row is reused.
     pub async fn register_declared_service(
@@ -777,7 +900,7 @@ impl Store {
         hostname: &str,
         service: &str,
     ) -> Result<service::Model, StoreError> {
-        let Some((_, machine, _)) = self.resolve_key(key_id).await? else {
+        let Some((_, machine)) = self.machine_by_key(key_id).await? else {
             return Err(StoreError::KeyNotEnrolled);
         };
         let svc = self.get_or_create_service(machine.id, service).await?;
@@ -1014,8 +1137,60 @@ impl From<cert_event::Model> for CertEventRecord {
     }
 }
 
-/// Formats a `KeyId` into canonical prefixed text representation.
-fn format_key_id(key_id: &KeyId) -> String {
+/// Unix seconds from the wall clock.
+fn unix_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
+}
+
+/// Opens the key log row for the key `machine` now holds.
+async fn open_key_log(
+    db: &impl ConnectionTrait,
+    machine: &machine::Model,
+    now: i64,
+) -> Result<(), StoreError> {
+    machine_key_log::ActiveModel {
+        key_id: Set(machine.key_id.clone()),
+        machine_id: Set(machine.id),
+        person_id: Set(machine.person_id),
+        added_at: Set(now),
+        retired_at: Set(None),
+        retired_reason: Set(None),
+        ..Default::default()
+    }
+    .insert(db)
+    .await?;
+    Ok(())
+}
+
+/// Closes the open key log row of `key_id` on `machine_id`.
+async fn close_key_log(
+    db: &impl ConnectionTrait,
+    machine_id: i32,
+    key_id: &str,
+    reason: &str,
+    now: i64,
+) -> Result<(), StoreError> {
+    machine_key_log::Entity::update_many()
+        .col_expr(machine_key_log::Column::RetiredAt, Expr::value(Some(now)))
+        .col_expr(
+            machine_key_log::Column::RetiredReason,
+            Expr::value(Some(reason.to_string())),
+        )
+        .filter(machine_key_log::Column::MachineId.eq(machine_id))
+        .filter(machine_key_log::Column::KeyId.eq(key_id))
+        .filter(machine_key_log::Column::RetiredAt.is_null())
+        .exec(db)
+        .await?;
+    Ok(())
+}
+
+/// Formats a `KeyId` into its canonical text form (`p256:<hex>`,
+/// `ed25519:<hex>`): the spelling `machine.key_id` stores and the fingerprint a
+/// person is shown.
+pub fn format_key_id(key_id: &KeyId) -> String {
     use std::fmt::Write;
     match key_id {
         KeyId::Ed25519(bytes) => {
@@ -1035,7 +1210,7 @@ fn format_key_id(key_id: &KeyId) -> String {
     }
 }
 
-/// Parses a stored `machine_key.key_id` back into a [`KeyId`].
+/// Parses a stored `machine.key_id` back into a [`KeyId`].
 ///
 /// This is the inverse of [`format_key_id`]; it lets callers (the identity
 /// resolver) serve the *stored* key material rather than trusting the key the

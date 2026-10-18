@@ -183,21 +183,49 @@ pub fn verify_solution(req: VerifyRequest<'_>) -> Result<Verified, ProofError> {
 /// browser. It is not compiled unless the `test-util` feature is on.
 #[cfg(feature = "test-util")]
 pub fn solve_challenge(challenge: &Challenge) -> Solution {
+    // Deliberately unchecked: tests solve challenges the verifier must then
+    // refuse (an unsupported algorithm, say), so this solves whatever it is given.
+    solve_within(challenge, u32::MAX).expect("challenge is solvable")
+}
+
+/// Solve a challenge received from someone else, within bounds.
+///
+/// The browser's solver is the ALTCHA widget; this is everyone else's (the
+/// `weave` CLI solves its pairing challenge with it). The challenge comes off
+/// the network, so nothing about it is trusted: malformed hex, an unsupported
+/// algorithm, a cost above `max_cost` or no solution within `max_counter`
+/// attempts all yield `None` rather than a panic or an unbounded spin.
+/// Blocking and CPU-bound: run it on a blocking thread.
+pub fn try_solve_challenge(
+    challenge: &Challenge,
+    max_cost: u32,
+    max_counter: u32,
+) -> Option<Solution> {
     let params = &challenge.parameters;
-    let nonce = hex::decode(&params.nonce).expect("challenge nonce is hex");
-    let salt = hex::decode(&params.salt).expect("challenge salt is hex");
-    for counter in 0u32.. {
+    if params.algorithm != SUPPORTED_ALGORITHM || params.cost > max_cost || params.key_length > 64 {
+        return None;
+    }
+    solve_within(challenge, max_counter)
+}
+
+/// Brute-forces counters `0..=max_counter` with PBKDF2-HMAC-SHA-256, whatever
+/// the challenge names as its algorithm.
+fn solve_within(challenge: &Challenge, max_counter: u32) -> Option<Solution> {
+    let params = &challenge.parameters;
+    let nonce = hex::decode(&params.nonce).ok()?;
+    let salt = hex::decode(&params.salt).ok()?;
+    for counter in 0..=max_counter {
         let password = build_password(&nonce, counter);
         let derived = derive_key(params.cost, params.key_length, &salt, &password);
         if key_prefix_matches(&params.key_prefix, &derived) {
-            return Solution {
+            return Some(Solution {
                 counter,
                 derived_key: hex::encode(&derived),
                 time: None,
-            };
+            });
         }
     }
-    unreachable!("uint32 counter space is exhausted")
+    None
 }
 
 /// Derive the key for one counter with PBKDF2-HMAC-SHA-256.

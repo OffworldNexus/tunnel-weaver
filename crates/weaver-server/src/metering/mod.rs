@@ -526,9 +526,9 @@ mod tests {
     /// test can inspect persisted rows without the live in-memory blend.
     async fn manager_with_store() -> (MeteringManager, i32, Store) {
         let store = Store::connect("sqlite::memory:").await.expect("store");
-        let alice = store.create_person("alice").await.expect("person");
+        let alice = store.create_test_person("alice").await.expect("person");
         let laptop = store
-            .create_machine(alice.id, "laptop")
+            .create_machine(alice.id, "laptop", &weaver_mux::KeyId::Ed25519([1; 32]))
             .await
             .expect("machine");
         let svc = store

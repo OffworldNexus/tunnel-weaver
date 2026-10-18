@@ -15,7 +15,10 @@ import {
   latestResetLink as readLatestResetLink,
   latestVerificationLink as readLatestVerificationLink,
   messages as readMessages,
-  resetLinks as readResetLinks
+  pairingOutcome,
+  pairingUrl,
+  resetLinks as readResetLinks,
+  seedPairing
 } from './harness.js';
 
 export class WeaverWorld extends World {
@@ -33,6 +36,12 @@ export class WeaverWorld extends World {
     this.password = '';
     /** The reset link taken from the capture mailbox (WVR-41). */
     this.resetLink = '';
+    /** The pairing seeded for this scenario, and machines approved in it by name. */
+    this.pairingFingerprint = '';
+    this.pairingHandle = '';
+    this.pairedMachines = {};
+    /** Every request URL the page issued, so a handle leak can be disproved. */
+    this.requestUrls = [];
 
     // Bind mailbox helpers so they can be pulled off `this` in steps.
     this.messages = readMessages;
@@ -41,6 +50,9 @@ export class WeaverWorld extends World {
     this.latestResetLink = readLatestResetLink;
     this.latestMailBySubject = readLatestMailBySubject;
     this.resetLinks = readResetLinks;
+    this.seedPairing = seedPairing;
+    this.pairingUrl = pairingUrl;
+    this.pairingOutcome = pairingOutcome;
   }
 
   /** An absolute URL for a route path (`/`, `/sign-up`, …). */

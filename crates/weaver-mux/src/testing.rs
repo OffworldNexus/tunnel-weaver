@@ -113,12 +113,13 @@ impl Ed25519TestSigner {
     }
 }
 
+#[async_trait::async_trait]
 impl Signer for Ed25519TestSigner {
     fn key_id(&self) -> KeyId {
         KeyId::Ed25519(self.key.verifying_key().to_bytes())
     }
 
-    fn sign(&mut self, msg: &[u8]) -> Result<Signature, SignError> {
+    async fn sign(&mut self, msg: &[u8]) -> Result<Signature, SignError> {
         let sig: ed25519_dalek::Signature = self.key.sign(msg);
         Ok(Signature::Ed25519(sig.to_bytes()))
     }
@@ -158,12 +159,13 @@ impl P256TestSigner {
     }
 }
 
+#[async_trait::async_trait]
 impl Signer for P256TestSigner {
     fn key_id(&self) -> KeyId {
         KeyId::P256(self.compressed())
     }
 
-    fn sign(&mut self, msg: &[u8]) -> Result<Signature, SignError> {
+    async fn sign(&mut self, msg: &[u8]) -> Result<Signature, SignError> {
         let sig: p256::ecdsa::Signature = self.key.sign(msg);
         let mut out = [0u8; 64];
         out.copy_from_slice(&sig.to_bytes());
@@ -174,12 +176,13 @@ impl Signer for P256TestSigner {
 /// A signer that always fails, for exercising the `SignError` path.
 pub struct FailingSigner(pub KeyId);
 
+#[async_trait::async_trait]
 impl Signer for FailingSigner {
     fn key_id(&self) -> KeyId {
         self.0
     }
 
-    fn sign(&mut self, _msg: &[u8]) -> Result<Signature, SignError> {
+    async fn sign(&mut self, _msg: &[u8]) -> Result<Signature, SignError> {
         Err(SignError("test signer refuses".into()))
     }
 }

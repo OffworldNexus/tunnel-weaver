@@ -1,4 +1,4 @@
-//! The account plane's axum router (WVR-36).
+//! The account plane's axum router.
 //!
 //! Mounted by the hyper edge for the admin host's `/account` and `/api/account`
 //! namespaces only. Every authentication decision lives here or below; the
@@ -27,6 +27,7 @@ use serde_json::{Value, json};
 use weaver_abuse::AltchaError;
 
 use crate::account::AccountRuntime;
+use crate::account::pairing;
 use crate::account::session::{self, CSRF_COOKIE, CSRF_HEADER, SESSION_COOKIE};
 use crate::email::{Mailbox, PasswordChanged, Reset, Verification, Welcome};
 use crate::store::StoreError;
@@ -35,6 +36,9 @@ use crate::store::account::{
     NewVerificationToken, ResetRequest,
 };
 use crate::store::entity::pending_registration;
+use crate::store::entity::{account, machine, person};
+use crate::store::names;
+use weaver_proto::pair;
 
 /// Purpose bound into an email-ownership verification token.
 const PURPOSE_EMAIL_VERIFICATION: &str = "email-verification";
@@ -63,6 +67,9 @@ pub fn router(runtime: Arc<AccountRuntime>) -> Router {
         .route("/api/account/me", get(me))
         .route("/api/account/logout", post(logout))
         .route("/api/account/password", post(change_password))
+        .route("/api/account/pair/lookup", post(pair_lookup))
+        .route("/api/account/pair/accept", post(pair_accept))
+        .route("/api/account/pair/reject", post(pair_reject))
         .fallback(spa)
         .with_state(runtime)
 }
@@ -736,7 +743,7 @@ async fn me(State(rt): State<Arc<AccountRuntime>>, headers: HeaderMap) -> Respon
                 .ok()
                 .flatten()
                 .map(|identity| identity.email);
-            // Drives the Security page's "Password is set" state (WVR-50): a live
+            // Drives the Security page's "Password is set" state: a live
             // credential exists for every email/password account today, but the
             // flag keeps the panel honest once passkeys or SSO arrive.
             let has_password = rt
@@ -766,6 +773,328 @@ async fn logout(State(rt): State<Arc<AccountRuntime>>, headers: HeaderMap) -> Re
         json_ok(json!({ "ok": true })),
         rt.sessions.clear_session_cookie(),
     )
+}
+
+/// Resolves the signed-in account from the session cookie.
+async fn signed_in(rt: &AccountRuntime, headers: &HeaderMap) -> Option<account::Model> {
+    let raw = session::cookie(headers, SESSION_COOKIE)?;
+    rt.sessions.account(&raw, unix_now()).await.ok().flatten()
+}
+
+/// A pairing action's answer.
+fn action(ok: bool, message: Option<&str>) -> Response {
+    let response = pair::ActionResponse {
+        ok,
+        message: message.map(str::to_string),
+    };
+    json_ok(serde_json::to_value(&response).unwrap_or(Value::Null))
+}
+
+const NO_LONGER_WAITING: &str = "This pairing request is no longer waiting.";
+const NOT_YOUR_MACHINE: &str = "That machine does not belong to this account.";
+const COULD_NOT_PAIR: &str = "Could not pair this machine. Try again.";
+
+/// Whether `machine_id` is a machine of `person`.
+async fn owns_machine(
+    rt: &AccountRuntime,
+    person: Option<&person::Model>,
+    machine_id: i32,
+) -> Result<Option<machine::Model>, StoreError> {
+    let Some(person) = person else {
+        return Ok(None);
+    };
+    Ok(rt
+        .store
+        .machine_by_id(machine_id)
+        .await?
+        .filter(|machine| machine.person_id == person.id))
+}
+
+/// `POST /api/account/pair/lookup` — resolve a handle without consuming it.
+///
+/// The handle arrives in the body, never the query, so it cannot reach a log or
+/// a `Referer`. A missing handle is answered with `gone`, which the SPA renders
+/// as "this request is no longer waiting" rather than an error.
+async fn pair_lookup(
+    State(rt): State<Arc<AccountRuntime>>,
+    headers: HeaderMap,
+    Json(req): Json<pair::HandleRequest>,
+) -> Response {
+    let Some(account) = signed_in(&rt, &headers).await else {
+        return err(StatusCode::UNAUTHORIZED, "not signed in");
+    };
+    let Some(view) = rt.pairings.view(&req.handle) else {
+        return json_ok(serde_json::to_value(pair::LookupResponse::Gone).unwrap_or(Value::Null));
+    };
+    match lookup(&rt, &account, &view).await {
+        Ok(response) => json_ok(serde_json::to_value(&response).unwrap_or(Value::Null)),
+        Err(e) => {
+            tracing::warn!(error = %e, "pairing lookup failed");
+            err(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "temporarily unavailable; please try again",
+            )
+        }
+    }
+}
+
+async fn lookup(
+    rt: &AccountRuntime,
+    account: &account::Model,
+    view: &pairing::PendingView,
+) -> Result<pair::LookupResponse, String> {
+    let person = rt
+        .store
+        .person_by_account(account.id)
+        .await
+        .map_err(|e| e.to_string())?;
+    let (person, machine) = match &view.target {
+        pair::Target::Existing { machine_id } => {
+            let Some(machine) = owns_machine(rt, person.as_ref(), *machine_id)
+                .await
+                .map_err(|e| e.to_string())?
+            else {
+                return Ok(pair::LookupResponse::NotYourMachine);
+            };
+            let person = person.map(|p| p.name).unwrap_or_default();
+            (
+                pair::Proposed {
+                    name: person,
+                    is_new: false,
+                },
+                pair::Proposed {
+                    name: machine.name,
+                    is_new: false,
+                },
+            )
+        }
+        pair::Target::New { hostname } => {
+            let machine =
+                pairing::unique_machine_name(&rt.store, person.as_ref(), hostname).await?;
+            let person = match person {
+                Some(person) => pair::Proposed {
+                    name: person.name,
+                    is_new: false,
+                },
+                None => pair::Proposed {
+                    name: pairing::propose_person_slug(&rt.store, account).await?,
+                    is_new: true,
+                },
+            };
+            (
+                person,
+                pair::Proposed {
+                    name: machine,
+                    is_new: true,
+                },
+            )
+        }
+    };
+    Ok(pair::LookupResponse::Waiting {
+        fingerprint: pairing::fingerprint(&view.key_id),
+        account: account.name.clone(),
+        person,
+        machine,
+    })
+}
+
+/// `POST /api/account/pair/accept` — approve the pending pairing.
+///
+/// The request is validated against the pending pairing first, so a name the
+/// person can fix leaves the handle waiting. Only then is the handle consumed
+/// — single use even if the writes fail — and the outcome pushed down the CLI's
+/// channel.
+async fn pair_accept(
+    State(rt): State<Arc<AccountRuntime>>,
+    headers: HeaderMap,
+    Json(req): Json<pair::AcceptRequest>,
+) -> Response {
+    if !origin_ok(&headers, &rt.base_url) || !csrf_ok(&headers) {
+        return err(StatusCode::FORBIDDEN, "request refused");
+    }
+    let Some(account) = signed_in(&rt, &headers).await else {
+        return err(StatusCode::UNAUTHORIZED, "not signed in");
+    };
+    let Some(view) = rt.pairings.view(&req.handle) else {
+        return action(false, Some(NO_LONGER_WAITING));
+    };
+    let person = match rt.store.person_by_account(account.id).await {
+        Ok(person) => person,
+        Err(e) => {
+            tracing::warn!(error = %e, "pairing: person lookup failed");
+            return action(false, Some(COULD_NOT_PAIR));
+        }
+    };
+
+    // Names the person may not set here are refused while the request is
+    // still waiting, so the page can correct itself.
+    let new_person_slug = match &view.target {
+        pair::Target::Existing { .. } => {
+            if req.person_slug.is_some() || req.machine_name.is_some() {
+                return action(
+                    false,
+                    Some("A machine that moves onto a new key keeps its names."),
+                );
+            }
+            None
+        }
+        pair::Target::New { .. } => match (&person, &req.person_slug) {
+            (Some(existing), Some(_)) => {
+                return action(
+                    false,
+                    Some(&format!(
+                        "This account's person name is already '{}' and cannot be changed here.",
+                        existing.name
+                    )),
+                );
+            }
+            (Some(_), None) => None,
+            (None, None) => return action(false, Some("Choose a person name.")),
+            (None, Some(slug)) => match validate_person_slug(&rt, slug).await {
+                Ok(slug) => Some(slug),
+                Err(message) => return action(false, Some(&message)),
+            },
+        },
+    };
+
+    let Some(taken) = rt.pairings.take(&req.handle) else {
+        return action(false, Some(NO_LONGER_WAITING));
+    };
+    match approve(
+        &rt,
+        &account,
+        person,
+        new_person_slug,
+        req.machine_name,
+        &taken,
+    )
+    .await
+    {
+        Ok(approved) => {
+            taken.finish(approved);
+            action(true, None)
+        }
+        Err((code, message)) => {
+            taken.fail(code, message);
+            action(false, Some(message))
+        }
+    }
+}
+
+/// The person slug a new person may take: valid, and not anyone's yet.
+async fn validate_person_slug(rt: &AccountRuntime, slug: &str) -> Result<String, String> {
+    let slug = slug.trim().to_ascii_lowercase();
+    if !names::is_valid_person_or_machine(&slug) {
+        return Err("A person name is 1 to 15 lowercase letters or digits.".into());
+    }
+    match rt.store.get_person_by_name(&slug).await {
+        Ok(None) => Ok(slug),
+        Ok(Some(_)) => Err(format!(
+            "The person name '{slug}' is taken. Choose another."
+        )),
+        Err(e) => {
+            tracing::warn!(error = %e, "pairing: person name lookup failed");
+            Err(COULD_NOT_PAIR.into())
+        }
+    }
+}
+
+/// Applies an accepted pairing, returning what to tell the CLI.
+async fn approve(
+    rt: &AccountRuntime,
+    account: &account::Model,
+    person: Option<person::Model>,
+    new_person_slug: Option<String>,
+    machine_name: Option<String>,
+    taken: &pairing::Taken,
+) -> Result<pair::ServerMessage, (pair::FailureCode, &'static str)> {
+    let unavailable = |e: StoreError| {
+        tracing::warn!(error = %e, "pairing: could not apply the approval");
+        (pair::FailureCode::Unavailable, COULD_NOT_PAIR)
+    };
+    // The key may have been paired meanwhile, by another request.
+    if rt
+        .store
+        .machine_by_key(&taken.key_id)
+        .await
+        .map_err(unavailable)?
+        .is_some()
+    {
+        return Err((
+            pair::FailureCode::AlreadyPaired,
+            "This device key is already paired.",
+        ));
+    }
+    let (person, machine) = match &taken.target {
+        pair::Target::Existing { machine_id } => {
+            // Ownership is re-checked now: the lookup's answer may be stale.
+            let Some(machine) = owns_machine(rt, person.as_ref(), *machine_id)
+                .await
+                .map_err(unavailable)?
+            else {
+                return Err((pair::FailureCode::NotYourMachine, NOT_YOUR_MACHINE));
+            };
+            let machine = rt
+                .store
+                .replace_machine_key(machine.id, &taken.key_id)
+                .await
+                .map_err(unavailable)?;
+            (person.map(|p| p.name).unwrap_or_default(), machine)
+        }
+        pair::Target::New { hostname } => {
+            let person = match (person, new_person_slug) {
+                (Some(person), _) => person,
+                (None, Some(slug)) => rt
+                    .store
+                    .create_person(account.id, &slug)
+                    .await
+                    .map_err(unavailable)?,
+                (None, None) => return Err((pair::FailureCode::Unavailable, COULD_NOT_PAIR)),
+            };
+            let requested = machine_name.as_deref().unwrap_or(hostname);
+            let name = pairing::unique_machine_name(&rt.store, Some(&person), requested)
+                .await
+                .map_err(|e| {
+                    tracing::warn!(error = %e, "pairing: machine name lookup failed");
+                    (pair::FailureCode::Unavailable, COULD_NOT_PAIR)
+                })?;
+            let machine = rt
+                .store
+                .create_machine(person.id, &name, &taken.key_id)
+                .await
+                .map_err(unavailable)?;
+            (person.name, machine)
+        }
+    };
+    Ok(pair::ServerMessage::Approved {
+        machine_id: machine.id,
+        person,
+        machine: machine.name,
+    })
+}
+
+/// `POST /api/account/pair/reject` — refuse the pending pairing.
+async fn pair_reject(
+    State(rt): State<Arc<AccountRuntime>>,
+    headers: HeaderMap,
+    Json(req): Json<pair::HandleRequest>,
+) -> Response {
+    if !origin_ok(&headers, &rt.base_url) || !csrf_ok(&headers) {
+        return err(StatusCode::FORBIDDEN, "request refused");
+    }
+    if signed_in(&rt, &headers).await.is_none() {
+        return err(StatusCode::UNAUTHORIZED, "not signed in");
+    }
+    match rt.pairings.take(&req.handle) {
+        Some(taken) => {
+            taken.fail(
+                pair::FailureCode::Rejected,
+                "The pairing request was rejected in the browser.",
+            );
+            action(true, None)
+        }
+        None => action(false, Some(NO_LONGER_WAITING)),
+    }
 }
 
 /// `POST /api/account/password` — change the signed-in account's password.
@@ -1036,7 +1365,7 @@ async fn send_reset(rt: &AccountRuntime, name: &str, email: &str, raw: &str) -> 
     Ok(())
 }
 
-/// Composes and sends the "your password was changed" notification (WVR-50).
+/// Composes and sends the "your password was changed" notification.
 ///
 /// Carries the event time and a link to the ordinary, unauthenticated recovery
 /// flow — never a pre-authorised action — so a recipient who does not recognise
@@ -1060,7 +1389,7 @@ async fn send_password_changed(
     Ok(())
 }
 
-/// The password inputs a refusal can be attributed to (WVR-50), so the SPA can
+/// The password inputs a refusal can be attributed to, so the SPA can
 /// render the message on the offending field instead of form-wide.
 const FIELD_CURRENT_PASSWORD: &str = "current_password";
 const FIELD_NEW_PASSWORD: &str = "new_password";

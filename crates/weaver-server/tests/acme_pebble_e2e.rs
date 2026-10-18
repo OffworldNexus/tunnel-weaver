@@ -340,6 +340,15 @@ async fn test_pebble_e2e_tunnel_registration_and_proxying() {
     let dir = tempdir().unwrap();
     let db_path = dir.path().join("weaver.db");
     let store = Arc::new(Store::open(&db_path).await.unwrap());
+    // The development key the client signs with, as `poc`'s machine `laptop`.
+    let poc = store.create_test_person("poc").await.unwrap();
+    store
+        .create_machine(poc.id, "laptop", &{
+            use weaver_mux::auth::Signer as _;
+            weave::Ed25519Signer::dev().key_id()
+        })
+        .await
+        .unwrap();
 
     let http_listener = TcpListener::bind("0.0.0.0:5002").await.unwrap();
     let https_listener = TcpListener::bind("0.0.0.0:5001").await.unwrap();
@@ -498,6 +507,7 @@ async fn test_pebble_e2e_tunnel_registration_and_proxying() {
             target: Target::parse(&format!("http://127.0.0.1:{origin_port}")).unwrap(),
         }],
         server: format!("pebble.test:{https_port}"),
+        signer: weave::SignerSpec::Dev,
         insecure_root_ca: Some(ca_path),
         insecure_targets: Vec::new(),
         preserve_host: Vec::new(),

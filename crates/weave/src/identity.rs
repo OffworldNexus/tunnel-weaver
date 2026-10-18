@@ -1,9 +1,13 @@
-//! Client key material.
+//! The hard-coded development device key.
 //!
-//! Milestone 1 ships one hard-coded development key whose public half the
-//! relay's database is seeded with by its initial migration. Real enrolment
-//! replaces this with a key stored in the OS keychain / TPM behind the same
-//! [`Signer`] trait.
+//! Compiled only with the `dev-signer` feature. A real `weave` holds no key at
+//! all: pairing provisions a P-256 key inside the **tpmd** local
+//! key agent and signs through [`crate::tpm`]. This module exists for the PoC
+//! and the integration tests, which authenticate as the key the relay's initial
+//! migration seeds — so the whole tunnel can be exercised without a key agent.
+//!
+//! It is a cargo feature rather than a runtime switch on purpose: a production
+//! binary must not even contain the seed that the seeded relay would accept.
 
 use ed25519_dalek::Signer as _;
 use weaver_mux::auth::Signer;
@@ -31,12 +35,13 @@ impl Ed25519Signer {
     }
 }
 
+#[async_trait::async_trait]
 impl Signer for Ed25519Signer {
     fn key_id(&self) -> KeyId {
         KeyId::Ed25519(self.key.verifying_key().to_bytes())
     }
 
-    fn sign(&mut self, msg: &[u8]) -> Result<Signature, SignError> {
+    async fn sign(&mut self, msg: &[u8]) -> Result<Signature, SignError> {
         let sig: ed25519_dalek::Signature = self.key.sign(msg);
         Ok(Signature::Ed25519(sig.to_bytes()))
     }

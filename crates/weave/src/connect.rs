@@ -72,3 +72,43 @@ pub async fn connect_tls(
     let tls_stream = connector.connect(server_name, tcp).await?;
     Ok(tls_stream)
 }
+
+/// A WebSocket over TLS to a relay.
+pub type RelaySocket =
+    tokio_tungstenite::WebSocketStream<tokio_rustls::client::TlsStream<tokio::net::TcpStream>>;
+
+/// Opens a WebSocket to `path` on a relay's admin host with `subprotocol`.
+///
+/// `admin_host` is normalised first, and the normalised host — what the relay
+/// compares against — is returned alongside the socket, for use as the mux
+/// server name. The same value is the SNI name and the `Host` header.
+pub async fn dial_relay(
+    admin_host: &str,
+    path: &str,
+    subprotocol: &str,
+    insecure_root_ca: Option<&Path>,
+) -> Result<(RelaySocket, String), Box<dyn std::error::Error + Send + Sync>> {
+    let normalized = crate::host::normalize_admin_host(admin_host)?;
+    let (host, port) = parse_server_address(&normalized)?;
+    let tls_stream = connect_tls(&host, port, insecure_root_ca).await?;
+    let authority = if host.contains(':') {
+        format!("[{host}]")
+    } else {
+        host.clone()
+    };
+    let req = http::Request::builder()
+        .method("GET")
+        .uri(format!("wss://{authority}:{port}{path}"))
+        .header(http::header::HOST, &host)
+        .header(http::header::CONNECTION, "Upgrade")
+        .header(http::header::UPGRADE, "websocket")
+        .header("Sec-WebSocket-Version", "13")
+        .header(
+            "Sec-WebSocket-Key",
+            tokio_tungstenite::tungstenite::handshake::client::generate_key(),
+        )
+        .header("Sec-WebSocket-Protocol", subprotocol)
+        .body(())?;
+    let (ws, _resp) = tokio_tungstenite::client_async_with_config(req, tls_stream, None).await?;
+    Ok((ws, host))
+}

@@ -17,8 +17,6 @@ use bytes::Bytes;
 use http::header::{HeaderName, HeaderValue};
 use hyper::body::Frame;
 use tokio::sync::mpsc::{self, error::TryRecvError};
-use tokio_rustls::client::TlsStream;
-use tokio_tungstenite::WebSocketStream;
 use weaver_mux::{CloseCode, CloseReason, Config, Connection, Event, StreamError, StreamId};
 use weaver_proto::control::{ControlHead, ControlReply};
 use weaver_proto::http::{HttpHead, HttpResponseHead};
@@ -26,24 +24,72 @@ use weaver_proto::policy::{self, HEAD_COMPRESS};
 use weaver_proto::{BodyFrame, Head, ResetCode, encode};
 use weaver_tokio::{Driver, DriverError, Handle, StreamHandler, SystemRng, WsTransport};
 
-use crate::connect::{connect_tls, parse_server_address};
+use crate::connect::dial_relay;
+#[cfg(feature = "dev-signer")]
 use crate::identity::Ed25519Signer;
 use crate::log::{Entry, LogStyle, Phase};
 use crate::pool::Pool;
 use crate::proxy::{BoxError, ExchangeConfig, OutMsg, run_exchange};
 use crate::status::StatusFooter;
 use crate::target::{ServiceSpec, Target};
+use crate::ui::Spinner;
 
 /// Sec-WebSocket-Protocol token both ends must agree on.
 pub const WS_SUBPROTOCOL: &str = "weaver-mux-v1";
+
+/// Where the mux handshake's signature comes from.
+#[derive(Debug, Clone)]
+pub enum SignerSpec {
+    /// The device key held by `tpmd`, resumed by its stored fingerprint.
+    Tpmd {
+        /// The stored `p256:<hex>` fingerprint.
+        key_id: String,
+    },
+    /// The hard-coded development key (feature `dev-signer` only).
+    #[cfg(feature = "dev-signer")]
+    Dev,
+}
+
+/// Builds the mux signer the handshake will use.
+///
+/// The tpmd key is *resumed*, never provisioned: `weave start` must sign with
+/// the key the relay already authorised, so a vanished key is an error the user
+/// resolves by pairing again.
+async fn build_signer(
+    spec: &SignerSpec,
+) -> Result<Box<dyn weaver_mux::auth::Signer + Send>, Box<dyn std::error::Error + Send + Sync>> {
+    match spec {
+        SignerSpec::Tpmd { key_id } => {
+            let key = crate::tpm::resume(key_id).await.map_err(|e| match e {
+                crate::tpm::TpmError::Unavailable(_) => crate::pair::tpm_error(e),
+                other => crate::ui::hinted(
+                    other.to_string(),
+                    "run `weave pair <admin-host>` again to pair a new key",
+                ),
+            })?;
+            if key.created() {
+                return Err(crate::ui::hinted(
+                    "the key agent no longer holds this machine's device key",
+                    "run `weave pair <admin-host>` again to pair a new key",
+                ));
+            }
+            Ok(Box::new(key))
+        }
+        #[cfg(feature = "dev-signer")]
+        SignerSpec::Dev => Ok(Box::new(Ed25519Signer::dev())),
+    }
+}
 
 /// Options for one `weave start` invocation, already parsed from the CLI.
 #[derive(Debug, Clone)]
 pub struct StartOptions {
     /// One `<service>=<target>` per service to expose.
     pub specs: Vec<ServiceSpec>,
-    /// Relay server address (`host` or `host:port`).
+    /// Relay server address (`host` or `host:port`), resolved by the CLI from
+    /// `--server` or the configured default.
     pub server: String,
+    /// Where the device key and its signature come from.
+    pub signer: SignerSpec,
     /// Extra root CA (PEM) for the relay connection.
     pub insecure_root_ca: Option<PathBuf>,
     /// Services whose target certificate verification is disabled.
@@ -100,36 +146,27 @@ pub async fn run_start_with_tokens(
     shutdown_token: tokio_util::sync::CancellationToken,
     release_token: tokio_util::sync::CancellationToken,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let (host, port) = parse_server_address(&opts.server)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    let server = crate::host::normalize_admin_host(&opts.server)?;
 
-    let tls_stream = connect_tls(&host, port, opts.insecure_root_ca.as_deref()).await?;
+    let spinner = Spinner::new("Contacting the key agent\u{2026}");
+    let signer = build_signer(&opts.signer).await?;
+    spinner.set_message(format!("Connecting to {server}\u{2026}"));
+    let (ws_stream, host) = dial_relay(
+        &server,
+        crate::unpair::CONNECT_PATH,
+        WS_SUBPROTOCOL,
+        opts.insecure_root_ca.as_deref(),
+    )
+    .await
+    .map_err(|e| crate::pair::connect_error(&server, e))?;
+    spinner.set_message(format!("Authenticating with {server}\u{2026}"));
 
-    let url = format!("wss://{host}:{port}/_weaver/connect");
-    let req = http::Request::builder()
-        .method("GET")
-        .uri(url)
-        .header(http::header::HOST, &host)
-        .header(http::header::CONNECTION, "Upgrade")
-        .header(http::header::UPGRADE, "websocket")
-        .header("Sec-WebSocket-Version", "13")
-        .header(
-            "Sec-WebSocket-Key",
-            tokio_tungstenite::tungstenite::handshake::client::generate_key(),
-        )
-        .header("Sec-WebSocket-Protocol", WS_SUBPROTOCOL)
-        .body(())?;
-
-    let (ws_stream, _): (WebSocketStream<TlsStream<tokio::net::TcpStream>>, _) =
-        tokio_tungstenite::client_async_with_config(req, tls_stream, None).await?;
-
-    let cfg = Config::client(
-        Box::new(Ed25519Signer::dev()),
-        host.clone(),
-        Box::new(SystemRng),
-    );
+    // The normalised host is the server name the relay's transcript binds.
+    let cfg = Config::client(signer, host, Box::new(SystemRng));
     let conn = Connection::new(cfg, Instant::now());
-    let handler = ProxyHandler::new(&opts);
+    let mut handler = ProxyHandler::new(&opts);
+    handler.server = server.clone();
+    handler.spinner = Some(spinner);
     let driver = Driver::new(conn, WsTransport::new(ws_stream), handler);
     let handle = driver.handle();
     handle.spawn_on({
@@ -162,8 +199,17 @@ pub async fn run_start_with_tokens(
 
     let (mut handler, result) = driver.run().await;
     // Give the terminal back before printing any outcome.
+    if let Some(spinner) = handler.spinner.take() {
+        spinner.clear();
+    }
     handler.footer.uninstall();
     if let Some(err) = handler.failure {
+        if handler.rejected {
+            return Err(crate::ui::hinted(
+                err,
+                format!("if this machine was unpaired there, run `weave pair {server}`"),
+            ));
+        }
         return Err(err.into());
     }
     if !handler.failures.is_empty() {
@@ -175,16 +221,33 @@ pub async fn run_start_with_tokens(
         )
         .into());
     }
+    let lost = |what: String| -> Box<dyn std::error::Error + Send + Sync> {
+        crate::ui::hinted(
+            format!("disconnected from {server}: {what}"),
+            "run `weave start` again to reconnect",
+        )
+    };
     match result {
         Ok(reason) if handler.shutting_down => {
             debug_assert_eq!(reason.code, CloseCode::Shutdown);
+            crate::ui::done(&format!("Disconnected from {server}"));
             Ok(())
         }
-        Ok(reason) => Err(format!("Connection closed by server: {:?}", reason.code).into()),
-        Err(DriverError::TransportClosed) if handler.shutting_down => Ok(()),
-        Err(DriverError::TransportClosed) => Err("Connection closed by relay".into()),
-        Err(DriverError::Protocol(e)) => Err(format!("Mux protocol error: {e}").into()),
-        Err(DriverError::Transport(e)) => Err(format!("WebSocket error: {e}").into()),
+        Ok(reason) if reason.code == CloseCode::KeyRevoked => Err(crate::ui::hinted(
+            format!("{server} revoked this machine's key"),
+            format!("run `weave pair {server}` to pair it again"),
+        )),
+        Ok(reason) => Err(lost(format!(
+            "the relay closed the connection ({:?})",
+            reason.code
+        ))),
+        Err(DriverError::TransportClosed) if handler.shutting_down => {
+            crate::ui::done(&format!("Disconnected from {server}"));
+            Ok(())
+        }
+        Err(DriverError::TransportClosed) => Err(lost("the connection dropped".into())),
+        Err(DriverError::Protocol(e)) => Err(lost(format!("protocol error: {e}"))),
+        Err(DriverError::Transport(e)) => Err(lost(format!("WebSocket error: {e}"))),
     }
 }
 
@@ -241,6 +304,12 @@ pub struct ProxyHandler {
     failures: Vec<String>,
     failure: Option<String>,
     shutting_down: bool,
+    /// The normalised admin host, for status lines.
+    server: String,
+    /// The connecting spinner, until the handshake settles.
+    spinner: Option<Spinner>,
+    /// The relay refused the handshake.
+    rejected: bool,
 }
 
 impl ProxyHandler {
@@ -286,6 +355,9 @@ impl ProxyHandler {
             failures: Vec::new(),
             failure: None,
             shutting_down: false,
+            server: opts.server.clone(),
+            spinner: None,
+            rejected: false,
         }
     }
 
@@ -347,6 +419,8 @@ impl ProxyHandler {
     fn on_control_reply(&mut self, conn: &mut Connection, id: StreamId, msg: &[u8]) {
         let service = self.control.get(&id).cloned().unwrap_or_default();
         match weaver_proto::decode::<ControlReply>(msg) {
+            // Not sent on a registration stream; `weave unpair` uses it.
+            Ok(ControlReply::Revoked) => {}
             Ok(ControlReply::Registered { hostname }) => {
                 let target = self
                     .services
@@ -741,9 +815,25 @@ fn is_long_lived(req: &HttpHead, head: &HttpResponseHead) -> bool {
 impl StreamHandler for ProxyHandler {
     fn on_event(&mut self, conn: &mut Connection, event: Event) {
         match event {
-            Event::Authenticated { .. } => self.register_services(conn),
+            Event::Authenticated { .. } => {
+                if let Some(spinner) = self.spinner.take() {
+                    spinner.done(&format!(
+                        "Connected to {}",
+                        crate::ui::accent(crate::ui::Stream::Err, &self.server)
+                    ));
+                }
+                self.footer.install();
+                self.register_services(conn);
+            }
             Event::Rejected { code, message } => {
-                self.failure = Some(format!("Connection rejected: {message} ({code:?})"));
+                if let Some(spinner) = self.spinner.take() {
+                    spinner.clear();
+                }
+                self.rejected = true;
+                self.failure = Some(format!(
+                    "{} refused the connection: {message} ({code:?})",
+                    self.server
+                ));
             }
             Event::Readable(id) => {
                 if self.control.contains_key(&id) {
