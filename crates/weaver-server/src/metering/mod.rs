@@ -45,6 +45,8 @@
 //!   clamping each bucket's `open_ms` to `0..=60_000`.
 
 use std::collections::HashMap;
+#[cfg(test)]
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -109,21 +111,54 @@ struct Inner {
     streams: HashMap<StreamId, i32>,
 }
 
+/// Where the manager reads its wall clock.
+///
+/// Production reads the system clock. Tests pin a value they move themselves:
+/// on the real clock a minute boundary can fall between two statements of a
+/// test that is asserting about minutes, so the minute the test recorded in is
+/// no longer the current one by the time it flushes or reads back.
+enum Clock {
+    /// The system clock.
+    System,
+    /// A value the caller controls, advanced by the caller rather than by time.
+    #[cfg(test)]
+    Fixed(Arc<AtomicI64>),
+}
+
+impl Clock {
+    /// Unix milliseconds.
+    fn now_ms(&self) -> i64 {
+        match self {
+            Clock::System => unix_ms(),
+            #[cfg(test)]
+            Clock::Fixed(value) => value.load(Ordering::Relaxed),
+        }
+    }
+}
+
 /// Owns traffic metering and its periodic persistence.
 ///
 /// Cheap to share behind an `Arc`: every observation method takes `&self`.
 pub struct MeteringManager {
     store: Store,
     flush_interval: Duration,
+    /// The wall clock. Injected so a test can hold the minute still.
+    clock: Clock,
     inner: Mutex<Inner>,
 }
 
 impl MeteringManager {
     /// Creates a manager that flushes every `flush_interval`.
     pub fn new(store: Store, flush_interval: Duration) -> Self {
+        Self::with_clock(store, flush_interval, Clock::System)
+    }
+
+    /// Creates a manager reading time from `clock`.
+    fn with_clock(store: Store, flush_interval: Duration, clock: Clock) -> Self {
         Self {
             store,
             flush_interval,
+            clock,
             inner: Mutex::new(Inner::default()),
         }
     }
@@ -137,7 +172,7 @@ impl MeteringManager {
 
     /// Records one visitor request (a `Head::Http` stream opened by the relay).
     pub fn record_request(&self, service_id: i32) {
-        self.record_request_at(service_id, unix_ms());
+        self.record_request_at(service_id, self.clock.now_ms());
     }
 
     /// Registers an open stream's owning service so the mux's byte reports for
@@ -159,7 +194,7 @@ impl MeteringManager {
     /// and HTTP framing are all included and long-lived connections are
     /// sampled as their bytes flow.
     pub fn visitor_service_bytes(&self, service_id: i32, bytes_in: u64, bytes_out: u64) {
-        self.visitor_service_bytes_at(service_id, unix_ms(), bytes_in, bytes_out);
+        self.visitor_service_bytes_at(service_id, self.clock.now_ms(), bytes_in, bytes_out);
     }
 
     /// Reports tunnel-leg compressed wire bytes the mux moved on a stream.
@@ -168,7 +203,7 @@ impl MeteringManager {
     /// long-lived stream is attributed to the minute each byte actually moved.
     /// `bytes_in` is `client -> relay`, `bytes_out` is `relay -> client`.
     pub fn tunnel_bytes(&self, stream_id: StreamId, bytes_in: u64, bytes_out: u64) {
-        self.tunnel_bytes_at(stream_id, unix_ms(), bytes_in, bytes_out);
+        self.tunnel_bytes_at(stream_id, self.clock.now_ms(), bytes_in, bytes_out);
     }
 
     /// Publishes this manager as the mux's byte sink.
@@ -180,12 +215,12 @@ impl MeteringManager {
 
     /// Marks a service as registered; open time starts accruing from now.
     pub fn register_service(&self, service_id: i32) {
-        self.register_service_at(service_id, unix_ms());
+        self.register_service_at(service_id, self.clock.now_ms());
     }
 
     /// Marks a service as no longer registered, accruing its final open slice.
     pub fn unregister_service(&self, service_id: i32) {
-        self.unregister_service_at(service_id, unix_ms());
+        self.unregister_service_at(service_id, self.clock.now_ms());
     }
 
     /// Aggregated per-service usage over `[since_secs, until_secs)`, optionally
@@ -216,7 +251,7 @@ impl MeteringManager {
             since_min
         };
         // Bring open time up to the present before snapshotting the live data.
-        self.tick_at(unix_ms());
+        self.tick_at(self.clock.now_ms());
 
         let persisted = self
             .store
@@ -304,14 +339,15 @@ impl MeteringManager {
     /// visible to [`query`](Self::query) from memory. Used by the periodic
     /// ticker and at shutdown.
     pub async fn flush(&self) -> Result<(), StoreError> {
-        self.flush_at(unix_ms()).await
+        self.flush_at(self.clock.now_ms()).await
     }
 
     /// Spawns the flush job, returning its handle.
     ///
-    /// The job ticks once a second, flushing on the configured cadence, and on
-    /// `shutdown` performs a final flush that includes the partial current
-    /// minute. Await the returned handle before closing the store.
+    /// The job ticks once a second, accruing open time and flushing on the
+    /// configured cadence. On `shutdown` it ticks once more and flushes; the
+    /// in-flight minute is still never written, because only complete minutes
+    /// are. Await the returned handle before closing the store.
     pub fn start(self: &Arc<Self>, shutdown: CancellationToken) -> JoinHandle<()> {
         let manager = Arc::clone(self);
         tokio::spawn(async move { manager.run(shutdown).await })
@@ -443,7 +479,7 @@ impl MeteringManager {
                     let now = Instant::now();
                     since_flush += now.saturating_duration_since(last);
                     last = now;
-                    let now_ms = unix_ms();
+                    let now_ms = self.clock.now_ms();
                     self.tick_at(now_ms);
                     if since_flush >= self.flush_interval {
                         since_flush = Duration::ZERO;
@@ -454,7 +490,7 @@ impl MeteringManager {
                 }
             }
         }
-        let now_ms = unix_ms();
+        let now_ms = self.clock.now_ms();
         self.tick_at(now_ms);
         if let Err(e) = self.flush_at(now_ms).await {
             warn!(error = %e, "Final usage flush failed");
@@ -525,6 +561,12 @@ mod tests {
     /// Like [`manager`], but also hands back a clone of the backing store so a
     /// test can inspect persisted rows without the live in-memory blend.
     async fn manager_with_store() -> (MeteringManager, i32, Store) {
+        manager_with(Clock::System).await
+    }
+
+    /// Like [`manager_with_store`], but reading time from `clock`, so a minute
+    /// boundary cannot move underneath a test that reasons about minutes.
+    async fn manager_with(clock: Clock) -> (MeteringManager, i32, Store) {
         let store = Store::connect("sqlite::memory:").await.expect("store");
         let alice = store.create_test_person("alice").await.expect("person");
         let laptop = store
@@ -536,7 +578,7 @@ mod tests {
             .await
             .expect("service");
         (
-            MeteringManager::new(store.clone(), Duration::from_secs(60)),
+            MeteringManager::with_clock(store.clone(), Duration::from_secs(60), clock),
             svc.id,
             store,
         )
@@ -741,9 +783,15 @@ mod tests {
 
     #[tokio::test]
     async fn shutdown_does_not_persist_the_incomplete_minute() {
-        let (meter, svc, store) = manager_with_store().await;
+        // Pinned: on the wall clock the observed minute can complete between
+        // recording and cancelling, and the job would then rightly persist it.
+        // The subject here is an *incomplete* minute, so it must not be allowed
+        // to end on its own.
+        let base = 100 * MINUTE_MS + 1_000;
+        let clock = Arc::new(AtomicI64::new(base));
+        let (meter, svc, store) = manager_with(Clock::Fixed(Arc::clone(&clock))).await;
         let meter = Arc::new(meter);
-        let minute = minute_of(unix_ms());
+        let minute = minute_of(base);
         meter.register_service(svc);
         meter.register_stream(1, svc);
         meter.record_request(svc);
@@ -752,7 +800,9 @@ mod tests {
 
         let token = CancellationToken::new();
         let task = meter.start(token.clone());
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        // 50 ms of open time, produced by moving the pinned clock rather than by
+        // waiting for the wall clock to move.
+        clock.store(base + 50, Ordering::Relaxed);
         token.cancel();
         let _ = task.await;
 
@@ -774,16 +824,19 @@ mod tests {
         assert_eq!(totals[0].bytes_out, 22);
         assert_eq!(totals[0].tunnel_in, 33);
         assert_eq!(totals[0].tunnel_out, 44);
-        assert!(totals[0].open_ms > 0);
+        assert_eq!(totals[0].open_ms, 50);
     }
 
     #[tokio::test]
     async fn public_flush_persists_only_complete_minutes() {
-        let (meter, svc, store) = manager_with_store().await;
+        // Pinned for the same reason as the shutdown test: the "current" minute
+        // must not be able to complete while the test runs.
+        let base = 100 * MINUTE_MS + 1_000;
+        let (meter, svc, store) = manager_with(Clock::Fixed(Arc::new(AtomicI64::new(base)))).await;
         // A request in the current (incomplete) minute is not persisted...
         meter.record_request(svc);
         meter.flush().await.expect("flush");
-        let now_minute = minute_of(unix_ms());
+        let now_minute = minute_of(base);
         assert!(
             store
                 .query_usage(None, None, now_minute, now_minute + 1)
