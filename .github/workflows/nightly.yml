@@ -18,6 +18,12 @@ jobs:
     env:
       DO_TOKEN: ${{ secrets.DIGITALOCEAN_TOKEN }}
       BASE_DOMAIN: ${{ secrets.NIGHTLY_DOMAIN }}
+      # The nightly delivers and reads real transactional email, so these are
+      # required (the email-dependent steps earlier in the list still skip when
+      # they are blank, but the account journey cannot).
+      RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+      WEAVER_E2E_EMAIL: ${{ secrets.WEAVER_E2E_EMAIL }}
+      WEAVER_E2E_FROM: ${{ secrets.WEAVER_E2E_FROM }}
       # Skip Playwright's postinstall browser download; the explicit step below
       # installs exactly Chromium with its system dependencies, as `e2e-bdd` does.
       PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: "1"
@@ -28,7 +34,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Verify DigitalOcean credentials and domain secret
+      - name: Verify required secrets
         run: |
           if [ -z "$DO_TOKEN" ]; then
             echo "::error::DIGITALOCEAN_TOKEN secret is not set; cannot provision disposable droplet."
@@ -36,6 +42,16 @@ jobs:
           fi
           if [ -z "$BASE_DOMAIN" ]; then
             echo "::error::NIGHTLY_DOMAIN secret is not set; cannot configure DNS."
+            exit 1
+          fi
+          # The account journey delivers and reads real email, so unlike the
+          # email-dependent cargo tests it cannot skip when these are blank.
+          missing=""
+          [ -n "$RESEND_API_KEY" ] || missing="$missing RESEND_API_KEY"
+          [ -n "$WEAVER_E2E_EMAIL" ] || missing="$missing WEAVER_E2E_EMAIL"
+          [ -n "$WEAVER_E2E_FROM" ] || missing="$missing WEAVER_E2E_FROM"
+          if [ -n "$missing" ]; then
+            echo "::error::missing required secret(s):$missing — the nightly signs up a real account and reads its verification link through the Resend Receiving API."
             exit 1
           fi
 
@@ -370,7 +386,6 @@ jobs:
 
           ssh -o StrictHostKeyChecking=no -i ~/.ssh/id_nightly root@"$IP" \
             "install -m 755 /tmp/weaver-server /usr/local/bin/weaver-server && \
-             apt-get update -qq && apt-get install -y -qq sqlite3 && \
              /usr/local/bin/weaver-server setup --headless \
                --tunnel-domain $TARGET_DOMAIN \
                --admin-domain $ADMIN_DOMAIN \
@@ -423,43 +438,14 @@ jobs:
           curl -s -v --fail --max-time 15 --cacert /tmp/certs/staging-ca.pem "https://$TARGET_DOMAIN/" > /dev/null
           curl -s -v --fail --max-time 15 --cacert /tmp/certs/staging-ca.pem "https://$ADMIN_DOMAIN/" > /dev/null
 
-      # The provider is pointed at a tiny CI mock on the droplet: the send path
-      # is the real one (the real transport, the real compose/render), it just
-      # posts to 127.0.0.1 instead of the internet, so nothing is actually
-      # mailed and the addressed email is not needed. The mock records what it
-      # received so the account verification link can be read back.
-      - name: Start the droplet mail sink (CI mock email endpoint)
-        run: |
-          IP="${{ steps.droplet.outputs.ip }}"
-          ssh -o StrictHostKeyChecking=no -i ~/.ssh/id_nightly root@"$IP" "cat > /tmp/mail_sink.py" <<'PY'
-          import http.server
-
-
-          class Handler(http.server.BaseHTTPRequestHandler):
-              def do_POST(self):
-                  length = int(self.headers.get("content-length", 0))
-                  body = self.rfile.read(length)
-                  with open("/tmp/mail_sink.jsonl", "ab") as sink:
-                      sink.write(body + b"\n")
-                  self.send_response(200)
-                  self.send_header("content-type", "application/json")
-                  self.end_headers()
-                  self.wfile.write(b'{"id": "mock-1"}')
-
-              def log_message(self, *args):
-                  pass
-
-
-          http.server.HTTPServer(("127.0.0.1", 8025), Handler).serve_forever()
-          PY
-          ssh -o StrictHostKeyChecking=no -i ~/.ssh/id_nightly root@"$IP" \
-            ': > /tmp/mail_sink.jsonl; nohup python3 /tmp/mail_sink.py >/tmp/mail_sink.log 2>&1 & for _ in $(seq 1 50); do if (exec 3<>/dev/tcp/127.0.0.1/8025) 2>/dev/null; then echo "mail sink listening"; exit 0; fi; sleep 0.2; done; cat /tmp/mail_sink.log; exit 1'
-
-      # The mail provider is configured through the real two-step OTP flow, but
-      # the account's OTP is read straight out of the relay's SQLite database
-      # (the persisted challenge stores only an unsalted SHA-256 of the six
-      # digits, so the code is recovered from the DB rather than from an inbox).
-      - name: Configure the mail provider (bogus endpoint)
+      # The provider is configured through the real two-step OTP flow: the relay
+      # mails a six-digit code through Resend, and it is read back through
+      # Resend's Receiving API — never from the database.
+      - name: Configure the mail provider (real Resend)
+        env:
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          WEAVER_E2E_EMAIL: ${{ secrets.WEAVER_E2E_EMAIL }}
+          WEAVER_E2E_FROM: ${{ secrets.WEAVER_E2E_FROM }}
         run: |
           IP="${{ steps.droplet.outputs.ip }}"
           TARGET_DOMAIN="${{ steps.domain.outputs.full_domain }}"
@@ -468,12 +454,17 @@ jobs:
 
           # `configure` writes through the store, so run it as the service user:
           # SQLite's -wal/-shm files must never end up root-owned under a running
-          # relay.
+          # relay. The OTP is addressed to the receiving mailbox.
           CONFIGURE="runuser -u weaver -- /usr/local/bin/weaver-server configure \
             --db $DB --tunnel-domain $TARGET_DOMAIN --admin-domain $ADMIN_DOMAIN \
-            --email admin@$TARGET_DOMAIN --headless \
-            --email-provider resend --email-from no-reply@$ADMIN_DOMAIN \
-            --email-api-key ci-mock --email-endpoint http://127.0.0.1:8025"
+            --email $WEAVER_E2E_EMAIL --headless \
+            --email-provider resend --email-from $WEAVER_E2E_FROM \
+            --email-api-key $RESEND_API_KEY"
+
+          # Snapshot already-received ids first, so a stale code from an earlier
+          # run (same subject) cannot be mistaken for this run's.
+          BEFORE=$(curl -s -H "Authorization: Bearer $RESEND_API_KEY" \
+            "https://api.resend.com/emails/receiving?limit=20" | jq -r '.data[].id' | tr '\n' ' ')
 
           # First run issues the OTP and exits non-zero.
           set +e
@@ -487,20 +478,34 @@ jobs:
           fi
           echo "$FIRST" | grep -q "OTP was sent" || { echo "::error::no OTP was sent"; exit 1; }
 
-          # Read the persisted challenge's digest out of the database and recover
-          # the six-digit code.
-          OTP_HASH=$(ssh -o StrictHostKeyChecking=no -i ~/.ssh/id_nightly root@"$IP" \
-            "sqlite3 $DB \"SELECT json_extract(config_json, '\$.email_otp.code_hash') FROM config WHERE id = 1;\"")
-          if [ -z "$OTP_HASH" ] || [ "$OTP_HASH" = "null" ]; then
-            echo "::error::no pending email OTP was persisted in the database"
-            exit 1
-          fi
-          OTP=$(OTP_HASH="$OTP_HASH" python3 -c 'import base64,hashlib,os;t=os.environ["OTP_HASH"];print(next((f"{i:06d}" for i in range(1000000) if base64.b64encode(hashlib.sha256(f"{i:06d}".encode()).digest()).decode()==t),""))')
+          # Read the code back through Resend's Receiving API, accepting only an
+          # email that arrived after the snapshot above.
+          OTP=""
+          for _ in $(seq 1 30); do
+            RESP=$(curl -s -H "Authorization: Bearer $RESEND_API_KEY" \
+              "https://api.resend.com/emails/receiving?limit=20")
+            ID=$(echo "$RESP" | jq -r --arg to "$WEAVER_E2E_EMAIL" --arg before "$BEFORE" '
+              ($before | split(" ")) as $seen
+              | .data[]
+              | select((.to | index($to)) and (.subject | test("verification code"; "i")))
+              | .id as $id
+              | select(($seen | index($id)) == null)
+              | $id' | head -n 1)
+            if [ -n "$ID" ] && [ "$ID" != "null" ]; then
+              TEXT=$(curl -s -H "Authorization: Bearer $RESEND_API_KEY" \
+                "https://api.resend.com/emails/receiving/$ID" | jq -r '.text // .html // ""')
+              OTP=$(printf '%s' "$TEXT" | grep -oE '[0-9]{6}' | head -n 1 || true)
+              if [ -n "$OTP" ]; then
+                break
+              fi
+            fi
+            sleep 2
+          done
           if [ -z "$OTP" ]; then
-            echo "::error::could not recover the OTP from the stored digest"
+            echo "::error::did not receive the configure OTP email at $WEAVER_E2E_EMAIL"
             exit 1
           fi
-          echo "recovered the email OTP from the database (code redacted)"
+          echo "received the configure OTP email (code redacted)"
 
           # Second run proves the code and persists the email block.
           ssh -o StrictHostKeyChecking=no -i ~/.ssh/id_nightly root@"$IP" \
@@ -529,41 +534,64 @@ jobs:
       # The real sign-up journey in a browser: create the account, then — once
       # the emailed verification link is known — verify, set a password, sign in.
       - name: Create the account in the browser
+        env:
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          WEAVER_E2E_EMAIL: ${{ secrets.WEAVER_E2E_EMAIL }}
         run: |
           ADMIN_DOMAIN="${{ steps.domain.outputs.admin_domain }}"
-          EMAIL="nightly-$(openssl rand -hex 6)@$ADMIN_DOMAIN"
-          echo "ACCOUNT_EMAIL=$EMAIL" >> "$GITHUB_ENV"
+          # The receiving mailbox is shared across runs, so snapshot the ids
+          # already there *before* the signup mail is sent: only a message that
+          # arrives after this point can belong to this run.
+          BEFORE=$(curl -s -H "Authorization: Bearer $RESEND_API_KEY" \
+            "https://api.resend.com/emails/receiving?limit=20" | jq -r '.data[].id' | tr '\n' ' ')
+          echo "RESEND_VERIFY_SNAPSHOT=$BEFORE" >> "$GITHUB_ENV"
+          echo "ACCOUNT_EMAIL=$WEAVER_E2E_EMAIL" >> "$GITHUB_ENV"
           echo "PROVISION_STATE=$RUNNER_TEMP/provision-state.json" >> "$GITHUB_ENV"
+
           (cd e2e && node nightly/provision.mjs signup \
             --base "https://$ADMIN_DOMAIN" \
-            --email "$EMAIL" \
+            --email "$WEAVER_E2E_EMAIL" \
             --name nightly \
             --state "$RUNNER_TEMP/provision-state.json")
 
       - name: Verify the account by its emailed link
+        env:
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          WEAVER_E2E_EMAIL: ${{ secrets.WEAVER_E2E_EMAIL }}
         run: |
-          IP="${{ steps.droplet.outputs.ip }}"
           ADMIN_DOMAIN="${{ steps.domain.outputs.admin_domain }}"
           PASSWORD="nightly-password-$(openssl rand -hex 4)"
           echo "ACCOUNT_PASSWORD=$PASSWORD" >> "$GITHUB_ENV"
 
-          # The verification link is the real one the relay composed and sent;
-          # the mock sink recorded the outgoing mail. Only its SHA-256 digest is
-          # stored in the relay's database, so the raw link is read from the
-          # recorded message rather than reconstructed.
+          # The verification link is the real one the relay mailed through
+          # Resend; read it back through Resend's Receiving API, accepting only a
+          # message that arrived after the pre-signup snapshot.
           LINK=""
           for _ in $(seq 1 30); do
-            LINK=$(ssh -o StrictHostKeyChecking=no -i ~/.ssh/id_nightly root@"$IP" \
-              "grep -oE 'https://[A-Za-z0-9.:_-]+/verify\\?token=[0-9a-f]+' /tmp/mail_sink.jsonl | tail -n 1")
-            [ -n "$LINK" ] && break
-            sleep 1
+            RESP=$(curl -s -H "Authorization: Bearer $RESEND_API_KEY" \
+              "https://api.resend.com/emails/receiving?limit=20")
+            ID=$(echo "$RESP" | jq -r --arg to "$WEAVER_E2E_EMAIL" --arg before "$RESEND_VERIFY_SNAPSHOT" '
+              ($before | split(" ")) as $seen
+              | .data[]
+              | select((.to | index($to)) and (.subject | test("verify your email"; "i")))
+              | .id as $id
+              | select(($seen | index($id)) == null)
+              | $id' | head -n 1)
+            if [ -n "$ID" ] && [ "$ID" != "null" ]; then
+              TEXT=$(curl -s -H "Authorization: Bearer $RESEND_API_KEY" \
+                "https://api.resend.com/emails/receiving/$ID" | jq -r '.text // .html // ""')
+              LINK=$(printf '%s' "$TEXT" | grep -oE 'https://[A-Za-z0-9.:_-]+/verify\?token=[0-9a-f]+' | head -n 1 || true)
+              if [ -n "$LINK" ]; then
+                break
+              fi
+            fi
+            sleep 2
           done
           if [ -z "$LINK" ]; then
-            echo "::error::no verification link was captured by the mail sink"
-            ssh -o StrictHostKeyChecking=no -i ~/.ssh/id_nightly root@"$IP" "cat /tmp/mail_sink.log; wc -c /tmp/mail_sink.jsonl" || true
+            echo "::error::did not receive the account verification email at $WEAVER_E2E_EMAIL"
             exit 1
           fi
-          echo "captured the verification link (token redacted)"
+          echo "received the account verification email (link redacted)"
 
           (cd e2e && node nightly/provision.mjs verify \
             --base "https://$ADMIN_DOMAIN" \
