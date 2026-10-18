@@ -4,7 +4,6 @@ pub mod altcha;
 pub mod cert;
 pub mod config;
 pub mod control;
-pub mod dev_enrol;
 pub mod dns;
 pub mod edge;
 pub mod email;

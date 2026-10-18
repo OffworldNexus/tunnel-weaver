@@ -807,10 +807,9 @@ impl Store {
     }
 
     /// Creates an active account with no email identity and no password, so
-    /// nobody can ever sign in to it.
-    ///
-    /// Only for identities created outside the signup flow: tests, and the
-    /// nightly's `dev-enrol` affordance.
+    /// nobody can ever sign in to it. Test-only: real accounts come from the
+    /// signup flow.
+    #[cfg(any(test, feature = "test-util"))]
     pub async fn create_account_without_login(
         &self,
         name: &str,

@@ -339,27 +339,6 @@ fn errors_are_one_line_with_a_hint() {
     assert!(lines[1].starts_with("  ") && lines[1].contains("weave pair"));
 }
 
-#[cfg(not(feature = "dev-signer"))]
-#[test]
-fn a_production_build_has_no_dev_affordances() {
-    let dir = isolated_config();
-    let out = weave(dir.path(), &["dev-enrol", "relay.example", "7"]);
-    assert!(!out.status.success());
-    assert!(text(&out.stderr).contains("unrecognized subcommand"));
-    let out = weave(
-        dir.path(),
-        &[
-            "start",
-            "web=8080",
-            "--dev-signer",
-            "--server",
-            "relay.example",
-        ],
-    );
-    assert!(!out.status.success());
-    assert!(text(&out.stderr).contains("unexpected argument '--dev-signer'"));
-}
-
 #[test]
 fn test_parse_server_address_variations() {
     assert_eq!(

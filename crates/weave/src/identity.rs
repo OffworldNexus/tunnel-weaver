@@ -2,12 +2,9 @@
 //!
 //! Compiled only with the `dev-signer` feature. A real `weave` holds no key at
 //! all: pairing provisions a P-256 key inside the **tpmd** local
-//! key agent and signs through [`crate::tpm`]. This module exists for tests
-//! only — the in-process integration tests and the nightly droplet run, where
-//! there is no key agent and no browser to approve a pairing: the relay enrols
-//! this key directly (`weaver-server dev-enrol`), [`dev_enrol`] records the
-//! matching relay row on the client, and `weave start --dev-signer` signs with
-//! it.
+//! key agent and signs through [`crate::tpm`]. This module exists for the
+//! in-process integration tests, which authenticate as this key so the whole
+//! tunnel can be exercised without a key agent.
 //!
 //! It is a cargo feature rather than a runtime switch on purpose: a production
 //! binary must not even contain the seed.
@@ -15,9 +12,6 @@
 use ed25519_dalek::Signer as _;
 use weaver_mux::auth::Signer;
 use weaver_mux::{KeyId, SignError, Signature};
-
-use crate::host::normalize_admin_host;
-use crate::store::{Relay, Store};
 
 /// Fixed 32-byte Ed25519 seed of the development client.
 pub const DEV_SECRET_KEY: [u8; 32] = *b"weaver-poc-laptop-secret-key-32b";
@@ -53,61 +47,9 @@ impl Signer for Ed25519Signer {
     }
 }
 
-/// The development key's fingerprint as the client store records it:
-/// `ed25519:<hex>`.
-pub fn dev_key_id() -> String {
-    let KeyId::Ed25519(bytes) = Ed25519Signer::dev().key_id() else {
-        unreachable!("the development key is Ed25519");
-    };
-    let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
-    format!("ed25519:{hex}")
-}
-
-/// Test-only: records that `admin_host` authorises the development key as
-/// `machine_id`, as a completed pairing would. Idempotent; the first relay
-/// recorded becomes the default.
-pub async fn dev_enrol(
-    store: &Store,
-    admin_host: &str,
-    machine_id: i32,
-) -> Result<Relay, Box<dyn std::error::Error + Send + Sync>> {
-    let admin_host = normalize_admin_host(admin_host)?;
-    Ok(store
-        .record_pairing(&admin_host, machine_id, &dev_key_id())
-        .await?)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn dev_key_id_spells_the_dev_key() {
-        assert_eq!(
-            dev_key_id(),
-            "ed25519:9b017abe250e5b63f6817a84ec9c7b7598b11fc80056ece29e06b8aa4b517906"
-        );
-    }
-
-    #[tokio::test]
-    async fn dev_enrol_records_a_normalised_default_row_idempotently() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path().join("weave.db")).await.unwrap();
-
-        let row = dev_enrol(&store, "A1.Example.Nexus.:443", 7).await.unwrap();
-        assert_eq!(row.admin_host, "a1.example.nexus");
-        assert_eq!(
-            (row.machine_id, row.key_id.as_str()),
-            (7, dev_key_id().as_str())
-        );
-        assert!(row.is_default);
-
-        let again = dev_enrol(&store, "a1.example.nexus", 7).await.unwrap();
-        assert_eq!(again, row);
-        assert_eq!(store.relays().await.unwrap(), [row]);
-
-        assert!(dev_enrol(&store, "http://nope", 1).await.is_err());
-    }
 
     #[test]
     fn dev_key_matches_seeded_relay_key() {
