@@ -79,10 +79,6 @@ async fn run_tunnel_connection(
     conn.set_bytes_sink(registry.metering().sink());
     let driver = Driver::new(conn, WsTransport::new(ws_stream), handler);
     let handle = driver.handle();
-    handle.spawn_on({
-        let h = handle.clone();
-        move |_, handler| handler.handle = Some(h)
-    });
     // Visitor requests arrive from hyper tasks; feed them to the driver.
     tokio::spawn(forward_proxy_requests(proxy_rx, handle));
 
@@ -174,6 +170,10 @@ pub(crate) struct RelayHandler {
 }
 
 impl StreamHandler for RelayHandler {
+    fn set_handle(&mut self, handle: RelayHandle) {
+        self.handle = Some(handle);
+    }
+
     fn on_event(&mut self, conn: &mut Connection, event: Event) {
         match event {
             Event::Authenticated { key_id, version } => {

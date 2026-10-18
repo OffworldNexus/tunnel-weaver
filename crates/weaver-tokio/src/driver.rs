@@ -23,6 +23,23 @@ pub trait StreamHandler: Send + 'static {
     /// `conn.recv_msg(id)` until `WouldBlock`; `Writable { id, .. }` →
     /// retry the message that got `WouldBlock`.
     fn on_event(&mut self, conn: &mut Connection, event: Event);
+
+    /// Receives the handler's own [`Handle`], called by [`Driver::new`] before
+    /// the loop starts.
+    ///
+    /// A handler that must act on the connection from inside an event keeps the
+    /// handle it is given here. It must be installed *here*: the loop prefers
+    /// inbound data over queued commands, so an event can be dispatched on the
+    /// very first poll — before a closure queued with [`Handle::spawn_on`]
+    /// would have run. [`Driver::new`] calls this, so a handler cannot be
+    /// running without having had the chance. The default does nothing, for
+    /// handlers that never touch the connection.
+    fn set_handle(&mut self, handle: Handle<Self>)
+    where
+        Self: Sized,
+    {
+        let _ = handle;
+    }
 }
 
 type Command<H> = Box<dyn FnOnce(&mut Connection, &mut H) + Send>;
@@ -92,14 +109,19 @@ const IDLE_WAKE: Duration = Duration::from_secs(60);
 
 impl<T: Transport, H: StreamHandler> Driver<T, H> {
     /// Wrap a connection, a transport and the application handler.
-    pub fn new(conn: Connection, transport: T, handler: H) -> Self {
+    pub fn new(conn: Connection, transport: T, mut handler: H) -> Self {
         let (tx, cmd_rx) = mpsc::channel(256);
+        let handle = Handle { tx };
+        // Handed over now, while nothing can be dispatched: "before the first
+        // event" has to mean "before `run` is polled", and a caller cannot
+        // reach the handler once the driver owns it.
+        handler.set_handle(handle.clone());
         Self {
             conn,
             transport,
             handler,
             cmd_rx,
-            handle: Handle { tx },
+            handle,
             buf: Vec::with_capacity(64 * 1024),
             last_close: None,
         }

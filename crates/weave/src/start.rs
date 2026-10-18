@@ -169,10 +169,6 @@ pub async fn run_start_with_tokens(
     handler.spinner = Some(spinner);
     let driver = Driver::new(conn, WsTransport::new(ws_stream), handler);
     let handle = driver.handle();
-    handle.spawn_on({
-        let h = handle.clone();
-        move |_, handler| handler.handle = Some(h)
-    });
 
     tokio::spawn({
         let handle = handle.clone();
@@ -813,6 +809,10 @@ fn is_long_lived(req: &HttpHead, head: &HttpResponseHead) -> bool {
 }
 
 impl StreamHandler for ProxyHandler {
+    fn set_handle(&mut self, handle: Handle<ProxyHandler>) {
+        self.handle = Some(handle);
+    }
+
     fn on_event(&mut self, conn: &mut Connection, event: Event) {
         match event {
             Event::Authenticated { .. } => {
