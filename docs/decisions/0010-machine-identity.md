@@ -76,9 +76,14 @@ is unknown to the relay.
 handshake already proved possession, which is exactly the authority to withdraw
 it — and sends a `Revoke` control head. The relay deletes the machine, its key,
 its services and its hostnames (a cascade), closes the key log row as revoked,
-replies `Revoked`, and closes the connection. A `KeyRevoked` close counts as
-confirmation because it means the key no longer resolves. There is no separate
-revocation credential and no way to revoke a key you do not hold.
+and replies `Revoked`, leaving the close to the client (and closing with
+`KeyRevoked` itself only if the client lingers). The client forgets the relay
+only after that reply; the periodic key re-check is held off while a revoke is
+in flight, so it cannot close the connection between the deletion and the
+reply. If the relay instead rejects the handshake because it no longer knows
+the key, the pairing was not effective and the client forgets it with a
+warning. There is no one-sided unpair, no separate revocation credential, and
+no way to revoke a key you do not hold.
 
 ## Consequences
 

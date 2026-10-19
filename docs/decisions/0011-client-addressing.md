@@ -73,7 +73,8 @@ the agent, and provisioning below it needs explicit consent.
 
 The store is a SeaORM-managed SQLite database in the platform's per-user data
 directory (`directories`), overridable with `WEAVE_DATA_DIR` for tests and
-embedding, mode 0600 on Unix. It holds no secret.
+embedding. It holds no secret — the admin host, the machine id and a public
+key fingerprint — so it is not given special permissions.
 
 ## Consequences
 

@@ -66,5 +66,4 @@ The `poc` sentence above has aged: `weaver_server::tunnel::identity` still owns
 `PocResolver` and the hard-coded key map are deleted from the production path.
 A key is now whichever machine holds it in `machine.key_id` (ADR 0010), and
 enrolment is browser-approved pairing (`weave pair`), not a development seed.
-`weave::identity` survives only behind the `dev-signer` cargo feature, for
-in-process tests.
+Tests inject a signer through the same `KeyAgent` seam production uses.

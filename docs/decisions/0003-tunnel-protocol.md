@@ -108,8 +108,8 @@ refusal schema on the control stream.
 **§4 Proof-of-concept identity is retired.** The development seed and
 `PocResolver` are gone from the production path. A real client holds no key at
 all: pairing provisions a P-256 key inside the `tpmd` local key agent, and the
-store-backed `StoreIdentityResolver` resolves `machine.key_id` (ADR 0010). A
-`dev-signer` cargo feature still ships the in-memory Ed25519 key for
-in-process tests, and a production binary does not contain the seed. The
+store-backed `StoreIdentityResolver` resolves `machine.key_id` (ADR 0010).
+There is no development seed anywhere any more: tests inject a signer through
+the client's `KeyAgent` seam, exactly as production injects tpmd. The
 "Milestone 2/3" deprecation path in §4 is therefore complete, in a different
 shape than predicted: enrolment is browser-approved pairing, not a token verb.

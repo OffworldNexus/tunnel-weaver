@@ -20,16 +20,35 @@
   `pnpm exec playwright install chromium`. It rebuilds
   `weaver-server --example e2e_server` first, so stop any running copy of that
   binary (a live one blocks the relink with `ETXTBSY`).
-- Not a gate: `pnpm -C frontend run check` (svelte-check) fails repo-wide, even
-  on a clean tree — `.svelte-kit/tsconfig.json` is never generated, so every
-  `#lib/*` import reports "cannot find module" (~50 errors). Use `cargo
-  clippy` + the SPA build instead.
+- Type-check the SPA: `pnpm -C frontend run check` (svelte-check, ~10s,
+  timeout 120000ms). Must report 0 errors and 0 warnings.
+- Lint the SPA: `pnpm -C frontend run lint` (Prettier check + type-aware
+  ESLint, ~8s, timeout 120000ms). Must report 0 errors and 0 warnings;
+  `pnpm -C frontend run format` applies Prettier and the autofixable rules.
 - Conformance (nightly / PR to develop only, needs the DO droplet): h2spec
   and Autobahn run in `.github/workflows/nightly.yml`; allow-lists live in
   `ci/conformance/*-allowlist.txt`, one case per line with a justification.
 - Last measured: 2026-10-12 (after WVR-50), full suite 559 passed/0 failed/4
   ignored (100s), SPA build 3s, e2e 9 scenarios/85 steps passed (23s).
   (Prior: 2026-10-12, 550 passed (72s); 546 passed; 2026-10-06, 441 passed.)
+
+## Conventions
+
+- **Fields are mandatory.** Every field — struct, database column, JSON
+  payload, TypeScript type — is required and always present unless there is a
+  real, stated reason for it to be absent. "It might be useful someday" and "it
+  is optional in the form" are not reasons.
+- **Strings are never nullable.** An empty string means "no value"; there is no
+  `Option<String>`, nullable `TEXT` column, or `string | null`. Code that needs
+  to know tests for emptiness.
+- **Other types: rarely nullable in TypeScript, honestly optional in Rust.** In
+  TS/JS, `| null` and `?:` are an untracked trap: before reaching for them,
+  check whether a sensible value already says "none" (`0`, `false`, an empty
+  array). In Rust, `Option<T>` (and a nullable column behind it) is fine when
+  absence is a real state the compiler should make callers handle — a
+  timestamp that has not happened yet, a foreign key that is legitimately
+  absent — rather than a "maybe set" convenience. Strings stay non-nullable
+  everywhere.
 
 ## Crate notes
 

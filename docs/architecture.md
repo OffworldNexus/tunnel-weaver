@@ -55,7 +55,7 @@ classDiagram
     class Connection {
         +new(Config, now) Connection
         +recv(now, bytes) Result~(), ProtocolError~
-        +poll_transmit(now, buf) bool
+        +poll_transmit(buf) bool
         +handle_timeout(now)
         +next_timeout() Option~Instant~
         +poll_event() Option~Event~
@@ -549,15 +549,17 @@ sequenceDiagram
 |---|---|
 | `weave pair <admin-host> [--machine ID] [--min-key-security L] [--allow-below-floor]` | enrol this machine's device key with a relay, with browser approval |
 | `weave start <service>=<target>… [--server HOST]` | register services on a paired relay and proxy to their origins |
-| `weave unpair [<admin-host>] [--local-only]` | revoke this machine on the relay (or just forget it locally) |
+| `weave unpair [<admin-host>]` | revoke this machine on the relay, then forget it locally |
 | `weave relays` / `weave relays default <admin-host>` | list paired relays / choose the default |
 
 Its durable state is a SeaORM-managed SQLite database
 (`crates/weave/src/store/`) in the platform's per-user data directory
-(`directories`; overridable with `WEAVE_DATA_DIR`), file `weave.db`, mode 0600
-on Unix. It holds **one `relay` row per pairing** — the admin host it dials,
-the machine id the relay assigned, and the device-key fingerprint authorised
-there — plus which relay is the default (a partial unique index allows at most
+(`directories`; overridable with `WEAVE_DATA_DIR`), file `weave.db`. It holds
+the fingerprint of the machine's one device key (a single `device` row, so a
+later command resumes that key instead of having tpmd mint another) and **one
+`relay` row per pairing** — the admin host it dials, the machine id the relay
+assigned, and the device-key fingerprint authorised there — plus which relay is
+the default (a partial unique index allows at most
 one; the first pairing becomes it). It deliberately holds no relay-owned
 state: no hostname, no tunnel root, no service address (ADR 0011).
 
@@ -645,8 +647,8 @@ its own store: a known relay under a different key means the old key is gone.
 - Revocation is bilateral: `weave unpair` authenticates with the very key it
   revokes and the relay deletes the machine — cascading to its services and
   hostnames, and closing its key log row as revoked. The name is freed, so a
-  later pairing may propose it again. `--local-only` skips the relay and only
-  forgets the relay locally.
+  later pairing may propose it again. The client forgets the relay only once
+  the relay has replied `Revoked`; there is no one-sided unpair.
 
 The relay's schema is now a **single squashed migration**, `m0001_init`,
 which creates the final schema directly (relay config and ACME accounts; the

@@ -175,15 +175,13 @@ What an operator should expect:
 `weave unpair [<admin-host>]` is **bilateral**. It authenticates with the very
 device key it is revoking and sends a `Revoke` control head; the relay deletes
 the machine — its key, its services and every hostname derived from them — then
-answers `Revoked` and closes the connection. A `KeyRevoked` close is an
-equivalent confirmation. The machine name is freed, so a later pairing may
-propose it again.
-
-`weave unpair <admin-host> --local-only` is the escape hatch for a relay that
-no longer exists or a device key that is gone: it forgets the relay locally and
-warns that the machine stays authorised on the relay until it is revoked there.
-There is no admin-host endpoint that revokes a machine for someone else; the
-only authority is possession of the key.
+answers `Revoked`. The client forgets the relay only after that reply. If the
+relay rejects the handshake because it no longer knows the key, the pairing was
+not effective, so the client forgets it with a warning; any other failure
+(unreachable relay, dropped connection) leaves the pairing in place. The
+machine name is freed, so a later pairing may propose it again. There is no
+endpoint that revokes a machine for someone else; the only authority is
+possession of the key.
 
 ## The key audit log
 
