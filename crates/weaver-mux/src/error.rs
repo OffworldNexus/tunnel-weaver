@@ -126,8 +126,8 @@ pub enum CloseCode {
 pub struct CloseReason {
     /// Why the connection is closing.
     pub code: CloseCode,
-    /// Optional human-readable detail.
-    pub message: Option<String>,
+    /// Human-readable detail, empty when there is none.
+    pub message: String,
 }
 
 impl CloseReason {
@@ -135,7 +135,7 @@ impl CloseReason {
     pub fn new(code: CloseCode) -> Self {
         Self {
             code,
-            message: None,
+            message: String::new(),
         }
     }
 
@@ -143,7 +143,7 @@ impl CloseReason {
     pub fn with_message(code: CloseCode, message: impl Into<String>) -> Self {
         Self {
             code,
-            message: Some(message.into()),
+            message: message.into(),
         }
     }
 }

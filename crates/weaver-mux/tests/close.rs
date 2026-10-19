@@ -20,7 +20,7 @@ async fn close_key_revoked() {
 
     p.server.close(CloseReason {
         code: CloseCode::KeyRevoked,
-        message: Some("key rotated".into()),
+        message: "key rotated".into(),
     });
     let now = p.clock.now();
     let mut buf = Vec::new();
@@ -42,7 +42,7 @@ async fn close_key_revoked() {
             Event::Closed {
                 reason: CloseReason {
                     code: CloseCode::KeyRevoked,
-                    message: Some("key rotated".into()),
+                    message: "key rotated".into(),
                 }
             },
         ]
@@ -71,7 +71,7 @@ async fn close_key_revoked() {
     assert!(matches!(
         client_events.last(),
         Some(Event::Closed { reason }) if reason.code == CloseCode::KeyRevoked
-            && reason.message.as_deref() == Some("key rotated")
+            && reason.message == "key rotated"
     ));
     assert_eq!(p.client.open(Class::Interactive), Err(StreamError::Closed));
     assert!(

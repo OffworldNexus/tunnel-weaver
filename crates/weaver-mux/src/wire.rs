@@ -250,7 +250,7 @@ mod tests {
         round_trip(&Ping { opaque: u64::MAX });
         round_trip(&crate::error::CloseReason {
             code: crate::error::CloseCode::KeyRevoked,
-            message: Some("bye".into()),
+            message: "bye".into(),
         });
     }
 
