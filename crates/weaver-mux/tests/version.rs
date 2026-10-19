@@ -11,7 +11,7 @@ async fn hello_with_version(client_max: u16) -> (Frame, Pair) {
     let mut p = Pair::default_pair();
     let now = p.clock.now();
     let mut buf = Vec::new();
-    assert!(p.server.poll_transmit(now, &mut buf));
+    assert!(p.server.poll_transmit(&mut buf));
     let challenge = Frame::parse(&buf).unwrap();
     let ch: Challenge = wire::decode_payload(FrameType::Challenge, &challenge.payload).unwrap();
 
@@ -22,7 +22,7 @@ async fn hello_with_version(client_max: u16) -> (Frame, Pair) {
         version: client_max,
         key_id: signer.key_id(),
         nonce_c,
-        sig: signer.sign(&msg).unwrap(),
+        sig: signer.sign(&msg).await.unwrap(),
     };
     let frame = Frame {
         stream_id: 0,
@@ -30,7 +30,7 @@ async fn hello_with_version(client_max: u16) -> (Frame, Pair) {
         payload: wire::encode_payload(&hello),
     };
     p.server.recv(now, &encode(&frame)).await.unwrap();
-    assert!(p.server.poll_transmit(now, &mut buf));
+    assert!(p.server.poll_transmit(&mut buf));
     (Frame::parse(&buf).unwrap(), p)
 }
 

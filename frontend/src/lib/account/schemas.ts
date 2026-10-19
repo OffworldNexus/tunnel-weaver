@@ -1,96 +1,51 @@
 /**
- * Valibot schemas shared by every account form.
- *
- * These power Superforms' client-side validation. The relay validates again
- * and authoritatively; the client checks are guidance so the user gets
- * immediate field-level feedback.
+ * Valibot schemas for the account forms: immediate field-level guidance. The
+ * relay validates again, authoritatively.
  */
+import { get } from 'svelte/store';
 import * as v from 'valibot';
 
-const EMAIL_MAX = 254;
+import { minPasswordLength } from '#lib/account/config';
+
 const NAME_MAX = 80;
 
-export const emailSchema = v.pipe(
-	v.string('Enter your email address.'),
+const email = v.pipe(
+	v.string(),
 	v.trim(),
 	v.nonEmpty('Enter your email address.'),
-	v.maxLength(EMAIL_MAX, 'That email address is too long.'),
+	v.maxLength(254, 'That email address is too long.'),
 	v.email('Enter a valid email address, like you@example.com.')
 );
 
-export const nameSchema = v.pipe(
-	v.string('Enter your name.'),
-	v.trim(),
-	v.nonEmpty('Enter your name.'),
-	v.maxLength(NAME_MAX, `Keep your name under ${NAME_MAX} characters.`)
+const required = (message: string) => v.pipe(v.string(), v.nonEmpty(message));
+
+/** Read at validation time: the minimum arrives with the relay's config. */
+const newPassword = v.pipe(
+	v.string(),
+	v.check(
+		(value) => value.length >= get(minPasswordLength),
+		() => `Use at least ${get(minPasswordLength)} characters.`
+	),
+	v.maxLength(1024, 'That password is too long.')
 );
 
-export const signInSchema = v.object({
-	email: emailSchema,
-	password: v.pipe(v.string('Enter your password.'), v.nonEmpty('Enter your password.'))
-});
+export const signInSchema = v.object({ email, password: required('Enter your password.') });
 
 export const signUpSchema = v.object({
-	name: nameSchema,
-	email: emailSchema
+	name: v.pipe(
+		v.string(),
+		v.trim(),
+		v.nonEmpty('Enter your name.'),
+		v.maxLength(NAME_MAX, `Keep your name under ${NAME_MAX} characters.`)
+	),
+	email
 });
 
-export const resendSchema = v.object({
-	flow: v.pipe(v.string(), v.nonEmpty())
+export const resetRequestSchema = v.object({ email });
+
+export const setPasswordSchema = v.object({ password: newPassword });
+
+export const changePasswordSchema = v.object({
+	current_password: required('Enter your current password.'),
+	new_password: newPassword
 });
-
-/** The reset-request form: a bare address, like the sign-up step. */
-export const resetRequestSchema = v.object({
-	email: emailSchema
-});
-
-/**
- * The minimum length comes from `/api/account/config`, which may arrive after
- * the form is created, so it is read lazily through a getter.
- */
-export function setPasswordSchema(minLength: () => number) {
-	return v.object({
-		password: v.pipe(
-			v.string('Choose a password.'),
-			v.check(
-				(value) => value.length >= minLength(),
-				() => `Use at least ${minLength()} characters.`
-			),
-			v.maxLength(1024, 'That password is too long.')
-		)
-	});
-}
-
-export type SignInForm = v.InferOutput<typeof signInSchema>;
-export type SignUpForm = v.InferOutput<typeof signUpSchema>;
-export type SetPasswordForm = v.InferOutput<ReturnType<typeof setPasswordSchema>>;
-export type ResendForm = v.InferOutput<typeof resendSchema>;
-export type ResetRequestForm = v.InferOutput<typeof resetRequestSchema>;
-
-/**
- * The change-password form (WVR-50): the current password for reauthentication,
- * and the new one.
- *
- * Deliberately **no confirmation field**: this would be the only account form
- * asking for one (set-password and reset both take a single new password), and
- * the strength meter plus the show/hide toggle make a repeat unnecessary. The
- * relay validates the same policy authoritatively.
- */
-export function changePasswordSchema(minLength: () => number) {
-	return v.object({
-		current_password: v.pipe(
-			v.string('Enter your current password.'),
-			v.nonEmpty('Enter your current password.')
-		),
-		new_password: v.pipe(
-			v.string('Choose a new password.'),
-			v.check(
-				(value) => value.length >= minLength(),
-				() => `Use at least ${minLength()} characters.`
-			),
-			v.maxLength(1024, 'That password is too long.')
-		)
-	});
-}
-
-export type ChangePasswordForm = v.InferOutput<ReturnType<typeof changePasswordSchema>>;

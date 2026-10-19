@@ -17,7 +17,7 @@ use futures_util::{Sink, Stream};
 use tokio::sync::mpsc;
 use weaver_mux::testing::{Ed25519TestSigner, MapVerifier, SeededRng};
 use weaver_mux::{Class, CloseCode, Compress, Config, Connection, Event, Signer as _, StreamId};
-use weaver_tokio::{Driver, StreamHandler};
+use weaver_tokio::{Driver, Handle, StreamHandler};
 
 const SERVER_NAME: &str = "mux.example.test";
 
@@ -319,4 +319,48 @@ async fn keepalives_survive_a_saturating_bulk_receive() {
         "sender saw Timeout: {server_res:?}"
     );
     assert_eq!(sink.closed, Some(CloseCode::Shutdown));
+}
+
+/// A handler that must hold its handle before any event can reach it.
+#[derive(Default)]
+struct NeedsHandle {
+    installed: bool,
+}
+
+impl StreamHandler for NeedsHandle {
+    fn set_handle(&mut self, handle: Handle<Self>) {
+        // A real handler keeps it, to act on the connection from inside an
+        // event; this one only records that the driver handed it over.
+        drop(handle);
+        self.installed = true;
+    }
+
+    fn on_event(&mut self, _conn: &mut Connection, _event: Event) {}
+}
+
+/// The driver hands a handler its handle at construction, before the loop can
+/// dispatch anything.
+///
+/// This is the invariant the relay and the client used to *assume* instead of
+/// enforce: both installed their handle from a task queued with `spawn_on`,
+/// while the loop prefers inbound data over queued commands. An event could be
+/// dispatched on the very first poll, before that task ran, and the handler
+/// panicked with "handle installed before the first event can fire".
+#[tokio::test]
+async fn the_handler_holds_its_handle_before_the_loop_starts() {
+    let (client_cfg, _) = configs();
+    let (client_pipe, peer_pipe) = duplex(1, Duration::from_millis(1));
+    // Drop the peer so the transport reports its end and `run` returns at once.
+    drop(peer_pipe);
+
+    let driver = Driver::new(
+        Connection::new(client_cfg, Instant::now()),
+        client_pipe,
+        NeedsHandle::default(),
+    );
+    let (handler, _) = driver.run().await;
+    assert!(
+        handler.installed,
+        "the handler must hold its handle before the loop dispatches anything"
+    );
 }

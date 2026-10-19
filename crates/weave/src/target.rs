@@ -9,7 +9,7 @@
 
 use std::fmt;
 
-use weaver_proto::is_valid_dns_label;
+use weaver_proto::{SERVICE_NAME_MAX, is_valid_service_name};
 
 /// Whether the origin is spoken to over plaintext or TLS.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -30,7 +30,7 @@ impl TargetScheme {
     }
 
     /// Default port when the target omits one.
-    fn default_port(self) -> u16 {
+    pub(crate) fn default_port(self) -> u16 {
         match self {
             Self::Http => 80,
             Self::Https => 443,
@@ -176,8 +176,7 @@ impl Target {
 
     /// The `host[:port]` value written into the `Host` header for the origin.
     pub fn authority(&self) -> String {
-        let default = self.scheme.default_port();
-        if self.port == default {
+        if self.port == self.scheme.default_port() {
             self.host.clone()
         } else {
             format!("{}:{}", self.host, self.port)
@@ -191,13 +190,36 @@ impl fmt::Display for Target {
     }
 }
 
-/// One `<service>=<target>` mapping from the command line.
+/// One service to expose: a `<service>=<target>` mapping and how to proxy it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServiceSpec {
     /// DNS-label service name as registered with the relay.
     pub service: String,
     /// The local origin it proxies to.
     pub target: Target,
+    /// Do not verify the target's TLS certificate.
+    pub insecure: bool,
+    /// Send the public hostname as `Host` instead of the target's.
+    pub preserve_host: bool,
+    /// Do not rewrite URLs and cookies in responses.
+    pub no_rewrite: bool,
+    /// Keep the visitor's `Forwarded` / `X-Forwarded-*` instead of replacing
+    /// them.
+    pub append_forwarded: bool,
+}
+
+impl ServiceSpec {
+    /// `service` proxied to `target` with the default policy.
+    pub fn new(service: impl Into<String>, target: Target) -> Self {
+        Self {
+            service: service.into(),
+            target,
+            insecure: false,
+            preserve_host: false,
+            no_rewrite: false,
+            append_forwarded: false,
+        }
+    }
 }
 
 /// Parse the positional `<service>=<target>` arguments, rejecting invalid
@@ -214,19 +236,15 @@ pub fn parse_specs(raw: &[String]) -> Result<Vec<ServiceSpec>, String> {
             ));
         };
         let service = service.trim();
-        if !is_valid_dns_label(service) {
+        if !is_valid_service_name(service) {
             return Err(format!(
-                "invalid service name '{service}': must be a single DNS label (a-z, 0-9, '-', ≤63 chars)"
+                "invalid service name '{service}': lowercase letters and digits, single dashes between them, at most {SERVICE_NAME_MAX} chars"
             ));
         }
         if specs.iter().any(|s| s.service == service) {
             return Err(format!("duplicate service '{service}'"));
         }
-        let target = Target::parse(target)?;
-        specs.push(ServiceSpec {
-            service: service.to_string(),
-            target,
-        });
+        specs.push(ServiceSpec::new(service, Target::parse(target)?));
     }
     Ok(specs)
 }

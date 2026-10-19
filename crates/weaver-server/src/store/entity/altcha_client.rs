@@ -1,4 +1,4 @@
-//! `altcha_client` table: registered ALTCHA API clients (WVR-136).
+//! `altcha_client` table: registered ALTCHA API clients.
 //!
 //! A client is either a tunnelled *service* (`service_id` set) or the relay's
 //! *internal* client (`service_id` null) that serves the admin domain. The

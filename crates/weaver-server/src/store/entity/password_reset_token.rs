@@ -1,5 +1,4 @@
-//! `password_reset_token` table: single-use, expiring password-reset tokens
-//! (WVR-41).
+//! `password_reset_token` table: single-use, expiring password-reset tokens.
 //!
 //! Only the digest is stored; the raw secret lives solely in the emailed link
 //! (carried in the URL fragment so it never reaches HTTP access logs).

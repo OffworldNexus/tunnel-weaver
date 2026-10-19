@@ -18,11 +18,23 @@ jobs:
     env:
       DO_TOKEN: ${{ secrets.DIGITALOCEAN_TOKEN }}
       BASE_DOMAIN: ${{ secrets.NIGHTLY_DOMAIN }}
+      # The nightly delivers and reads real transactional email, so these are
+      # required (the email-dependent steps earlier in the list still skip when
+      # they are blank, but the account journey cannot).
+      RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+      WEAVER_E2E_EMAIL: ${{ secrets.WEAVER_E2E_EMAIL }}
+      WEAVER_E2E_FROM: ${{ secrets.WEAVER_E2E_FROM }}
+      # Skip Playwright's postinstall browser download; the explicit step below
+      # installs exactly Chromium with its system dependencies, as `e2e-bdd` does.
+      PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: "1"
+      # The tpmd rev `crates/weave/Cargo.toml` pins its client to. The agent
+      # binary must speak the same protocol as the client the tunnel uses.
+      TPMD_REV: 90cb2db45b3ea6bc065918f11c7e0fd23b4ce837
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Verify DigitalOcean credentials and domain secret
+      - name: Verify required secrets
         run: |
           if [ -z "$DO_TOKEN" ]; then
             echo "::error::DIGITALOCEAN_TOKEN secret is not set; cannot provision disposable droplet."
@@ -30,6 +42,16 @@ jobs:
           fi
           if [ -z "$BASE_DOMAIN" ]; then
             echo "::error::NIGHTLY_DOMAIN secret is not set; cannot configure DNS."
+            exit 1
+          fi
+          # The account journey delivers and reads real email, so unlike the
+          # email-dependent cargo tests it cannot skip when these are blank.
+          missing=""
+          [ -n "$RESEND_API_KEY" ] || missing="$missing RESEND_API_KEY"
+          [ -n "$WEAVER_E2E_EMAIL" ] || missing="$missing WEAVER_E2E_EMAIL"
+          [ -n "$WEAVER_E2E_FROM" ] || missing="$missing WEAVER_E2E_FROM"
+          if [ -n "$missing" ]; then
+            echo "::error::missing required secret(s):$missing — the nightly signs up a real account and reads its verification link through the Resend Receiving API."
             exit 1
           fi
 
@@ -63,8 +85,8 @@ jobs:
           echo "tunnel_domain=$TUNNEL_DOMAIN" >> "$GITHUB_OUTPUT"
           echo "admin_rec=$ADMIN_REC" >> "$GITHUB_OUTPUT"
           echo "tunnel_rec=$TUNNEL_REC" >> "$GITHUB_OUTPUT"
-          # `full_domain` is the tunnel domain; most steps treat it as the relay
-          # hostname they talk to.
+          # `full_domain` is the tunnel domain; the relay's admin host is the
+          # name a paired client dials, and the tunnel is served under this.
           echo "full_domain=$TUNNEL_DOMAIN" >> "$GITHUB_OUTPUT"
 
       - name: Install stable Rust toolchain
@@ -86,7 +108,9 @@ jobs:
         with:
           node-version: 24
           cache: pnpm
-          cache-dependency-path: frontend/pnpm-lock.yaml
+          cache-dependency-path: |
+            frontend/pnpm-lock.yaml
+            e2e/pnpm-lock.yaml
 
       - name: Build the account SPA
         run: |
@@ -94,8 +118,57 @@ jobs:
           pnpm install --frozen-lockfile
           pnpm run build
 
+      # The nightly drives the real sign-up, verification and pairing pages in a
+      # browser, so it installs the same Playwright the `e2e-bdd` job does.
+      - name: Install the e2e dependencies and Chromium
+        working-directory: e2e
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm exec playwright install --with-deps chromium
+
+      # `weave` is built plainly: the nightly pairs a real device key held by
+      # tpmd, exactly as a production client does.
       - name: Build release binaries (weaver-server and weave)
         run: cargo build --release -p weaver-server -p weave
+
+      # The key agent. It is consumed as a binary, pinned to the same rev as the
+      # `tpmd-client` the tunnel links.
+      - name: Install tpmd (the local key agent)
+        run: |
+          cargo install --git https://github.com/OffworldNexus/tpmd --rev "$TPMD_REV" tpmd
+          tpmd --version
+
+      # The one shortcut the runner cannot avoid: it has no TPM, so tpmd runs
+      # its `dummy` software key store. It is the backend's guaranteed floor
+      # (level `file`), and both the agent and `weave pair` are told a floor that
+      # level can meet — no prompt, no silent weakening.
+      - name: Start tpmd with the dummy backend
+        run: |
+          XDG_RUNTIME_DIR="$(mktemp -d)"
+          export XDG_RUNTIME_DIR
+          echo "XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR" >> "$GITHUB_ENV"
+          TPMD_STATE_DIR="$(mktemp -d)"
+          echo "TPMD_STATE_DIR=$TPMD_STATE_DIR" >> "$GITHUB_ENV"
+          # An isolated client store for every later `weave` step.
+          WEAVE_DATA_DIR="$RUNNER_TEMP/weave-data"
+          echo "WEAVE_DATA_DIR=$WEAVE_DATA_DIR" >> "$GITHUB_ENV"
+
+          tpmd serve --user --backend dummy \
+            --state-dir "$TPMD_STATE_DIR" \
+            --min-key-security file > /tmp/tpmd.log 2>&1 &
+
+          SOCKET="$XDG_RUNTIME_DIR/tpmd/tpmd.sock"
+          for _ in $(seq 1 100); do
+            [ -S "$SOCKET" ] && break
+            sleep 0.2
+          done
+          if [ ! -S "$SOCKET" ]; then
+            echo "::error::tpmd never bound $SOCKET"
+            cat /tmp/tpmd.log
+            exit 1
+          fi
+          echo "tpmd is listening on $SOCKET"
+          tpmd status --socket "$SOCKET"
 
       # Real-provider email e2e. The test skips unless RESEND_API_KEY and
       # WEAVER_E2E_EMAIL are configured, so PRs without the secrets stay green.
@@ -319,6 +392,39 @@ jobs:
                --email admin@$TARGET_DOMAIN \
                --acme-provider letsencrypt-staging"
 
+      - name: Wait for the relay to serve the admin and tunnel hostnames
+        run: |
+          IP="${{ steps.droplet.outputs.ip }}"
+          TARGET_DOMAIN="${{ steps.domain.outputs.full_domain }}"
+          ADMIN_DOMAIN="${{ steps.domain.outputs.admin_domain }}"
+
+          mkdir -p /tmp/certs
+          curl -s https://letsencrypt.org/certs/staging/letsencrypt-stg-root-x1.pem > /tmp/certs/staging-ca.pem
+          curl -s https://letsencrypt.org/certs/staging/letsencrypt-stg-root-x2.pem >> /tmp/certs/staging-ca.pem
+          curl -s https://letsencrypt.org/certs/staging/gen-y/root-ye.pem >> /tmp/certs/staging-ca.pem
+          curl -s https://letsencrypt.org/certs/staging/gen-y/root-yr.pem >> /tmp/certs/staging-ca.pem
+
+          # The relay orders its wildcard and admin certificates at startup; both
+          # names must answer HTTPS before anything pairs or browses.
+          for name in "$ADMIN_DOMAIN" "$TARGET_DOMAIN"; do
+            echo "Waiting for https://$name/ ..."
+            ok=""
+            for _ in $(seq 1 60); do
+              if curl -s -o /dev/null --fail --max-time 10 --cacert /tmp/certs/staging-ca.pem "https://$name/"; then
+                echo "https://$name/ is serving"
+                ok=1
+                break
+              fi
+              sleep 2
+            done
+            if [ -z "$ok" ]; then
+              echo "::error::https://$name/ never came up"
+              ssh -o StrictHostKeyChecking=no -i ~/.ssh/id_nightly root@"$IP" \
+                "/usr/local/bin/weaver-server cert status --json" || true
+              exit 1
+            fi
+          done
+
       - name: Verify issued certificate and HTTPS endpoint
         run: |
           IP="${{ steps.droplet.outputs.ip }}"
@@ -329,61 +435,260 @@ jobs:
           ssh -o StrictHostKeyChecking=no -i ~/.ssh/id_nightly root@"$IP" \
             "/usr/local/bin/weaver-server cert status --json"
 
-          # Verify HTTPS reachability for both domains. At this point DNS for
-          # the tunnel zone is served by the relay itself.
-          curl -k -v --fail --max-time 15 "https://$TARGET_DOMAIN/"
-          curl -k -v --fail --max-time 15 "https://$ADMIN_DOMAIN/"
+          curl -s -v --fail --max-time 15 --cacert /tmp/certs/staging-ca.pem "https://$TARGET_DOMAIN/" > /dev/null
+          curl -s -v --fail --max-time 15 --cacert /tmp/certs/staging-ca.pem "https://$ADMIN_DOMAIN/" > /dev/null
 
-      - name: Verify tunnel registration, certificate issuance, and HTTP proxying
+      # The provider is configured through the real two-step OTP flow: the relay
+      # mails a six-digit code through Resend, and it is read back through
+      # Resend's Receiving API — never from the database.
+      - name: Configure the mail provider (real Resend)
+        env:
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          WEAVER_E2E_EMAIL: ${{ secrets.WEAVER_E2E_EMAIL }}
+          WEAVER_E2E_FROM: ${{ secrets.WEAVER_E2E_FROM }}
         run: |
           IP="${{ steps.droplet.outputs.ip }}"
           TARGET_DOMAIN="${{ steps.domain.outputs.full_domain }}"
+          ADMIN_DOMAIN="${{ steps.domain.outputs.admin_domain }}"
+          DB=/var/lib/weaver/weaver.db
 
-          # Download Let's Encrypt Staging CA certificate bundle
-          mkdir -p /tmp/certs
-          curl -s https://letsencrypt.org/certs/staging/letsencrypt-stg-root-x1.pem > /tmp/certs/staging-ca.pem
-          curl -s https://letsencrypt.org/certs/staging/letsencrypt-stg-root-x2.pem >> /tmp/certs/staging-ca.pem
-          curl -s https://letsencrypt.org/certs/staging/gen-y/root-ye.pem >> /tmp/certs/staging-ca.pem
-          curl -s https://letsencrypt.org/certs/staging/gen-y/root-yr.pem >> /tmp/certs/staging-ca.pem
+          # `configure` writes through the store, so run it as the service user:
+          # SQLite's -wal/-shm files must never end up root-owned under a running
+          # relay. The OTP is addressed to the receiving mailbox.
+          CONFIGURE="runuser -u weaver -- /usr/local/bin/weaver-server configure \
+            --db $DB --tunnel-domain $TARGET_DOMAIN --admin-domain $ADMIN_DOMAIN \
+            --email $WEAVER_E2E_EMAIL --headless \
+            --email-provider resend --email-from $WEAVER_E2E_FROM \
+            --email-api-key $RESEND_API_KEY"
+
+          # Snapshot already-received ids first, so a stale code from an earlier
+          # run (same subject) cannot be mistaken for this run's.
+          BEFORE=$(curl -s -H "Authorization: Bearer $RESEND_API_KEY" \
+            "https://api.resend.com/emails/receiving?limit=20" | jq -r '.data[].id' | tr '\n' ' ')
+
+          # First run issues the OTP and exits non-zero.
+          set +e
+          FIRST=$(ssh -o StrictHostKeyChecking=no -i ~/.ssh/id_nightly root@"$IP" "$CONFIGURE" 2>&1)
+          FIRST_RC=$?
+          set -e
+          echo "$FIRST"
+          if [ "$FIRST_RC" -eq 0 ]; then
+            echo "::error::the first configure run should have required the OTP"
+            exit 1
+          fi
+          echo "$FIRST" | grep -q "OTP was sent" || { echo "::error::no OTP was sent"; exit 1; }
+
+          # Read the code back through Resend's Receiving API, accepting only an
+          # email that arrived after the snapshot above.
+          OTP=""
+          for _ in $(seq 1 30); do
+            RESP=$(curl -s -H "Authorization: Bearer $RESEND_API_KEY" \
+              "https://api.resend.com/emails/receiving?limit=20")
+            ID=$(echo "$RESP" | jq -r --arg to "$WEAVER_E2E_EMAIL" --arg before "$BEFORE" '
+              ($before | split(" ")) as $seen
+              | .data[]
+              | select((.to | index($to)) and (.subject | test("verification code"; "i")))
+              | .id as $id
+              | select(($seen | index($id)) == null)
+              | $id' | head -n 1)
+            if [ -n "$ID" ] && [ "$ID" != "null" ]; then
+              TEXT=$(curl -s -H "Authorization: Bearer $RESEND_API_KEY" \
+                "https://api.resend.com/emails/receiving/$ID" | jq -r '.text // .html // ""')
+              OTP=$(printf '%s' "$TEXT" | grep -oE '[0-9]{6}' | head -n 1 || true)
+              if [ -n "$OTP" ]; then
+                break
+              fi
+            fi
+            sleep 2
+          done
+          if [ -z "$OTP" ]; then
+            echo "::error::did not receive the configure OTP email at $WEAVER_E2E_EMAIL"
+            exit 1
+          fi
+          echo "received the configure OTP email (code redacted)"
+
+          # Second run proves the code and persists the email block.
+          ssh -o StrictHostKeyChecking=no -i ~/.ssh/id_nightly root@"$IP" \
+            "$CONFIGURE --email-otp $OTP"
+
+          # The account runtime reads the mail configuration at startup, so the
+          # relay picks the provider up on a restart.
+          ssh -o StrictHostKeyChecking=no -i ~/.ssh/id_nightly root@"$IP" \
+            "systemctl restart weaver-server.service"
+          healthy=""
+          for _ in $(seq 1 30); do
+            if curl -s -o /dev/null --fail --max-time 10 --cacert /tmp/certs/staging-ca.pem "https://$ADMIN_DOMAIN/"; then
+              echo "relay is back up with email configured"
+              healthy=1
+              break
+            fi
+            sleep 2
+          done
+          if [ -z "$healthy" ]; then
+            echo "::error::the relay did not come back after the email configuration"
+            ssh -o StrictHostKeyChecking=no -i ~/.ssh/id_nightly root@"$IP" \
+              "systemctl status weaver-server.service --no-pager || true"
+            exit 1
+          fi
+
+      # The real sign-up journey in a browser: create the account, then — once
+      # the emailed verification link is known — verify, set a password, sign in.
+      - name: Create the account in the browser
+        env:
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          WEAVER_E2E_EMAIL: ${{ secrets.WEAVER_E2E_EMAIL }}
+        run: |
+          ADMIN_DOMAIN="${{ steps.domain.outputs.admin_domain }}"
+          # The receiving mailbox is shared across runs, so snapshot the ids
+          # already there *before* the signup mail is sent: only a message that
+          # arrives after this point can belong to this run.
+          BEFORE=$(curl -s -H "Authorization: Bearer $RESEND_API_KEY" \
+            "https://api.resend.com/emails/receiving?limit=20" | jq -r '.data[].id' | tr '\n' ' ')
+          echo "RESEND_VERIFY_SNAPSHOT=$BEFORE" >> "$GITHUB_ENV"
+          echo "ACCOUNT_EMAIL=$WEAVER_E2E_EMAIL" >> "$GITHUB_ENV"
+          echo "PROVISION_STATE=$RUNNER_TEMP/provision-state.json" >> "$GITHUB_ENV"
+
+          (cd e2e && node nightly/provision.mjs signup \
+            --base "https://$ADMIN_DOMAIN" \
+            --email "$WEAVER_E2E_EMAIL" \
+            --name nightly \
+            --state "$RUNNER_TEMP/provision-state.json")
+
+      - name: Verify the account by its emailed link
+        env:
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          WEAVER_E2E_EMAIL: ${{ secrets.WEAVER_E2E_EMAIL }}
+        run: |
+          ADMIN_DOMAIN="${{ steps.domain.outputs.admin_domain }}"
+          PASSWORD="nightly-password-$(openssl rand -hex 4)"
+          echo "ACCOUNT_PASSWORD=$PASSWORD" >> "$GITHUB_ENV"
+
+          # The verification link is the real one the relay mailed through
+          # Resend; read it back through Resend's Receiving API, accepting only a
+          # message that arrived after the pre-signup snapshot.
+          LINK=""
+          for _ in $(seq 1 30); do
+            RESP=$(curl -s -H "Authorization: Bearer $RESEND_API_KEY" \
+              "https://api.resend.com/emails/receiving?limit=20")
+            ID=$(echo "$RESP" | jq -r --arg to "$WEAVER_E2E_EMAIL" --arg before "$RESEND_VERIFY_SNAPSHOT" '
+              ($before | split(" ")) as $seen
+              | .data[]
+              | select((.to | index($to)) and (.subject | test("verify your email"; "i")))
+              | .id as $id
+              | select(($seen | index($id)) == null)
+              | $id' | head -n 1)
+            if [ -n "$ID" ] && [ "$ID" != "null" ]; then
+              TEXT=$(curl -s -H "Authorization: Bearer $RESEND_API_KEY" \
+                "https://api.resend.com/emails/receiving/$ID" | jq -r '.text // .html // ""')
+              LINK=$(printf '%s' "$TEXT" | grep -oE 'https://[A-Za-z0-9.:_-]+/verify\?token=[0-9a-f]+' | head -n 1 || true)
+              if [ -n "$LINK" ]; then
+                break
+              fi
+            fi
+            sleep 2
+          done
+          if [ -z "$LINK" ]; then
+            echo "::error::did not receive the account verification email at $WEAVER_E2E_EMAIL"
+            exit 1
+          fi
+          echo "received the account verification email (link redacted)"
+
+          (cd e2e && node nightly/provision.mjs verify \
+            --base "https://$ADMIN_DOMAIN" \
+            --email "$ACCOUNT_EMAIL" \
+            --password "$PASSWORD" \
+            --link "$LINK" \
+            --state "$PROVISION_STATE")
+
+      # The real pairing: `weave pair` provisions the key in tpmd, solves the
+      # relay's proof of work, prints the approval link and waits; the browser
+      # approves the machine on the relay's own page.
+      - name: Pair the machine (weave pair + browser approval)
+        run: |
+          ADMIN_DOMAIN="${{ steps.domain.outputs.admin_domain }}"
+
+          ./target/release/weave pair "$ADMIN_DOMAIN" \
+            --min-key-security file \
+            --insecure-root-ca /tmp/certs/staging-ca.pem > /tmp/pair.log 2>&1 &
+          PAIR_PID=$!
+
+          LINK=""
+          for _ in $(seq 1 60); do
+            LINK=$(grep -oE 'https://[A-Za-z0-9.:_-]+/pair#handle=[0-9a-f]+' /tmp/pair.log | head -n 1)
+            [ -n "$LINK" ] && break
+            sleep 1
+          done
+          if [ -z "$LINK" ]; then
+            echo "::error::weave pair never printed an approval link"
+            cat /tmp/pair.log
+            kill "$PAIR_PID" 2>/dev/null || true
+            exit 1
+          fi
+          echo "captured the pairing link (handle redacted)"
+
+          (cd e2e && node nightly/provision.mjs approve \
+            --base "https://$ADMIN_DOMAIN" \
+            --link "$LINK" \
+            --machine laptop \
+            --person nightly \
+            --state "$PROVISION_STATE")
+
+          if ! wait "$PAIR_PID"; then
+            echo "::error::weave pair did not record the approval"
+            cat /tmp/pair.log
+            exit 1
+          fi
+          cat /tmp/pair.log
+          grep -q "Paired as" /tmp/pair.log || { echo "::error::pairing was not confirmed"; exit 1; }
+
+      - name: Verify tunnel registration, certificate issuance, and HTTP proxying
+        run: |
+          ADMIN_DOMAIN="${{ steps.domain.outputs.admin_domain }}"
 
           # A trivial local origin for `weave start` to proxy to.
           mkdir -p /tmp/origin && echo "hello from origin" > /tmp/origin/hello
           (cd /tmp/origin && python3 -m http.server 18080 --bind 127.0.0.1 > /tmp/origin.log 2>&1 &)
 
-          echo "Starting weave start client against $TARGET_DOMAIN:443..."
-          ./target/release/weave start web=18080 --server "$TARGET_DOMAIN" --insecure-root-ca /tmp/certs/staging-ca.pem > /tmp/weave.log 2>&1 &
-          WEAVE_PID=$!
+          # The client dials the relay's admin host; the tunnel itself is served
+          # under the tunnel domain. The hostname is the one the relay assigns
+          # and the client prints — never assumed.
+          echo "Starting weave start client against $ADMIN_DOMAIN:443..."
+          ./target/release/weave start web=18080 --server "$ADMIN_DOMAIN" --insecure-root-ca /tmp/certs/staging-ca.pem > /tmp/weave.log 2>&1 &
+          echo "$!" > /tmp/weave.pid
 
-          TUNNEL_HOST="poc-laptop-web.$TARGET_DOMAIN"
-          echo "Waiting for tunnel registration on $TUNNEL_HOST..."
-          for i in $(seq 1 60); do
-            if grep -q "https://$TUNNEL_HOST/" /tmp/weave.log; then
-              echo "Tunnel successfully registered: https://$TUNNEL_HOST/"
-              break
-            fi
+          TUNNEL_HOST=""
+          for _ in $(seq 1 90); do
+            TUNNEL_HOST=$(grep -oE 'https://[A-Za-z0-9.-]+/' /tmp/weave.log | head -n 1 | sed -E 's#https://##; s#/$##')
+            [ -n "$TUNNEL_HOST" ] && break
             sleep 1
           done
-
-          if ! grep -q "https://$TUNNEL_HOST/" /tmp/weave.log; then
-            echo "Error: Tunnel registration timed out. Log output:"
+          if [ -z "$TUNNEL_HOST" ]; then
+            echo "::error::weave start never reported a registered hostname"
             cat /tmp/weave.log
-            kill $WEAVE_PID || true
+            kill "$(cat /tmp/weave.pid)" 2>/dev/null || true
             exit 1
           fi
+          echo "TUNNEL_HOST=$TUNNEL_HOST" >> "$GITHUB_ENV"
+          echo "Tunnel successfully registered: https://$TUNNEL_HOST/"
 
           echo "Querying visitor endpoint on https://$TUNNEL_HOST/hello..."
-          HTTP_STATUS=$(curl -s -o /tmp/visitor.out -w "%{http_code}" --cacert /tmp/certs/staging-ca.pem "https://$TUNNEL_HOST/hello")
+          HTTP_STATUS=""
+          for _ in $(seq 1 60); do
+            HTTP_STATUS=$(curl -s -o /tmp/visitor.out -w "%{http_code}" --cacert /tmp/certs/staging-ca.pem "https://$TUNNEL_HOST/hello" || true)
+            [ "$HTTP_STATUS" = "200" ] && break
+            sleep 1
+          done
           echo "Received HTTP status: $HTTP_STATUS"
           if [ "$HTTP_STATUS" != "200" ]; then
-            echo "Error: Expected HTTP 200 from the proxied origin, got $HTTP_STATUS"
+            echo "::error::Expected HTTP 200 from the proxied origin, got $HTTP_STATUS"
             cat /tmp/weave.log
-            kill $WEAVE_PID || true
+            kill "$(cat /tmp/weave.pid)" 2>/dev/null || true
             exit 1
           fi
           if ! grep -q "hello from origin" /tmp/visitor.out; then
-            echo "Error: visitor did not receive the origin body:"
+            echo "::error::visitor did not receive the origin body:"
             cat /tmp/visitor.out
-            kill $WEAVE_PID || true
+            kill "$(cat /tmp/weave.pid)" 2>/dev/null || true
             exit 1
           fi
 
@@ -391,13 +696,12 @@ jobs:
           for probe in /.env /.git/HEAD /env /actuator/env "/%2e%2e%2f%2eenv"; do
             WAF_STATUS=$(curl -s -o /dev/null -w "%{http_code}" --cacert /tmp/certs/staging-ca.pem "https://$TUNNEL_HOST$probe")
             if [ "$WAF_STATUS" != "403" ]; then
-              echo "Error: WAF let $probe through with $WAF_STATUS"
-              kill $WEAVE_PID || true
+              echo "::error::WAF let $probe through with $WAF_STATUS"
+              kill "$(cat /tmp/weave.pid)" 2>/dev/null || true
               exit 1
             fi
           done
           echo "WAF refused the scanner playbook with 403"
-          echo "$WEAVE_PID" > /tmp/weave.pid
 
       # HTTP/2 conformance (RFC 7540/7541) against the public hostname,
       # with the trivial origin still behind the tunnel. h2spec is the
@@ -407,8 +711,6 @@ jobs:
         id: h2spec
         continue-on-error: true
         run: |
-          TARGET_DOMAIN="${{ steps.domain.outputs.full_domain }}"
-          TUNNEL_HOST="poc-laptop-web.$TARGET_DOMAIN"
           H2SPEC_VERSION="2.6.0"
           curl -sSL "https://github.com/summerwind/h2spec/releases/download/v${H2SPEC_VERSION}/h2spec_linux_amd64.tar.gz" | tar xz -C /tmp
           chmod +x /tmp/h2spec
@@ -438,9 +740,6 @@ jobs:
         id: http11probe
         continue-on-error: true
         run: |
-          TARGET_DOMAIN="${{ steps.domain.outputs.full_domain }}"
-          TUNNEL_HOST="poc-laptop-web.$TARGET_DOMAIN"
-
           git clone --depth 1 https://github.com/MDA2AV/Http11Probe /tmp/http11probe
           (cd /tmp/http11probe && dotnet build Http11Probe.slnx -c Release -v q)
           PROBE="dotnet run --no-build -c Release --project /tmp/http11probe/src/Http11Probe.Cli --"
@@ -472,8 +771,7 @@ jobs:
         id: autobahn
         continue-on-error: true
         run: |
-          TARGET_DOMAIN="${{ steps.domain.outputs.full_domain }}"
-          WS_HOST="poc-laptop-ws.$TARGET_DOMAIN"
+          ADMIN_DOMAIN="${{ steps.domain.outputs.admin_domain }}"
 
           # Echo origin: Python `websockets`, which implements the close
           # handshake and permessage-deflate correctly (websocat's mirror
@@ -484,13 +782,26 @@ jobs:
           sleep 2
           cat /tmp/ws-origin.log
 
-          # Add the ws service on its own client (the web one is still up).
-          ./target/release/weave start ws=19000 --server "$TARGET_DOMAIN" --insecure-root-ca /tmp/certs/staging-ca.pem --quiet > /tmp/weave-ws.log 2>&1 &
+          # Add the ws service on its own `weave start`, signed by the same
+          # device key (the web one is still up); its hostname is read the same
+          # way.
+          ./target/release/weave start ws=19000 --server "$ADMIN_DOMAIN" --insecure-root-ca /tmp/certs/staging-ca.pem --quiet > /tmp/weave-ws.log 2>&1 &
           WS_WEAVE_PID=$!
-          for i in $(seq 1 60); do
-            if curl -s -o /dev/null --cacert /tmp/certs/staging-ca.pem "https://$WS_HOST/" ; then break; fi
+
+          WS_HOST=""
+          for _ in $(seq 1 90); do
+            WS_HOST=$(grep -oE 'https://[A-Za-z0-9.-]+/' /tmp/weave-ws.log | head -n 1 | sed -E 's#https://##; s#/$##')
+            [ -n "$WS_HOST" ] && break
             sleep 1
           done
+          if [ -z "$WS_HOST" ]; then
+            echo "::error::the ws weave start never reported a registered hostname"
+            cat /tmp/weave-ws.log
+            kill "$WS_WEAVE_PID" 2>/dev/null || true
+            exit 1
+          fi
+          echo "WS_HOST=$WS_HOST" >> "$GITHUB_ENV"
+          echo "WebSocket tunnel registered: https://$WS_HOST/"
 
           mkdir -p /tmp/autobahn/reports
           # The Autobahn image is Python 2 with an old TLS stack and no CA
@@ -519,6 +830,10 @@ jobs:
         with:
           name: conformance-reports
           path: |
+            /tmp/tpmd.log
+            /tmp/pair.log
+            /tmp/weave.log
+            /tmp/weave-ws.log
             /tmp/h2spec.xml
             /tmp/h2spec.log
             /tmp/probe-origin.json
@@ -527,6 +842,7 @@ jobs:
             /tmp/probe-tunnel.log
             /tmp/shim.log
             /tmp/autobahn/reports/
+            /tmp/weave-provision-failure.png
           if-no-files-found: ignore
 
       - name: Conformance gate
@@ -540,14 +856,11 @@ jobs:
 
       - name: Tunnel teardown → 404
         run: |
-          TARGET_DOMAIN="${{ steps.domain.outputs.full_domain }}"
-          TUNNEL_HOST="poc-laptop-web.$TARGET_DOMAIN"
           WEAVE_PID=$(cat /tmp/weave.pid)
           echo "Stopping weave client (PID $WEAVE_PID)..."
-          # The client may already be gone: the WebSocket step starts a second
-          # `weave start` with the same hard-coded PoC identity, which the relay
-          # treats as superseding this one. Either way the tunnel is gone, which
-          # is what the 404 check below verifies, so a missing PID is fine.
+          # The WebSocket step already stopped its own `weave start` (same device
+          # key). Either way the tunnel is gone, which is what the 404 check
+          # below verifies, so a missing PID is fine.
           kill -INT "$WEAVE_PID" 2>/dev/null || true
           wait "$WEAVE_PID" 2>/dev/null || true
 
@@ -556,7 +869,7 @@ jobs:
           POST_STATUS=$(curl -s -o /dev/null -w "%{http_code}" --cacert /tmp/certs/staging-ca.pem "https://$TUNNEL_HOST/hello")
           echo "Received status after teardown: $POST_STATUS"
           if [ "$POST_STATUS" != "404" ]; then
-            echo "Error: Expected HTTP 404 after tunnel shutdown, got $POST_STATUS"
+            echo "::error::Expected HTTP 404 after tunnel shutdown, got $POST_STATUS"
             exit 1
           fi
 

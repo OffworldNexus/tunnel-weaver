@@ -1,10 +1,9 @@
 <script lang="ts">
-	import Keycap from '#lib/ui/Keycap.svelte';
 	import Icon from '#lib/ui/Icon.svelte';
-	import { href } from '#lib/app/paths';
+	import Keycap from '#lib/ui/Keycap.svelte';
+	import { resolve } from '$app/paths';
 
-	/** The public source repository; the only off-site link on the landing page. */
-	const repoUrl = 'https://github.com/OffworldNexus/tunnel-weaver';
+	import { REPO_URL } from './repo';
 </script>
 
 <!-- Closing CTA: repeat the primary action at the end of the page. -->
@@ -15,9 +14,9 @@
 			Create an account, verify your email, and your first hostname is a few minutes away.
 		</p>
 		<div class="closing__actions">
-			<Keycap href={href('/sign-up')}>Create account</Keycap>
-			<Keycap variant="ghost" href={href('/sign-in')}>Sign in</Keycap>
-			<Keycap variant="ghost" href={repoUrl} target="_blank" rel="noopener noreferrer">
+			<Keycap href={resolve('/sign-up')}>Create account</Keycap>
+			<Keycap variant="ghost" href={resolve('/sign-in')}>Sign in</Keycap>
+			<Keycap variant="ghost" href={REPO_URL} target="_blank" rel="noopener noreferrer">
 				<span class="closing__cta"><Icon name="github" />Get on GitHub</span>
 			</Keycap>
 		</div>

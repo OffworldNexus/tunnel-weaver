@@ -1,4 +1,4 @@
-//! `email_verification` table: append-only ownership history (WVR-36).
+//! `email_verification` table: append-only ownership history.
 //!
 //! The initial verification is a real row referencing the token that proved it,
 //! not a boolean on the account.

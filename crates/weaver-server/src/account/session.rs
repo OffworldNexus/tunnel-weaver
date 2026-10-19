@@ -1,4 +1,4 @@
-//! Browser sessions and CSRF cookies (WVR-36).
+//! Browser sessions and CSRF cookies.
 //!
 //! A session is an opaque random token carried in a `__Host-` Secure, HttpOnly,
 //! `SameSite=Lax` cookie. The server stores only its SHA-256 digest, so a stolen
@@ -13,7 +13,6 @@
 
 use http::HeaderMap;
 use http::header::COOKIE;
-use rand::RngCore;
 use sha2::{Digest, Sha256};
 
 use crate::store::entity::account;
@@ -29,30 +28,12 @@ pub const CSRF_HEADER: &str = "x-csrf-token";
 
 /// Generates a fresh 256-bit opaque token as lowercase hex.
 pub fn new_token() -> String {
-    random_hex(32)
+    crate::random_hex(32)
 }
 
 /// The stored form of a bearer secret: SHA-256, lowercase hex.
 pub fn token_hash(token: &str) -> String {
-    let digest = Sha256::digest(token.as_bytes());
-    let mut out = String::with_capacity(64);
-    for byte in digest {
-        use std::fmt::Write;
-        let _ = write!(out, "{byte:02x}");
-    }
-    out
-}
-
-/// Cryptographically random lowercase-hex string of `bytes * 2` characters.
-pub fn random_hex(bytes: usize) -> String {
-    let mut buf = vec![0u8; bytes];
-    rand::rng().fill_bytes(&mut buf);
-    let mut out = String::with_capacity(bytes * 2);
-    for byte in buf {
-        use std::fmt::Write;
-        let _ = write!(out, "{byte:02x}");
-    }
-    out
+    hex::encode(Sha256::digest(token.as_bytes()))
 }
 
 /// Returns the value of cookie `name` from a request's `Cookie` header(s).

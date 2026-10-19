@@ -49,9 +49,8 @@ pub use consume::{AltchaError, ConsumeRequest, verify_and_consume};
 #[cfg(feature = "test-util")]
 pub use pow::solve_challenge;
 pub use pow::{
-    CreateRequest, SUPPORTED_ALGORITHM, Verified, VerifyRequest, create_challenge, verify_solution,
+    CreateRequest, SUPPORTED_ALGORITHM, SolveError, SolveLimits, Verified, VerifyRequest,
+    create_challenge, try_solve_challenge, verify_solution,
 };
 pub use store::{AltchaClient, ConsumeKey, ConsumeOutcome, ProofStore};
-pub use types::{
-    Challenge, ChallengeParameters, CounterMode, HmacAlgorithm, Payload, ProofError, Solution,
-};
+pub use types::{Challenge, ChallengeParameters, Payload, ProofError, Solution};

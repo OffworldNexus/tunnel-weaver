@@ -59,15 +59,6 @@ proptest! {
         }
     }
 
-    /// REMAINING after a single unit-cost admission is exact.
-    #[test]
-    fn remaining_after_one(burst in 1u32..=10) {
-        let q = quota(burst, 1, 1000);
-        let mut gcra = Gcra::new();
-        let d = gcra.check(&q, 1, 0, CAP);
-        prop_assert_eq!(d.outcome, Outcome::Admitted);
-        prop_assert_eq!(d.remaining, burst - 1);
-    }
 }
 
 #[tokio::test]
@@ -173,10 +164,9 @@ fn two_budget_policy(on_store_error: StoreErrorPolicy) -> PolicySet {
     }])
 }
 
-fn decision(outcome: Outcome, remaining: u32, retry_after_ms: i64) -> Charge {
+fn decision(outcome: Outcome, retry_after_ms: i64) -> Charge {
     Charge {
         outcome,
-        remaining,
         retry_after_ms,
     }
 }
@@ -185,13 +175,13 @@ fn decision(outcome: Outcome, remaining: u32, retry_after_ms: i64) -> Charge {
 async fn gate_reports_the_longest_retry() {
     let gate = Gate::new(
         StubStore(vec![
-            decision(Outcome::Throttled, 0, 100),
-            decision(Outcome::Throttled, 0, 300),
+            decision(Outcome::Throttled, 100),
+            decision(Outcome::Throttled, 300),
         ]),
         two_budget_policy(StoreErrorPolicy::Degraded),
         CAP,
     );
-    let fp = fingerprint("10.0.0.1".parse().unwrap(), None);
+    let fp = fingerprint("10.0.0.1".parse().unwrap());
     let err = gate
         .admit(PolicyId::RELAY_WEB, &fp, 1, 0)
         .await
@@ -203,20 +193,24 @@ async fn gate_reports_the_longest_retry() {
 }
 
 #[tokio::test]
-async fn gate_admits_with_tightest_remaining() {
+async fn gate_throttles_when_any_budget_refuses() {
     let gate = Gate::new(
         StubStore(vec![
-            decision(Outcome::Admitted, 5, 0),
-            decision(Outcome::Admitted, 2, 0),
+            decision(Outcome::Admitted, 0),
+            decision(Outcome::Throttled, 200),
         ]),
         two_budget_policy(StoreErrorPolicy::Degraded),
         CAP,
     );
-    let fp = fingerprint("10.0.0.1".parse().unwrap(), None);
-    let admission = gate.admit(PolicyId::RELAY_WEB, &fp, 1, 0).await.unwrap();
-    assert_eq!(admission.remaining, 2);
+    let fp = fingerprint("10.0.0.1".parse().unwrap());
+    assert_eq!(
+        gate.admit(PolicyId::RELAY_WEB, &fp, 1, 0).await,
+        Err(GateError::Throttled {
+            policy: PolicyId::RELAY_WEB,
+            retry_after_ms: 200,
+        })
+    );
 }
-
 #[tokio::test]
 async fn gate_surfaces_store_failure_stance() {
     let gate = Gate::new(
@@ -224,7 +218,7 @@ async fn gate_surfaces_store_failure_stance() {
         two_budget_policy(StoreErrorPolicy::FailClosed),
         CAP,
     );
-    let fp = fingerprint("10.0.0.1".parse().unwrap(), None);
+    let fp = fingerprint("10.0.0.1".parse().unwrap());
     assert_eq!(
         gate.admit(PolicyId::RELAY_WEB, &fp, 1, 0)
             .await
@@ -243,7 +237,7 @@ async fn gate_end_to_end_through_memory_store() {
         two_budget_policy(StoreErrorPolicy::Degraded),
         CAP,
     );
-    let fp = fingerprint("203.0.113.9".parse().unwrap(), None);
+    let fp = fingerprint("203.0.113.9".parse().unwrap());
     // The peer-host burst (3) is the tighter budget, so the 4th unit is refused.
     for i in 0..3 {
         assert!(
@@ -256,6 +250,6 @@ async fn gate_end_to_end_through_memory_store() {
         Err(GateError::Throttled { .. })
     ));
     // A different source has its own budget.
-    let other = fingerprint("203.0.113.10".parse().unwrap(), None);
+    let other = fingerprint("203.0.113.10".parse().unwrap());
     assert!(gate.admit(PolicyId::RELAY_WEB, &other, 1, 0).await.is_ok());
 }

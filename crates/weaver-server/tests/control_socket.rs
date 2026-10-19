@@ -183,7 +183,6 @@ async fn test_control_socket_daemon_suite() {
             key_pem: key_pem.to_string(),
             not_before: now - 3600,
             not_after: now + 86400 * days,
-            issuer: Some("Test Issuer".to_string()),
             directory: "letsencrypt-staging".to_string(),
             obtained_at: now - 3600,
             validation: "dns-01".to_string(),
@@ -204,7 +203,7 @@ async fn test_control_socket_daemon_suite() {
             "weaver.test",
             now - 3600,
             "issued",
-            Some("Certificate successfully issued"),
+            "Certificate successfully issued",
         )
         .await
         .unwrap();
@@ -305,7 +304,7 @@ async fn test_control_socket_daemon_suite() {
         assert_eq!(val["ok"], true);
         assert_eq!(val["tunnel_domain"], "weaver.test");
         assert_eq!(val["admin_domain"], "relay-admin.test");
-        assert_eq!(val["schema_version"], 5);
+        assert_eq!(val["schema_version"], 1);
         // The seeded tunnel wildcard reports issued; the admin certificate has
         // no stored row and is still pending, so it counts as ordering.
         assert_eq!(val["cert_counts"]["issued"], 1);
@@ -814,8 +813,11 @@ async fn test_usage_control_verb_and_cli() {
     );
 
     // Seed one service and drive the manager's own loop so open time accrues.
-    let alice = store.create_person("Alice").await.unwrap();
-    let laptop = store.create_machine(alice.id, "laptop").await.unwrap();
+    let alice = store.create_test_person("Alice").await.unwrap();
+    let laptop = store
+        .create_machine(alice.id, "laptop", &weaver_mux::KeyId::Ed25519([1; 32]))
+        .await
+        .unwrap();
     let web = store.get_or_create_service(laptop.id, "web").await.unwrap();
 
     let metering = Arc::new(MeteringManager::new(
@@ -1006,7 +1008,6 @@ async fn test_status_and_cert_status_report_admin_and_cert_metadata() {
                 key_pem: "WILDCARD-KEY".into(),
                 not_before: now - 60,
                 not_after: now + 86_400,
-                issuer: None,
                 directory: "letsencrypt-staging".into(),
                 obtained_at: now - 60,
                 validation: "dns-01".into(),
@@ -1022,7 +1023,6 @@ async fn test_status_and_cert_status_report_admin_and_cert_metadata() {
                 key_pem: "ADMIN-KEY".into(),
                 not_before: now - 60,
                 not_after: now + 86_400,
-                issuer: None,
                 directory: "letsencrypt-staging".into(),
                 obtained_at: now - 60,
                 validation: "http-01".into(),
@@ -1131,7 +1131,6 @@ async fn test_doctor_control_verb_and_cli() {
                 key_pem: "WILDCARD-KEY".into(),
                 not_before: now - 60,
                 not_after: now + 86_400,
-                issuer: None,
                 directory: "letsencrypt-staging".into(),
                 obtained_at: now - 60,
                 validation: "dns-01".into(),

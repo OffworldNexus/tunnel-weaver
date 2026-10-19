@@ -5,7 +5,7 @@
 //! hashed code with its TTL and attempt count — and the pending
 //! [`EmailConfig`] it is proving — under the config singleton.
 
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use rand::Rng;
@@ -15,6 +15,7 @@ use thiserror::Error;
 
 use crate::config::{ConfigError, EmailConfig};
 use crate::store::{Store, StoreError};
+use crate::wall_clock::unix_secs;
 
 /// Number of digits in a code.
 pub const OTP_DIGITS: usize = 6;
@@ -56,14 +57,6 @@ fn hash_code(code: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(code.as_bytes());
     base64::engine::general_purpose::STANDARD.encode(hasher.finalize())
-}
-
-/// Current Unix time in seconds.
-fn now_unix() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64
 }
 
 /// Subject line shared by all OTP messages (English; setup has no locale).
@@ -157,7 +150,7 @@ impl PendingOtp {
         let code = generate_code();
         let record = PendingOtp {
             code_hash: hash_code(&code),
-            expires_at: now_unix() + OTP_TTL_SECS,
+            expires_at: unix_secs() + OTP_TTL_SECS,
             attempts: 0,
             max_attempts: OTP_MAX_ATTEMPTS,
             pending,
@@ -198,7 +191,7 @@ impl PendingOtp {
 
     /// Verifies against the wall clock and counts a miss.
     pub fn verify(&mut self, candidate: &str) -> Result<(), OtpError> {
-        self.verify_at(candidate, now_unix())
+        self.verify_at(candidate, unix_secs())
     }
 
     /// Verifies at a supplied Unix time so expiry is testable.
@@ -228,7 +221,7 @@ mod tests {
     fn flush() -> PendingOtp {
         PendingOtp {
             code_hash: hash_code("123456"),
-            expires_at: now_unix() + OTP_TTL_SECS,
+            expires_at: unix_secs() + OTP_TTL_SECS,
             attempts: 0,
             max_attempts: OTP_MAX_ATTEMPTS,
             pending: EmailConfig::default(),
@@ -284,13 +277,13 @@ mod tests {
     #[test]
     fn pending_verifies_hash_and_expiry() {
         let mut pending = flush();
-        assert_eq!(pending.verify_at("123456", now_unix()), Ok(()));
+        assert_eq!(pending.verify_at("123456", unix_secs()), Ok(()));
         assert_eq!(
-            pending.verify_at("999999", now_unix()),
+            pending.verify_at("999999", unix_secs()),
             Err(OtpError::Wrong)
         );
         assert_eq!(
-            pending.verify_at("123456", now_unix() + OTP_TTL_SECS + 1),
+            pending.verify_at("123456", unix_secs() + OTP_TTL_SECS + 1),
             Err(OtpError::Expired)
         );
     }

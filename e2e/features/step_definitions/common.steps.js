@@ -1,19 +1,50 @@
-/**
- * Shared, view-level steps used by more than one feature.
- *
- * These only assert what a person can see; feature-specific journeys live in
- * `landing.steps.js` and `account.steps.js`. Steps are registered globally by
- * Cucumber, so keeping the generic assertions here avoids duplication.
- */
+/** Steps shared across features: navigation, what a person sees, and signing in. */
 
-import { Then } from '@cucumber/cucumber';
+import { Given, Then, When } from '@cucumber/cucumber';
 import * as assert from '../support/assertions.js';
+import { press, registerAccount, signIn } from '../support/flow.js';
 
-Then('I see the {string} heading', async function (name) {
-  await assert.seeHeading(this.page, name);
+const PAGES = {
+  landing: '/',
+  'sign-up': '/sign-up',
+  'reset request': '/forgot-password',
+  account: '/app'
+};
+
+/** A per-scenario address, so a persistent database cannot collide across runs. */
+function uniqueEmail(name) {
+  const slug = name.toLowerCase().replace(/[^a-z0-9]+/g, '-');
+  return `e2e+${slug}-${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}@example.com`;
+}
+
+Given('a unique email address for {string}', function (name) {
+  this.name = name;
+  this.email = uniqueEmail(name);
 });
 
-Then('I see the welcome heading {string}', async function (name) {
+Given('an account exists for {string} with the password {string}', async function (name, password) {
+  await registerAccount(this, name, password);
+});
+
+Given('I open the {string} page', async function (page) {
+  await this.open(PAGES[page]);
+});
+
+When('I follow the {string} link', async function (name) {
+  // Calls to action repeat across the landing page.
+  await this.page.getByRole('link', { name, exact: true }).first().click();
+});
+
+When('I sign in with the (wrong )password {string}', async function (password) {
+  await signIn(this, password);
+});
+
+When('I sign out', async function () {
+  await press(this, 'Sign out');
+  await assert.seeHeading(this.page, 'Sign in');
+});
+
+Then('I see the {string} heading', async function (name) {
   await assert.seeHeading(this.page, name);
 });
 
@@ -21,17 +52,16 @@ Then('I see a link to {string}', async function (name) {
   await assert.seeLink(this.page, name);
 });
 
-Then('I see the sign-in error {string}', async function (text) {
+Then('I see the error {string}', async function (text) {
   await assert.seeAlert(this.page, text);
 });
 
+Then('I see {string}', async function (text) {
+  await assert.seeText(this.page, text);
+});
+
 Then('the verified email is shown as the account address', async function () {
-  await assert.seeFieldValue(
-    this.page,
-    this.page.getByLabel('Email'),
-    this.email,
-    'the verified email field'
-  );
+  await assert.seeFieldValue(this.page, 'Email', this.email);
 });
 
 Then('I see the signed-in identity for {string}', async function (name) {

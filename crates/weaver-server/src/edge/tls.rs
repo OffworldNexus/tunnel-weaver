@@ -10,7 +10,6 @@ use rcgen::generate_simple_self_signed;
 use rustls::ServerConfig;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::ResolvesServerCert;
-use rustls::sign::CertifiedKey;
 use thiserror::Error;
 
 /// Errors that can occur during TLS configuration and certificate generation.
@@ -23,24 +22,6 @@ pub enum TlsError {
     /// Rustls configuration error.
     #[error("Rustls error: {0}")]
     Rustls(#[from] rustls::Error),
-}
-
-/// Generates an in-memory self-signed fallback certificate for the root domain and `*.tunnel_domain`.
-pub fn generate_placeholder_certified_key(
-    tunnel_domain: &str,
-) -> Result<Arc<CertifiedKey>, TlsError> {
-    let sans = vec![tunnel_domain.to_string(), format!("*.{tunnel_domain}")];
-    let certified_key = generate_simple_self_signed(sans)?;
-
-    let cert_der = certified_key.cert.der().to_vec();
-    let key_der = certified_key.signing_key.serialize_der();
-
-    let cert_chain = vec![CertificateDer::from(cert_der)];
-    let key = PrivateKeyDer::try_from(key_der)
-        .map_err(|e| rustls::Error::General(format!("Invalid private key: {e}")))?;
-
-    let signing_key = rustls::crypto::ring::sign::any_supported_type(&key)?;
-    Ok(Arc::new(CertifiedKey::new(cert_chain, signing_key)))
 }
 
 /// Builds a `rustls::ServerConfig` using the provided dynamic certificate resolver

@@ -134,20 +134,9 @@ pub fn render_abuse_check_result(verified: bool, summary: &str) -> String {
 ///
 /// WhiteNoise-style manifest versioning: the page links
 /// `/abuse/check/assets/altcha/<version>/<file>`, so a change to *any* vendored
-/// file changes the version and busts every cache. Computed once per process
-/// over the embedded (identity) bytes in table order.
+/// file changes the version and busts every cache. Computed at build time.
 pub fn altcha_asset_version() -> &'static str {
-    static VERSION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    VERSION.get_or_init(|| {
-        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-        for row in ALTCHA_ASSETS {
-            for &byte in row.1 {
-                hash ^= u64::from(byte);
-                hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-            }
-        }
-        format!("{hash:016x}")
-    })
+    ALTCHA_ASSET_VERSION
 }
 
 /// The vendored ALTCHA widget assets, keyed by their path under
@@ -178,35 +167,13 @@ fn render(template: impl Template) -> String {
 /// Strict-Transport-Security (HSTS) when serving with a valid non-placeholder
 /// certificate.
 pub fn apply_security_headers<B>(response: &mut http::Response<B>, include_hsts: bool) {
-    let headers = response.headers_mut();
-    headers.insert(
-        http::header::CONTENT_TYPE,
-        http::HeaderValue::from_static("text/html; charset=utf-8"),
-    );
-    headers.insert(
-        http::header::CONTENT_SECURITY_POLICY,
+    apply_html_headers(
+        response,
         http::HeaderValue::from_static(
             "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'",
         ),
+        include_hsts,
     );
-    headers.insert(
-        http::header::X_CONTENT_TYPE_OPTIONS,
-        http::HeaderValue::from_static("nosniff"),
-    );
-    headers.insert(
-        http::header::X_FRAME_OPTIONS,
-        http::HeaderValue::from_static("DENY"),
-    );
-    headers.insert(
-        http::header::REFERRER_POLICY,
-        http::HeaderValue::from_static("no-referrer"),
-    );
-    if include_hsts {
-        headers.insert(
-            http::header::STRICT_TRANSPORT_SECURITY,
-            http::HeaderValue::from_static("max-age=31536000; includeSubDomains"),
-        );
-    }
 }
 
 /// Security headers for non-HTML responses (JSON, static assets).
@@ -235,6 +202,21 @@ pub fn apply_common_security_headers<B>(response: &mut http::Response<B>, includ
     }
 }
 
+/// An HTML document's headers: its content type, `csp`, and the common set.
+fn apply_html_headers<B>(
+    response: &mut http::Response<B>,
+    csp: http::HeaderValue,
+    include_hsts: bool,
+) {
+    let headers = response.headers_mut();
+    headers.insert(
+        http::header::CONTENT_TYPE,
+        http::HeaderValue::from_static("text/html; charset=utf-8"),
+    );
+    headers.insert(http::header::CONTENT_SECURITY_POLICY, csp);
+    apply_common_security_headers(response, include_hsts);
+}
+
 /// Security headers for the ALTCHA diagnostic page.
 ///
 /// This is the one deliberately relaxed policy in the relay: the page loads the
@@ -253,51 +235,37 @@ pub fn apply_demo_security_headers<B>(
          img-src 'self' data:; font-src 'self'; worker-src 'self'; \
          connect-src {connect_origin}; form-action 'self'; frame-ancestors 'none'; base-uri 'none'"
     );
-    let headers = response.headers_mut();
-    headers.insert(
-        http::header::CONTENT_TYPE,
-        http::HeaderValue::from_static("text/html; charset=utf-8"),
+    // An origin that is not a valid header value cannot be allowed to connect;
+    // the page then gets the strictest policy.
+    let csp = http::HeaderValue::from_str(&csp)
+        .unwrap_or_else(|_| http::HeaderValue::from_static("default-src 'none'"));
+    apply_html_headers(response, csp, include_hsts);
+}
+
+/// Security headers for the account SPA shell.
+///
+/// The app is same-origin with its API, so `connect-src 'self'` suffices and no
+/// cross-origin exception is needed. Scripts/styles/workers are limited to the
+/// host; `style-src` allows inline styles because Svelte injects them.
+pub fn apply_spa_security_headers<B>(response: &mut http::Response<B>, include_hsts: bool) {
+    apply_html_headers(
+        response,
+        http::HeaderValue::from_static(
+            "default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; \
+             img-src 'self' data:; font-src 'self'; worker-src 'self'; connect-src 'self'; \
+             form-action 'self'; frame-ancestors 'none'; base-uri 'none'",
+        ),
+        include_hsts,
     );
-    if let Ok(value) = http::HeaderValue::from_str(&csp) {
-        headers.insert(http::header::CONTENT_SECURITY_POLICY, value);
-    }
-    headers.insert(
-        http::header::X_CONTENT_TYPE_OPTIONS,
-        http::HeaderValue::from_static("nosniff"),
-    );
-    headers.insert(
-        http::header::X_FRAME_OPTIONS,
-        http::HeaderValue::from_static("DENY"),
-    );
-    headers.insert(
-        http::header::REFERRER_POLICY,
-        http::HeaderValue::from_static("no-referrer"),
-    );
-    if include_hsts {
-        headers.insert(
-            http::header::STRICT_TRANSPORT_SECURITY,
-            http::HeaderValue::from_static("max-age=31536000; includeSubDomains"),
-        );
-    }
 }
 
 // The embedded static assets, generated by `build.rs` (which also pre-compresses
-// the gzip/zstd variants and refuses to build the SPA half without a real SPA
-// build unless the feature is off).
+// the gzip/zstd variants, and emits the SPA table only with `account-spa`).
 include!(concat!(env!("OUT_DIR"), "/assets.rs"));
 
 /// One generated row: `(name, identity bytes, content type, gzip, zstd)`.
-pub(crate) type AssetRow = (
+type AssetRow = (
     &'static str,
-    &'static [u8],
-    &'static str,
-    Option<&'static [u8]>,
-    Option<&'static [u8]>,
-);
-
-/// A generated row without a name: the shell serves every deep link, so it needs
-/// no lookup key.
-pub(crate) type IndexRow = (
     &'static [u8],
     &'static str,
     Option<&'static [u8]>,
@@ -397,18 +365,9 @@ pub fn negotiate_encoding(accept_encoding: Option<&str>, asset: &Asset) -> Conte
     }
 }
 
-/// The embedded SPA's content version, used to build immutable asset URLs.
-pub fn spa_asset_version() -> &'static str {
-    SPA_ASSET_VERSION
-}
-
-/// Whether a real SPA is embedded (false when only the placeholder shell is).
-pub fn spa_is_embedded() -> bool {
-    SPA_ASSET_VERSION != "placeholder"
-}
-
 /// An embedded SPA asset by its path relative to the build root (for example
 /// `_app/immutable/entry/start.js`).
+#[cfg(feature = "account-spa")]
 pub fn spa_asset(path: &str) -> Option<Asset> {
     SPA_ASSETS
         .iter()
@@ -417,52 +376,9 @@ pub fn spa_asset(path: &str) -> Option<Asset> {
 }
 
 /// The SPA shell, served for every history-route deep link.
+#[cfg(feature = "account-spa")]
 pub fn spa_index() -> Asset {
-    Asset {
-        bytes: SPA_INDEX.0,
-        content_type: SPA_INDEX.1,
-        gzip: SPA_INDEX.2,
-        zstd: SPA_INDEX.3,
-    }
-}
-
-/// Security headers for the account SPA shell.
-///
-/// The app is same-origin with its API, so `connect-src 'self'` suffices and no
-/// cross-origin exception is needed. Scripts/styles/workers are limited to the
-/// host; `style-src` allows inline styles because Svelte injects them.
-pub fn apply_spa_security_headers<B>(response: &mut http::Response<B>, include_hsts: bool) {
-    let headers = response.headers_mut();
-    headers.insert(
-        http::header::CONTENT_TYPE,
-        http::HeaderValue::from_static("text/html; charset=utf-8"),
-    );
-    headers.insert(
-        http::header::CONTENT_SECURITY_POLICY,
-        http::HeaderValue::from_static(
-            "default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; \
-             img-src 'self' data:; font-src 'self'; worker-src 'self'; connect-src 'self'; \
-             form-action 'self'; frame-ancestors 'none'; base-uri 'none'",
-        ),
-    );
-    headers.insert(
-        http::header::X_CONTENT_TYPE_OPTIONS,
-        http::HeaderValue::from_static("nosniff"),
-    );
-    headers.insert(
-        http::header::X_FRAME_OPTIONS,
-        http::HeaderValue::from_static("DENY"),
-    );
-    headers.insert(
-        http::header::REFERRER_POLICY,
-        http::HeaderValue::from_static("no-referrer"),
-    );
-    if include_hsts {
-        headers.insert(
-            http::header::STRICT_TRANSPORT_SECURITY,
-            http::HeaderValue::from_static("max-age=31536000; includeSubDomains"),
-        );
-    }
+    spa_asset("index.html").expect("build.rs refuses an SPA build without index.html")
 }
 
 #[cfg(test)]

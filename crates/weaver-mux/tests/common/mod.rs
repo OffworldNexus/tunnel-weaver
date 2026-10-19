@@ -91,7 +91,7 @@ impl Pair {
     pub async fn step(&mut self, from: Side) -> Option<Frame> {
         let now = self.clock.now();
         let mut buf = Vec::new();
-        if !self.side(from).poll_transmit(now, &mut buf) {
+        if !self.side(from).poll_transmit(&mut buf) {
             return None;
         }
         let frame = Frame::parse(&buf).expect("we only emit well-formed frames");
@@ -168,7 +168,7 @@ pub fn send(conn: &mut Connection, id: u32, msg: &[u8]) {
 }
 
 /// Set a server's announced parameters.
-pub fn server_params(cfg: &mut Config, f: impl FnOnce(&mut weaver_mux::ServerParams)) {
+pub fn server_params(cfg: &mut Config, f: impl FnOnce(&mut weaver_mux::Params)) {
     f(cfg.server_params_mut().expect("server config"));
 }
 

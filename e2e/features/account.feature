@@ -8,34 +8,29 @@ Feature: Account lifecycle
   Background:
     Given a unique email address for "Ada Lovelace"
 
-  Scenario: The full happy path from landing through a password change to a fresh sign-in
-    Given I open the landing page
-    When I follow the "Create account" call to action
+  Scenario: The full journey from landing through a password change to a fresh sign-in
+    Given I open the "landing" page
+    When I follow the "Create account" link
     And I create an account for "Ada Lovelace"
     Then I see the "Check your email" heading
     When I open the verification link from the latest email
     Then I see the "Set your password" heading
     And the verified email is shown as the account address
     When I set the password to "correct-horse-battery-staple"
-    Then I see the "Sign in" heading
+    Then I see "Your account is active. Sign in to continue."
     When I sign in with the password "correct-horse-battery-staple"
     Then I see the signed-in identity for "Ada Lovelace"
     When I sign out
     Then I see the "Sign in" heading
     When I sign in with the password "correct-horse-battery-staple"
     Then I see the signed-in identity for "Ada Lovelace"
-    # WVR-50: appended to this journey — it already registers the account, signs
-    # in and lands on the shell where the Security nav lives, so the change is a
-    # continuation rather than a second registration. It also retitles the
-    # scenario, whose endpoint is now a third sign-in.
-    When I open the Security page
+    When I follow the "Security" link
     Then I see the "Security" heading
-    And I see the Password panel showing "Password is set"
-    When I follow the "Change password" link from the Password panel
+    And the Password panel shows "Password is set"
+    When I follow the "Change password" link
     Then I see the "Change your password" heading
-    And the change form asks only for the current and new password
     When I change my password from "correct-horse-battery-staple" to "correct-horse-battery-staple-2"
-    Then I see the password change success notice
+    Then I see "Your password has been changed. Sign in with your new password."
     And I am signed out everywhere, this device included
     When I sign in with the password "correct-horse-battery-staple-2"
     Then I see the signed-in identity for "Ada Lovelace"
@@ -44,27 +39,22 @@ Feature: Account lifecycle
   Scenario: Signing in with the wrong password is refused generically
     Given an account exists for "Ada Lovelace" with the password "correct-horse-battery-staple"
     When I sign in with the wrong password "definitely-not-it"
-    Then I see the sign-in error "invalid email or password"
+    Then I see the error "invalid email or password"
 
   Scenario: Creating an account with an existing email does not disclose it before confirmation
     Given an account exists for "Ada Lovelace" with the password "correct-horse-battery-staple"
-    When I open the sign-up page
+    When I open the "sign-up" page
     And I create an account for "Ada Lovelace"
     Then I see the "Check your email" heading
     When I open the verification link from the latest email
     Then I see the "You already have an account" heading
 
-  # WVR-41: the password-reset round trip. Both scenarios sit here because they
-  # start from the same per-scenario unique address the Background seeds: the
-  # first gives it an account, the second deliberately does not, and both walk
-  # the same `/forgot-password` request path.
   Scenario: Requesting a reset link by email and signing in with the new password
     Given an account exists for "Ada Lovelace" with the password "correct-horse-battery-staple"
-    When I follow the "Forgot password?" link from the sign-in page
-    Then I see the "Reset your password" heading
-    When I request a reset link for my email
+    When I follow the "Forgot password?" link
+    And I request a reset link for my email
     Then I see the "Reset request accepted" heading
-    And I see the acknowledgement that instructions will be emailed
+    And I see "If an account exists, we'll email instructions to reset your password."
     When I take the reset link from the latest email
     Then the reset link carries its token in the fragment, never the query string
     When I open the reset link
@@ -72,35 +62,29 @@ Feature: Account lifecycle
     And the verified email is shown as the account address
     When I set the new password to "correct-horse-battery-staple-2"
     Then I see the "Sign in" heading
-    And I see the reset success notice
+    And I see "Your password has been reset. Sign in with your new password."
     When I sign in with the password "correct-horse-battery-staple-2"
     Then I see the signed-in identity for "Ada Lovelace"
-    When I open the same reset link again
+    When I open the reset link again
     Then I see the "Link expired or used" heading
 
-  # WVR-41: the enumeration-safe half. The Background's address has no account
-  # here, so this proves the relay's acceptance screen and its copy are identical
-  # to the happy path's — and that no mail is sent.
+  # The address has no account here: the acknowledgement must read exactly as
+  # it does for one that has, and no mail may be sent.
   Scenario: Requesting a reset for an address without an account discloses nothing
-    Given I open the reset request page
+    Given I open the "reset request" page
     When I request a reset link for my email
     Then I see the "Reset request accepted" heading
-    And I see the acknowledgement that instructions will be emailed
+    And I see "If an account exists, we'll email instructions to reset your password."
     And no reset email is sent
 
-  # WVR-50: the one refusal worth a browser. The relay scopes a wrong current
-  # password to `field: "current_password"` and leaves the credential alone
-  # (crates/weaver-server/tests/account_api.rs); what only a browser can show is
-  # that the SPA renders the refusal on that very field and — unlike the success
-  # path — does not end the session.
+  # A refused change keeps the session, unlike a successful one.
   Scenario: Changing the password with a wrong current password is refused on its field
     Given an account exists for "Ada Lovelace" with the password "correct-horse-battery-staple"
     When I sign in with the password "correct-horse-battery-staple"
     Then I see the signed-in identity for "Ada Lovelace"
-    When I open the Security page
-    And I follow the "Change password" link from the Password panel
-    Then I see the "Change your password" heading
-    When I try to change my password from "definitely-not-my-password" to "correct-horse-battery-staple-2"
-    Then I see the change refusal on the current password field
-    When I open my account page
+    When I follow the "Security" link
+    And I follow the "Change password" link
+    And I change my password from "definitely-not-my-password" to "correct-horse-battery-staple-2"
+    Then the current password field reports "that is not your current password"
+    When I open the "account" page
     Then I see the signed-in identity for "Ada Lovelace"

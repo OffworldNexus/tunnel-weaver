@@ -207,3 +207,74 @@ proptest! {
         prop_assert_eq!(result.unwrap_err(), ProofError::BadSignature);
     }
 }
+
+// ----- the bounded solver, for challenges issued by someone else -----
+
+const LIMITS: weaver_abuse::SolveLimits = weaver_abuse::SolveLimits {
+    max_cost: 1_000,
+    max_work: 1_000_000,
+};
+
+fn with(algorithm: &str, cost: u32, prefix: &str) -> Challenge {
+    create_challenge(CreateRequest {
+        algorithm,
+        cost,
+        key_length: 32,
+        key_prefix: prefix,
+        ttl_secs: 300,
+        secret: SECRET,
+        data: data("diagnostic", "flow-1"),
+        nonce: [7u8; 16],
+        salt: [9u8; 16],
+        now_ms: NOW_MS,
+    })
+}
+
+#[test]
+fn bounded_solver_produces_a_solution_that_verifies() {
+    let ch = with(SUPPORTED_ALGORITHM, 10, "0");
+    let solution = weaver_abuse::try_solve_challenge(&ch, &LIMITS).expect("cheap challenge");
+    verify_solution(VerifyRequest {
+        challenge: &ch,
+        solution: &solution,
+        secret: SECRET,
+        now_ms: NOW_MS,
+        expected_purpose: "diagnostic",
+        expected_flow: "flow-1",
+    })
+    .expect("the bounded solver's answer verifies");
+}
+
+#[test]
+fn bounded_solver_refuses_an_unknown_algorithm() {
+    let ch = with("SCRYPT", 10, "0");
+    assert_eq!(
+        weaver_abuse::try_solve_challenge(&ch, &LIMITS),
+        Err(weaver_abuse::SolveError::UnsupportedAlgorithm(
+            "SCRYPT".into()
+        ))
+    );
+}
+
+#[test]
+fn bounded_solver_refuses_too_much_work_before_doing_any() {
+    // Over the per-attempt cost.
+    assert!(matches!(
+        weaver_abuse::try_solve_challenge(&with(SUPPORTED_ALGORITHM, 1_001, "0"), &LIMITS),
+        Err(weaver_abuse::SolveError::TooExpensive(_))
+    ));
+    // Under the cost, but a prefix whose expected attempts exceed the budget:
+    // refused instantly, not after spending it.
+    assert!(matches!(
+        weaver_abuse::try_solve_challenge(&with(SUPPORTED_ALGORITHM, 10, "0000000"), &LIMITS),
+        Err(weaver_abuse::SolveError::TooExpensive(_))
+    ));
+}
+
+#[test]
+fn bounded_solver_refuses_a_malformed_prefix() {
+    assert!(matches!(
+        weaver_abuse::try_solve_challenge(&with(SUPPORTED_ALGORITHM, 10, "zz"), &LIMITS),
+        Err(weaver_abuse::SolveError::Malformed(_))
+    ));
+}

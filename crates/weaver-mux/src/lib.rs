@@ -45,7 +45,7 @@
 //!     // 2. deadlines
 //!     conn.handle_timeout(now);
 //!     // 3. bytes out — one frame per call, only after the previous one flushed
-//!     while transport.is_flushed() && conn.poll_transmit(now, &mut buf) {
+//!     while transport.is_flushed() && conn.poll_transmit(&mut buf) {
 //!         transport.send(&buf);
 //!     }
 //!     // 4. events
@@ -100,14 +100,11 @@ pub mod testing;
 
 pub use auth::{PublicKey, Signer, Verifier};
 pub use compress::Compress;
-pub use config::{
-    Config, DEFAULT_BULK_THRESHOLD, MAX_WINDOW, MIN_MESSAGE, MIN_WINDOW, Role, ServerParams,
-    Weights,
-};
+pub use config::{Config, DEFAULT_BULK_THRESHOLD, Role, Weights};
 pub use connection::Connection;
 pub use error::{CloseCode, CloseReason, ProtocolError, RejectCode, SignError, StreamError};
 pub use event::Event;
 pub use frame::{Frame, FrameType};
 pub use sched::Class;
 pub use stream::{RST_CODE_CONNECTION_CLOSED, StreamBytesSink, StreamId};
-pub use wire::{KeyId, Params, Signature};
+pub use wire::{KeyId, Params, ParseKeyIdError, Signature};

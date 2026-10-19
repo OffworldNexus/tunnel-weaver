@@ -43,9 +43,3 @@ impl ResetCode {
         }
     }
 }
-
-impl From<ResetCode> for u32 {
-    fn from(code: ResetCode) -> Self {
-        code.as_u32()
-    }
-}

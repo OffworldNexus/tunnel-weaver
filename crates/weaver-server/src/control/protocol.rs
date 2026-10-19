@@ -168,7 +168,8 @@ pub struct CertEventSummary {
     pub id: i64,
     pub at: i64,
     pub kind: String,
-    pub detail: Option<String>,
+    /// Empty when the event carries no detail.
+    pub detail: String,
 }
 
 /// Summary representation of a certificate in the summary list view.
@@ -202,10 +203,8 @@ pub struct CertDetailResponse {
     pub state: CertState,
     pub not_before: Option<i64>,
     pub not_after: Option<i64>,
-    pub issuer: Option<String>,
     pub provider: String,
     pub active: bool,
-    pub last_active_at: Option<i64>,
     pub cert_events: Vec<CertEventSummary>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cert_id: Option<i32>,

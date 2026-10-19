@@ -3,7 +3,7 @@
 //! Nothing here touches the wall clock or OS randomness: every helper is
 //! seeded so a failing test reproduces byte-for-byte.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
 use std::time::{Duration, Instant};
 
@@ -81,13 +81,6 @@ impl FakeClock {
         self.now += by;
         self.now
     }
-
-    /// Jump the clock to exactly `to` (must not go backwards).
-    pub fn set(&mut self, to: Instant) -> Instant {
-        assert!(to >= self.now, "FakeClock cannot go backwards");
-        self.now = to;
-        self.now
-    }
 }
 
 /// In-memory Ed25519 signer derived from a seed.
@@ -113,12 +106,13 @@ impl Ed25519TestSigner {
     }
 }
 
+#[async_trait::async_trait]
 impl Signer for Ed25519TestSigner {
     fn key_id(&self) -> KeyId {
         KeyId::Ed25519(self.key.verifying_key().to_bytes())
     }
 
-    fn sign(&mut self, msg: &[u8]) -> Result<Signature, SignError> {
+    async fn sign(&mut self, msg: &[u8]) -> Result<Signature, SignError> {
         let sig: ed25519_dalek::Signature = self.key.sign(msg);
         Ok(Signature::Ed25519(sig.to_bytes()))
     }
@@ -158,12 +152,13 @@ impl P256TestSigner {
     }
 }
 
+#[async_trait::async_trait]
 impl Signer for P256TestSigner {
     fn key_id(&self) -> KeyId {
         KeyId::P256(self.compressed())
     }
 
-    fn sign(&mut self, msg: &[u8]) -> Result<Signature, SignError> {
+    async fn sign(&mut self, msg: &[u8]) -> Result<Signature, SignError> {
         let sig: p256::ecdsa::Signature = self.key.sign(msg);
         let mut out = [0u8; 64];
         out.copy_from_slice(&sig.to_bytes());
@@ -174,43 +169,31 @@ impl Signer for P256TestSigner {
 /// A signer that always fails, for exercising the `SignError` path.
 pub struct FailingSigner(pub KeyId);
 
+#[async_trait::async_trait]
 impl Signer for FailingSigner {
     fn key_id(&self) -> KeyId {
         self.0
     }
 
-    fn sign(&mut self, _msg: &[u8]) -> Result<Signature, SignError> {
+    async fn sign(&mut self, _msg: &[u8]) -> Result<Signature, SignError> {
         Err(SignError("test signer refuses".into()))
     }
 }
 
 /// `Verifier` backed by a map. Keys can be marked invalid to exercise the
 /// `still_valid` re-check.
-#[derive(Default)]
 pub struct MapVerifier {
     keys: HashMap<KeyId, PublicKey>,
-    revoked: std::collections::HashSet<KeyId>,
-    /// Number of `still_valid` calls, for asserting the reverify cadence.
-    pub still_valid_calls: usize,
+    revoked: HashSet<KeyId>,
 }
 
 impl MapVerifier {
-    /// Empty verifier: every key is unknown.
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Register a key.
-    pub fn insert(&mut self, id: KeyId, pk: PublicKey) -> &mut Self {
-        self.keys.insert(id, pk);
-        self
-    }
-
-    /// Convenience: build a verifier that knows exactly this signer's key.
+    /// A verifier that knows exactly this one key.
     pub fn with_key(id: KeyId, pk: PublicKey) -> Self {
-        let mut v = Self::new();
-        v.insert(id, pk);
-        v
+        Self {
+            keys: HashMap::from([(id, pk)]),
+            revoked: HashSet::new(),
+        }
     }
 
     /// Make `still_valid` return `false` for this key from now on.
@@ -226,7 +209,6 @@ impl Verifier for MapVerifier {
     }
 
     async fn still_valid(&mut self, key_id: &KeyId) -> bool {
-        self.still_valid_calls += 1;
         !self.revoked.contains(key_id)
     }
 }

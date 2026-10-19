@@ -2,7 +2,6 @@
 
 pub mod acme;
 pub mod clock;
-pub mod events;
 pub mod managed;
 pub mod providers;
 pub mod renewal;
@@ -25,7 +24,6 @@ pub use acme::{
 #[cfg(any(test, feature = "test-util"))]
 pub use clock::MockClock;
 pub use clock::{Clock, SystemClock, format_unix_timestamp};
-pub use events::record_cert_event;
 pub use managed::{ManagedCert, ManagedCerts, Validation};
 pub use providers::{PROVIDERS, find_provider, format_providers_table};
 pub use renewal::{compute_backoff, should_renew};
@@ -273,7 +271,10 @@ impl CertManager {
         let host = host.to_ascii_lowercase();
         tokio::spawn(async move {
             let now = manager.clock.now_unix();
-            let _ = record_cert_event(&manager.store, &cert_name, now, "visit", Some(&host)).await;
+            let _ = manager
+                .store
+                .record_cert_event(&cert_name, now, "visit", &host)
+                .await;
 
             match manager.status(&cert_name) {
                 // A live order already covers this host.
@@ -370,7 +371,6 @@ impl CertManager {
                             key_pem: cert.key_pem.clone(),
                             not_before: cert.not_before,
                             not_after: cert.not_after,
-                            issuer: None,
                             directory: cert.directory.clone(),
                             obtained_at: now,
                             validation: spec.validation.label().to_string(),
@@ -394,14 +394,15 @@ impl CertManager {
                     "Certificate issued and active in TLS resolver"
                 );
                 let _ = notify_cert_status("issued");
-                let _ = record_cert_event(
-                    &self.store,
-                    &cert_name,
-                    now,
-                    "issued",
-                    Some(&format!("directory: {}", cert.directory)),
-                )
-                .await;
+                let _ = self
+                    .store
+                    .record_cert_event(
+                        &cert_name,
+                        now,
+                        "issued",
+                        &format!("directory: {}", cert.directory),
+                    )
+                    .await;
 
                 let mut in_flight = self.in_flight.lock().await;
                 if let Some(tx) = in_flight.remove(&cert_name) {
@@ -445,14 +446,15 @@ impl CertManager {
                     "Certificate issuance failed; affected hostnames will be without a valid certificate until it succeeds"
                 );
 
-                let _ = record_cert_event(
-                    &self.store,
-                    &cert_name,
-                    self.clock.now_unix(),
-                    "failed",
-                    Some(&err.to_string()),
-                )
-                .await;
+                let _ = self
+                    .store
+                    .record_cert_event(
+                        &cert_name,
+                        self.clock.now_unix(),
+                        "failed",
+                        &err.to_string(),
+                    )
+                    .await;
 
                 let mut in_flight = self.in_flight.lock().await;
                 if let Some(tx) = in_flight.remove(&cert_name) {
@@ -640,14 +642,10 @@ impl CertManager {
 
             match self.execute_issuance(cert_name.clone()).await {
                 Ok(()) => {
-                    let _ = record_cert_event(
-                        &self.store,
-                        &cert_name,
-                        self.clock.now_unix(),
-                        "renewed",
-                        None,
-                    )
-                    .await;
+                    let _ = self
+                        .store
+                        .record_cert_event(&cert_name, self.clock.now_unix(), "renewed", "")
+                        .await;
                     results.push(Ok(cert_name));
                 }
                 Err(e) => {

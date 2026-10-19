@@ -27,7 +27,7 @@
 	lede="Three steps from a local service to a shareable link."
 	listTag="ol"
 >
-	{#each steps as step}
+	{#each steps as step (step.n)}
 		<li class="step">
 			<span class="step__num" aria-hidden="true">{step.n}</span>
 			<h3 class="step__title">{step.title}</h3>

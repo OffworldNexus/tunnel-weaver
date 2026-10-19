@@ -1,6 +1,6 @@
 //! Minimal executor for fuzz targets.
 //!
-//! libFuzzer drives a plain synchronous closure, but the mux handshake now
+//! libFuzzer drives a plain synchronous closure, but the mux handshake
 //! awaits its `Verifier`. With the in-memory `MapVerifier` every future
 //! completes on the first poll, so a no-op waker plus a single `poll` is
 //! enough — and it keeps the fuzz build free of a runtime dependency.

@@ -1,75 +1,46 @@
 <script lang="ts">
 	/**
-	 * Email-link verification.
-	 *
-	 * Runs once on mount: exchanges the single-use token from the URL for the
-	 * next step. A new address yields a completion token (→ set a password); an
-	 * address that already has an account is only disclosed now. Either way the
-	 * link is consumed, so failures are terminal and offer a resend.
+	 * Exchanges the single-use email-link token for the next step: a new address
+	 * goes on to set a password; an address that already has an account is only
+	 * disclosed now that ownership is proven. Either way the link is spent, so a
+	 * failure is terminal.
 	 */
-
-	import { goto } from '$app/navigation';
-	import { page } from '$app/state';
 	import { onMount } from 'svelte';
-	import { api, messageOf } from '#lib/account/api';
-	import { loadFlow, saveFlow } from '#lib/account/flow';
-	import { networkError } from '#lib/account/notices';
-	import { href } from '#lib/app/paths';
+
+	import { api } from '#lib/account/api';
+	import { flow } from '#lib/account/state';
 	import Keycap from '#lib/ui/Keycap.svelte';
 	import Page from '#lib/ui/Page.svelte';
+	import { goto } from '$app/navigation';
+	import { resolve } from '$app/paths';
+	import { page } from '$app/state';
 
 	type VerifyOutcome =
-		| { outcome: 'set_password'; completion_token: string; name: string; email: string }
+		| { outcome: 'set_password'; completion_token: string; email: string }
 		| { outcome: 'existing_account'; email: string };
 
-	let status: 'checking' | 'expired' = 'checking';
 	let message = '';
-	const carried = loadFlow();
-	const canResend = Boolean(carried.flow);
+	const canResend = Boolean(flow.load().flow);
 
-	onMount(() => {
-		run();
-	});
-
-	// Exchange the single-use link token; both outcomes consume it.
-	async function run() {
-		status = 'checking';
-		message = '';
-		const token = page.url.searchParams.get('token') ?? '';
+	onMount(async () => {
+		const token = page.url.searchParams.get('token');
 		if (!token) {
-			status = 'expired';
 			message = 'This link is missing its token.';
 			return;
 		}
-		try {
-			const result = await api<VerifyOutcome>('/api/account/verify', {
-				method: 'POST',
-				body: { token }
-			});
-			if (result.ok && result.data?.outcome === 'set_password') {
-				// New address: keep the completion token for the password step.
-				saveFlow({
-					completion_token: result.data.completion_token,
-					name: result.data.name,
-					email: result.data.email
-				});
-				await goto(href('/set-password'));
-				return;
-			}
-			if (result.ok && result.data?.outcome === 'existing_account') {
-				// Already registered: reveal it only now that ownership is proven.
-				saveFlow({ email: result.data.email });
-				await goto(href('/existing-account'));
-				return;
-			}
-			status = 'expired';
-			message = messageOf(result.data, 'This link has expired or has already been used.');
-		} catch {
-			status = 'expired';
-			message = 'We could not reach the server. Please try again.';
-			networkError();
+		const res = await api<VerifyOutcome>('/api/account/verify', { token });
+		if (!res.ok || !res.data) {
+			message = res.error ?? 'This link has expired or has already been used.';
+			return;
 		}
-	}
+		if (res.data.outcome === 'set_password') {
+			flow.save({ completion_token: res.data.completion_token, email: res.data.email });
+			await goto(resolve('/set-password'));
+		} else {
+			flow.save({ email: res.data.email });
+			await goto(resolve('/existing-account'));
+		}
+	});
 </script>
 
 <svelte:head>
@@ -77,21 +48,19 @@
 </svelte:head>
 
 <Page labelledby="verify-title">
-	<h1 id="verify-title">
-		{status === 'checking' ? 'Verifying your link' : 'This link no longer works'}
-	</h1>
-
-	{#if status === 'checking'}
+	{#if !message}
+		<h1 id="verify-title">Verifying your link</h1>
 		<p class="lede" aria-live="polite">One moment while we confirm your email address…</p>
 	{:else}
+		<h1 id="verify-title">This link no longer works</h1>
 		<p class="lede">{message}</p>
-		<div class="actions" style="margin-top:24px">
+		<div class="actions">
 			{#if canResend}
-				<Keycap wide href={href('/check-email')}>Request a new link</Keycap>
+				<Keycap wide href={resolve('/check-email')}>Request a new link</Keycap>
 			{/if}
-			<Keycap wide variant="ghost" href={href('/sign-up')}>Start again</Keycap>
+			<Keycap wide variant="ghost" href={resolve('/sign-up')}>Start again</Keycap>
 		</div>
 	{/if}
 
-	<p class="switch"><a href={href('/sign-in')}>Back to sign in</a></p>
+	<p class="switch"><a href={resolve('/sign-in')}>Back to sign in</a></p>
 </Page>

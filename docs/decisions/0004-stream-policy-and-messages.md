@@ -58,3 +58,12 @@ The transport delimits messages, so the mux preserves application message bounda
 | `weaver-proto` | HTTP/control schemas, HTTP → policy rules, proto version | sockets, tokio, who a key is |
 | `weaver-tokio` | how to pump a `Connection` over a `Sink+Stream` | schemas, policy rules |
 | binaries | identity, routing, certs, CLI | frame layout, scheduler |
+
+## Amendment: enrolment is pairing, `PocResolver` is gone
+
+The `poc` sentence above has aged: `weaver_server::tunnel::identity` still owns
+`IdentityResolver` and the store-backed `StoreIdentityResolver`, but
+`PocResolver` and the hard-coded key map are deleted from the production path.
+A key is now whichever machine holds it in `machine.key_id` (ADR 0010), and
+enrolment is browser-approved pairing (`weave pair`), not a development seed.
+Tests inject a signer through the same `KeyAgent` seam production uses.

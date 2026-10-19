@@ -9,6 +9,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -20,6 +21,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot};
 use tokio_tungstenite::WebSocketStream;
 use tracing::{debug, info, trace};
+use weaver_mux::auth::{PublicKey, Verifier};
 use weaver_mux::{
     CloseCode, CloseReason, Compress, Config, Connection, Event, KeyId, StreamError, StreamId,
 };
@@ -29,7 +31,7 @@ use weaver_proto::{BodyFrame, Head, ResetCode, policy};
 use weaver_tokio::{Driver, Handle, StreamHandler, SystemRng, WsTransport};
 
 use crate::metering::MeteringManager;
-use crate::tunnel::identity::ResolverVerifier;
+use crate::tunnel::identity::StoreIdentityResolver;
 use crate::tunnel::proxy::{BodyFrameItem, BoxBody, ProxyError, ProxyRequest, TunnelResponseBody};
 use crate::tunnel::registry::TunnelRegistry;
 
@@ -40,28 +42,52 @@ type RelayHandle = Handle<RelayHandler>;
 pub fn spawn_tunnel_connection(
     ws_stream: WebSocketStream<TokioIo<hyper::upgrade::Upgraded>>,
     registry: Arc<TunnelRegistry>,
-    tunnel_domain: String,
+    server_name: String,
 ) {
-    tokio::spawn(run_tunnel_connection(ws_stream, registry, tunnel_domain));
+    tokio::spawn(run_tunnel_connection(ws_stream, registry, server_name));
 }
 
-/// How often the mux asks the `IdentityResolver` whether the connected
-/// key is still acceptable; a `false` answer closes with `KeyRevoked`.
+/// How often the mux asks whether the connected key is still held by a
+/// machine; a `false` answer closes with `KeyRevoked`.
 const REVERIFY_INTERVAL: Duration = Duration::from_secs(60);
+
+/// How long a client that revoked its own key has to read the `Revoked` reply
+/// and close before the relay closes for it.
+const REVOKE_GRACE: Duration = Duration::from_secs(5);
+
+/// The mux verifier of one connection.
+///
+/// Once the client has asked to revoke its key, the reverify timer must not
+/// close the connection: the machine is gone, and a close drops the `Revoked`
+/// reply before it is flushed. The revocation ends the connection instead.
+struct ConnectionVerifier {
+    identities: Arc<StoreIdentityResolver>,
+    revoking: Arc<AtomicBool>,
+}
+
+#[async_trait::async_trait]
+impl Verifier for ConnectionVerifier {
+    async fn public_key(&mut self, key_id: &KeyId) -> Option<PublicKey> {
+        self.identities.public_key(key_id).await
+    }
+
+    async fn still_valid(&mut self, key_id: &KeyId) -> bool {
+        self.revoking.load(Ordering::Acquire) || self.identities.identity(key_id).await.is_some()
+    }
+}
 
 async fn run_tunnel_connection(
     ws_stream: WebSocketStream<TokioIo<hyper::upgrade::Upgraded>>,
     registry: Arc<TunnelRegistry>,
-    tunnel_domain: String,
+    server_name: String,
 ) {
-    let verifier = Box::new(ResolverVerifier(registry.identities()));
-    let mut cfg = Config::server(verifier, tunnel_domain, Box::new(SystemRng));
-    if let weaver_mux::Role::Server {
-        reverify_interval, ..
-    } = &mut cfg.role
-    {
-        *reverify_interval = Some(REVERIFY_INTERVAL);
-    }
+    let revoking = Arc::new(AtomicBool::new(false));
+    let verifier = Box::new(ConnectionVerifier {
+        identities: registry.identities(),
+        revoking: Arc::clone(&revoking),
+    });
+    let cfg = Config::server(verifier, server_name, Box::new(SystemRng))
+        .with_reverify_interval(REVERIFY_INTERVAL);
     let mut conn = Connection::new(cfg, Instant::now());
 
     let (proxy_tx, proxy_rx) = mpsc::channel::<ProxyRequest>(64);
@@ -72,6 +98,7 @@ async fn run_tunnel_connection(
         proxy_tx,
         conn_id: None,
         key: None,
+        revoking,
         leases: HashMap::new(),
         inflight: HashMap::new(),
     };
@@ -79,10 +106,6 @@ async fn run_tunnel_connection(
     conn.set_bytes_sink(registry.metering().sink());
     let driver = Driver::new(conn, WsTransport::new(ws_stream), handler);
     let handle = driver.handle();
-    handle.spawn_on({
-        let h = handle.clone();
-        move |_, handler| handler.handle = Some(h)
-    });
     // Visitor requests arrive from hyper tasks; feed them to the driver.
     tokio::spawn(forward_proxy_requests(proxy_rx, handle));
 
@@ -169,11 +192,17 @@ pub(crate) struct RelayHandler {
     proxy_tx: mpsc::Sender<ProxyRequest>,
     conn_id: Option<u64>,
     key: Option<KeyId>,
+    /// Shared with this connection's [`ConnectionVerifier`].
+    revoking: Arc<AtomicBool>,
     leases: HashMap<StreamId, Lease>,
     inflight: HashMap<StreamId, Exchange>,
 }
 
 impl StreamHandler for RelayHandler {
+    fn set_handle(&mut self, handle: RelayHandle) {
+        self.handle = Some(handle);
+    }
+
     fn on_event(&mut self, conn: &mut Connection, event: Event) {
         match event {
             Event::Authenticated { key_id, version } => {
@@ -291,54 +320,99 @@ impl RelayHandler {
             let _ = conn.reset(id, ResetCode::Cancelled.as_u32());
             return;
         };
-        let ControlHead::Register { service, .. } = &head;
-        let service = service.clone();
         let (Some(key), Some(conn_id)) = (self.key, self.conn_id) else {
             let _ = conn.reset(id, ResetCode::Cancelled.as_u32());
             return;
         };
         if let Err(code) = head.validate() {
-            Self::reply(conn, id, refused(code, &service));
+            Self::reply(
+                conn,
+                id,
+                ControlReply::Refused {
+                    code,
+                    message: "request refused".into(),
+                },
+            );
             return;
         }
-        // Registration touches the cert manager (async): run it off the
-        // loop and come back through the handle.
-        self.leases.insert(id, Lease::Pending);
-        let registry = Arc::clone(&self.registry);
-        let proxy_tx = self.proxy_tx.clone();
-        let handle = self.handle();
-        tokio::spawn(async move {
-            let res = registry
-                .register_service(key, conn_id, &service, proxy_tx)
-                .await;
-            handle.spawn_on(move |conn, handler| {
-                let reply = match res {
-                    Ok(hostname) => {
-                        match handler.leases.get(&id) {
-                            Some(Lease::Released) => {
-                                // The client finished the stream while we
-                                // were registering: the lease is already gone.
+        match head {
+            ControlHead::Register { service, .. } => {
+                // Registration touches the cert manager (async): run it off the
+                // loop and come back through the handle.
+                self.leases.insert(id, Lease::Pending);
+                let registry = Arc::clone(&self.registry);
+                let proxy_tx = self.proxy_tx.clone();
+                let handle = self.handle();
+                tokio::spawn(async move {
+                    let res = registry
+                        .register_service(key, conn_id, &service, proxy_tx)
+                        .await;
+                    handle.spawn_on(move |conn, handler| {
+                        let reply = match res {
+                            Ok(hostname) => {
+                                match handler.leases.get(&id) {
+                                    Some(Lease::Released) => {
+                                        // The client finished the stream while we
+                                        // were registering: the lease is already gone.
+                                        handler.leases.remove(&id);
+                                        handler.registry.unregister_service(key, &hostname);
+                                        return;
+                                    }
+                                    _ => {
+                                        handler
+                                            .leases
+                                            .insert(id, Lease::Registered(hostname.clone()));
+                                        handler.watch_cert(id, hostname.clone());
+                                    }
+                                }
+                                ControlReply::Registered { hostname }
+                            }
+                            Err(code) => {
                                 handler.leases.remove(&id);
-                                handler.registry.unregister_service(key, &hostname);
-                                return;
+                                refused(code, &service)
                             }
-                            _ => {
-                                handler
-                                    .leases
-                                    .insert(id, Lease::Registered(hostname.clone()));
-                                handler.watch_cert(id, hostname.clone());
-                            }
+                        };
+                        Self::reply(conn, id, reply);
+                    });
+                });
+            }
+            ControlHead::Revoke { .. } => {
+                // The handshake already proved possession of the device key,
+                // which is the authority to revoke it. Deleting the machine is
+                // not instant, so it runs off the loop. From here until the
+                // reply is out, nothing may close the connection: the client
+                // forgets its pairing only once it reads `Revoked`.
+                self.revoking.store(true, Ordering::Release);
+                let registry = Arc::clone(&self.registry);
+                let revoking = Arc::clone(&self.revoking);
+                let handle = self.handle();
+                tokio::spawn(async move {
+                    match registry.store().revoke_machine(&key).await {
+                        Ok(_) => {
+                            // The services are gone with the machine: stop
+                            // routing and metering them now, not at close.
+                            registry.unregister_connection(key, conn_id);
+                            handle.spawn_on(move |conn, _| {
+                                Self::reply(conn, id, ControlReply::Revoked)
+                            });
+                            // The client closes once it has read the reply;
+                            // one that does not is closed for it.
+                            tokio::time::sleep(REVOKE_GRACE).await;
+                            handle.close(CloseReason::new(CloseCode::KeyRevoked));
                         }
-                        ControlReply::Registered { hostname }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "Failed to revoke machine");
+                            revoking.store(false, Ordering::Release);
+                            let reply = ControlReply::Refused {
+                                code: RefusalCode::Other,
+                                message: REVOKE_FAILED.into(),
+                            };
+                            handle.spawn_on(move |conn, _| Self::reply(conn, id, reply));
+                        }
                     }
-                    Err(code) => {
-                        handler.leases.remove(&id);
-                        refused(code, &service)
-                    }
-                };
-                Self::reply(conn, id, reply);
-            });
-        });
+                });
+            }
+        }
     }
 
     /// Push the hostname's current certificate state on the control stream,
@@ -886,15 +960,18 @@ impl RelayHandler {
     }
 }
 
+/// Why a `Revoke` was refused: the store failed, so trying again may work.
+const REVOKE_FAILED: &str = "the relay could not revoke this machine; try again";
+
 fn refused(code: RefusalCode, service: &str) -> ControlReply {
     let message = match &code {
         RefusalCode::AlreadyRegistered => format!("Service '{service}' is already registered"),
-        RefusalCode::InvalidName => format!("Service '{service}' is not a valid DNS label"),
+        RefusalCode::InvalidName => format!("Service '{service}' is not a valid service name"),
         RefusalCode::Unauthorized => "Unauthorized client identity".into(),
         RefusalCode::UnsupportedVersion { min, max } => {
             format!("unsupported application protocol version (relay accepts {min}..={max})")
         }
-        RefusalCode::Other(s) => s.clone(),
+        RefusalCode::Other => format!("the relay could not register '{service}'; try again"),
     };
     ControlReply::Refused { code, message }
 }

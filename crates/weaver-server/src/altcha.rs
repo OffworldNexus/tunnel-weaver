@@ -119,7 +119,7 @@ impl AltchaRuntime {
     /// Verify and consume an ALTCHA payload for a consumer, returning the
     /// engine's result.
     ///
-    /// This is the account plane's entry point into the WVR-136 engine: it
+    /// This is the account plane's entry point into the ALTCHA engine: it
     /// resolves the client named inside the payload and consumes the proof
     /// exactly once. Whether a refusal should block the caller's action is the
     /// caller's decision, not the engine's.
@@ -137,7 +137,7 @@ impl AltchaRuntime {
                 payload,
                 purpose,
                 flow,
-                now_ms: crate::abuse::unix_ms(),
+                now_ms: crate::wall_clock::unix_ms(),
             },
         )
         .await
@@ -183,7 +183,7 @@ impl AltchaRuntime {
             data,
             nonce,
             salt,
-            now_ms: crate::abuse::unix_ms(),
+            now_ms: crate::wall_clock::unix_ms(),
         })
     }
 
@@ -200,8 +200,8 @@ impl AltchaRuntime {
             return Ok(());
         }
         let new = NewAltchaClient {
-            public_key: format!("ak_{}", random_hex(16)),
-            secret: random_hex(32),
+            public_key: format!("ak_{}", crate::random_hex(16)),
+            secret: crate::random_hex(32),
             algorithm: weaver_abuse::altcha::SUPPORTED_ALGORITHM.to_string(),
             cost: self.default_cost as i32,
             key_length: 32,
@@ -211,7 +211,7 @@ impl AltchaRuntime {
         };
         match self
             .store
-            .altcha_client_create(new, crate::abuse::unix_ms())
+            .altcha_client_create(new, crate::wall_clock::unix_ms())
             .await
         {
             Ok(_) | Err(crate::store::StoreError::Conflict(_)) => Ok(()),
@@ -443,7 +443,7 @@ pub async fn api_verify(
         );
     };
 
-    let now_ms = crate::abuse::unix_ms();
+    let now_ms = crate::wall_clock::unix_ms();
     let result = verify_and_consume(
         &runtime.proof,
         ConsumeRequest {
@@ -506,7 +506,7 @@ pub async fn demo_page(
     };
     let display = if mode == "auto" { "bar" } else { "standard" };
     let client = model_to_client(model);
-    let flow = random_hex(16);
+    let flow = crate::random_hex(16);
     let challenge_url = format!(
         "{}/altcha/challenge?key={}&purpose={}&flow={}",
         runtime.api_base_url.trim_end_matches('/'),
@@ -791,13 +791,6 @@ fn hex_val(b: u8) -> Option<u8> {
         b'A'..=b'F' => Some(b - b'A' + 10),
         _ => None,
     }
-}
-
-/// A random lowercase-hex string of `n` bytes.
-fn random_hex(n: usize) -> String {
-    let mut bytes = vec![0u8; n];
-    rand::rng().fill_bytes(&mut bytes);
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// The CORS headers an API response carries.

@@ -1,4 +1,4 @@
-//! Email account lifecycle persistence (WVR-36).
+//! Email account lifecycle persistence.
 //!
 //! This module is the only place the account tables are queried. It exposes
 //! typed operations and keeps every write inside a transaction so the
@@ -530,7 +530,7 @@ impl Store {
         Ok(account)
     }
 
-    /// Atomically applies an authenticated password change (WVR-50).
+    /// Atomically applies an authenticated password change.
     ///
     /// The caller has already proved the account's current password, so this is
     /// the reset body without the token consume: retire the live credential,
@@ -618,18 +618,6 @@ impl Store {
             .exec(&self.db)
             .await?;
         Ok(result.rows_affected == 1)
-    }
-
-    /// Invalidates every live session for an account; returns the count.
-    ///
-    /// Used by the reset flow: changing a password must not leave other devices
-    /// authenticated against the retired credential.
-    pub async fn session_invalidate_all_for_account(
-        &self,
-        account_id: i32,
-        now: i64,
-    ) -> Result<u64, StoreError> {
-        invalidate_sessions_for_account(&self.db, account_id, now).await
     }
 
     /// Deletes sessions that expired before `cutoff`; returns the count.

@@ -3,9 +3,10 @@
 //!
 //! The SvelteKit build output — a static shell plus hashed assets — is produced
 //! *before* cargo compiles the server (see the CI workflow), and embedded as
-//! `include_bytes!` entries with a content version derived from every file.
+//! `include_bytes!` entries. The ALTCHA widget additionally gets a content
+//! version derived from every file, which versions its asset URLs.
 //!
-//! Pre-compressing now keeps all compression cost out of the relay: every asset
+//! Pre-compressing here keeps all compression cost out of the relay: every asset
 //! is stored identity-encoded and, when its type benefits, once gzipped and once
 //! zstd-framed. The edge then picks a variant from `Accept-Encoding` (see
 //! `negotiate_encoding`). The compressed bytes are written under `OUT_DIR` and
@@ -14,12 +15,9 @@
 //! the build rather than a user's request.
 //!
 //! When the `account-spa` feature is off — which is how `weave` links this
-//! crate — this emits an empty SPA map and a placeholder shell, so the client
-//! never carries SPA bytes and a Node-less build of the client still compiles.
-//!
-//! When the feature is **on**, a missing SPA build is a hard error, not a
-//! fallback: shipping the placeholder shell would be a silent regression that
-//! only surfaces in production, so `build.rs` refuses with the command to run.
+//! crate — no SPA table is emitted at all, so the client never carries SPA
+//! bytes and a Node-less build of the client still compiles. When it is on, a
+//! missing SPA build is a hard error naming the command to run.
 
 use std::fs;
 use std::io::Write as _;
@@ -59,51 +57,8 @@ fn main() {
             );
         }
         println!("cargo:rerun-if-changed={}", root.display());
-
-        let mut files = collect(&root, &|_| true);
-        files.sort_by(|a, b| a.0.cmp(&b.0));
-        let version = content_version(&files);
-
-        let mut rows = Vec::new();
-        for (name, path, content_type) in &files {
-            let bytes = fs::read(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
-            let variants = compressor.variants("spa", content_type, &bytes);
-            rows.push((name.as_str(), path, *content_type, variants));
-        }
-
-        out.push_str("pub(crate) static SPA_ASSETS: &[AssetRow] = &[\n");
-        for (name, path, content_type, variants) in &rows {
-            out.push_str(&format!(
-                "    ({name:?}, include_bytes!({:?}), {content_type:?}, {}, {}),\n",
-                path.to_string_lossy(),
-                variants.gzip_field(),
-                variants.zstd_field()
-            ));
-        }
-        out.push_str("];\n");
-
-        let index = rows
-            .iter()
-            .find(|(name, ..)| *name == "index.html")
-            .expect("the SPA build always contains index.html");
-        out.push_str(&format!(
-            "pub(crate) static SPA_INDEX: IndexRow = (include_bytes!({:?}), {:?}, {}, {});\n",
-            index.1.to_string_lossy(),
-            index.2,
-            index.3.gzip_field(),
-            index.3.zstd_field()
-        ));
-        out.push_str(&format!(
-            "pub(crate) const SPA_ASSET_VERSION: &str = {:?};\n",
-            format!("{version:016x}")
-        ));
-    } else {
-        out.push_str("pub(crate) static SPA_ASSETS: &[AssetRow] = &[];\n");
-        let shell = format!("{:?}.as_bytes()", PLACEHOLDER_SHELL);
-        out.push_str(&format!(
-            "pub(crate) static SPA_INDEX: IndexRow = ({shell}, \"text/html; charset=utf-8\", None, None);\n"
-        ));
-        out.push_str("pub(crate) const SPA_ASSET_VERSION: &str = \"placeholder\";\n");
+        let files = collect(&root, &|_| true);
+        emit_table(&mut out, "SPA_ASSETS", "spa", &files, &mut compressor);
     }
 
     // ---- the vendored ALTCHA widget (always embedded) --------------------
@@ -111,24 +66,45 @@ fn main() {
     println!("cargo:rerun-if-changed={}", altcha_root.display());
     // Only the files the widget actually loads; the directory also holds
     // provenance notes we must not ship.
-    let mut altcha = collect(&altcha_root, &|name| {
+    let altcha = collect(&altcha_root, &|name| {
         name.ends_with(".js") || name.ends_with(".css")
     });
-    altcha.sort_by(|a, b| a.0.cmp(&b.0));
-    out.push_str("pub(crate) static ALTCHA_ASSETS: &[AssetRow] = &[\n");
-    for (name, path, content_type) in &altcha {
+    emit_table(
+        &mut out,
+        "ALTCHA_ASSETS",
+        "altcha",
+        &altcha,
+        &mut compressor,
+    );
+    out.push_str(&format!(
+        "pub(crate) const ALTCHA_ASSET_VERSION: &str = {:?};\n",
+        format!("{:016x}", content_version(&altcha))
+    ));
+
+    fs::write(&dest, out).expect("write generated asset table");
+}
+
+/// Emits `pub(crate) static <name>: &[AssetRow]`, one row per file with its
+/// pre-compressed variants.
+fn emit_table(
+    out: &mut String,
+    name: &str,
+    namespace: &str,
+    files: &[(String, PathBuf, &'static str)],
+    compressor: &mut Compressor,
+) {
+    out.push_str(&format!("pub(crate) static {name}: &[AssetRow] = &[\n"));
+    for (file, path, content_type) in files {
         let bytes = fs::read(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
-        let variants = compressor.variants("altcha", content_type, &bytes);
+        let variants = compressor.variants(namespace, content_type, &bytes);
         out.push_str(&format!(
-            "    ({name:?}, include_bytes!({:?}), {content_type:?}, {}, {}),\n",
+            "    ({file:?}, include_bytes!({:?}), {content_type:?}, {}, {}),\n",
             path.to_string_lossy(),
-            variants.gzip_field(),
-            variants.zstd_field()
+            field(&variants.gzip),
+            field(&variants.zstd)
         ));
     }
     out.push_str("];\n");
-
-    fs::write(&dest, out).expect("write generated asset table");
 }
 
 /// Pre-compresses assets into `OUT_DIR/compressed`, once each.
@@ -141,18 +117,6 @@ struct Compressor {
 struct Variants {
     gzip: Option<String>,
     zstd: Option<String>,
-}
-
-impl Variants {
-    /// The generated field for the gzip variant (`None` when not compressed).
-    fn gzip_field(&self) -> String {
-        field(&self.gzip)
-    }
-
-    /// The generated field for the zstd variant.
-    fn zstd_field(&self) -> String {
-        field(&self.zstd)
-    }
 }
 
 impl Compressor {
@@ -251,20 +215,21 @@ fn compressible(content_type: &str) -> bool {
 fn content_version(files: &[(String, PathBuf, &'static str)]) -> u64 {
     let mut version: u64 = 0xcbf2_9ce4_8422_2325;
     for (_, path, _) in files {
-        if let Ok(bytes) = fs::read(path) {
-            for &byte in &bytes {
-                version ^= u64::from(byte);
-                version = version.wrapping_mul(0x0000_0100_0000_01b3);
-            }
+        let bytes = fs::read(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        for byte in bytes {
+            version ^= u64::from(byte);
+            version = version.wrapping_mul(0x0000_0100_0000_01b3);
         }
     }
     version
 }
 
-/// Recursively collects `(relative path, absolute path, content type)`.
+/// Recursively collects `(relative path, absolute path, content type)`, sorted
+/// by relative path so the generated tables are deterministic.
 fn collect(root: &Path, keep: &dyn Fn(&str) -> bool) -> Vec<(String, PathBuf, &'static str)> {
     let mut out = Vec::new();
     walk(root, root, keep, &mut out);
+    out.sort_by(|a, b| a.0.cmp(&b.0));
     out
 }
 
@@ -327,9 +292,3 @@ fn content_type(path: &Path) -> &'static str {
         _ => "application/octet-stream",
     }
 }
-
-/// The shell served when no SPA is embedded.
-const PLACEHOLDER_SHELL: &str = "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
-     <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
-     <title>Tunnel Weaver</title></head><body>\
-     <p>The account app is not embedded in this build.</p></body></html>";

@@ -1,16 +1,20 @@
 //! Authoritative DNS responder for the relay's tunnel zone.
 //!
 //! The responder itself is a thin protocol shell: it validates the query shape
-//! and asks a list of [`DomainGenerator`]s, in order, to produce an answer for
-//! the name. The generators are the business side — the tunnel domain mapping
-//! (A/AAAA/NS/SOA/CAA for the apex and one label beneath it) and the ACME
-//! DNS-01 challenge registry (TXT for live `_acme-challenge` names) — so the
-//! responder never reads the store or knows what a "zone" is. There are no zone
-//! files and no second binary.
+//! and asks every [`DomainGenerator`] about the name. The generators are the
+//! business side — the tunnel domain mapping (A/AAAA/NS/SOA/CAA for the apex and
+//! one label beneath it) and the ACME DNS-01 challenge registry (TXT for live
+//! `_acme-challenge` names) — so the responder never reads the store or knows
+//! what a "zone" is. There are no zone files and no second binary.
 //!
-//! A name no generator claims is `REFUSED`: we are not authoritative for it.
+//! Each generator answers for itself only: the name exists (with its records),
+//! does not exist, or is none of its concern ([`Answer`]). The responder
+//! combines the answers without ranking the generators, so their order is
+//! irrelevant: any "exists" makes the name exist; otherwise any "does not
+//! exist" is `NXDOMAIN`; a name that concerns nobody is `REFUSED`, because we
+//! are not authoritative for it.
 //!
-//! Design points (OFF-190):
+//! Design points:
 //! - **No recursion, ever.** `RA=0`.
 //! - **Every in-zone name resolves identically** to the relay's addresses. That
 //!   is the anti-enumeration mechanism: there are no distinct records to walk.
@@ -86,27 +90,38 @@ pub const CAA_TTL: u32 = 60;
 /// resolver that cached NODATA for `_acme-challenge.<root>` would break DCV.
 pub const NEGATIVE_TTL: u32 = 30;
 
-/// The answer a [`DomainGenerator`] produced for a query.
-#[derive(Debug, Default)]
-pub struct Generated {
-    /// Records for the answer section.
-    pub answers: Vec<Record>,
-    /// Records for the authority section (typically the SOA for NODATA).
-    pub authority: Vec<Record>,
+/// What one [`DomainGenerator`] knows about a name.
+#[derive(Debug)]
+pub enum Answer {
+    /// The name exists. `records` are its records of the asked type — empty
+    /// for NODATA — and `authority` is what a negative answer should carry.
+    Exists {
+        /// Records for the answer section.
+        records: Vec<Record>,
+        /// Records for the authority section when the answer is empty.
+        authority: Vec<Record>,
+    },
+    /// The name is this generator's to define, and it does not exist.
+    Absent {
+        /// Records for the authority section (the zone's SOA).
+        authority: Vec<Record>,
+    },
+    /// The name is none of this generator's concern.
+    NotMine,
 }
 
 /// A business-side source of DNS records.
 ///
-/// Generators are polled in order; the first that returns `Some` owns the name.
-/// `None` means "not mine, try the next". A generator that owns the name but has
-/// no data for the type returns `Some` with empty answers (NODATA).
+/// A generator speaks only for itself and never assumes another one exists:
+/// the responder combines every generator's [`Answer`], order-independently.
 #[async_trait]
 pub trait DomainGenerator: Send + Sync {
-    /// Records for `qname` (normalized: lowercased, no trailing dot) of `qtype`.
-    async fn generate(&self, qname: &str, qtype: RecordType) -> Option<Generated>;
+    /// What this generator knows about `qname` (normalized: lowercased, no
+    /// trailing dot) for `qtype`.
+    async fn generate(&self, qname: &str, qtype: RecordType) -> Answer;
 }
 
-/// Generative authoritative responder over an ordered set of generators.
+/// Generative authoritative responder over a set of generators.
 pub struct DnsResponder {
     generators: Vec<Arc<dyn DomainGenerator>>,
 }
@@ -120,11 +135,7 @@ impl std::fmt::Debug for DnsResponder {
 }
 
 impl DnsResponder {
-    /// Builds a responder from an ordered generator list.
-    ///
-    /// Order matters: the ACME challenge generator must come before the tunnel
-    /// domain generator so `_acme-challenge.<tunnel>` is answered as TXT/NODATA
-    /// rather than as a wildcard A record.
+    /// Builds a responder over `generators`; their order is irrelevant.
     pub fn new(generators: Vec<Arc<dyn DomainGenerator>>) -> Self {
         Self { generators }
     }
@@ -190,22 +201,51 @@ impl DnsResponder {
             return Some(resp);
         }
 
-        // Ask the generators, in order. The first that owns the name wins.
+        // Ask every generator and combine: any "exists" makes the name exist,
+        // with every generator's records; otherwise any "absent" is NXDOMAIN;
+        // a name that concerns nobody is not ours to answer (NXDOMAIN would
+        // claim authority we do not have).
+        let mut exists = false;
+        let mut absent = false;
+        let mut records = Vec::new();
+        let mut authority = Vec::new();
         for generator in &self.generators {
-            if let Some(generated) = generator.generate(&qname, qtype).await {
-                for answer in generated.answers {
-                    resp.add_answer(answer);
+            match generator.generate(&qname, qtype).await {
+                Answer::Exists {
+                    records: r,
+                    authority: a,
+                } => {
+                    exists = true;
+                    records.extend(r);
+                    authority.extend(a);
                 }
-                for authority in generated.authority {
-                    resp.add_authority(authority);
+                Answer::Absent { authority: a } => {
+                    absent = true;
+                    authority.extend(a);
                 }
-                return Some(resp);
+                Answer::NotMine => {}
             }
         }
-
-        // No generator owns the name: we are not authoritative for it, so
-        // `REFUSED` (NXDOMAIN would claim authority we do not have).
-        resp.metadata.response_code = ResponseCode::Refused;
+        if !exists && !absent {
+            resp.metadata.response_code = ResponseCode::Refused;
+            return Some(resp);
+        }
+        if !exists {
+            resp.metadata.response_code = ResponseCode::NXDomain;
+        }
+        if records.is_empty() {
+            // A negative answer (NXDOMAIN or NODATA) carries the zone's SOA so
+            // resolvers cache it for the SOA minimum only. One is enough even
+            // if several generators supplied it.
+            authority.dedup();
+            for record in authority {
+                resp.add_authority(record);
+            }
+        } else {
+            for record in records {
+                resp.add_answer(record);
+            }
+        }
         Some(resp)
     }
 }
@@ -250,15 +290,28 @@ impl TunnelDomains {
         }
     }
 
-    /// True if `name` (normalized) is the apex or exactly one label beneath it.
-    /// The wildcard matches exactly one label, so deeper names are out of zone.
-    fn in_zone(&self, name: &str) -> bool {
+    /// What `name` (normalized) is in this zone.
+    ///
+    /// The zone is the apex and exactly one label beneath it; deeper names are
+    /// not ours. Every in-zone name resolves identically (the anti-enumeration
+    /// property) — except a label that cannot be a hostname at all (one with
+    /// an underscore, say), which no tunnel can ever be, so it does not exist.
+    fn zone_name(&self, name: &str) -> ZoneName {
         if name == self.tunnel {
-            return true;
+            return ZoneName::Apex;
         }
         match name.strip_suffix(&format!(".{}", self.tunnel)) {
-            Some(label) => !label.is_empty() && !label.contains('.'),
-            None => false,
+            Some(label) if !label.is_empty() && !label.contains('.') => {
+                if label
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+                {
+                    ZoneName::Host
+                } else {
+                    ZoneName::NotAHost
+                }
+            }
+            _ => ZoneName::Outside,
         }
     }
 
@@ -299,13 +352,41 @@ impl TunnelDomains {
     }
 }
 
+/// Where a name sits relative to the tunnel zone.
+enum ZoneName {
+    /// The zone apex.
+    Apex,
+    /// One hostname label beneath the apex.
+    Host,
+    /// One label beneath the apex that cannot be a hostname.
+    NotAHost,
+    /// Not in the zone.
+    Outside,
+}
+
+/// The answer section and the negative-answer authority, as one generator
+/// builds them.
+#[derive(Default)]
+struct Generated {
+    answers: Vec<Record>,
+    authority: Vec<Record>,
+}
+
 #[async_trait]
 impl DomainGenerator for TunnelDomains {
-    async fn generate(&self, qname: &str, qtype: RecordType) -> Option<Generated> {
-        if !self.in_zone(qname) {
-            return None;
+    async fn generate(&self, qname: &str, qtype: RecordType) -> Answer {
+        match self.zone_name(qname) {
+            ZoneName::Outside => return Answer::NotMine,
+            ZoneName::NotAHost => {
+                return Answer::Absent {
+                    authority: vec![self.soa_record()],
+                };
+            }
+            ZoneName::Apex | ZoneName::Host => {}
         }
-        let owner = Name::from_str(&format!("{qname}.")).ok()?;
+        let Ok(owner) = Name::from_str(&format!("{qname}.")) else {
+            return Answer::NotMine;
+        };
         let mut generated = Generated::default();
 
         match qtype {
@@ -378,14 +459,17 @@ impl DomainGenerator for TunnelDomains {
             }
         }
 
-        Some(generated)
+        Answer::Exists {
+            records: generated.answers,
+            authority: generated.authority,
+        }
     }
 }
 
 /// The ACME DNS-01 challenge registry: TXT for live `_acme-challenge` names.
 ///
-/// Owns every `_acme-challenge.*` name (returning NODATA for non-TXT) so the
-/// tunnel-domain generator never mistakes a challenge name for a service.
+/// A name exists exactly while a challenge for it is stored; any other name is
+/// none of its concern. It knows nothing about the zones those names sit in.
 pub struct AcmeChallenges {
     store: Arc<Store>,
 }
@@ -395,34 +479,40 @@ impl AcmeChallenges {
     pub fn new(store: Arc<Store>) -> Self {
         Self { store }
     }
-
-    /// True if `name` is an ACME challenge owner name.
-    fn owns(name: &str) -> bool {
-        name.starts_with("_acme-challenge.")
-    }
 }
 
 #[async_trait]
 impl DomainGenerator for AcmeChallenges {
-    async fn generate(&self, qname: &str, qtype: RecordType) -> Option<Generated> {
-        if !Self::owns(qname) {
-            return None;
+    async fn generate(&self, qname: &str, qtype: RecordType) -> Answer {
+        if !qname.starts_with("_acme-challenge.") {
+            return Answer::NotMine;
         }
-
-        let mut generated = Generated::default();
-        if qtype == RecordType::TXT {
-            let values = self.store.get_challenges(qname).await.unwrap_or_default();
-            let owner = Name::from_str(&format!("{qname}.")).ok()?;
-            for value in values {
-                generated.answers.push(Record::from_rdata(
-                    owner.clone(),
-                    CHALLENGE_TTL,
-                    RData::TXT(TXT::new(vec![value])),
-                ));
-            }
+        let values = self.store.get_challenges(qname).await.unwrap_or_default();
+        let Ok(owner) = Name::from_str(&format!("{qname}.")) else {
+            return Answer::NotMine;
+        };
+        if values.is_empty() {
+            return Answer::NotMine;
         }
-        // No live value (or a non-TXT type): NODATA, not NXDOMAIN.
-        Some(generated)
+        // The name exists while a challenge is stored; a non-TXT type is NODATA.
+        let records = if qtype == RecordType::TXT {
+            values
+                .into_iter()
+                .map(|value| {
+                    Record::from_rdata(
+                        owner.clone(),
+                        CHALLENGE_TTL,
+                        RData::TXT(TXT::new(vec![value])),
+                    )
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        Answer::Exists {
+            records,
+            authority: Vec::new(),
+        }
     }
 }
 
@@ -539,6 +629,7 @@ mod tests {
     struct TestResponder {
         responder: Arc<DnsResponder>,
         store: Arc<Store>,
+        generator_config: DnsResponderConfig,
     }
 
     async fn responder(relay_ips: Vec<IpAddr>) -> TestResponder {
@@ -571,7 +662,11 @@ mod tests {
             Arc::new(AcmeChallenges::new(Arc::clone(&store))),
             Arc::new(TunnelDomains::new(&generator_config)),
         ]));
-        TestResponder { responder, store }
+        TestResponder {
+            responder,
+            store,
+            generator_config,
+        }
     }
 
     fn query(qname: &str, qtype: RecordType, class: hickory_proto::rr::DNSClass) -> Message {
@@ -632,24 +727,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn challenge_txt_is_multi_value_and_absent_is_nodata() {
+    async fn challenge_txt_is_multi_value_and_a_tunnel_name_has_no_txt() {
         let t = responder(vec!["203.0.113.7".parse().unwrap()]).await;
         t.store
-            .publish_challenge(
-                "_acme-challenge.example.com",
-                "value-a",
-                Some("example.com"),
-                0,
-            )
+            .publish_challenge("_acme-challenge.example.com", "value-a", "example.com", 0)
             .await
             .unwrap();
         t.store
-            .publish_challenge(
-                "_acme-challenge.example.com",
-                "value-b",
-                Some("example.com"),
-                0,
-            )
+            .publish_challenge("_acme-challenge.example.com", "value-b", "example.com", 0)
             .await
             .unwrap();
 
@@ -762,5 +847,90 @@ mod tests {
                 .any(|(tag, value)| *tag == "issuewild" && value == "letsencrypt.org"),
             "CAA issuewild must name the CA without a trailing dot: {records:?}"
         );
+    }
+
+    async fn ask(t: &TestResponder, qname: &str, qtype: RecordType) -> Message {
+        t.responder
+            .answer(&query(qname, qtype, hickory_proto::rr::DNSClass::IN))
+            .await
+            .unwrap()
+    }
+
+    /// The generators' order is irrelevant: the same answers come back whichever
+    /// is listed first.
+    #[tokio::test]
+    async fn generator_order_does_not_change_any_answer() {
+        let t = responder(vec!["203.0.113.7".parse().unwrap()]).await;
+        t.store
+            .publish_challenge("_acme-challenge.example.com", "value-a", "example.com", 0)
+            .await
+            .unwrap();
+        // The same generators, listed the other way round.
+        let reversed = Arc::new(DnsResponder::new(vec![
+            Arc::new(TunnelDomains::new(&t.generator_config)),
+            Arc::new(AcmeChallenges::new(Arc::clone(&t.store))),
+        ]));
+        for (name, qtype) in [
+            ("_acme-challenge.example.com", RecordType::TXT),
+            ("_acme-challenge.example.com", RecordType::A),
+            ("example.com", RecordType::A),
+            ("poc-laptop-web.example.com", RecordType::A),
+            ("_other.example.com", RecordType::A),
+            ("example.org", RecordType::A),
+        ] {
+            let a = ask(&t, name, qtype).await;
+            let b = reversed
+                .answer(&query(name, qtype, hickory_proto::rr::DNSClass::IN))
+                .await
+                .unwrap();
+            assert_eq!(
+                (a.response_code, a.answers.len(), a.authorities.len()),
+                (b.response_code, b.answers.len(), b.authorities.len()),
+                "{name} {qtype:?}"
+            );
+        }
+    }
+
+    /// A stored challenge exists for every type (TXT answers, anything else is
+    /// NODATA); once withdrawn, the name is no tunnel host either, so NXDOMAIN.
+    #[tokio::test]
+    async fn challenge_name_exists_only_while_a_challenge_is_stored() {
+        let t = responder(vec!["203.0.113.7".parse().unwrap()]).await;
+        let name = "_acme-challenge.example.com";
+        t.store
+            .publish_challenge(name, "value-a", "example.com", 0)
+            .await
+            .unwrap();
+
+        let resp = ask(&t, name, RecordType::A).await;
+        assert_eq!(
+            resp.response_code,
+            ResponseCode::NoError,
+            "NODATA, not NXDOMAIN"
+        );
+        assert!(resp.answers.is_empty());
+        assert_eq!(resp.authorities.len(), 1, "NODATA carries the SOA");
+
+        t.store.remove_challenge(name, "value-a").await.unwrap();
+        let resp = ask(&t, name, RecordType::TXT).await;
+        assert_eq!(resp.response_code, ResponseCode::NXDomain);
+        assert_eq!(resp.authorities.len(), 1, "NXDOMAIN carries the SOA");
+    }
+
+    /// A label that cannot be a hostname does not exist in the tunnel zone.
+    #[tokio::test]
+    async fn a_non_hostname_label_is_nxdomain() {
+        let t = responder(vec!["203.0.113.7".parse().unwrap()]).await;
+        let resp = ask(&t, "_other.example.com", RecordType::A).await;
+        assert_eq!(resp.response_code, ResponseCode::NXDomain);
+        assert!(resp.answers.is_empty());
+    }
+
+    /// A challenge-looking name outside our zones is not ours to answer.
+    #[tokio::test]
+    async fn a_challenge_name_outside_our_zones_is_refused() {
+        let t = responder(vec!["203.0.113.7".parse().unwrap()]).await;
+        let resp = ask(&t, "_acme-challenge.example.org", RecordType::TXT).await;
+        assert_eq!(resp.response_code, ResponseCode::Refused);
     }
 }

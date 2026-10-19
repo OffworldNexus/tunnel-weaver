@@ -1,24 +1,15 @@
 <script lang="ts">
-	/**
-	 * Landing page — the product's front door.
-	 *
-	 * Public and stateless: an on-brand full-viewport hero, a "how it works"
-	 * walkthrough, a benefits row and a closing call to action. Its only actions
-	 * are links into the real auth routes; nothing here talks to the API. The
-	 * sections are landing-only, so they live alongside this page in `_landing/`.
-	 */
-
+	/** The public front door: static, its only actions are links. */
 	import Brand from '#lib/brand/Brand.svelte';
-	import Keycap from '#lib/ui/Keycap.svelte';
 	import Icon from '#lib/ui/Icon.svelte';
+	import Keycap from '#lib/ui/Keycap.svelte';
 	import SiteFooter from '#lib/ui/SiteFooter.svelte';
-	import Hero from './_landing/Hero.svelte';
-	import Steps from './_landing/Steps.svelte';
+
 	import Benefits from './_landing/Benefits.svelte';
 	import Closing from './_landing/Closing.svelte';
-
-	/** The public source repository; the only off-site link on the landing page. */
-	const repoUrl = 'https://github.com/OffworldNexus/tunnel-weaver';
+	import Hero from './_landing/Hero.svelte';
+	import { REPO_URL } from './_landing/repo';
+	import Steps from './_landing/Steps.svelte';
 </script>
 
 <svelte:head>
@@ -35,7 +26,7 @@
 	<div class="landing__top">
 		<Brand />
 		<div class="landing__actions">
-			<Keycap variant="ghost" href={repoUrl} target="_blank" rel="noopener noreferrer">
+			<Keycap variant="ghost" href={REPO_URL} target="_blank" rel="noopener noreferrer">
 				<span class="landing__github">
 					<Icon name="github" />
 					<span class="landing__github-label">Get on GitHub</span>

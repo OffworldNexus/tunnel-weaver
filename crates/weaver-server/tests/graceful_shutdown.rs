@@ -35,7 +35,7 @@ fn create_valid_test_config(
     }
 }
 
-// OFF-70: Failure mode — in-flight requests complete cleanly without truncation
+// Failure mode — in-flight requests complete cleanly without truncation
 // when SIGTERM triggers shutdown within the 10-second drain window.
 #[tokio::test]
 async fn test_graceful_shutdown_on_sigterm_with_drain() {

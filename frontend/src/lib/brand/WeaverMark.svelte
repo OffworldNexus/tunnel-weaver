@@ -6,4 +6,5 @@
 </script>
 
 <!-- Decorative: the accessible name comes from the surrounding link. -->
+<!-- eslint-disable-next-line svelte/no-at-html-tags -- a build-time asset from this repo, never user input -->
 {@html mark}

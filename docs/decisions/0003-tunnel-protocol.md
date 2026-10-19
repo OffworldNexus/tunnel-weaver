@@ -4,7 +4,9 @@ Date: 2026-09-16
 
 ## Status
 
-Accepted
+Accepted. Amended (see the amendment at the end): the hostname schema is now
+flat (ADR 0008), the control plane gained `Revoke`/`Revoked`, and the
+proof-of-concept identity described in §4 has been retired.
 
 ## Context
 
@@ -77,3 +79,37 @@ Deprecation path:
 - Stream 1 failure unambiguously signals service teardown, simplifying health monitoring and automated certificate deactivation.
 - Supersession prevents stale or zombie connections from retaining tunnel routes when a device sleeps, reconnects, or restarts.
 - Strict DNS label validation on service names ensures valid hostnames before requesting certificates or DNS updates.
+
+## Amendment: flat hostnames, bilateral revoke, real device keys
+
+Three of the calls above have moved on since this ADR was accepted.
+
+**§3 Hostname schema is flat.** OFF-190/ADR 0008 replaced the four-level
+`<service>.<machine>.<person>.<root>` hierarchy with a single flat label,
+`<person>-<machine>-<service>.<root>`, because one wildcard certificate covers
+exactly one label. Person and machine names cannot contain a dash, so the label
+still splits unambiguously. §3 above is superseded; the authoritative
+statement is ADR 0008. The relay's identity path still derives the hostname
+from the `(person, machine, service)` tuple
+(`weaver_server::tunnel::identity::derive_hostname`), so the *source* of the
+name is unchanged even though its shape is.
+
+**A second control head, `Revoke`.** The control stream carries one additional
+one-shot head, `ControlHead::Revoke { proto_version }`, which deletes the
+machine holding the key the connection authenticated with (its key, services
+and hostnames), and one reply, `ControlReply::Revoked`. No extra proof is
+needed or possible: the mux handshake already proved possession of the device
+key, which is exactly the authority to withdraw it. This is what makes
+`weave unpair` bilateral. The relay replies `Revoked` and the client closes;
+a `KeyRevoked` close is an equivalent confirmation. The existing refusal path
+is reused for a revoke that cannot be applied, so there is still exactly one
+refusal schema on the control stream.
+
+**§4 Proof-of-concept identity is retired.** The development seed and
+`PocResolver` are gone from the production path. A real client holds no key at
+all: pairing provisions a P-256 key inside the `tpmd` local key agent, and the
+store-backed `StoreIdentityResolver` resolves `machine.key_id` (ADR 0010).
+There is no development seed anywhere any more: tests inject a signer through
+the client's `KeyAgent` seam, exactly as production injects tpmd. The
+"Milestone 2/3" deprecation path in §4 is therefore complete, in a different
+shape than predicted: enrolment is browser-approved pairing, not a token verb.

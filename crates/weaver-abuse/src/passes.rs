@@ -1,9 +1,7 @@
 //! The built-in pipeline passes.
 //!
-//! [`ScannerPass`] runs the rule set and stops on the first blocking finding.
-//! [`BudgetPass`] charges the requesting view's GCRA budget. They collaborate
-//! through the shared [`RequestContext`]: the WAF pass records findings, and a
-//! later pass (a future `CostPass`, or PoW) can read them.
+//! [`ScannerPass`] runs the scanner firewall and blocks on a probe.
+//! [`BudgetPass`] charges the requesting view's GCRA budget.
 
 use async_trait::async_trait;
 
@@ -11,32 +9,17 @@ use crate::context::RequestContext;
 use crate::gate::{Gate, GateError};
 use crate::pass::{Decision, Pass, PassOutcome};
 use crate::policy::{RouteTable, StoreErrorPolicy};
-use crate::rule::{Rule, Severity};
+use crate::scanner;
 use crate::store::BudgetStore;
 use crate::surface::is_exempt;
 
-/// Runs the rule set and stops on the first blocking finding.
+/// Runs the scanner firewall ([`crate::scanner`]) and blocks on a probe.
 ///
-/// Control-plane routes ([`is_exempt`]) skip the rules entirely, so health,
-/// ACME and the mux handshake stay reachable no matter what the catalogue
-/// grows to.
-pub struct ScannerPass {
-    rules: Vec<Box<dyn Rule>>,
-}
-
-impl ScannerPass {
-    /// Build from an explicit rule set.
-    pub fn new(rules: Vec<Box<dyn Rule>>) -> Self {
-        Self { rules }
-    }
-}
-
-impl Default for ScannerPass {
-    /// The default pass: the scanner firewall rule only.
-    fn default() -> Self {
-        Self::new(vec![Box::new(crate::rule::ScannerRule)])
-    }
-}
+/// Control-plane routes ([`is_exempt`]) skip it entirely, so health, ACME and
+/// the mux handshake stay reachable no matter what the catalogue grows to.
+#[derive(Debug, Default)]
+#[non_exhaustive]
+pub struct ScannerPass;
 
 #[async_trait]
 impl Pass for ScannerPass {
@@ -44,31 +27,18 @@ impl Pass for ScannerPass {
         "scanner"
     }
 
-    async fn run(&self, ctx: &mut RequestContext<'_>) -> PassOutcome {
+    async fn run(&self, ctx: &RequestContext<'_>) -> PassOutcome {
         if is_exempt(ctx.surface, &ctx.method, ctx.path) {
             return PassOutcome::Continue;
         }
-        for rule in &self.rules {
-            if let Some(finding) = rule.inspect(ctx) {
-                let blocking = finding.severity == Severity::Block;
-                let verdict = finding
-                    .verdict
-                    .unwrap_or(crate::scanner::ScanVerdict::Malformed);
-                let rule_name = finding.rule;
-                ctx.findings.push(finding);
-                if blocking {
-                    return PassOutcome::Stop(Decision::Block {
-                        verdict,
-                        rule: rule_name,
-                    });
-                }
-            }
+        match scanner::inspect(&ctx.method, ctx.raw_path) {
+            Some(verdict) => PassOutcome::Stop(Decision::Block { verdict }),
+            None => PassOutcome::Continue,
         }
-        PassOutcome::Continue
     }
 }
 
-/// Charges the requesting view's budget for the request's fingerprint.
+/// Charges the requesting view's budget one unit for the request's fingerprint.
 ///
 /// A view with no route is not budgeted (for example, tunnelled traffic, whose
 /// policy is deliberately separate). Control-plane routes are never charged.
@@ -90,25 +60,22 @@ impl<S: BudgetStore> Pass for BudgetPass<S> {
         "budget"
     }
 
-    async fn run(&self, ctx: &mut RequestContext<'_>) -> PassOutcome {
+    async fn run(&self, ctx: &RequestContext<'_>) -> PassOutcome {
         if is_exempt(ctx.surface, &ctx.method, ctx.path) {
             return PassOutcome::Continue;
         }
-        let Some(route) = self.routes.get(ctx.view) else {
+        let Some(policy) = self.routes.get(ctx.view) else {
             return PassOutcome::Continue;
         };
-        let cost = route.cost.units(ctx);
-        ctx.cost = cost;
         match self
             .gate
-            .admit(route.policy, &ctx.fingerprint, cost, ctx.now_ms)
+            .admit(policy, &ctx.fingerprint, 1, ctx.now_ms)
             .await
         {
-            Ok(_) => PassOutcome::Continue,
+            Ok(()) => PassOutcome::Continue,
             Err(GateError::Throttled {
                 policy,
                 retry_after_ms,
-                ..
             }) => PassOutcome::Stop(Decision::Throttle {
                 policy,
                 retry_after_ms,

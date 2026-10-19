@@ -320,19 +320,10 @@ pub async fn execute_install(
                 .to_string()
         });
 
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64;
+        let now = crate::wall_clock::unix_secs();
 
         store
-            .upsert_acme_account(
-                &dir_url,
-                &config.admin_email,
-                &acct.creds_json,
-                Some(&acct.kid),
-                now,
-            )
+            .upsert_acme_account(&dir_url, &config.admin_email, &acct.creds_json, now)
             .await
             .map_err(|e| format!("failed to store pre-registered ACME credentials: {e}"))?;
     }

@@ -1,4 +1,4 @@
-//! A runnable end-to-end harness for the account lifecycle (WVR-36).
+//! A runnable end-to-end harness for the account plane and pairing.
 //!
 //! This example boots the *real* account stack — the real SQLite `Store`, the
 //! real ALTCHA runtime, the real HTTPS edge — against a temporary database and a
@@ -28,26 +28,29 @@
 //! and `127.0.0.1` (IP) SANs. Logs go to stderr; `curl -k` (or Playwright with
 //! `ignoreHTTPSErrors`) accepts the self-signed certificate.
 
+use std::collections::HashMap;
 use std::io::Write as _;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::http::StatusCode;
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 use tokio::signal::unix::{SignalKind, signal};
 use tokio_util::sync::CancellationToken;
+use weaver_mux::KeyId;
+use weaver_proto::pair::{ServerMessage, Target};
 
 use weaver_server::account::AccountRuntime;
 use weaver_server::account::password::BreachCheck;
 use weaver_server::altcha::AltchaRuntime;
 use weaver_server::cert::managed::ManagedCerts;
-use weaver_server::config::{AccountConfig, Config};
+use weaver_server::config::{AccountConfig, BudgetConfig, Config};
 use weaver_server::edge::https::{HttpsEdgeConfig, run_https_server_full};
 use weaver_server::edge::tls::create_self_signed_server_config_for;
 use weaver_server::email::{Email, Mailbox, Mailer, MailerError, MailerIdentity, SendReceipt};
@@ -101,13 +104,25 @@ impl Mailer for CaptureMailer {
 ///
 /// `base_url` must carry the real HTTPS port: it doubles as the browser
 /// `Origin` the account plane checks on every state-changing request. Argon2 is
-/// dialled down so a browser-driven signup stays snappy.
+/// dialled down so a browser-driven signup stays snappy, and the per-network
+/// abuse budgets are widened for the same reason — a suite is many clients on
+/// one address, so the production burst would throttle the run rather than the
+/// abuse it is meant to stop.
 fn account_config(base_url: String) -> AccountConfig {
+    let generous = || BudgetConfig {
+        burst: 100_000,
+        refill_units: 100_000,
+        refill_per_secs: 1,
+    };
     AccountConfig {
         base_url: Some(base_url),
         argon2_memory_kib: 8,
         argon2_iterations: 1,
         argon2_parallelism: 1,
+        signup: generous(),
+        login: generous(),
+        resend: generous(),
+        pair: generous(),
         ..AccountConfig::default()
     }
 }
@@ -141,16 +156,106 @@ fn sample_config(https_port: u16) -> Config {
 
 // ----- mail endpoint --------------------------------------------------------
 
+/// Everything the harness's plain-HTTP side needs: the captured mail, the
+/// account runtime (to seed a pending pairing) and what each seeded "CLI" was
+/// told.
+#[derive(Clone)]
+struct HarnessState {
+    sent: Captured,
+    account: Arc<AccountRuntime>,
+    https_port: u16,
+    outcomes: Outcomes,
+}
+
+/// The outcome each seeded pairing's stand-in CLI received, by handle.
+type Outcomes = Arc<Mutex<HashMap<String, ServerMessage>>>;
+
 /// `GET /messages` — the captured messages, newest last.
-async fn list_messages(State(sent): State<Captured>) -> Json<Vec<CapturedMessage>> {
-    let messages = sent.lock().unwrap().clone();
+async fn list_messages(State(state): State<HarnessState>) -> Json<Vec<CapturedMessage>> {
+    let messages = state.sent.lock().unwrap().clone();
     Json(messages)
 }
 
 /// `DELETE /messages` — drop everything captured so far.
-async fn clear_messages(State(sent): State<Captured>) -> StatusCode {
-    sent.lock().unwrap().clear();
+async fn clear_messages(State(state): State<HarnessState>) -> StatusCode {
+    state.sent.lock().unwrap().clear();
     StatusCode::NO_CONTENT
+}
+
+/// Query for [`seed_pairing`]: at most one of `machine` / `machine_id`.
+#[derive(Deserialize)]
+struct SeedQuery {
+    /// The hostname of a new machine (the default target, `laptop`).
+    machine: Option<String>,
+    /// An existing machine the key is for.
+    machine_id: Option<i32>,
+    /// Which fabricated key to seed with. A real `weave pair` run mints a fresh
+    /// key per machine, so varying this keeps two seeded scenarios from colliding
+    /// on the unique `machine.key_id` once the first approves.
+    key: Option<u8>,
+}
+
+/// The handle and fingerprint of a freshly seeded pending pairing.
+#[derive(Serialize)]
+struct SeededPairing {
+    handle: String,
+    fingerprint: String,
+}
+
+/// `POST /pair/seed?machine=<hostname>` or `POST /pair/seed?machine_id=<id>`
+/// [`&key=<u8>`] — seed a pending pairing.
+///
+/// The browser half of pairing is exercised without a CLI, a key agent or a
+/// proof of work: the scenario seeds a pending pairing, opens the link, and
+/// reads what the stand-in CLI was told from `/pair/outcome`.
+async fn seed_pairing(
+    State(state): State<HarnessState>,
+    Query(query): Query<SeedQuery>,
+) -> Result<Json<SeededPairing>, (StatusCode, &'static str)> {
+    let target = match (query.machine, query.machine_id) {
+        (Some(_), Some(_)) => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "pass either machine or machine_id, not both",
+            ));
+        }
+        (None, Some(machine_id)) => Target::Existing { machine_id },
+        (hostname, None) => Target::New {
+            hostname: hostname.unwrap_or_else(|| "laptop".to_string()),
+        },
+    };
+    let key_id = KeyId::P256([query.key.unwrap_or(0x02); 33]);
+    let (handle, receiver) = state.account.pairings.register(key_id, target);
+    let outcomes = Arc::clone(&state.outcomes);
+    let recorded = handle.clone();
+    tokio::spawn(async move {
+        if let Ok(outcome) = receiver.await {
+            outcomes.lock().unwrap().insert(recorded, outcome);
+        }
+    });
+    Ok(Json(SeededPairing {
+        handle,
+        fingerprint: key_id.to_string(),
+    }))
+}
+
+/// Query for [`pair_outcome`] and [`pair_link`].
+#[derive(Deserialize)]
+struct HandleQuery {
+    handle: String,
+}
+
+/// `GET /pair/outcome?handle=<hex>` — the `ServerMessage` the seeded pairing's
+/// CLI received (`Approved` or `Failed`), or `{"state":"pending"}` while none.
+async fn pair_outcome(
+    State(state): State<HarnessState>,
+    Query(query): Query<HandleQuery>,
+) -> Json<serde_json::Value> {
+    let outcome = state.outcomes.lock().unwrap().get(&query.handle).cloned();
+    Json(match outcome {
+        Some(message) => serde_json::to_value(message).expect("server message is JSON"),
+        None => serde_json::json!({ "state": "pending" }),
+    })
 }
 
 /// `GET /health` — liveness for the test runner.
@@ -158,12 +263,43 @@ async fn health() -> &'static str {
     "ok"
 }
 
+/// The URL the CLI prints for a handle.
+#[derive(Serialize)]
+struct PairLink {
+    url: String,
+}
+
+/// `GET /pair/link?handle=<hex>` — the link the CLI prints for that handle.
+///
+/// Built by the product's own [`weave::pair::pairing_url`], so a scenario opens
+/// exactly the URL the terminal prints. If the CLI's link format and the
+/// `/pair` page's fragment parser ever drift apart, the browser test fails —
+/// where a scenario that hand-built the fragment would have passed while the
+/// product was broken.
+async fn pair_link(
+    State(state): State<HarnessState>,
+    Query(query): Query<HandleQuery>,
+) -> Json<PairLink> {
+    let admin_host = format!("localhost:{}", state.https_port);
+    Json(PairLink {
+        url: weave::pair::pairing_url(&admin_host, &query.handle),
+    })
+}
+
 /// Starts the capture-mail endpoint on `127.0.0.1:0`, returning its address.
-async fn serve_mail(sent: Captured) -> SocketAddr {
+async fn serve_mail(sent: Captured, account: Arc<AccountRuntime>, https_port: u16) -> SocketAddr {
     let app = Router::new()
         .route("/messages", get(list_messages).delete(clear_messages))
+        .route("/pair/seed", post(seed_pairing))
+        .route("/pair/link", get(pair_link))
+        .route("/pair/outcome", get(pair_outcome))
         .route("/health", get(health))
-        .with_state(sent);
+        .with_state(HarnessState {
+            sent,
+            account,
+            https_port,
+            outcomes: Arc::default(),
+        });
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind mail");
     let addr = listener.local_addr().expect("mail addr");
     tokio::spawn(async move {
@@ -245,7 +381,7 @@ async fn main() {
         tunnel_registry: None,
         guard: abuse::build(&config, store.clone()),
         altcha: Some(altcha),
-        account: Some(account),
+        account: Some(Arc::clone(&account)),
     };
     let shutdown = CancellationToken::new();
     tokio::spawn(run_https_server_full(
@@ -255,7 +391,7 @@ async fn main() {
         shutdown.clone(),
     ));
 
-    let mail_addr = serve_mail(Arc::clone(&sent)).await;
+    let mail_addr = serve_mail(Arc::clone(&sent), account, https_port).await;
 
     // The two lines a test runner reads. Flushed immediately so a reader can
     // poll the pipe rather than guess when the servers are up.

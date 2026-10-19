@@ -25,13 +25,14 @@ use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 use tokio_rustls::TlsConnector;
 
-use crate::proxy::{Body, BoxError};
+use crate::error::BoxError;
+use crate::proxy::Body;
 use crate::target::{Target, TargetScheme};
 
 /// How long to wait for the TCP/TLS connection to a target before giving
 /// up with a 502. There is deliberately no timeout on the origin's response
 /// itself (see ADR 0006).
-pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Maximum idle connections kept per target.
 const MAX_IDLE_PER_TARGET: usize = 8;
@@ -76,25 +77,12 @@ impl PoolKey {
 }
 
 /// A small keep-alive pool of origin connections, keyed by target.
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct Pool {
     idle: Arc<Mutex<HashMap<PoolKey, Vec<OriginConn>>>>,
 }
 
-impl Default for Pool {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl Pool {
-    /// An empty pool.
-    pub fn new() -> Self {
-        Self {
-            idle: Arc::new(Mutex::new(HashMap::new())),
-        }
-    }
-
     /// Take a usable connection to `target`, opening one if the pool is
     /// empty. `insecure` disables certificate verification for this target.
     pub async fn acquire(&self, target: &Target, insecure: bool) -> Result<OriginConn, BoxError> {

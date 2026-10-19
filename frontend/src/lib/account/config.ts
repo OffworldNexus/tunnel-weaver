@@ -1,45 +1,32 @@
-import { get, writable } from 'svelte/store';
+import { derived, writable } from 'svelte/store';
+
+import { api } from '#lib/account/api';
 
 /** Client-facing constants the account SPA reads from the relay. */
 export interface AccountConfig {
 	altcha_challenge_url: string;
 	altcha_assets_base: string;
 	min_password_length: number;
-	verification_ttl_secs: number;
 	resend_cooldown_secs: number;
-	/** A monitored support address, or null when the relay has none configured. */
-	support_email?: string | null;
+	support_email: string | null;
 }
 
 export const config = writable<AccountConfig | null>(null);
 
-let inflight: Promise<AccountConfig> | null = null;
+/** The relay's minimum, mirrored for guidance; the relay enforces it on submit. */
+export const minPasswordLength = derived(config, ($config) => $config?.min_password_length ?? 8);
 
-/**
- * Fetches `/api/account/config` once and caches it in a store. The minimum
- * password length and ALTCHA asset base are read from here — never hardcoded.
- */
+let loading: Promise<AccountConfig> | null = null;
+
+/** Fetches `/api/account/config` once; a failed fetch is retried on the next call. */
 export function ensureConfig(): Promise<AccountConfig> {
-	const current = get(config);
-	if (current) return Promise.resolve(current);
-	if (inflight) return inflight;
-
-	inflight = fetch('/api/account/config', {
-		credentials: 'same-origin',
-		headers: { accept: 'application/json' }
-	})
-		.then(async (response) => {
-			if (!response.ok) throw new Error('config unavailable');
-			return (await response.json()) as AccountConfig;
-		})
-		.then((value) => {
-			config.set(value);
-			return value;
-		})
-		.catch((error) => {
-			inflight = null;
-			throw error;
-		});
-
-	return inflight;
+	loading ??= api<AccountConfig>('/api/account/config').then((res) => {
+		if (!res.ok || !res.data) {
+			loading = null;
+			throw new Error(res.error ?? 'config unavailable');
+		}
+		config.set(res.data);
+		return res.data;
+	});
+	return loading;
 }

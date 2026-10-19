@@ -1,4 +1,4 @@
-//! Micro-benchmark for the edge WAF `inspect` hot path (OFF-96).
+//! Micro-benchmark for the edge WAF `inspect` hot path.
 //!
 //! Run with:
 //!
@@ -320,7 +320,7 @@ const EXTS: &[&str] = &[
     "json", "xml", "txt", "md", "map",
 ];
 
-/// Frontend dev-server asset paths from OFF-96.
+/// Frontend dev-server asset paths.
 const DEV_ASSETS: &[&str] = &[
     "/@fs/home/dev/app/.svelte-kit/generated/client/app.js",
     "/node_modules/.pnpm/@sveltejs+kit@1/node_modules/@sveltejs/kit/src/runtime/client/entry.js",

@@ -1,6 +1,6 @@
 //! `certificates` table: issued TLS certificates.
 //!
-//! One row per certificate, keyed by its own `name`. In the OFF-198 model there
+//! One row per certificate, keyed by its own `name`. There
 //! are two long-lived rows — the `[<root>, *.<root>]` tunnel wildcard held
 //! under the zone apex, and the single-name admin certificate held under the
 //! admin domain — but the table itself does not hard-code that cardinality so
@@ -22,7 +22,6 @@ pub struct Model {
     pub key_pem: String,
     pub not_before: i64,
     pub not_after: i64,
-    pub issuer: Option<String>,
     pub directory: String,
     pub obtained_at: i64,
     /// ACME validation mechanism that produced this row: `dns-01` for the

@@ -45,45 +45,23 @@ pub fn rewrite_response_headers(head: &mut HttpResponseHead, target: &Target, pu
     }
 }
 
-/// Candidate origin prefixes a self-referential URL may use: with the
-/// explicit port, and (for a default port) with it omitted.
-fn origin_prefixes(target: &Target) -> Vec<String> {
-    let mut out = vec![target.origin()];
-    let default = match target.scheme {
-        crate::target::TargetScheme::Http => 80,
-        crate::target::TargetScheme::Https => 443,
-    };
-    if target.port == default {
-        out.push(format!("{}://{}", target.scheme.as_str(), target.host));
-    }
-    out
-}
-
-/// Rewrite an absolute URL whose origin is one of the target's candidate
-/// origins. Returns `None` for relative or foreign URLs.
+/// Rewrites an absolute URL pointing at the target, with or without its
+/// default port, onto the public origin. `None` for relative or foreign URLs.
 fn rewrite_url(value: &str, target: &Target, public_origin: &str) -> Option<String> {
     let trimmed = value.trim();
-    if !(trimmed.starts_with("http://") || trimmed.starts_with("https://")) {
-        // Relative reference (or a scheme we do not rewrite): leave it.
-        return None;
-    }
-    let prefixes = origin_prefixes(target);
-    let mut best: Option<&String> = None;
-    for prefix in prefixes.iter() {
-        // Match origin exactly or followed by a path/query/fragment boundary,
-        // so `http://localhost:8080` never matches `http://localhost:8080x`.
-        if let Some(rest) = trimmed.strip_prefix(prefix.as_str())
-            && (rest.is_empty()
-                || rest.starts_with('/')
-                || rest.starts_with('?')
-                || rest.starts_with('#'))
-            && best.is_none_or(|b| b.len() < prefix.len())
-        {
-            best = Some(prefix);
-        }
-    }
-    let prefix = best?;
-    Some(format!("{public_origin}{}", &trimmed[prefix.len()..]))
+    let explicit = target.origin();
+    let implicit = format!("{}://{}", target.scheme.as_str(), target.host);
+    let candidates = if target.port == target.scheme.default_port() {
+        vec![explicit, implicit]
+    } else {
+        vec![explicit]
+    };
+    candidates.iter().find_map(|origin| {
+        let rest = trimmed.strip_prefix(origin.as_str())?;
+        // A boundary, so `http://localhost:8080` never matches `…:80800`.
+        (rest.is_empty() || rest.starts_with(['/', '?', '#']))
+            .then(|| format!("{public_origin}{rest}"))
+    })
 }
 
 /// `Refresh: 5; url=/foo` / `0;url=http://origin/foo`. Only the URL part is

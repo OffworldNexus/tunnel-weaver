@@ -12,21 +12,13 @@ use weaver_proto::control::RefusalCode;
 use crate::cert::CertManager;
 use crate::metering::MeteringManager;
 use crate::store::Store;
-use crate::tunnel::identity::{IdentityResolver, derive_hostname};
+use crate::tunnel::identity::StoreIdentityResolver;
 use crate::tunnel::proxy::ProxyRequest;
-
-/// Current Unix time, for `last_active_at` stamps.
-fn now_unix() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64
-}
 
 /// Route information for a registered tunnel service.
 #[derive(Clone)]
 pub struct TunnelRoute {
-    /// Fully-qualified hostname (e.g. "web.laptop.poc.example.com").
+    /// Fully-qualified hostname (e.g. "poc-laptop-web.example.com").
     pub hostname: String,
     /// Registered service name (e.g. "web").
     pub service: String,
@@ -48,7 +40,7 @@ struct ActiveConnection {
 pub struct TunnelRegistry {
     tunnel_domain: String,
     cert_manager: Arc<CertManager>,
-    identities: Arc<dyn IdentityResolver>,
+    identities: Arc<StoreIdentityResolver>,
     store: Store,
     metering: Arc<MeteringManager>,
     routes: RwLock<HashMap<String, TunnelRoute>>,
@@ -65,7 +57,7 @@ impl TunnelRegistry {
     pub fn new(
         tunnel_domain: String,
         cert_manager: Arc<CertManager>,
-        identities: Arc<dyn IdentityResolver>,
+        identities: Arc<StoreIdentityResolver>,
         store: Store,
         metering: Arc<MeteringManager>,
     ) -> Self {
@@ -100,7 +92,7 @@ impl TunnelRegistry {
             self.active_hosts.write().unwrap().remove(&lower);
         }
         let store = self.store.clone();
-        let active_at = active.then(now_unix);
+        let active_at = active.then(crate::wall_clock::unix_secs);
         tokio::spawn(async move {
             if let Err(err) = store.set_domain_active(&lower, active_at).await {
                 tracing::warn!(hostname = %lower, error = %err, "Failed to persist domain active flag");
@@ -172,16 +164,16 @@ impl TunnelRegistry {
         }
     }
 
-    /// Registers a service on an active connection.
-    ///
-    /// Verifies the caller identity, checks for duplicates (the service name
-    /// was validated by `ControlHead::validate` on receipt),
-    /// activates the certificate in `CertManager`, and updates routing tables.
     /// The certificate manager this registry activates hostnames on.
     pub fn cert_manager(&self) -> Arc<CertManager> {
         Arc::clone(&self.cert_manager)
     }
 
+    /// Registers a service on an active connection.
+    ///
+    /// Verifies the caller identity, checks for duplicates, persists the
+    /// service, updates the routing tables and waits (bounded) for the
+    /// certificate.
     pub async fn register_service(
         &self,
         key_id: KeyId,
@@ -193,7 +185,7 @@ impl TunnelRegistry {
             return Err(RefusalCode::Unauthorized);
         };
 
-        let host_lower = derive_hostname(service, &identity, &self.tunnel_domain);
+        let host_lower = identity.hostname(service, &self.tunnel_domain);
 
         // Refuse duplicates before touching the database: a rejected
         // registration must not leave `service`/`domain` rows behind.
@@ -205,16 +197,15 @@ impl TunnelRegistry {
         }
 
         // Persist the declared service under the authenticated machine and
-        // link the hostname to it. The person and machine must already exist:
-        // this call never enrols an identity. The returned id is what the
-        // meter attributes traffic and open time to.
+        // link the hostname to it. The returned id is what the meter
+        // attributes traffic and open time to.
         let persisted = self
             .store
-            .register_declared_service(&key_id, &host_lower, service)
+            .register_declared_service(identity.machine_id, &host_lower, service)
             .await
             .map_err(|e| {
                 tracing::error!(error = %e, hostname = %host_lower, "Failed to persist declared service");
-                RefusalCode::Other("failed to persist declared service".into())
+                RefusalCode::Other
             })?;
 
         {
@@ -294,16 +285,15 @@ impl TunnelRegistry {
         }
     }
 
-    /// Looks up an active tunnel route by hostname.
     /// The identity resolver, shared with the mux `Verifier`.
-    pub fn identities(&self) -> Arc<dyn IdentityResolver> {
+    pub fn identities(&self) -> Arc<StoreIdentityResolver> {
         Arc::clone(&self.identities)
     }
 
     /// Resolves an incoming `Host` to its live tunnel.
     ///
     /// The materialized `domains` table is the source of truth for
-    /// `hostname -> service_id` (the "one join" of OFF-190); the in-memory map
+    /// `hostname -> service_id`; the in-memory map
     /// only supplies the process-local `proxy_tx` channel, which cannot be a DB
     /// row. A domain with no live route, or a route whose `service_id` does not
     /// match the database, resolves to `None`.

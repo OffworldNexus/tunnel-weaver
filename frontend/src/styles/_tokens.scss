@@ -8,14 +8,11 @@
 :root {
 	color-scheme: light dark;
 
-	--tw-bg: #cdc6bf;
 	--tw-deck: #e5e0d8;
 	--tw-well: #fefaf3;
 	--tw-text: #0b0604;
 	--tw-muted: #524943;
-	/* The edge/border role. Figma's `--border` is mode-invariant (#897e76 in
-	   both themes); the lighter #cdc6bf is Figma's `muted` value in dark mode,
-	   which `--tw-muted` already carries. */
+	// Mode-invariant, like the keycap colours.
 	--tw-border: #897e76;
 	--tw-accent: #772a0a;
 	--tw-success: #4d5818;
@@ -39,18 +36,16 @@
 	// technical values.
 	--tw-sans: Inter, Roboto, 'Helvetica Neue', 'Arial Nova', 'Nimbus Sans', Arial, sans-serif;
 	--tw-heading: Avenir, Montserrat, Corbel, 'URW Gothic', source-sans-pro, sans-serif;
-	--tw-mono: ui-monospace, 'Cascadia Code', 'Source Code Pro', Menlo, Consolas, 'DejaVu Sans Mono',
-		monospace;
+	--tw-mono:
+		ui-monospace, 'Cascadia Code', 'Source Code Pro', Menlo, Consolas, 'DejaVu Sans Mono', monospace;
 }
 
 @media (prefers-color-scheme: dark) {
 	:root {
-		--tw-bg: #0b0604;
 		--tw-deck: #201a16;
 		--tw-well: #0b0604;
 		--tw-text: #fefaf3;
 		--tw-muted: #cdc6bf;
-		--tw-border: #897e76;
 		--tw-accent: #ffcf2e;
 		--tw-success: #cfd9a0;
 		--tw-danger: #ffb8af;

@@ -2,11 +2,13 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use crate::auth;
 use crate::compress::{self, Compress, ZstdCtx};
-use crate::config::{Config, MAX_WINDOW, MIN_MESSAGE, MIN_WINDOW, Role};
+use crate::config::{
+    Config, HANDSHAKE_TIMEOUT, MAX_WINDOW, MIN_MESSAGE, MIN_WINDOW, Role, ZSTD_LEVEL,
+};
 use crate::error::{CloseCode, CloseReason, ProtocolError, RejectCode, StreamError};
 use crate::event::Event;
 use crate::frame::{Frame, FrameType};
@@ -38,7 +40,6 @@ pub struct Connection {
     key_id: Option<KeyId>,
     version: Option<u16>,
     params: Option<Params>,
-    compression_enabled: bool,
     streams: HashMap<StreamId, Stream>,
     /// Optional observer the mux reports per-stream DATA payload bytes to.
     /// Set by the layer above; the mux itself keeps no byte accounting.
@@ -46,17 +47,14 @@ pub struct Connection {
     next_stream_id: u32,
     last_peer_stream_id: u32,
     sched: SchedTree,
-    /// Handshake frames go out before anything else and before the
-    /// scheduler exists in its final shape (the client learns `max_frame`
-    /// from WELCOME).
-    handshake_out: VecDeque<Frame>,
-    /// GOAWAY is emitted from here, ahead of the scheduler, so it is
-    /// literally the next frame after `close()`.
-    pending_goaway: Option<Frame>,
+    /// Frames that bypass the scheduler: the handshake (which runs before
+    /// the scheduler exists in its final shape — the client learns
+    /// `max_frame` from WELCOME) and GOAWAY, which must be literally the
+    /// next frame after `close()`.
+    priority_out: VecDeque<Frame>,
     closed: Option<CloseReason>,
     timers: Timers,
     events: VecDeque<Event>,
-    rtt: Option<Duration>,
     ping_counter: u64,
     zstd: ZstdCtx,
 }
@@ -94,14 +92,14 @@ impl Connection {
         };
         let timers = Timers::new(
             now,
-            cfg.handshake_timeout,
+            HANDSHAKE_TIMEOUT,
             cfg.ping_interval,
             cfg.idle_timeout,
             reverify,
         );
         // The client learns `max_frame` from WELCOME and rebuilds then.
-        let sched = SchedTree::new(cfg.weights, max_frame.max(2));
-        let zstd = ZstdCtx::new(cfg.zstd_level);
+        let sched = SchedTree::new(cfg.weights, max_frame);
+        let zstd = ZstdCtx::new(ZSTD_LEVEL);
         let mut conn = Self {
             cfg,
             hs,
@@ -109,18 +107,15 @@ impl Connection {
             key_id: None,
             version: None,
             params: None,
-            compression_enabled: false,
             streams: HashMap::new(),
             bytes_sink: None,
             next_stream_id,
             last_peer_stream_id: 0,
             sched,
-            handshake_out: VecDeque::new(),
-            pending_goaway: None,
+            priority_out: VecDeque::new(),
             closed: None,
             timers,
             events: VecDeque::new(),
-            rtt: None,
             ping_counter: 0,
             zstd,
         };
@@ -128,7 +123,7 @@ impl Connection {
             let mut nonce_s = [0u8; 32];
             conn.cfg.rng.fill_bytes(&mut nonce_s);
             conn.nonce_s = Some(nonce_s);
-            conn.handshake_out.push_back(Frame {
+            conn.priority_out.push_back(Frame {
                 stream_id: 0,
                 frame_type: FrameType::Challenge,
                 payload: wire::encode_payload(&Challenge { nonce_s }),
@@ -148,15 +143,6 @@ impl Connection {
     #[cfg(any(test, feature = "test-util"))]
     pub fn version(&self) -> Option<u16> {
         self.version
-    }
-
-    /// Most recent PING → PONG round trip, measured with the caller's `now`.
-    ///
-    /// Test-only introspection (`test-util`); production drives the
-    /// connection through events alone.
-    #[cfg(any(test, feature = "test-util"))]
-    pub fn rtt(&self) -> Option<Duration> {
-        self.rtt
     }
 
     /// True once `close()` was called or the peer closed.
@@ -188,7 +174,7 @@ impl Connection {
     /// connection through events alone.
     #[cfg(any(test, feature = "test-util"))]
     pub fn pending_messages(&self, id: StreamId) -> Option<usize> {
-        self.streams.get(&id).map(Stream::pending_messages)
+        self.streams.get(&id).map(|s| s.inbox.len())
     }
 
     /// Reports per-stream DATA payload byte flow to an observer.
@@ -244,7 +230,7 @@ impl Connection {
                 Some(Expired::Ping) => {
                     self.ping_counter += 1;
                     let opaque = self.ping_counter;
-                    self.timers.ping_outstanding = Some((opaque, now));
+                    self.timers.ping_outstanding = Some(opaque);
                     self.sched.push_control(Frame {
                         stream_id: 0,
                         frame_type: FrameType::Ping,
@@ -263,24 +249,17 @@ impl Connection {
     /// frame. Lets an event loop decide to keep sending versus go back to
     /// waiting for input without paying for an encode.
     pub fn wants_transmit(&self) -> bool {
-        self.pending_goaway.is_some() || !self.handshake_out.is_empty() || self.sched.has_backlog()
+        !self.priority_out.is_empty() || self.sched.has_backlog()
     }
 
     /// Fill `buf` with exactly one frame. Returns `false` (and leaves `buf`
     /// empty) when there is nothing to send. Call only after the previous
     /// frame has been flushed to the transport.
-    pub fn poll_transmit(&mut self, now: Instant, buf: &mut Vec<u8>) -> bool {
-        let now = self.timers.observe(now);
+    pub fn poll_transmit(&mut self, buf: &mut Vec<u8>) -> bool {
         buf.clear();
 
-        if let Some(frame) = self.pending_goaway.take() {
+        if let Some(frame) = self.priority_out.pop_front() {
             frame.encode_into(buf);
-            self.timers.on_send(now);
-            return true;
-        }
-        if let Some(frame) = self.handshake_out.pop_front() {
-            frame.encode_into(buf);
-            self.timers.on_send(now);
             return true;
         }
         let Some(pick) = self.sched.pick() else {
@@ -292,16 +271,8 @@ impl Connection {
                     return false;
                 };
                 let len = frame.wire_len() as u32;
-                match frame.frame_type {
-                    FrameType::Open => self.on_open_sent(frame.stream_id),
-                    FrameType::Ping => {
-                        // RTT is measured from the instant the PING actually
-                        // leaves, not from when the timer queued it.
-                        if let Some(p) = self.timers.ping_outstanding.as_mut() {
-                            p.1 = now;
-                        }
-                    }
-                    _ => {}
+                if frame.frame_type == FrameType::Open {
+                    self.on_open_sent(frame.stream_id);
                 }
                 self.sched.served(Pick::Control, Class::Control, len, None);
                 frame.encode_into(buf);
@@ -323,11 +294,7 @@ impl Connection {
                     payload,
                 };
                 let next_len = stream.head_len();
-                if next_len.is_none() {
-                    stream.sched_active = false;
-                }
-                let queue_fin =
-                    stream.outbox.is_empty() && stream.fin_requested && !stream.fin_queued;
+                let queue_fin = next_len.is_none() && !stream.local_open;
                 self.sched
                     .served(Pick::Stream(id), class, frame.wire_len() as u32, next_len);
                 if queue_fin {
@@ -337,7 +304,6 @@ impl Connection {
                 frame.encode_into(buf);
             }
         }
-        self.timers.on_send(now);
         true
     }
 
@@ -346,22 +312,17 @@ impl Connection {
         if let Some(s) = self.streams.get_mut(&id) {
             s.open_sent = true;
             if let Some(len) = s.head_len() {
-                s.sched_active = true;
-                let class = s.class;
-                self.sched.activate_stream(id, class, len);
+                self.sched.activate_stream(id, s.class, len);
             }
         }
     }
 
     fn queue_fin(&mut self, id: StreamId) {
-        if let Some(s) = self.streams.get_mut(&id) {
-            s.fin_queued = true;
-            self.sched.push_control(Frame {
-                stream_id: id,
-                frame_type: FrameType::Fin,
-                payload: Vec::new(),
-            });
-        }
+        self.sched.push_control(Frame {
+            stream_id: id,
+            frame_type: FrameType::Fin,
+            payload: Vec::new(),
+        });
     }
 
     /// Drop a stream entry once nothing remains to send or deliver.
@@ -414,13 +375,13 @@ impl Connection {
         use FrameType as T;
         if frame.stream_id == 0 {
             return match frame.frame_type {
-                T::Challenge => self.on_challenge(frame),
+                T::Challenge => self.on_challenge(frame).await,
                 T::Hello => self.on_hello(now, frame).await,
                 T::Welcome => self.on_welcome(now, frame),
                 T::Reject => self.on_reject(frame),
                 T::Goaway => self.on_goaway(frame),
                 T::Ping => self.after_auth().and_then(|_| self.on_ping(frame)),
-                T::Pong => self.after_auth().and_then(|_| self.on_pong(now, frame)),
+                T::Pong => self.after_auth().and_then(|_| self.on_pong(frame)),
                 T::Open | T::Data | T::Fin | T::Rst | T::WindowUpdate => {
                     Err(ProtocolError::BadStreamId(0))
                 }
@@ -451,7 +412,7 @@ impl Connection {
 
     // --- handshake ------------------------------------------------------
 
-    fn on_challenge(&mut self, frame: Frame) -> Result<(), ProtocolError> {
+    async fn on_challenge(&mut self, frame: Frame) -> Result<(), ProtocolError> {
         if self.hs != HandshakeState::AwaitChallenge {
             return Err(ProtocolError::StateViolation("unexpected CHALLENGE"));
         }
@@ -468,7 +429,7 @@ impl Connection {
             self.cfg.channel_binding.as_ref(),
         );
         let key_id = signer.key_id();
-        let sig = match signer.sign(&msg) {
+        let sig = match signer.sign(&msg).await {
             Ok(sig) => sig,
             Err(e) => {
                 // We cannot authenticate; tell the peer we are leaving and
@@ -481,7 +442,7 @@ impl Connection {
             }
         };
         self.key_id = Some(key_id);
-        self.handshake_out.push_back(Frame {
+        self.priority_out.push_back(Frame {
             stream_id: 0,
             frame_type: FrameType::Hello,
             payload: wire::encode_payload(&Hello {
@@ -505,12 +466,7 @@ impl Connection {
         else {
             return Err(ProtocolError::StateViolation("unexpected HELLO"));
         };
-        let params = Params {
-            max_frame: params.max_frame,
-            initial_window: params.initial_window,
-            compression_allowed: params.compression_allowed,
-            max_message: params.max_message,
-        };
+        let params = *params;
         let hello: Hello = wire::decode_payload(FrameType::Hello, &frame.payload)?;
         let version = match handshake::negotiate(hello.version) {
             Ok(v) => v,
@@ -534,7 +490,7 @@ impl Connection {
             self.reject(RejectCode::BadSignature, "signature verification failed");
             return Ok(());
         }
-        self.handshake_out.push_back(Frame {
+        self.priority_out.push_back(Frame {
             stream_id: 0,
             frame_type: FrameType::Welcome,
             payload: wire::encode_payload(&Welcome { version, params }),
@@ -545,7 +501,7 @@ impl Connection {
     }
 
     fn reject(&mut self, code: RejectCode, message: &str) {
-        self.handshake_out.push_back(Frame {
+        self.priority_out.push_back(Frame {
             stream_id: 0,
             frame_type: FrameType::Reject,
             payload: wire::encode_payload(&Reject {
@@ -589,7 +545,6 @@ impl Connection {
         self.hs = HandshakeState::Done;
         self.version = Some(version);
         self.params = Some(params);
-        self.compression_enabled = self.cfg.compression_allowed && params.compression_allowed;
         self.timers.on_authenticated(now);
         self.events
             .push_back(Event::Authenticated { key_id, version });
@@ -624,12 +579,9 @@ impl Connection {
         Ok(())
     }
 
-    fn on_pong(&mut self, now: Instant, frame: Frame) -> Result<(), ProtocolError> {
+    fn on_pong(&mut self, frame: Frame) -> Result<(), ProtocolError> {
         let p: Ping = wire::decode_payload(FrameType::Pong, &frame.payload)?;
-        if let Some((opaque, sent_at)) = self.timers.ping_outstanding
-            && opaque == p.opaque
-        {
-            self.rtt = Some(now.saturating_duration_since(sent_at));
+        if self.timers.ping_outstanding == Some(p.opaque) {
             self.timers.ping_outstanding = None;
         }
         Ok(())
@@ -762,7 +714,9 @@ impl Connection {
         if !stream.partial.is_empty() {
             return Err(ProtocolError::StateViolation("FIN inside a message"));
         }
-        self.deliver_finished(id);
+        if stream.inbox.is_empty() {
+            self.finished(id);
+        }
         Ok(())
     }
 
@@ -849,7 +803,6 @@ impl Connection {
                 max: params.max_message,
             });
         }
-        let compression_enabled = self.compression_enabled;
         let sink = self.bytes_sink.clone();
         let stream = self
             .streams
@@ -868,34 +821,28 @@ impl Connection {
             stream.wants_writable = true;
             return Err(StreamError::WouldBlock);
         }
-        let stance = if compression_enabled {
+        let stance = if params.compression_allowed {
             compress
         } else {
             Compress::Never
         };
         let class = stream.class;
-        let mut fragments: Vec<&[u8]> = if msg.is_empty() {
+        let fragments: Vec<&[u8]> = if msg.is_empty() {
             vec![&[]]
         } else {
             msg.chunks(chunk_max).collect()
         };
         let last = fragments.len() - 1;
-        for (i, chunk) in fragments.drain(..).enumerate() {
-            let mut payload = Vec::with_capacity(1 + chunk.len());
+        for (i, chunk) in fragments.into_iter().enumerate() {
             let more = if i < last { DATA_FLAG_MORE } else { 0 };
-            payload.push(more);
-            let mut done = false;
-            if compress::should_compress(stance, class, chunk)
-                && let Ok(c) = self.zstd.compress(chunk)
-                && c.len() < chunk.len()
-            {
-                payload[0] |= DATA_FLAG_COMPRESSED;
-                payload.extend_from_slice(&c);
-                done = true;
-            }
-            if !done {
-                payload.extend_from_slice(chunk);
-            }
+            let compressed = compress::should_compress(stance, class, chunk)
+                .then(|| self.zstd.compress(chunk).ok())
+                .flatten()
+                .filter(|c| c.len() < chunk.len());
+            let payload = match compressed {
+                Some(c) => [&[more | DATA_FLAG_COMPRESSED][..], &c].concat(),
+                None => [&[more][..], chunk].concat(),
+            };
             stream.outbox_bytes += payload.len() as u32;
             // Report the DATA payload (flags byte + body, post-compression);
             // the 5-byte frame header is not part of it.
@@ -912,23 +859,13 @@ impl Connection {
             (Class::Interactive, Some(t)) if stream.written_total > t => Class::Bulk,
             (c, _) => c,
         };
-        let head_len = stream.head_len();
-        let open_sent = stream.open_sent;
-        let was_active = stream.sched_active;
+        // DATA waits for our OPEN to leave (see `on_open_sent`).
+        let head_len = stream.head_len().filter(|_| stream.open_sent);
         if new_class != old_class {
             stream.class = new_class;
-            stream.sched_active = open_sent && head_len.is_some();
-            self.sched.reclass(
-                id,
-                old_class,
-                new_class,
-                if open_sent { head_len } else { None },
-            );
-        } else if open_sent
-            && !was_active
-            && let Some(len) = head_len
-        {
-            stream.sched_active = true;
+            self.sched.reclass(id, old_class, new_class, head_len);
+        } else if let Some(len) = head_len {
+            // A no-op when the stream is already backlogged.
             self.sched.activate_stream(id, new_class, len);
         }
         Ok(())
@@ -945,7 +882,6 @@ impl Connection {
             return Err(StreamError::SendClosed);
         }
         stream.local_open = false;
-        stream.fin_requested = true;
         if stream.outbox.is_empty() {
             self.queue_fin(id);
             self.maybe_forget(id);
@@ -980,28 +916,21 @@ impl Connection {
         let Some((msg, wire_len)) = stream.inbox.pop_front() else {
             return Err(StreamError::WouldBlock);
         };
-        let credit = if stream.remote_open {
-            stream.recv.on_consumed(wire_len)
-        } else {
-            None
-        };
-        if let Some(credit) = credit {
-            self.queue_window_update(id, credit);
+        if stream.remote_open {
+            if let Some(credit) = stream.recv.on_consumed(wire_len) {
+                self.queue_window_update(id, credit);
+            }
+        } else if stream.inbox.is_empty() {
+            self.finished(id);
         }
-        self.deliver_finished(id);
         Ok(msg)
     }
 
-    /// Emit `Finished` once the peer's FIN has arrived and every message
-    /// has been consumed; then forget the stream if our side is done too.
-    fn deliver_finished(&mut self, id: StreamId) {
-        let Some(stream) = self.streams.get_mut(&id) else {
-            return;
-        };
-        if stream.remote_drained() && !stream.finished_delivered {
-            stream.finished_delivered = true;
-            self.events.push_back(Event::Finished(id));
-        }
+    /// The peer's FIN has arrived and every message has been consumed: tell
+    /// the application, then forget the stream if our side is done too.
+    /// Called exactly once per stream, on that transition.
+    fn finished(&mut self, id: StreamId) {
+        self.events.push_back(Event::Finished(id));
         self.maybe_forget(id);
     }
 
@@ -1025,7 +954,6 @@ impl Connection {
             } else {
                 None
             };
-            stream.sched_active = head_len.is_some();
             self.sched.reclass(id, old, class, head_len);
         }
         Ok(())
@@ -1035,22 +963,24 @@ impl Connection {
     // Close
     // ------------------------------------------------------------------
 
-    /// Tear the connection down. GOAWAY is the very next frame out, every
-    /// open stream is reset, and `Event::Closed` is emitted locally.
+    /// Tear the connection down. GOAWAY is the last frame out, every open
+    /// stream is reset locally, and `Event::Closed` is emitted.
     pub fn close(&mut self, reason: CloseReason) {
         self.close_internal(reason, true);
     }
 
     /// `send_goaway` is false when the peer initiated the close (or already
-    /// left after REJECT): nothing we send would be read.
+    /// left after REJECT): nothing we send would be read. When it is true,
+    /// GOAWAY replaces everything still queued: the peer stops reading at
+    /// GOAWAY, so nothing else is worth sending.
     fn close_internal(&mut self, reason: CloseReason, send_goaway: bool) {
         if self.closed.is_some() {
             return;
         }
-        // Pending control frames (OPEN, WINDOW_UPDATE, ...) are moot now.
         self.sched.clear_control();
         if send_goaway {
-            self.pending_goaway = Some(Frame {
+            self.priority_out.clear();
+            self.priority_out.push_back(Frame {
                 stream_id: 0,
                 frame_type: FrameType::Goaway,
                 payload: wire::encode_payload(&reason),
@@ -1060,15 +990,6 @@ impl Connection {
         ids.sort_unstable();
         for id in ids {
             self.drop_stream(id);
-            if send_goaway {
-                self.sched.push_control(Frame {
-                    stream_id: id,
-                    frame_type: FrameType::Rst,
-                    payload: wire::encode_payload(&Rst {
-                        code: RST_CODE_CONNECTION_CLOSED,
-                    }),
-                });
-            }
             self.events.push_back(Event::Reset {
                 id,
                 code: RST_CODE_CONNECTION_CLOSED,

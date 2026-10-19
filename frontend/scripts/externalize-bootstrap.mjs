@@ -27,7 +27,9 @@ const inlineScript = /<script(?![^>]*\bsrc=)([^>]*)>([\s\S]*?)<\/script>/g;
 const written = [];
 
 html = html.replace(inlineScript, (match, attrs, body) => {
-	if (!body.trim()) return match;
+	if (!body.trim()) {
+		return match;
+	}
 
 	// Recover the configured base path from the bootstrap's absolute imports.
 	const baseMatch = body.match(/["']([^"']*)\/_app\/immutable\/entry\/start/);
@@ -36,7 +38,7 @@ html = html.replace(inlineScript, (match, attrs, body) => {
 	const hash = createHash('sha256').update(body).digest('hex').slice(0, 12);
 	const name = `bootstrap.${hash}.js`;
 	mkdirSync(outDir, { recursive: true });
-	writeFileSync(join(outDir, name), body.replace(/^[\r\n]+/, '').replace(/\s+$/, '\n'));
+	writeFileSync(join(outDir, name), `${body.replace(/^[\r\n]+/, '').trimEnd()}\n`);
 	written.push(name);
 
 	return `<script${attrs} src="${base}/_app/immutable/entry/${name}"></script>`;

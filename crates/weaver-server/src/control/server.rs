@@ -647,15 +647,11 @@ async fn handle_connection(
                         .as_ref()
                         .map(|r| r.not_after)
                         .or_else(|| state.not_after());
-                    let issuer = cert_rec.as_ref().and_then(|r| r.issuer.clone());
                     let provider = cert_rec
                         .as_ref()
                         .map(|r| r.directory.clone())
                         .unwrap_or_else(|| config.acme_provider.clone());
                     let active = is_active(&store, &target).await;
-                    // Activity now lives on the domain, not the certificate;
-                    // the wildcard row has no per-name activity timestamp.
-                    let last_active_at = None;
                     let cert_id = cert_rec.as_ref().map(|r| r.id);
                     let validation = cert_rec.as_ref().map(|r| r.validation.clone());
 
@@ -665,10 +661,8 @@ async fn handle_connection(
                         state,
                         not_before,
                         not_after,
-                        issuer,
                         provider,
                         active,
-                        last_active_at,
                         cert_events,
                         cert_id,
                         validation,

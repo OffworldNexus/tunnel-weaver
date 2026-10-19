@@ -1,17 +1,14 @@
 <script lang="ts">
 	/**
-	 * "You already have an account" — the disclosure shown after verifying an
-	 * email that belongs to an existing account. Deliberately reveals nothing
-	 * about that account beyond its existence.
+	 * Shown after verifying an email that already has an account. Reveals
+	 * nothing about that account beyond its existence.
 	 */
-
-	import { loadFlow } from '#lib/account/flow';
-	import { href } from '#lib/app/paths';
+	import { flow } from '#lib/account/state';
 	import Keycap from '#lib/ui/Keycap.svelte';
 	import Page from '#lib/ui/Page.svelte';
+	import { resolve } from '$app/paths';
 
-	// Disclose only that the address already has an account — nothing about it.
-	const email = loadFlow().email ?? '';
+	const { email } = flow.load();
 </script>
 
 <svelte:head>
@@ -25,12 +22,12 @@
 
 	<p class="lede">
 		An account already exists for {#if email}<strong>{email}</strong>{:else}that address{/if}. Sign
-		in to continue, or <a href={href('/forgot-password')}>reset your password</a> if you need a new
+		in to continue, or <a href={resolve('/forgot-password')}>reset your password</a> if you need a new
 		one.
 	</p>
 
 	<div class="actions">
-		<Keycap wide href={href('/sign-in')}>Sign in</Keycap>
+		<Keycap wide href={resolve('/sign-in')}>Sign in</Keycap>
 	</div>
 </Page>
 

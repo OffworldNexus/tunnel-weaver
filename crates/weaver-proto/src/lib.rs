@@ -3,11 +3,14 @@
 //! This crate defines *what* travels on the mux streams shared by the
 //! `weave` client and the `weaver-server` relay, and *how the mux should
 //! treat it* ([`policy`]). It knows nothing about sockets, tokio, identities
-//! or hostnames.
+//! or hostnames — with one deliberate exception, [`pair`], the enrolment
+//! schema, which names a key id and a raw hostname and travels as JSON off the
+//! mux.
 //!
 //! # Conventions
 //!
 //! * Every stream's first message is a postcard-encoded [`Head`].
+//!   [`pair`] is the exception: it is JSON.
 //! * Control streams: client sends `Head::Control`, relay answers with one
 //!   [`ControlReply`]; the stream then stays open for the registration's
 //!   lifetime.
@@ -32,21 +35,24 @@ use thiserror::Error;
 
 pub mod control;
 pub mod http;
+pub mod pair;
 pub mod policy;
 pub mod reset;
 
-pub use control::{CertStatus, ControlHead, ControlReply, RefusalCode, is_valid_dns_label};
+pub use control::{
+    CertStatus, ControlHead, ControlReply, RefusalCode, SERVICE_NAME_MAX, is_valid_service_name,
+};
 pub use http::{HttpHead, HttpResponseHead};
 pub use reset::ResetCode;
 
 /// Lowest application protocol version this build accepts.
-pub const MIN_PROTOCOL_VERSION: u16 = 1;
+const MIN_PROTOCOL_VERSION: u16 = 1;
 /// Application protocol version this build speaks. Carried in
 /// [`ControlHead::Register`] and negotiated independently of the mux.
 pub const PROTOCOL_VERSION: u16 = 1;
 
 /// Relay-side check of a client's advertised application version.
-pub fn accept_protocol_version(client: u16) -> Result<(), RefusalCode> {
+fn accept_protocol_version(client: u16) -> Result<(), RefusalCode> {
     if (MIN_PROTOCOL_VERSION..=PROTOCOL_VERSION).contains(&client) {
         Ok(())
     } else {
@@ -87,11 +93,6 @@ pub enum BodyFrame {
 }
 
 impl BodyFrame {
-    /// True when this frame is body data rather than trailers.
-    pub fn is_chunk(&self) -> bool {
-        matches!(self, Self::Chunk(_))
-    }
-
     /// Trailer list if this is a [`BodyFrame::Trailers`].
     pub fn trailers(&self) -> Option<&[(String, Vec<u8>)]> {
         match self {
@@ -170,7 +171,6 @@ mod tests {
         let chunk = BodyFrame::Chunk(b"hello".to_vec());
         let decoded: BodyFrame = decode(&encode(&chunk).unwrap()).unwrap();
         assert_eq!(chunk, decoded);
-        assert!(decoded.is_chunk());
         assert!(decoded.trailers().is_none());
 
         let trailers = BodyFrame::Trailers(vec![
@@ -179,7 +179,6 @@ mod tests {
         ]);
         let decoded: BodyFrame = decode(&encode(&trailers).unwrap()).unwrap();
         assert_eq!(trailers, decoded);
-        assert!(!decoded.is_chunk());
         assert_eq!(decoded.trailers().unwrap().len(), 2);
     }
 

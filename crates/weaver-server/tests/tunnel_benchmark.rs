@@ -73,11 +73,11 @@ impl ThrottledPipe {
         let now = self.clock.advance(Duration::from_millis(10));
         let mut buf = Vec::with_capacity(64 * 1024);
 
-        while self.client.poll_transmit(now, &mut buf) {
+        while self.client.poll_transmit(&mut buf) {
             self.c_to_s.push(std::mem::take(&mut buf));
         }
 
-        while self.server.poll_transmit(now, &mut buf) {
+        while self.server.poll_transmit(&mut buf) {
             self.s_to_c.push(std::mem::take(&mut buf));
         }
 

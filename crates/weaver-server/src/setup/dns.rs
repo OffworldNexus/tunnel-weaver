@@ -12,7 +12,6 @@ use std::time::Duration;
 
 use hickory_proto::op::{Message, MessageType, OpCode, Query};
 use hickory_proto::rr::{Name, RData, RecordType};
-use sha2::Digest;
 use tokio::net::UdpSocket;
 
 use crate::store::names::normalize_domain;
@@ -52,52 +51,6 @@ const QUERY_TIMEOUT: Duration = Duration::from_secs(3);
 /// Total attempts per query (the first try plus retries).
 const QUERY_ATTEMPTS: usize = 3;
 
-/// Result of resolving the delegated zone through the public recursives.
-///
-/// Distinguishes the apex from a freshly generated one-label probe name so a
-/// half-propagated delegation (apex answers, wildcard does not, or vice versa)
-/// is caught.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ZoneProbe {
-    /// Resolved IP addresses for `<root>`.
-    pub root_ips: Vec<IpAddr>,
-    /// Ephemeral probe subdomain queried (e.g. `probe-<random>.<root>`).
-    pub probe_domain: String,
-    /// Resolved IP addresses for `probe-<random>.<root>`.
-    pub probe_ips: Vec<IpAddr>,
-    /// Whether every public resolver returned the same set for the probe name.
-    pub resolvers_ok: bool,
-}
-
-/// Generates a random lowercase hex string of specified byte length (produces `len * 2` hex chars).
-pub fn generate_random_hex(len: usize) -> String {
-    let mut bytes = vec![0u8; len];
-    if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
-        use std::io::Read;
-        if f.read_exact(&mut bytes).is_ok() {
-            return bytes.iter().map(|b| format!("{b:02x}")).collect();
-        }
-    }
-
-    // Fallback: SHA256 of timestamp and process id
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let pid = std::process::id();
-    let hash = sha2::Sha256::digest(format!("{now}:{pid}").as_bytes());
-    for (i, b) in bytes.iter_mut().enumerate() {
-        *b = hash[i % hash.len()];
-    }
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
-}
-
-/// A random transaction ID for a DNS query.
-fn random_query_id() -> u16 {
-    let hex = generate_random_hex(2);
-    u16::from_str_radix(&hex, 16).unwrap_or(0)
-}
-
 /// Sends one DNS query to `resolver`, retrying a couple of times on timeout.
 async fn query_resolver(
     resolver: IpAddr,
@@ -119,7 +72,7 @@ async fn query_once(resolver: IpAddr, qname: &str, qtype: RecordType) -> Result<
     let name = Name::from_str(&format!("{qname}."))
         .map_err(|e| format!("invalid query name '{qname}': {e}"))?;
 
-    let id = random_query_id();
+    let id = rand::random::<u16>();
     let mut msg = Message::new(id, MessageType::Query, OpCode::Query);
     msg.metadata.recursion_desired = true;
     msg.add_query(Query::query(name, qtype));
@@ -269,8 +222,8 @@ pub async fn probe_delegation(tunnel_domain: &str) -> Result<(Vec<String>, bool)
 /// lets `setup` tell "the operator has not added the NS record" apart from
 /// "the responder is not up yet", without depending on resolver caches.
 ///
-/// `expected_ns` is the relay's admin hostname: OFF-198 delegates the tunnel
-/// zone to the admin name, which is always resolvable because it lives outside
+/// `expected_ns` is the relay's admin hostname: the tunnel zone is delegated
+/// to the admin name, which is always resolvable because it lives outside
 /// the delegation.
 pub async fn probe_registrar_delegation(
     tunnel_domain: &str,
@@ -340,7 +293,7 @@ pub async fn probe_registrar_delegation(
 
 /// True when the parent's `NS <root>` targets include `expected_ns`.
 ///
-/// OFF-198 delegates the tunnel zone to the relay's *admin* hostname (which
+/// The tunnel zone is delegated to the relay's *admin* hostname (which
 /// lives outside the delegation and is therefore always resolvable), not to the
 /// apex itself. Comparison is case-insensitive with any trailing dot ignored.
 pub fn delegation_matches(targets: &[String], expected_ns: &str) -> bool {
@@ -348,54 +301,6 @@ pub fn delegation_matches(targets: &[String], expected_ns: &str) -> bool {
     targets
         .iter()
         .any(|target| normalize_domain(target) == expected)
-}
-
-/// Resolves the apex and a fresh probe name through the public recursives.
-///
-/// This needs the relay's authoritative responder to be up (and the delegation
-/// to point at it), so call it *after* the DNS socket is started.
-pub async fn probe_zone(tunnel_domain: &str) -> ZoneProbe {
-    let root = normalize_domain(tunnel_domain);
-    let resolvers = system_resolvers();
-
-    // Apex A/AAAA through the public resolvers (union of both families).
-    let mut root_ips = Vec::new();
-    for resolver in &resolvers {
-        if let Ok(ips) = resolve_both(*resolver, &root).await {
-            root_ips.extend(ips);
-        }
-    }
-    root_ips.sort();
-    root_ips.dedup();
-
-    // Fresh probe subdomain through EACH resolver; every resolver should return
-    // exactly the apex set.
-    let probe_domain = format!("probe-{}.{}", generate_random_hex(6), root);
-    let mut probe_ips = Vec::new();
-    let mut resolvers_ok = true;
-    for resolver in &resolvers {
-        match resolve_both(*resolver, &probe_domain).await {
-            Ok(ips) => {
-                if ips != root_ips {
-                    resolvers_ok = false;
-                }
-                probe_ips.extend(ips);
-            }
-            Err(_) => resolvers_ok = false,
-        }
-    }
-    probe_ips.sort();
-    probe_ips.dedup();
-    if probe_ips != root_ips {
-        resolvers_ok = false;
-    }
-
-    ZoneProbe {
-        root_ips,
-        probe_domain,
-        probe_ips,
-        resolvers_ok,
-    }
 }
 
 /// Resolves `name` A and AAAA through every public recursive and returns the
@@ -464,23 +369,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn random_hex_is_lowercase_and_sized() {
-        let hex = generate_random_hex(6);
-        assert_eq!(hex.len(), 12);
-        assert!(
-            hex.chars()
-                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
-        );
-    }
-
-    #[test]
     fn normalize_strips_trailing_dot_and_lowercases() {
         assert_eq!(normalize_domain("Example.COM."), "example.com");
     }
 
     #[test]
     fn delegation_target_is_the_admin_hostname() {
-        // OFF-198: the tunnel zone is delegated to the relay's admin hostname,
+        // the tunnel zone is delegated to the relay's admin hostname,
         // not to the apex itself.
         let targets = vec![
             "relay.example.net.".to_string(),

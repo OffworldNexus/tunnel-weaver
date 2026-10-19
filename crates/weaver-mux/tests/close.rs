@@ -20,11 +20,11 @@ async fn close_key_revoked() {
 
     p.server.close(CloseReason {
         code: CloseCode::KeyRevoked,
-        message: Some("key rotated".into()),
+        message: "key rotated".into(),
     });
     let now = p.clock.now();
     let mut buf = Vec::new();
-    assert!(p.server.poll_transmit(now, &mut buf));
+    assert!(p.server.poll_transmit(&mut buf));
     assert_eq!(Frame::parse(&buf).unwrap().frame_type, FrameType::Goaway);
 
     let events = p.drain_events(Side::Server);
@@ -42,7 +42,7 @@ async fn close_key_revoked() {
             Event::Closed {
                 reason: CloseReason {
                     code: CloseCode::KeyRevoked,
-                    message: Some("key rotated".into()),
+                    message: "key rotated".into(),
                 }
             },
         ]
@@ -54,7 +54,7 @@ async fn close_key_revoked() {
         Err(StreamError::Closed)
     );
 
-    // Deliver GOAWAY (and trailing RSTs) to the client.
+    // Deliver GOAWAY to the client.
     p.client.recv(now, &buf).await.unwrap_err_or_ok();
     p.pump().await;
     let client_events = p.drain_events(Side::Client);
@@ -71,11 +71,11 @@ async fn close_key_revoked() {
     assert!(matches!(
         client_events.last(),
         Some(Event::Closed { reason }) if reason.code == CloseCode::KeyRevoked
-            && reason.message.as_deref() == Some("key rotated")
+            && reason.message == "key rotated"
     ));
     assert_eq!(p.client.open(Class::Interactive), Err(StreamError::Closed));
     assert!(
-        !p.client.poll_transmit(now, &mut buf),
+        !p.client.poll_transmit(&mut buf),
         "peer-initiated close sends nothing"
     );
     assert_eq!(p.client.next_timeout(), None);

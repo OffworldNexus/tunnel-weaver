@@ -43,17 +43,8 @@ pub enum Outcome {
 pub struct Charge {
     /// Whether the request was admitted.
     pub outcome: Outcome,
-    /// Additional unit-cost requests affordable right now.
-    pub remaining: u32,
     /// Milliseconds to wait before retrying; 0 when admitted.
     pub retry_after_ms: i64,
-}
-
-/// A read-only view of a key's current budget.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Snapshot {
-    /// Additional unit-cost requests affordable right now.
-    pub remaining: u32,
 }
 
 /// The per-key limiter state: a single theoretical-arrival time.
@@ -93,24 +84,13 @@ impl Gcra {
             self.tat_ms = Some(new_tat);
             Charge {
                 outcome: Outcome::Admitted,
-                remaining: remaining_units(new_tat, tolerance, quota, now_ms),
                 retry_after_ms: 0,
             }
         } else {
             Charge {
                 outcome: Outcome::Throttled,
-                remaining: 0,
                 retry_after_ms: (allow_at - now_ms).clamp(1, retry_cap_ms.max(1)),
             }
-        }
-    }
-
-    /// Inspect the budget without charging it.
-    pub fn peek(&self, quota: &Quota, now_ms: i64) -> Snapshot {
-        let tolerance = tolerance_ms(quota);
-        let tat = self.tat_ms.unwrap_or(now_ms).max(now_ms);
-        Snapshot {
-            remaining: remaining_units(tat, tolerance, quota, now_ms),
         }
     }
 }
@@ -128,16 +108,6 @@ fn tolerance_ms(quota: &Quota) -> i64 {
 /// How much time `cost` units occupy, `cost·T`.
 fn cost_ms(quota: &Quota, cost: u32) -> i64 {
     i64::from(cost).saturating_mul(emission_ms(quota))
-}
-
-/// Additional unit-cost requests that would conform immediately from `tat`.
-fn remaining_units(tat: i64, tolerance: i64, quota: &Quota, now_ms: i64) -> u32 {
-    let debt = tat.saturating_sub(now_ms).max(0);
-    if debt > tolerance {
-        return 0;
-    }
-    let extra = (tolerance - debt) / emission_ms(quota);
-    u32::try_from(extra + 1).unwrap_or(u32::MAX)
 }
 
 #[cfg(test)]
@@ -164,16 +134,6 @@ mod tests {
         assert_eq!(denied.retry_after_ms, 1_000);
         // Waiting exactly the reported delay admits again.
         assert_eq!(gcra.check(&q, 1, 1_000, 60_000).outcome, Outcome::Admitted);
-    }
-
-    #[test]
-    fn remaining_counts_affordable_requests() {
-        let q = quota(3, 1, 1_000);
-        let mut gcra = Gcra::new();
-        assert_eq!(gcra.peek(&q, 0).remaining, 3);
-        assert_eq!(gcra.check(&q, 1, 0, 60_000).remaining, 2);
-        assert_eq!(gcra.check(&q, 1, 0, 60_000).remaining, 1);
-        assert_eq!(gcra.check(&q, 1, 0, 60_000).remaining, 0);
     }
 
     #[test]

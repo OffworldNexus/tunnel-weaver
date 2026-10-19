@@ -38,14 +38,6 @@ impl Validation {
             Validation::Http01 => ChallengeType::Http01,
         }
     }
-
-    /// Parses a persisted validation label, defaulting to DNS-01.
-    pub fn from_label(label: &str) -> Validation {
-        match label {
-            "http-01" => Validation::Http01,
-            _ => Validation::Dns01,
-        }
-    }
 }
 
 /// One certificate the relay keeps issued and renewed.

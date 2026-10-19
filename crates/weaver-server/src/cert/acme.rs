@@ -229,32 +229,46 @@ impl AcmeEngine {
             .await
             .map_err(Self::map_instant_acme_error)?;
 
-        // 4. Provision every authorization before marking any ready. The guards
-        //    withdraw each response when this scope ends, whatever the outcome.
+        // 4. Provision every authorization, and only then mark them ready. The
+        //    apex and the wildcard of the tunnel certificate share one owner
+        //    name, `_acme-challenge.<root>`, with a TXT value each: marking the
+        //    first ready before the second is published lets the CA resolve
+        //    (and cache, for the record's TTL) a one-value answer, and then
+        //    fail the second against it with "incorrect TXT record". The
+        //    guards withdraw each response when this scope ends, whatever the
+        //    outcome.
+        let challenge_type = validation.challenge_type();
+        let missing = || {
+            AcmeError::Other(format!(
+                "no '{}' challenge offered for an authorization of {cert_name}",
+                validation.label()
+            ))
+        };
         let mut guards = Vec::new();
         let mut authzs = order.authorizations();
         while let Some(authz_res) = authzs.next().await {
             let mut authz = authz_res.map_err(Self::map_instant_acme_error)?;
-
-            let mut chal = authz
-                .challenge(validation.challenge_type())
-                .ok_or_else(|| {
-                    AcmeError::Other(format!(
-                        "no '{}' challenge offered for an authorization of {cert_name}",
-                        validation.label()
-                    ))
-                })?;
-
-            let identifier = chal.identifier().to_string();
-            let key_auth = chal.key_authorization().as_str().to_string();
-            let token = chal.token.clone();
+            let chal = authz
+                .challenge(challenge_type.clone())
+                .ok_or_else(missing)?;
             let guard = solver
-                .provision(&identifier, &token, &key_auth, cert_name)
+                .provision(
+                    &chal.identifier().to_string(),
+                    &chal.token,
+                    chal.key_authorization().as_str(),
+                    cert_name,
+                )
                 .await
                 .map_err(|e| AcmeError::Other(format!("Failed to provision challenge: {e}")))?;
             guards.push(guard);
-
-            chal.set_ready()
+        }
+        let mut authzs = order.authorizations();
+        while let Some(authz_res) = authzs.next().await {
+            let mut authz = authz_res.map_err(Self::map_instant_acme_error)?;
+            authz
+                .challenge(challenge_type.clone())
+                .ok_or_else(missing)?
+                .set_ready()
                 .await
                 .map_err(Self::map_instant_acme_error)?;
         }
@@ -416,18 +430,11 @@ impl AcmeEngine {
 
         let creds_json = serde_json::to_string(&credentials)
             .map_err(|e| AcmeError::Other(format!("Failed to serialize credentials: {e}")))?;
-        let kid = account.id().to_string();
         let now = self.clock.now_unix();
 
         // Persist into acme_account
         self.store
-            .upsert_acme_account(
-                directory_url,
-                &self.config.admin_email,
-                &creds_json,
-                Some(&kid),
-                now,
-            )
+            .upsert_acme_account(directory_url, &self.config.admin_email, &creds_json, now)
             .await
             .map_err(|e| AcmeError::Other(format!("Failed to save account: {e}")))?;
 

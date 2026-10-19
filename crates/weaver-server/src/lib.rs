@@ -13,6 +13,14 @@ pub mod server;
 pub mod setup;
 pub mod store;
 pub mod tunnel;
+pub mod wall_clock;
 
 pub use config::{Config, ConfigError};
 pub use store::{Migrator, Store, StoreError};
+
+/// Cryptographically random lowercase-hex string of `bytes * 2` characters.
+pub fn random_hex(bytes: usize) -> String {
+    let mut buf = vec![0u8; bytes];
+    rand::RngCore::fill_bytes(&mut rand::rng(), &mut buf);
+    hex::encode(buf)
+}

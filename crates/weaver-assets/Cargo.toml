@@ -8,7 +8,7 @@ repository.workspace = true
 
 [features]
 default = []
-## Embed the built SvelteKit account SPA (WVR-36). Off by default so the
+## Embed the built SvelteKit account SPA. Off by default so the
 ## workspace builds without Node and so the `weave` client never carries SPA
 ## bytes; only `weaver-server` enables it.
 account-spa = []

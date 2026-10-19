@@ -18,7 +18,7 @@ pub mod domain;
 pub mod email_identity;
 pub mod email_verification;
 pub mod machine;
-pub mod machine_key;
+pub mod machine_key_log;
 pub mod password_credential;
 pub mod password_reset_token;
 pub mod pending_registration;

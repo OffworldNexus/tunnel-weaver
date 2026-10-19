@@ -178,10 +178,10 @@ pub async fn run_server(
     // minute, which the drain below awaits before the store is closed.
     let usage_task = Arc::clone(&metering).start(shutdown_token.clone());
 
-    // WVR-135: the relay-web budget gate (None when abuse is unconfigured) plus
+    // The relay-web budget gate (None when abuse is unconfigured) plus
     // a background sweep that drops idle buckets so the table stays bounded.
     let guard = crate::abuse::build(&config, store.clone());
-    // WVR-136: the ALTCHA runtime (None when `abuse.altcha` is not enabled).
+    // The ALTCHA runtime (None when `abuse.altcha` is not enabled).
     let altcha =
         crate::altcha::AltchaRuntime::from_config(&config, store.clone()).map_err(|e| {
             ServerError::Activation(format!("Failed to initialize ALTCHA runtime: {e}"))
@@ -204,7 +204,7 @@ pub async fn run_server(
                     tokio::select! {
                         _ = token.cancelled() => break,
                         _ = ticker.tick() => {
-                            let cutoff = crate::abuse::unix_ms() - ttl_ms;
+                            let cutoff = crate::wall_clock::unix_ms() - ttl_ms;
                             if let Err(err) = store.abuse_sweep(cutoff).await {
                                 warn!(error = %err, "abuse bucket sweep failed");
                             }
@@ -214,7 +214,7 @@ pub async fn run_server(
             })
         });
 
-    // WVR-136: sweep expired spent-proof markers so the table stays bounded. The
+    // Sweep expired spent-proof markers so the table stays bounded. The
     // ALTCHA API is always served, so this always runs.
     let altcha_sweep = config
         .abuse
@@ -232,7 +232,7 @@ pub async fn run_server(
                 tokio::select! {
                     _ = token.cancelled() => break,
                     _ = ticker.tick() => {
-                        let cutoff = crate::abuse::unix_ms();
+                        let cutoff = crate::wall_clock::unix_ms();
                         if let Err(err) = store.altcha_sweep_proofs(cutoff).await {
                             warn!(error = %err, "ALTCHA proof sweep failed");
                         }
@@ -242,7 +242,7 @@ pub async fn run_server(
         })
     };
 
-    // WVR-36: the account plane. It is always served on the admin host. The
+    // The account plane. It is always served on the admin host. The
     // mailer is optional: when email is not configured, signup still records the
     // pending registration and the user can resend once mail is set up.
     let support_url = format!("https://{}", config.admin_domain);
@@ -265,11 +265,12 @@ pub async fn run_server(
     .map_err(|e| ServerError::Activation(format!("Failed to initialize the account plane: {e}")))?;
     let account_sweep = {
         let store = store.clone();
+        let account_config = config.account.clone();
         let interval = config.account.sweep_interval_secs.max(1);
         let token = shutdown_token.clone();
         info!(
             interval_secs = interval,
-            "account token/session sweep running"
+            "account token/session/key-log sweep running"
         );
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(Duration::from_secs(interval));
@@ -277,7 +278,7 @@ pub async fn run_server(
                 tokio::select! {
                     _ = token.cancelled() => break,
                     _ = ticker.tick() => {
-                        let cutoff = crate::abuse::unix_ms() / 1000;
+                        let cutoff = crate::wall_clock::unix_ms() / 1000;
                         if let Err(err) = store.verification_token_sweep(cutoff).await {
                             warn!(error = %err, "verification token sweep failed");
                         }
@@ -286,6 +287,10 @@ pub async fn run_server(
                         }
                         if let Err(err) = store.session_sweep(cutoff).await {
                             warn!(error = %err, "session sweep failed");
+                        }
+                        let key_log_cutoff = account_config.key_log_cutoff(cutoff);
+                        if let Err(err) = store.sweep_machine_key_log(key_log_cutoff).await {
+                            warn!(error = %err, "machine key log sweep failed");
                         }
                     }
                 }
@@ -323,9 +328,9 @@ pub async fn run_server(
         https_token,
     ));
 
-    // Authoritative DNS responder: one task per inherited/self-bound socket.
-    // It polls the ACME challenge generator (TXT) and the tunnel-domain
-    // generator (A/AAAA/NS/SOA/CAA), in that order.
+    // Authoritative DNS responder: one task per inherited/self-bound socket,
+    // over the ACME challenge registry (TXT) and the tunnel domain
+    // (A/AAAA/NS/SOA/CAA).
     let generator_config = DnsResponderConfig::from_config(&config);
     let generators: Vec<Arc<dyn DomainGenerator>> = vec![
         Arc::new(AcmeChallenges::new(Arc::new(store.clone()))),

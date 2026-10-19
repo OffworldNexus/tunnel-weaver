@@ -1,8 +1,10 @@
 # Relay operations
 
 Operational notes for a `weaver-server` relay, focused on the OFF-190/OFF-198
-DNS split and certificate model. See
-[ADR 0008](decisions/0008-flat-hostnames-wildcard-cert.md) for the design.
+DNS split and certificate model, plus machine pairing and the account plane.
+See [ADR 0008](decisions/0008-flat-hostnames-wildcard-cert.md) for the DNS
+design and [ADR 0010](decisions/0010-machine-identity.md) /
+[ADR 0011](decisions/0011-client-addressing.md) for pairing.
 
 ## What the relay now serves
 
@@ -19,13 +21,21 @@ The tunnel domain:
 - Authoritative DNS for `<root>` on UDP/TCP 53.
 
 The admin domain:
-- `https://<admin>/` — the relay's own welcome/health endpoint, covered by a
-  single-name certificate (HTTP-01). Because the admin zone is not delegated to
-  us, its certificate can only be validated over port 80.
+- `https://<admin>/` — the relay's own welcome/health endpoint and the account
+  plane (landing, sign-up, sign-in, pairing), covered by a single-name
+  certificate (HTTP-01). Because the admin zone is not delegated to us, its
+  certificate can only be validated over port 80.
+- `wss://<admin>/_weaver/connect` — the tunnel WebSocket. It is served here as
+  well as on the tunnel root, so the admin host is a complete client entry
+  point: a paired client dials only the name it knows and learns its public
+  hostnames from the relay.
+- `wss://<admin>/api/account/pair/channel` — the machine pairing channel (see
+  [Machine pairing](#machine-pairing)).
 
 Cleartext HTTP on 80 serves ACME HTTP-01 challenges for the admin certificate
-and redirects everything else to HTTPS. `weave start` is unchanged: it publishes
-a local port and prints the URL.
+and redirects everything else to HTTPS. `weave start <service>=<target>…`
+proxies local origins; it prints the public URL the relay assigned, which it
+learns from the control reply rather than deriving itself.
 
 ## `relay_ips` and NAT
 
@@ -110,6 +120,109 @@ systemd owns the binds; the service runs with an empty `CapabilityBoundingSet=`.
 Without socket activation (containers), DNS self-bind on 53 needs
 `CAP_NET_BIND_SERVICE` or a privileged port mapping.
 
+## Machine pairing
+
+A machine is enrolled by a person in a browser, never implicitly. The client
+(`weave`) runs:
+
+```
+weave pair <admin-host> [--machine ID] [--min-key-security LEVEL] [--allow-below-floor]
+```
+
+which opens a WebSocket to the admin host at `/api/account/pair/channel`,
+solves an ALTCHA proof-of-work challenge (purpose `pair`), sends the machine's
+public key (the private key never leaves `tpmd`) and its target, and prints a
+link:
+
+```
+https://<admin>/pair#handle=<hex>
+```
+
+The handle is a capability and rides in the URL **fragment**, so it never
+reaches an access log (`Referer`) or a proxy's query log. A signed-in person
+opens the link and approves or rejects on the SPA's `/pair` page. For a new
+machine they confirm the machine name — and, when the account has no person
+yet, the person slug — both editable proposals; for a lost key they simply
+confirm that the machine moves onto the new key. On approval the CLI records
+the relay locally and prints the machine it is paired as.
+
+What an operator should expect:
+
+- **Approval is the only enrolment path.** There is no implicit key creation at
+  authentication time, and the pairing channel is unauthenticated — it is
+  bounded by the proof of work, the `account-pair` request budget (default: a
+  20-request burst refilling 20 per 10 minutes), a 16 KiB message cap and a
+  60 s `Begin` timeout. Refusals come back as a typed `Failed { code }`.
+- **A pending pairing is memory only.** It lives exactly as long as the CLI's
+  channel, so a relay restart simply ends it (`LookupResponse::Gone` in the
+  browser).
+- **A key belongs to one machine.** A key that is already enrolled is refused
+  with `AlreadyPaired`; `Existing { machine_id }` re-attaches a machine whose
+  key was lost, replacing the old key in place (the machine, its name, its
+  services and its hostnames all stay).
+- **The client decides the target.** `weave pair` moves a known machine onto a
+  new key when its own store's fingerprint no longer matches, and asks for a
+  new machine otherwise; `--machine ID` overrides.
+- **The device-key floor is the client's.** `--min-key-security`
+  (`file`/`keyring`/`sealed`/`hardware`, default `sealed`) is enforced by the
+  key agent; a weaker backend needs `--allow-below-floor`. The relay never sees
+  the key.
+- **Config**: `account.pair` (a `BudgetConfig`) and `abuse.altcha` (the
+  challenge tuning). Neither is required; both have built-in defaults.
+
+## Revoking a machine
+
+`weave unpair [<admin-host>]` is **bilateral**. It authenticates with the very
+device key it is revoking and sends a `Revoke` control head; the relay deletes
+the machine — its key, its services and every hostname derived from them — then
+answers `Revoked`. The client forgets the relay only after that reply. If the
+relay rejects the handshake because it no longer knows the key, the pairing was
+not effective, so the client forgets it with a warning; any other failure
+(unreachable relay, dropped connection) leaves the pairing in place. The
+machine name is freed, so a later pairing may propose it again. There is no
+endpoint that revokes a machine for someone else; the only authority is
+possession of the key.
+
+## The key audit log
+
+The relay keeps `machine_key_log`, an audit trail of which key a machine held
+and when. A row opens when a key is attached (`retired_at` null) and closes
+when it is replaced or the machine is revoked (`retired_reason` is `replaced`
+or `revoked`). The table deliberately has **no foreign keys**, so the history
+outlives the machine and person it describes. It is **write-only** as far as
+authentication goes: nothing that authorises a key reads it; `machine.key_id`
+is the only source of truth for who a key is.
+
+Retention is swept by the account sweep (every `account.sweep_interval_secs`):
+rows retired longer ago than `account.key_log_retention_days` (default **365**,
+minimum 1) are deleted, while the row of a machine's current key is never
+deleted however old it is. Set the retention to `0` and `Config::load` rejects
+the config.
+
+## Schema
+
+All migrations were squashed into a single `m0001_init` that creates the final
+schema directly. `machine_key` no longer exists; a machine holds exactly one
+key in `machine.key_id` (unique). There is deliberately **no backward
+compatibility and no migration path** from an earlier build: an existing relay
+database must be rebuilt, and its machines re-paired. (The live relay was
+rebuilt rather than migrated.) Deployment tooling that expected incrementally
+applied migrations should treat the relay database as disposable before this
+change lands.
+
+## The nightly
+
+The DigitalOcean nightly drives the real product, not a bypass. `tpmd` is
+installed from the pinned revision and run per-user on its `dummy` backend
+(whose floor is `file`, so `weave pair` runs with `--min-key-security file`);
+the account is created through the real sign-up page and verified by the real
+emailed link read back through Resend's Receiving API; the machine is approved
+in Chromium on the real `/pair` page; then `weave start` runs with the hostname
+read from the relay's own output; and h2spec, Http11Probe and Autobahn run
+through the tunnel. It needs `DIGITALOCEAN_TOKEN`, `NIGHTLY_DOMAIN` and the
+Resend secrets (`RESEND_API_KEY`, `WEAVER_E2E_EMAIL`, `WEAVER_E2E_FROM`), and
+fails fast when they are missing.
+
 ## Transactional email
 
 Email is opt-in. With no `email` block in the config, the relay boots normally
@@ -135,10 +248,11 @@ itself sends nothing in this milestone.
 - Credentials live in the 0600 SQLite file, like the certificate keys. `status`
   reports the configured provider and sender but never a credential, `doctor`
   prints none either, and provider error output is redacted.
-- `weaver-server send-a-joke ADDRESS [--email-endpoint URL]` is a temporary
-  hidden dev/e2e verb that sends the joke template through the configured
-  provider; it exits non-zero with the redacted provider error on rejection. It
-  is removed once real account email ships.
+- `weaver-server send-a-joke ADDRESS [--email-endpoint URL]` is a hidden dev/e2e
+  verb that sends the joke template through the configured provider; it exits
+  non-zero with the redacted provider error on rejection. It predates the
+  account email flow and survives only as a provider smoke check; nothing in the
+  product or CI depends on it.
 
 No retries, queue, bounce handling, or delivery webhooks exist: a send is
 awaited, and an accepted send is a tracing event. A non-2xx provider response

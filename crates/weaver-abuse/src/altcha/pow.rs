@@ -63,10 +63,7 @@ pub fn create_challenge(req: CreateRequest<'_>) -> Challenge {
         expires_at,
         key_length: req.key_length,
         key_prefix: req.key_prefix.to_ascii_lowercase(),
-        key_signature: None,
-        memory_cost: None,
         nonce: hex::encode(req.nonce),
-        parallelism: None,
         salt: hex::encode(req.salt),
     };
     let signature = hex::encode(hmac_sha256(
@@ -183,21 +180,98 @@ pub fn verify_solution(req: VerifyRequest<'_>) -> Result<Verified, ProofError> {
 /// browser. It is not compiled unless the `test-util` feature is on.
 #[cfg(feature = "test-util")]
 pub fn solve_challenge(challenge: &Challenge) -> Solution {
+    // Deliberately unchecked: tests solve challenges the verifier must then
+    // refuse (an unsupported algorithm, say), so this solves whatever it is given.
+    solve_within(challenge, u32::MAX).expect("challenge is solvable")
+}
+
+/// How much work a solver agrees to spend on a challenge it did not issue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SolveLimits {
+    /// The highest PBKDF2 iteration count accepted per attempt.
+    pub max_cost: u32,
+    /// The total PBKDF2 iterations (cost × attempts) accepted for one challenge.
+    pub max_work: u64,
+}
+
+/// Why a challenge from someone else was not solved.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum SolveError {
+    /// The challenge names a key-derivation algorithm this solver does not run.
+    #[error("unsupported proof-of-work algorithm {0:?}")]
+    UnsupportedAlgorithm(String),
+    /// The challenge's parameters are not well-formed.
+    #[error("malformed proof-of-work challenge: {0}")]
+    Malformed(&'static str),
+    /// The challenge asks for more work than the limits allow.
+    #[error("the proof of work is too expensive: {0}")]
+    TooExpensive(String),
+    /// No counter within the work budget produced a matching key.
+    #[error("no solution found within the work budget")]
+    Unsolved,
+}
+
+/// Solve a challenge received from someone else, within `limits`.
+///
+/// The browser's solver is the ALTCHA widget; this is everyone else's (the
+/// `weave` CLI solves its pairing challenge with it). The challenge comes off
+/// the network, so nothing about it is trusted: an algorithm this solver does
+/// not run, malformed parameters, or more work than `limits` allows are typed
+/// errors, never a panic or an unbounded spin. The expected work is checked
+/// before any is done. Blocking and CPU-bound: run it on a blocking thread.
+pub fn try_solve_challenge(
+    challenge: &Challenge,
+    limits: &SolveLimits,
+) -> Result<Solution, SolveError> {
     let params = &challenge.parameters;
-    let nonce = hex::decode(&params.nonce).expect("challenge nonce is hex");
-    let salt = hex::decode(&params.salt).expect("challenge salt is hex");
-    for counter in 0u32.. {
+    if !is_supported(&params.algorithm) {
+        return Err(SolveError::UnsupportedAlgorithm(params.algorithm.clone()));
+    }
+    if params.cost == 0 || params.key_length == 0 || params.key_length > 64 {
+        return Err(SolveError::Malformed("cost or key length out of range"));
+    }
+    if !params.key_prefix.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(SolveError::Malformed("the key prefix is not hex"));
+    }
+    if params.cost > limits.max_cost {
+        return Err(SolveError::TooExpensive(format!(
+            "cost {} where at most {} is accepted",
+            params.cost, limits.max_cost
+        )));
+    }
+    let max_counter = (limits.max_work / u64::from(params.cost)).min(u64::from(u32::MAX)) as u32;
+    // Each hex digit of prefix multiplies the expected attempts by 16. Refuse
+    // when even the expected case would not fit, rather than discover it after
+    // spending the whole budget.
+    let expected = 16f64.powi(params.key_prefix.len().min(16) as i32);
+    if expected > f64::from(max_counter) {
+        return Err(SolveError::TooExpensive(format!(
+            "a {}-digit prefix at cost {}",
+            params.key_prefix.len(),
+            params.cost
+        )));
+    }
+    solve_within(challenge, max_counter).ok_or(SolveError::Unsolved)
+}
+
+/// Brute-forces counters `0..=max_counter` with PBKDF2-HMAC-SHA-256, whatever
+/// the challenge names as its algorithm.
+fn solve_within(challenge: &Challenge, max_counter: u32) -> Option<Solution> {
+    let params = &challenge.parameters;
+    let nonce = hex::decode(&params.nonce).ok()?;
+    let salt = hex::decode(&params.salt).ok()?;
+    for counter in 0..=max_counter {
         let password = build_password(&nonce, counter);
         let derived = derive_key(params.cost, params.key_length, &salt, &password);
         if key_prefix_matches(&params.key_prefix, &derived) {
-            return Solution {
+            return Some(Solution {
                 counter,
                 derived_key: hex::encode(&derived),
                 time: None,
-            };
+            });
         }
     }
-    unreachable!("uint32 counter space is exhausted")
+    None
 }
 
 /// Derive the key for one counter with PBKDF2-HMAC-SHA-256.

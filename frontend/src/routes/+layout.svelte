@@ -1,19 +1,12 @@
 <script lang="ts">
 	import '../styles/global.scss';
-	import { config, ensureConfig } from '#lib/account/config';
+
+	import { ensureConfig } from '#lib/account/config';
 	import Toaster from '#lib/ui/Toaster.svelte';
 
-	// Warm the constants endpoint as soon as the shell mounts.
-	ensureConfig().catch(() => {
-		// Page-level components report a network failure with a retry path.
-	});
+	// Warm the constants; the pages that need them report a failure themselves.
+	ensureConfig().catch(() => {});
 </script>
-
-<svelte:head>
-	{#if $config}
-		<link rel="stylesheet" href={`${$config.altcha_assets_base}altcha.css`} />
-	{/if}
-</svelte:head>
 
 <a class="skip-link" href="#main">Skip to content</a>
 <Toaster />

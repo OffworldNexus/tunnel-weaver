@@ -100,7 +100,7 @@ impl Sim {
         let now = self.p.clock.now();
         let mut budget = RATE as i64;
         let mut buf = Vec::new();
-        while budget > 0 && self.p.client.poll_transmit(now, &mut buf) {
+        while budget > 0 && self.p.client.poll_transmit(&mut buf) {
             let f = Frame::parse(&buf).unwrap();
             budget -= f.wire_len() as i64;
             let _ = self.p.server.recv(now, &buf).await;
@@ -347,16 +347,12 @@ async fn goaway_is_the_very_next_frame() {
     s.saturate(bulk);
     s.run(20).await;
     s.p.client.close(CloseReason::new(CloseCode::Shutdown));
-    let now = s.p.clock.now();
     let mut buf = Vec::new();
-    assert!(s.p.client.poll_transmit(now, &mut buf));
+    assert!(s.p.client.poll_transmit(&mut buf));
     assert_eq!(Frame::parse(&buf).unwrap().frame_type, FrameType::Goaway);
-    assert!(s.p.client.poll_transmit(now, &mut buf));
-    let f = Frame::parse(&buf).unwrap();
-    assert_eq!((f.frame_type, f.stream_id), (FrameType::Rst, bulk));
     assert!(
-        !s.p.client.poll_transmit(now, &mut buf),
-        "no DATA after close"
+        !s.p.client.poll_transmit(&mut buf),
+        "nothing after GOAWAY: the peer stops reading there"
     );
     assert!(matches!(
         s.p.drain_events(Side::Client).last(),

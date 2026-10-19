@@ -29,7 +29,7 @@ fn test_service_unit_golden_match() {
         "Rendered weaver-server.service does not match golden file"
     );
 
-    // OFF-73: Sandboxed systemd privilege isolation — unit templates enforce minimal privilege
+    // Sandboxed systemd privilege isolation — unit templates enforce minimal privilege
     // boundaries (weaver user, empty capability sets, strict filesystem isolation, restricted runtime directory).
     assert!(rendered.contains("User=weaver"));
     assert!(rendered.contains("Group=weaver"));

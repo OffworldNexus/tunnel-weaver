@@ -22,12 +22,18 @@ pub enum PublicKey {
 }
 
 /// Client-side access to the device key. Implemented by the adapter; may
-/// call into a TPM / Secure Enclave, hence the fallible `sign`.
+/// call into a TPM / Secure Enclave — or, as in `weave`, out to the `tpmd`
+/// local key agent over async IPC — hence the fallible, asynchronous `sign`.
+///
+/// Signing is asynchronous for the same reason `Verifier::public_key` is:
+/// the real implementations do I/O. The mux itself stays sans-IO; it only
+/// awaits the adapter.
+#[async_trait::async_trait]
 pub trait Signer {
     /// The identity that will be sent in HELLO.
     fn key_id(&self) -> KeyId;
     /// Sign `msg` with the key behind [`Signer::key_id`].
-    fn sign(&mut self, msg: &[u8]) -> Result<Signature, SignError>;
+    async fn sign(&mut self, msg: &[u8]) -> Result<Signature, SignError>;
 }
 
 /// Server-side key lookup. Implemented by the adapter (registry, database,
@@ -117,24 +123,24 @@ mod tests {
         assert_eq!(&t2[t.len()..], &[9; 32]);
     }
 
-    #[test]
-    fn ed25519_round_trip() {
+    #[tokio::test]
+    async fn ed25519_round_trip() {
         let mut s = Ed25519TestSigner::from_seed(1);
         let id = s.key_id();
         let pk = s.public_key();
-        let sig = s.sign(b"hello").unwrap();
+        let sig = s.sign(b"hello").await.unwrap();
         assert!(verify(&id, &pk, b"hello", &sig));
         assert!(!verify(&id, &pk, b"hellp", &sig));
         // Wrong algorithm pairing is rejected.
         assert!(!verify(&id, &pk, b"hello", &Signature::P256([0; 64])));
     }
 
-    #[test]
-    fn p256_round_trip() {
+    #[tokio::test]
+    async fn p256_round_trip() {
         let mut s = P256TestSigner::from_seed(1);
         let id = s.key_id();
         let pk = s.public_key();
-        let sig = s.sign(b"hello").unwrap();
+        let sig = s.sign(b"hello").await.unwrap();
         assert!(verify(&id, &pk, b"hello", &sig));
         assert!(!verify(&id, &pk, b"hellp", &sig));
         let other = P256TestSigner::from_seed(2).public_key();

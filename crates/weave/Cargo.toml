@@ -8,7 +8,7 @@ repository.workspace = true
 
 [[bin]]
 name = "weave"
-path = "src/main.rs"
+path = "src/bin/weave/main.rs"
 
 [lib]
 name = "weave"
@@ -17,21 +17,47 @@ path = "src/lib.rs"
 [dependencies]
 bytes = { workspace = true }
 clap = { workspace = true }
-crossterm = { workspace = true }
 jiff = { workspace = true }
-ed25519-dalek = { workspace = true }
+async-trait = { workspace = true }
+inquire = { workspace = true }
 futures-util = { workspace = true }
 http = { workspace = true }
 http-body-util = { workspace = true }
 hyper = { workspace = true, features = ["client"] }
 hyper-util = { workspace = true }
+hostname = "0.4"
 rustls = { workspace = true }
 rustls-platform-verifier = { workspace = true }
+thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-rustls = { workspace = true }
 tokio-tungstenite = { workspace = true }
 tokio-util = { workspace = true }
+weaver-abuse = { workspace = true }
 weaver-assets = { workspace = true }
 weaver-mux = { workspace = true }
 weaver-proto = { workspace = true }
 weaver-tokio = { workspace = true }
+sea-orm = { workspace = true }
+sea-orm-migration = { workspace = true }
+serde_json = { workspace = true }
+sqlx = { workspace = true }
+directories = "6"
+# The device key is held by tpmd, the local key agent: `weave` links its
+# consumer API and never holds a private key.
+#
+# Pinned to a rev on purpose: it serves the system socket at
+# `/run/tpmd/tpmd.sock`, which is what the packaged service exposes; `develop`
+# still uses the old `/run/tpmd.sock`. Move to `branch = "develop"` once the new
+# path lands there.
+tpmd-client = { git = "https://github.com/OffworldNexus/tpmd", rev = "90cb2db45b3ea6bc065918f11c7e0fd23b4ce837" }
+# For the endpoint list `Client::connect_within` takes.
+tpmd-ipc = { git = "https://github.com/OffworldNexus/tpmd", rev = "90cb2db45b3ea6bc065918f11c7e0fd23b4ce837" }
+# Terminal output: spinners, colour, and OSC 8 hyperlink detection.
+indicatif = "0.18"
+console = "0.16"
+supports-hyperlinks = "3"
+
+[dev-dependencies]
+tempfile = { workspace = true }
+weaver-mux = { workspace = true, features = ["test-util"] }

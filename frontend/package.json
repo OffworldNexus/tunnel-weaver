@@ -11,20 +11,35 @@
 		"dev": "vite dev",
 		"build": "vite build && node scripts/externalize-bootstrap.mjs",
 		"preview": "vite preview",
-		"check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json"
+		"check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
+		"lint": "svelte-kit sync && prettier --check . && eslint --max-warnings 0 .",
+		"format": "prettier --write . && eslint --fix ."
 	},
 	"devDependencies": {
+		"@eslint/js": "^10.0.1",
 		"@sveltejs/adapter-static": "^4.0.0",
 		"@sveltejs/kit": "^3.0.1",
 		"@sveltejs/vite-plugin-svelte": "^7.3.1",
+		"eslint": "^10.13.0",
+		"eslint-config-prettier": "^10.1.8",
+		"eslint-plugin-simple-import-sort": "^14.0.0",
+		"eslint-plugin-sonarjs": "^4.2.2",
+		"eslint-plugin-svelte": "^3.23.1",
+		"globals": "^17.13.0",
+		"prettier": "^3.9.10",
+		"prettier-plugin-svelte": "^4.1.1",
 		"sass": "^1.105.1",
 		"svelte": "^5.57.2",
 		"svelte-check": "^4.7.6",
 		"typescript": "^6.0.3",
+		"typescript-eslint": "^8.71.2",
 		"vite": "^8.3.4"
 	},
 	"dependencies": {
 		"@ark-ui/svelte": "^5.24.3",
+		"@zxcvbn-ts/core": "^4.2.0",
+		"@zxcvbn-ts/language-common": "^4.1.3",
+		"@zxcvbn-ts/language-en": "^4.1.1",
 		"sveltekit-superforms": "^3.0.0",
 		"valibot": "^1.5.0"
 	}
