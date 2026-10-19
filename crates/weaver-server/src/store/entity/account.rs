@@ -1,4 +1,4 @@
-//! `account` table: stable email-account identities (WVR-36).
+//! `account` table: stable email-account identities.
 //!
 //! Distinct from `person`, which is the ASCII tunnel-namespace owner. An account
 //! carries a non-unique, Unicode display name (multiple accounts may share one,

@@ -204,7 +204,7 @@ pub async fn run_server(
                     tokio::select! {
                         _ = token.cancelled() => break,
                         _ = ticker.tick() => {
-                            let cutoff = crate::abuse::unix_ms() - ttl_ms;
+                            let cutoff = crate::wall_clock::unix_ms() - ttl_ms;
                             if let Err(err) = store.abuse_sweep(cutoff).await {
                                 warn!(error = %err, "abuse bucket sweep failed");
                             }
@@ -232,7 +232,7 @@ pub async fn run_server(
                 tokio::select! {
                     _ = token.cancelled() => break,
                     _ = ticker.tick() => {
-                        let cutoff = crate::abuse::unix_ms();
+                        let cutoff = crate::wall_clock::unix_ms();
                         if let Err(err) = store.altcha_sweep_proofs(cutoff).await {
                             warn!(error = %err, "ALTCHA proof sweep failed");
                         }
@@ -278,7 +278,7 @@ pub async fn run_server(
                 tokio::select! {
                     _ = token.cancelled() => break,
                     _ = ticker.tick() => {
-                        let cutoff = crate::abuse::unix_ms() / 1000;
+                        let cutoff = crate::wall_clock::unix_ms() / 1000;
                         if let Err(err) = store.verification_token_sweep(cutoff).await {
                             warn!(error = %err, "verification token sweep failed");
                         }
@@ -328,9 +328,9 @@ pub async fn run_server(
         https_token,
     ));
 
-    // Authoritative DNS responder: one task per inherited/self-bound socket.
-    // It polls the ACME challenge generator (TXT) and the tunnel-domain
-    // generator (A/AAAA/NS/SOA/CAA), in that order.
+    // Authoritative DNS responder: one task per inherited/self-bound socket,
+    // over the ACME challenge registry (TXT) and the tunnel domain
+    // (A/AAAA/NS/SOA/CAA).
     let generator_config = DnsResponderConfig::from_config(&config);
     let generators: Vec<Arc<dyn DomainGenerator>> = vec![
         Arc::new(AcmeChallenges::new(Arc::new(store.clone()))),

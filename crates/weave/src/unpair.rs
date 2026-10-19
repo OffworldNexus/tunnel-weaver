@@ -1,236 +1,143 @@
-//! `weave unpair` — revoke this machine on a relay and forget it locally.
+//! `weave unpair`: revoke this machine on a relay, then forget the relay.
 //!
-//! Unpairing is bilateral. The connection to the relay is authenticated by the
-//! very device key being revoked (the mux handshake), so possessing the key *is*
-//! the authority to withdraw it: the relay deletes the machine, its key and its
-//! hostnames. Only once the relay confirms does this command touch local state —
-//! so a failure leaves the pairing intact rather than silently half-removing it.
-//!
-//! `--local-only` is the escape hatch for a relay that no longer exists: it
-//! forgets the relay without asking it, and says so.
+//! The tunnel handshake is signed by the very key being revoked, so holding
+//! the key is the authority to withdraw it. The relay is forgotten locally only
+//! once it confirms with `Revoked`, or when it does not accept the key at all
+//! (the pairing was not in effect anyway). Any other failure keeps the pairing.
 
-use std::time::Instant;
-
-use weaver_mux::{CloseCode, CloseReason, Config, Connection, Event, StreamId};
+use weaver_mux::{CloseCode, CloseReason, Connection, Event, RejectCode, StreamId};
 use weaver_proto::control::{ControlHead, ControlReply};
-use weaver_proto::policy;
-use weaver_proto::{Head, encode};
-use weaver_tokio::{Driver, StreamHandler, SystemRng, WsTransport};
+use weaver_tokio::StreamHandler;
 
-use crate::connect::dial_relay;
-use crate::host::normalize_admin_host;
-use crate::store::Store;
-use crate::ui::{self, Spinner, Stream, hinted};
+use crate::client::{Client, PairedKey, open_control};
+use crate::error::Error;
+use crate::host::AdminHost;
 
-/// Boxed error the CLI prints and exits on.
-type BoxError = Box<dyn std::error::Error + Send + Sync>;
+/// A relay this machine is no longer paired with.
+#[derive(Debug, Clone)]
+pub struct Unpaired {
+    /// The relay.
+    pub host: String,
+    /// The relay revoked the machine. `false` when it did not accept the key,
+    /// so there was nothing to revoke.
+    pub revoked: bool,
+    /// The relay that became the default in its place; empty when none did.
+    pub new_default: String,
+    /// How many relays remain paired.
+    pub remaining: usize,
+}
 
-/// The relay's tunnel-edge WebSocket endpoint, on its admin host.
-pub const CONNECT_PATH: &str = "/_weaver/connect";
+impl Client {
+    /// Revokes this machine on `admin_host` (the default relay when empty)
+    /// and forgets it.
+    pub async fn unpair(&self, admin_host: &str) -> Result<Unpaired, Error> {
+        let relay = self.paired_relay(admin_host).await?;
+        let host = relay.admin_host.clone();
 
-/// Revokes this machine on `admin_host` (the default relay when `None`) and
-/// forgets it locally; with `local_only`, only forgets it.
-pub async fn run_unpair(admin_host: Option<&str>, local_only: bool) -> Result<(), BoxError> {
-    let store = Store::open_default().await?;
-
-    let relay = match admin_host {
-        Some(raw) => {
-            let host = normalize_admin_host(raw)?;
-            match store.relay(&host).await? {
-                Some(relay) => relay,
-                None => return unpair_unknown(&store, &host, local_only).await,
+        let revoked = match self.open_paired_key(&relay).await? {
+            PairedKey::Valid(signer) => {
+                self.reporter.revoking(&host);
+                let handler = Revoke {
+                    host: host.clone(),
+                    stream: None,
+                    outcome: None,
+                };
+                let driver = self.mux(&AdminHost::parse(&host)?, signer, handler).await?;
+                let (handler, closed) = driver.run().await;
+                match handler.outcome {
+                    Some(Outcome::Revoked) => true,
+                    Some(Outcome::UnknownKey(message)) => {
+                        self.reporter.pairing_not_effective(&host, &message);
+                        false
+                    }
+                    Some(Outcome::Failed(error)) => return Err(error),
+                    None => {
+                        let reason = match closed {
+                            Ok(reason) => {
+                                format!("the relay closed the connection ({:?})", reason.code)
+                            }
+                            Err(e) => e.to_string(),
+                        };
+                        return Err(Error::Disconnected {
+                            host,
+                            reason: format!("{reason} before confirming the revoke"),
+                        });
+                    }
+                }
             }
-        }
-        None => store.default_relay().await?.ok_or_else(|| {
-            hinted(
-                "this machine is not paired with any relay",
-                "nothing to unpair",
-            )
-        })?,
-    };
-    let host = relay.admin_host.clone();
-
-    if local_only {
-        ui::warn(&format!(
-            "Forgetting {host} without asking it: the machine stays authorised there. \
-             Revoke it with `weave unpair {host}`, or ask the relay's operator to remove it."
-        ));
-    } else {
-        revoke_on_relay(&host, &relay.key_id).await?;
-    }
-
-    let forgotten = store.forget(&host).await?;
-    if local_only {
-        ui::success(&format!(
-            "Unpaired {} locally",
-            ui::accent(Stream::Out, &host)
-        ));
-    } else {
-        ui::success(&format!(
-            "Revoked this machine on {} and unpaired it",
-            ui::accent(Stream::Out, &host)
-        ));
-    }
-    match forgotten.and_then(|f| f.new_default) {
-        Some(next) => ui::step(
-            Stream::Out,
-            &ui::dim(Stream::Out, ui::ARROW),
-            &format!(
-                "{} is now the default relay",
-                ui::accent(Stream::Out, &next.admin_host)
-            ),
-        ),
-        None if store.relays().await?.is_empty() => ui::step(
-            Stream::Out,
-            &ui::dim(Stream::Out, ui::ARROW),
-            "This machine is no longer paired with any relay",
-        ),
-        None => {}
-    }
-    Ok(())
-}
-
-/// No local record of `host`. The device key is still the authority, so the
-/// relay can still be asked directly — otherwise a lost store would leave the
-/// machine authorised there for good.
-async fn unpair_unknown(store: &Store, host: &str, local_only: bool) -> Result<(), BoxError> {
-    if local_only {
-        return Err(hinted(
-            format!("this machine is not paired with {host} locally"),
-            "run `weave relays` to see the relays it is paired with",
-        ));
-    }
-    let key_id = store.key_ids().await?.into_iter().next().ok_or_else(|| {
-        hinted(
-            format!("nothing to revoke: this machine has no device key paired with {host}"),
-            "run `weave relays` to see the relays it is paired with",
-        )
-    })?;
-    revoke_on_relay(host, &key_id).await?;
-    ui::success(&format!(
-        "Revoked this machine on {} {}",
-        ui::accent(Stream::Out, host),
-        ui::dim(Stream::Out, "(there was no local record of it)")
-    ));
-    Ok(())
-}
-
-/// Asks the relay to revoke the machine holding `key_id`.
-async fn revoke_on_relay(admin_host: &str, key_id: &str) -> Result<(), BoxError> {
-    // Sign the handshake with the key being revoked: possession is the proof.
-    let spinner = Spinner::new("Contacting the key agent\u{2026}");
-    let signer = crate::tpm::resume(key_id).await.map_err(|e| {
-        hinted(
-            e.to_string(),
-            format!("the relay cannot be asked without the key; use `weave unpair {admin_host} --local-only` to just forget it"),
-        )
-    })?;
-    if signer.created() {
-        return Err(hinted(
-            "the device key is not in the key agent, so the relay cannot be asked to revoke it",
-            format!("use `weave unpair {admin_host} --local-only` to just forget it"),
-        ));
-    }
-    spinner.set_message(format!("Revoking this machine on {admin_host}\u{2026}"));
-    let result = revoke_with_signer(admin_host, None, Box::new(signer)).await;
-    spinner.clear();
-    result
-}
-
-/// Revokes, over the mux, the machine that `signer`'s key belongs to.
-///
-/// Split out so tests can drive it with an in-memory signer instead of a key
-/// agent: the authority is the handshake, so any signer the relay accepts works.
-pub async fn revoke_with_signer(
-    edge: &str,
-    insecure_root_ca: Option<&std::path::Path>,
-    signer: Box<dyn weaver_mux::auth::Signer + Send>,
-) -> Result<(), BoxError> {
-    let (ws_stream, host) = dial_relay(
-        edge,
-        CONNECT_PATH,
-        crate::start::WS_SUBPROTOCOL,
-        insecure_root_ca,
-    )
-    .await
-    .map_err(|e| crate::pair::connect_error(edge, e))?;
-
-    let cfg = Config::client(signer, host.clone(), Box::new(SystemRng));
-    let conn = Connection::new(cfg, Instant::now());
-    let (handler, closed) =
-        Driver::new(conn, WsTransport::new(ws_stream), RevokeHandler::default())
-            .run()
-            .await;
-    if let Some(outcome) = handler.outcome {
-        return match outcome {
-            Ok(()) => Ok(()),
-            Err(message) => Err(message.into()),
+            PairedKey::Lost => {
+                self.reporter.pairing_not_effective(
+                    &host,
+                    "this machine no longer has the key paired there",
+                );
+                false
+            }
         };
+
+        let new_default = self.store.forget(&host).await?;
+        Ok(Unpaired {
+            host,
+            revoked,
+            new_default: new_default
+                .map(|relay| relay.admin_host)
+                .unwrap_or_default(),
+            remaining: self.store.relays().await?.len(),
+        })
     }
-    // No explicit reply reached us. Revoking the key makes the relay close this
-    // connection as revoked — which *is* the confirmation, arriving as the
-    // close rather than as a message.
-    if let Ok(reason) = &closed
-        && reason.code == CloseCode::KeyRevoked
-    {
-        return Ok(());
-    }
-    Err(format!("the relay did not confirm the revoke (closed: {closed:?})").into())
+}
+
+enum Outcome {
+    Revoked,
+    /// The relay does not know the key.
+    UnknownKey(String),
+    Failed(Error),
 }
 
 /// Opens one control stream, sends `Revoke`, and records the answer.
-#[derive(Default)]
-struct RevokeHandler {
+struct Revoke {
+    host: String,
     stream: Option<StreamId>,
-    outcome: Option<Result<(), String>>,
+    outcome: Option<Outcome>,
 }
 
-impl StreamHandler for RevokeHandler {
+impl Revoke {
+    fn settle(&mut self, conn: &mut Connection, outcome: Outcome) {
+        self.outcome = Some(outcome);
+        conn.close(CloseReason::with_message(CloseCode::Shutdown, "unpaired"));
+    }
+}
+
+impl StreamHandler for Revoke {
     fn on_event(&mut self, conn: &mut Connection, event: Event) {
         match event {
-            Event::Authenticated { .. } => {
-                let Ok(bytes) = encode(&Head::Control(ControlHead::revoke())) else {
-                    self.outcome = Some(Err("could not encode the revoke request".into()));
-                    return;
-                };
-                match conn.open(policy::CONTROL_CLASS) {
-                    Ok(id) => match conn.send(id, &bytes, policy::CONTROL_COMPRESS) {
-                        Ok(()) => self.stream = Some(id),
-                        Err(e) => {
-                            self.outcome = Some(Err(format!("could not send the revoke: {e}")));
-                        }
-                    },
-                    Err(e) => {
-                        self.outcome = Some(Err(format!("could not open a control stream: {e}")));
-                    }
-                }
-            }
+            Event::Authenticated { .. } => match open_control(conn, &ControlHead::revoke()) {
+                Ok(id) => self.stream = Some(id),
+                Err(e) => self.settle(conn, Outcome::Failed(Error::Protocol(e))),
+            },
+            Event::Rejected {
+                code: RejectCode::UnknownKey,
+                message,
+            } => self.outcome = Some(Outcome::UnknownKey(message)),
             Event::Rejected { code, message } => {
-                self.outcome = Some(Err(format!(
-                    "the relay refused the connection: {message} ({code:?})"
-                )));
+                self.outcome = Some(Outcome::Failed(Error::Rejected {
+                    host: self.host.clone(),
+                    code,
+                    message,
+                }));
             }
             Event::Readable(id) if Some(id) == self.stream => {
-                while let Ok(msg) = conn.recv_msg(id) {
-                    match weaver_proto::decode::<ControlReply>(&msg) {
-                        Ok(ControlReply::Revoked) => {
-                            self.outcome = Some(Ok(()));
-                            conn.close(CloseReason::with_message(CloseCode::Shutdown, "unpaired"));
-                        }
-                        Ok(ControlReply::Refused { message, .. }) => {
-                            self.outcome = Some(Err(message));
-                            conn.close(CloseReason::with_message(CloseCode::Shutdown, "unpaired"));
-                        }
-                        Ok(_) => {}
-                        Err(e) => {
-                            self.outcome = Some(Err(format!("unexpected reply: {e}")));
-                            conn.close(CloseReason::with_message(CloseCode::Shutdown, "unpaired"));
-                        }
-                    }
+                if let Ok(msg) = conn.recv_msg(id) {
+                    let outcome = match weaver_proto::decode::<ControlReply>(&msg) {
+                        Ok(ControlReply::Revoked) => Outcome::Revoked,
+                        Ok(ControlReply::Refused { message, .. }) => Outcome::Failed(
+                            Error::Protocol(format!("the relay refused: {message}")),
+                        ),
+                        Ok(other) => Outcome::Failed(Error::Protocol(format!("{other:?}"))),
+                        Err(e) => Outcome::Failed(Error::Protocol(e.to_string())),
+                    };
+                    self.settle(conn, outcome);
                 }
             }
-            // A `Reset` here is the local teardown of our own stream after we
-            // close on success, so it must not overwrite an outcome.
             _ => {}
         }
     }

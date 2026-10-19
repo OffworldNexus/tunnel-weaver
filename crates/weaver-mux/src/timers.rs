@@ -22,14 +22,12 @@ pub struct Timers {
     pub last_now: Instant,
     /// Last frame received from the peer.
     pub last_recv: Instant,
-    /// Last frame we put on the wire.
-    pub last_send: Instant,
     /// Armed until the handshake completes.
     pub handshake_deadline: Option<Instant>,
     /// Set once authenticated; enables ping/idle/reverify.
     pub authenticated: bool,
-    /// `(opaque, sent_at)` of the PING awaiting its PONG.
-    pub ping_outstanding: Option<(u64, Instant)>,
+    /// Opaque value of the PING awaiting its PONG.
+    pub ping_outstanding: Option<u64>,
     /// Next `still_valid` poll (server with `reverify_interval` only).
     pub reverify_due: Option<Instant>,
     pub ping_interval: Duration,
@@ -48,7 +46,6 @@ impl Timers {
         Self {
             last_now: now,
             last_recv: now,
-            last_send: now,
             handshake_deadline: Some(now + handshake_timeout),
             authenticated: false,
             ping_outstanding: None,
@@ -74,7 +71,6 @@ impl Timers {
         self.authenticated = true;
         self.handshake_deadline = None;
         self.last_recv = now;
-        self.last_send = now;
         self.reverify_due = self.reverify_interval.map(|i| now + i);
     }
 
@@ -83,18 +79,12 @@ impl Timers {
         self.last_recv = now;
     }
 
-    pub fn on_send(&mut self, now: Instant) {
-        self.last_send = now;
-    }
-
     /// A PING is due after `ping_interval` of silence *from the peer*.
     ///
-    /// It must be keyed on `last_recv`, not on our own sends: during a
-    /// one-way bulk transfer the sender is never idle by its own clock, so
-    /// keying on `max(recv, send)` meant it never pinged, got nothing back,
-    /// and closed itself with `Timeout` after `idle_timeout` — a live
-    /// connection dropped in the middle of a healthy transfer. Probing the
-    /// peer whenever *it* has been quiet is what keepalive is for.
+    /// Keyed on `last_recv`, not on our own sends: during a one-way bulk
+    /// transfer the sender is never idle by its own clock, yet it must still
+    /// probe the quiet peer or its own idle deadline closes a live
+    /// connection.
     fn ping_due(&self) -> Option<Instant> {
         if self.authenticated && self.ping_outstanding.is_none() {
             Some(self.last_recv + self.ping_interval)

@@ -1,4 +1,4 @@
-//! WVR-135: the relay web surface runs the safety pipeline and answers
+//! the relay web surface runs the safety pipeline and answers
 //! `429 + Retry-After`, while control-plane routes stay reachable.
 
 use std::net::SocketAddr;
@@ -87,7 +87,7 @@ async fn cleartext_surface_is_throttled_but_acme_is_exempt() {
     let cfg = sample_config(Some(tight_abuse()));
     let guard = abuse::build(&cfg, store.clone());
     store
-        .publish_http01("tok", "key-auth", None, 0)
+        .publish_http01("tok", "key-auth", "admin.example.com", 0)
         .await
         .unwrap();
 

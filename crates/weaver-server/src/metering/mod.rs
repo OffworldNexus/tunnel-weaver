@@ -35,7 +35,7 @@
 //! The manager stamps all observations with its own clock; deterministic tests
 //! drive the private `*_at(now_ms)` variants.
 //!
-//! Timing rules (OFF-76):
+//! Timing rules:
 //! * A minute key is `unix_ms / 60_000`, tagged at observation time, so a late
 //!   or missed tick never moves data between buckets.
 //! * Byte reports are per-flow deltas tagged when they flow, so a long-lived
@@ -48,7 +48,7 @@ use std::collections::HashMap;
 #[cfg(test)]
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -129,7 +129,7 @@ impl Clock {
     /// Unix milliseconds.
     fn now_ms(&self) -> i64 {
         match self {
-            Clock::System => unix_ms(),
+            Clock::System => crate::wall_clock::unix_ms(),
             #[cfg(test)]
             Clock::Fixed(value) => value.load(Ordering::Relaxed),
         }
@@ -539,14 +539,6 @@ fn accrue(inner: &mut Inner, service_id: i32, now_ms: i64) {
     if let Some(open) = inner.registered.get_mut(&service_id) {
         open.accounted_ms = now_ms;
     }
-}
-
-/// Wall-clock Unix milliseconds.
-fn unix_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as i64
 }
 
 #[cfg(test)]

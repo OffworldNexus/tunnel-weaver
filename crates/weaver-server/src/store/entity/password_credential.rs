@@ -1,4 +1,4 @@
-//! `password_credential` table: append-only password history (WVR-36).
+//! `password_credential` table: append-only password history.
 //!
 //! The PHC-encoded Argon2 hash embeds its own algorithm/version/parameters and
 //! salt. Exactly one row per account is current (`retired_at` null).

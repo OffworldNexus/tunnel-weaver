@@ -12,10 +12,7 @@ pub enum StoreError {
     /// No per-user data directory could be determined for this platform.
     #[error("cannot locate a data directory for this platform")]
     NoDataDir,
-    /// The path is not usable as a SQLite database location.
-    #[error("invalid path: {0}")]
-    InvalidPath(String),
     /// An admin host that cannot be normalised.
-    #[error("invalid relay address: {0}")]
-    InvalidHost(String),
+    #[error(transparent)]
+    InvalidHost(#[from] crate::host::HostError),
 }

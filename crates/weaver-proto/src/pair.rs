@@ -170,12 +170,13 @@ pub enum LookupResponse {
 pub struct AcceptRequest {
     /// The handle from the link's fragment.
     pub handle: String,
-    /// The person slug to create; only when the lookup said `person.is_new`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub person_slug: Option<String>,
-    /// The machine name to create; only when the lookup said `machine.is_new`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub machine_name: Option<String>,
+    /// The person slug to create; empty unless the lookup said `person.is_new`.
+    #[serde(default)]
+    pub person_slug: String,
+    /// The machine name to create; empty unless the lookup said
+    /// `machine.is_new` (then empty means "the proposed name").
+    #[serde(default)]
+    pub machine_name: String,
 }
 
 /// Answer to accept/reject.
@@ -183,19 +184,9 @@ pub struct AcceptRequest {
 pub struct ActionResponse {
     /// Whether the action was applied.
     pub ok: bool,
-    /// On failure, why — safe to show the person.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub message: Option<String>,
-}
-
-/// Encode a pairing message as JSON text.
-pub fn encode_json<T: Serialize>(value: &T) -> Result<String, serde_json::Error> {
-    serde_json::to_string(value)
-}
-
-/// Decode a pairing message from JSON text.
-pub fn decode_json<T: serde::de::DeserializeOwned>(text: &str) -> Result<T, serde_json::Error> {
-    serde_json::from_str(text)
+    /// On failure, why — safe to show the person. Empty on success.
+    #[serde(default)]
+    pub message: String,
 }
 
 #[cfg(test)]
@@ -207,14 +198,14 @@ mod tests {
         let new = Target::New {
             hostname: "Rémys-MacBook-Pro.local".into(),
         };
-        let text = encode_json(&new).unwrap();
+        let text = serde_json::to_string(&new).unwrap();
         assert!(text.contains("\"kind\":\"new\""));
-        assert_eq!(decode_json::<Target>(&text).unwrap(), new);
+        assert_eq!(serde_json::from_str::<Target>(&text).unwrap(), new);
 
         let existing = Target::Existing { machine_id: 42 };
-        let text = encode_json(&existing).unwrap();
+        let text = serde_json::to_string(&existing).unwrap();
         assert_eq!(text, "{\"kind\":\"existing\",\"machine_id\":42}");
-        assert_eq!(decode_json::<Target>(&text).unwrap(), existing);
+        assert_eq!(serde_json::from_str::<Target>(&text).unwrap(), existing);
     }
 
     #[test]
@@ -224,39 +215,44 @@ mod tests {
             person: "remy".into(),
             machine: "laptop".into(),
         };
-        let text = encode_json(&approved).unwrap();
+        let text = serde_json::to_string(&approved).unwrap();
         assert!(text.contains("\"type\":\"approved\""));
-        assert_eq!(decode_json::<ServerMessage>(&text).unwrap(), approved);
+        assert_eq!(
+            serde_json::from_str::<ServerMessage>(&text).unwrap(),
+            approved
+        );
 
         let failed = ServerMessage::Failed {
             code: FailureCode::NotYourMachine,
             message: "no".into(),
         };
-        let text = encode_json(&failed).unwrap();
+        let text = serde_json::to_string(&failed).unwrap();
         assert!(text.contains("\"code\":\"not_your_machine\""));
-        assert_eq!(decode_json::<ServerMessage>(&text).unwrap(), failed);
+        assert_eq!(
+            serde_json::from_str::<ServerMessage>(&text).unwrap(),
+            failed
+        );
     }
 
     #[test]
-    fn accept_omits_fixed_names() {
+    fn accept_names_default_to_empty() {
         let accept = AcceptRequest {
             handle: "ab".into(),
-            person_slug: None,
-            machine_name: Some("laptop".into()),
+            person_slug: String::new(),
+            machine_name: "laptop".into(),
         };
-        let text = encode_json(&accept).unwrap();
-        assert_eq!(text, "{\"handle\":\"ab\",\"machine_name\":\"laptop\"}");
-        assert_eq!(decode_json::<AcceptRequest>(&text).unwrap(), accept);
+        let text = "{\"handle\":\"ab\",\"machine_name\":\"laptop\"}";
+        assert_eq!(serde_json::from_str::<AcceptRequest>(text).unwrap(), accept);
     }
 
     #[test]
     fn lookup_response_is_tagged() {
         assert_eq!(
-            encode_json(&LookupResponse::Gone).unwrap(),
+            serde_json::to_string(&LookupResponse::Gone).unwrap(),
             "{\"state\":\"gone\"}"
         );
         assert_eq!(
-            encode_json(&LookupResponse::NotYourMachine).unwrap(),
+            serde_json::to_string(&LookupResponse::NotYourMachine).unwrap(),
             "{\"state\":\"not_your_machine\"}"
         );
         let waiting = LookupResponse::Waiting {
@@ -271,7 +267,10 @@ mod tests {
                 is_new: true,
             },
         };
-        let text = encode_json(&waiting).unwrap();
-        assert_eq!(decode_json::<LookupResponse>(&text).unwrap(), waiting);
+        let text = serde_json::to_string(&waiting).unwrap();
+        assert_eq!(
+            serde_json::from_str::<LookupResponse>(&text).unwrap(),
+            waiting
+        );
     }
 }

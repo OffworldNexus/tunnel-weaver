@@ -22,7 +22,7 @@ pub struct Model {
     pub name: String,
     pub value: String,
     /// Store key of the managed certificate this challenge is being solved for.
-    pub certificate: Option<String>,
+    pub certificate: String,
     pub created_at: i64,
     /// `dns-01` (TXT digest) or `http-01` (key authorization).
     pub kind: String,

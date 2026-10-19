@@ -5,6 +5,7 @@ use std::time::Duration;
 use rand_core::Rng;
 
 use crate::auth::{Signer, Verifier};
+use crate::wire::Params;
 
 /// Which end of the connection this is, with the data only that end
 /// needs. The only asymmetry in the API: a client signs, a server verifies
@@ -20,7 +21,7 @@ pub enum Role {
         /// Looks up and re-validates the client's key.
         verifier: Box<dyn Verifier + Send>,
         /// Parameters announced in WELCOME and in force for both sides.
-        params: ServerParams,
+        params: Params,
         /// Poll `Verifier::still_valid` this often; `None` never re-checks.
         reverify_interval: Option<Duration>,
     },
@@ -49,29 +50,15 @@ impl std::fmt::Debug for Role {
     }
 }
 
-/// What a server announces in WELCOME. Clamped into the protocol's legal
+/// What a server announces by default. Clamped into the protocol's legal
 /// ranges at [`crate::Connection::new`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ServerParams {
-    /// Largest DATA payload per frame, in bytes.
-    pub max_frame: u32,
-    /// Initial per-stream, per-direction credit, in bytes.
-    pub initial_window: u32,
-    /// Largest application message on a stream; bounds both sides'
-    /// reassembly buffers.
-    pub max_message: u32,
-    /// Whether zstd may be used on this connection at all. A server can
-    /// refuse compression, never force it.
-    pub compression_allowed: bool,
-}
-
-impl Default for ServerParams {
+impl Default for Params {
     fn default() -> Self {
         Self {
             max_frame: 16 * 1024,
             initial_window: 512 * 1024,
-            max_message: 1024 * 1024,
             compression_allowed: true,
+            max_message: 1024 * 1024,
         }
     }
 }
@@ -104,11 +91,15 @@ impl Default for Weights {
 }
 
 /// Smallest `initial_window` a server may announce.
-pub const MIN_WINDOW: u32 = 64 * 1024;
+pub(crate) const MIN_WINDOW: u32 = 64 * 1024;
 /// Largest `initial_window` a server may announce.
-pub const MAX_WINDOW: u32 = 4 * 1024 * 1024;
+pub(crate) const MAX_WINDOW: u32 = 4 * 1024 * 1024;
 /// Smallest `max_message` a server may announce.
-pub const MIN_MESSAGE: u32 = 16 * 1024;
+pub(crate) const MIN_MESSAGE: u32 = 16 * 1024;
+/// Deadline for the whole CHALLENGE/HELLO/WELCOME exchange.
+pub(crate) const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Local zstd level; not negotiated.
+pub(crate) const ZSTD_LEVEL: i32 = 3;
 
 /// Everything a [`crate::Connection`] needs to know, supplied by the
 /// adapter. Keys are never held here: only the boxed [`Signer`] or
@@ -126,13 +117,6 @@ pub struct Config {
     /// An `Interactive` stream becomes `Bulk` once this many bytes have
     /// been sent on it. `None` disables demotion.
     pub bulk_threshold: Option<u64>,
-    /// Local zstd level; not negotiated.
-    pub zstd_level: i32,
-    /// Local compression stance. Compression happens only when both this
-    /// and the server's `compression_allowed` are true.
-    pub compression_allowed: bool,
-    /// Deadline for the whole CHALLENGE/HELLO/WELCOME exchange.
-    pub handshake_timeout: Duration,
     /// Send a PING after this much silence on the connection.
     pub ping_interval: Duration,
     /// Close the connection after this much silence from the peer.
@@ -152,9 +136,6 @@ impl Config {
             server_name: server_name.into(),
             weights: Weights::default(),
             bulk_threshold: Some(DEFAULT_BULK_THRESHOLD),
-            zstd_level: 3,
-            compression_allowed: true,
-            handshake_timeout: Duration::from_secs(10),
             ping_interval: Duration::from_secs(15),
             idle_timeout: Duration::from_secs(60),
             channel_binding: None,
@@ -180,7 +161,7 @@ impl Config {
         Self::base(
             Role::Server {
                 verifier,
-                params: ServerParams::default(),
+                params: Params::default(),
                 reverify_interval: None,
             },
             server_name,
@@ -188,26 +169,34 @@ impl Config {
         )
     }
 
+    /// Poll the server's `Verifier::still_valid` every `every`. A client has no
+    /// verifier, so this does nothing there.
+    pub fn with_reverify_interval(mut self, every: Duration) -> Self {
+        if let Role::Server {
+            reverify_interval, ..
+        } = &mut self.role
+        {
+            *reverify_interval = Some(every);
+        }
+        self
+    }
+
     /// Server-announced parameters, mutable. `None` on a client.
-    pub fn server_params_mut(&mut self) -> Option<&mut ServerParams> {
+    pub fn server_params_mut(&mut self) -> Option<&mut Params> {
         match &mut self.role {
             Role::Server { params, .. } => Some(params),
             Role::Client { .. } => None,
         }
     }
 
-    /// Clamp the locally configured values into the ranges the protocol
-    /// allows so a server never announces parameters the client must reject.
+    /// Clamp the announced parameters into the ranges the protocol allows so
+    /// a server never announces parameters the client must reject.
     pub(crate) fn normalize(&mut self) {
         if let Some(p) = self.server_params_mut() {
             p.initial_window = p.initial_window.clamp(MIN_WINDOW, MAX_WINDOW);
             p.max_frame = p.max_frame.max(2);
             p.max_message = p.max_message.max(MIN_MESSAGE);
         }
-        self.weights.control = self.weights.control.max(1);
-        self.weights.realtime = self.weights.realtime.max(1);
-        self.weights.interactive = self.weights.interactive.max(1);
-        self.weights.bulk = self.weights.bulk.max(1);
     }
 }
 
@@ -218,9 +207,6 @@ impl std::fmt::Debug for Config {
             .field("server_name", &self.server_name)
             .field("weights", &self.weights)
             .field("bulk_threshold", &self.bulk_threshold)
-            .field("zstd_level", &self.zstd_level)
-            .field("compression_allowed", &self.compression_allowed)
-            .field("handshake_timeout", &self.handshake_timeout)
             .field("ping_interval", &self.ping_interval)
             .field("idle_timeout", &self.idle_timeout)
             .field("channel_binding", &self.channel_binding.is_some())

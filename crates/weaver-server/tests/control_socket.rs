@@ -183,7 +183,6 @@ async fn test_control_socket_daemon_suite() {
             key_pem: key_pem.to_string(),
             not_before: now - 3600,
             not_after: now + 86400 * days,
-            issuer: Some("Test Issuer".to_string()),
             directory: "letsencrypt-staging".to_string(),
             obtained_at: now - 3600,
             validation: "dns-01".to_string(),
@@ -204,7 +203,7 @@ async fn test_control_socket_daemon_suite() {
             "weaver.test",
             now - 3600,
             "issued",
-            Some("Certificate successfully issued"),
+            "Certificate successfully issued",
         )
         .await
         .unwrap();
@@ -1009,7 +1008,6 @@ async fn test_status_and_cert_status_report_admin_and_cert_metadata() {
                 key_pem: "WILDCARD-KEY".into(),
                 not_before: now - 60,
                 not_after: now + 86_400,
-                issuer: None,
                 directory: "letsencrypt-staging".into(),
                 obtained_at: now - 60,
                 validation: "dns-01".into(),
@@ -1025,7 +1023,6 @@ async fn test_status_and_cert_status_report_admin_and_cert_metadata() {
                 key_pem: "ADMIN-KEY".into(),
                 not_before: now - 60,
                 not_after: now + 86_400,
-                issuer: None,
                 directory: "letsencrypt-staging".into(),
                 obtained_at: now - 60,
                 validation: "http-01".into(),
@@ -1134,7 +1131,6 @@ async fn test_doctor_control_verb_and_cli() {
                 key_pem: "WILDCARD-KEY".into(),
                 not_before: now - 60,
                 not_after: now + 86_400,
-                issuer: None,
                 directory: "letsencrypt-staging".into(),
                 obtained_at: now - 60,
                 validation: "dns-01".into(),

@@ -47,5 +47,5 @@ pub fn set_tcp_notsent_lowat(stream: &tokio::net::TcpStream) {
     let _ = stream;
 }
 
-#[allow(dead_code)]
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
 const LOWAT: u32 = 32 * 1024;

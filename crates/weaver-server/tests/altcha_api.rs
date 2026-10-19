@@ -1,4 +1,4 @@
-//! WVR-136: the ALTCHA API on the tunnel apex and the admin diagnostic page.
+//! the ALTCHA API on the tunnel apex and the admin diagnostic page.
 //!
 //! These drive the real HTTPS edge and the real SQLite store: a client is
 //! registered, the browser fetches a signed challenge, the widget's solve is
@@ -91,7 +91,7 @@ async fn test_store() -> Store {
                 ttl_secs: 300,
                 service_id: None,
             },
-            weaver_server::abuse::unix_ms(),
+            weaver_server::wall_clock::unix_ms(),
         )
         .await
         .unwrap();

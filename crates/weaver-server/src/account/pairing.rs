@@ -1,7 +1,7 @@
 //! The pairing plane: a machine asks for its key to be enrolled, a person
 //! approves it in the browser.
 //!
-//! Three pieces live here:
+//! Two pieces live here:
 //!
 //! * [`Pairings`] — the in-memory registry of *pending* pairings. It is
 //!   deliberately not a table: a pending pairing exists exactly as long as the
@@ -10,8 +10,6 @@
 //! * [`serve_channel`] — the WebSocket side, spawned by the raw edge. It issues
 //!   a proof of work, checks the CLI's `Begin`, registers the pending pairing,
 //!   hands the CLI its handle, and relays the browser's outcome.
-//! * The name rules lookup and accept share — proposing a person slug and a
-//!   machine name.
 //!
 //! The channel is unauthenticated, so it never answers anything about existing
 //! machines beyond "this key is already paired" (which only the key's holder can
@@ -37,21 +35,18 @@ use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use weaver_abuse::{AltchaError, Pipeline, RequestContext, Surface, ViewId};
 use weaver_mux::KeyId;
 use weaver_proto::pair::{
-    self, Begin, FailureCode, PAIR_CHANNEL_PATH, PAIR_POW_PURPOSE, ServerMessage, Target,
+    Begin, FailureCode, PAIR_CHANNEL_PATH, PAIR_POW_PURPOSE, ServerMessage, Target,
 };
 
 use crate::abuse::Refusal;
 use crate::account::AccountRuntime;
-use crate::store::Store;
-use crate::store::entity::{account, person};
-use crate::store::names;
 
 /// How long the CLI has, after the challenge, to send its `Begin`. Covers
 /// solving the proof of work on a slow machine.
-pub const BEGIN_TIMEOUT: Duration = Duration::from_secs(60);
+const BEGIN_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Largest message the channel accepts. A `Begin` is a few hundred bytes.
-pub const MAX_MESSAGE_BYTES: usize = 16 * 1024;
+const MAX_MESSAGE_BYTES: usize = 16 * 1024;
 
 /// The WebSocket limits the pairing channel runs with.
 pub fn channel_config() -> WebSocketConfig {
@@ -73,8 +68,6 @@ pub struct PendingView {
 pub struct Taken {
     /// The machine's public key.
     pub key_id: KeyId,
-    /// Which machine the key is for.
-    pub target: Target,
     sender: oneshot::Sender<ServerMessage>,
 }
 
@@ -125,11 +118,6 @@ pub struct Pairings {
 }
 
 impl Pairings {
-    /// Creates an empty registry.
-    pub fn new() -> Self {
-        Self::default()
-    }
-
     /// Registers a pending pairing, superseding any earlier one for the same
     /// key. Returns the handle and the channel the outcome arrives on.
     pub fn register(
@@ -137,7 +125,7 @@ impl Pairings {
         key_id: KeyId,
         target: Target,
     ) -> (String, oneshot::Receiver<ServerMessage>) {
-        let handle = crate::account::session::random_hex(32);
+        let handle = crate::random_hex(32);
         let (sender, receiver) = oneshot::channel();
         let mut inner = self.inner.lock().expect("pairings mutex poisoned");
         if let Some(previous) = inner.handle_by_key.insert(key_id, handle.clone()) {
@@ -176,23 +164,17 @@ impl Pairings {
             .remove(handle)?;
         Some(Taken {
             key_id: pending.view.key_id,
-            target: pending.view.target,
             sender: pending.sender,
         })
     }
 
-    /// How many pairings are waiting (tests, diagnostics).
-    pub fn len(&self) -> usize {
+    /// Whether nothing is waiting.
+    pub fn is_empty(&self) -> bool {
         self.inner
             .lock()
             .expect("pairings mutex poisoned")
             .by_handle
-            .len()
-    }
-
-    /// Whether nothing is waiting.
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
+            .is_empty()
     }
 }
 
@@ -207,19 +189,16 @@ pub struct Peer {
 impl Peer {
     /// Charges the pairing budget for one pending pairing.
     async fn admit(&self) -> Result<(), FailureCode> {
-        let mut ctx = RequestContext {
+        let ctx = RequestContext {
             surface: Surface::https(weaver_abuse::Host::Admin),
             method: http::Method::GET,
             path: PAIR_CHANNEL_PATH,
             raw_path: PAIR_CHANNEL_PATH,
-            body_len: None,
-            fingerprint: weaver_abuse::fingerprint(crate::abuse::effective_peer(self.addr), None),
+            fingerprint: weaver_abuse::fingerprint(crate::abuse::effective_peer(self.addr)),
             view: ViewId::ACCOUNT_PAIR,
-            now_ms: crate::abuse::unix_ms(),
-            findings: Vec::new(),
-            cost: 0,
+            now_ms: crate::wall_clock::unix_ms(),
         };
-        match Refusal::from_decision(self.guard.evaluate(&mut ctx).await) {
+        match Refusal::from_decision(self.guard.evaluate(&ctx).await) {
             None => Ok(()),
             Some(Refusal::Throttled { .. }) => Err(FailureCode::Throttled),
             Some(Refusal::Unavailable) => Err(FailureCode::Unavailable),
@@ -366,15 +345,14 @@ where
 {
     while let Some(message) = ws.next().await {
         return match message {
-            Ok(Message::Text(text)) if text.len() <= MAX_MESSAGE_BYTES => {
-                match pair::decode_json::<Begin>(&text) {
-                    Ok(begin) => Read::Begin(Box::new(begin)),
-                    Err(_) => Read::Malformed,
-                }
-            }
+            Ok(Message::Text(text)) => match serde_json::from_str::<Begin>(&text) {
+                Ok(begin) => Read::Begin(Box::new(begin)),
+                Err(_) => Read::Malformed,
+            },
             Ok(Message::Ping(_) | Message::Pong(_)) => continue,
             Ok(Message::Close(_)) => Read::Gone,
             Ok(_) => Read::Malformed,
+            // Over `MAX_MESSAGE_BYTES`.
             Err(tokio_tungstenite::tungstenite::Error::Capacity(_)) => Read::Malformed,
             Err(_) => Read::Gone,
         };
@@ -413,7 +391,7 @@ async fn verify_proof(
 }
 
 /// Whether `key_id` is a well-formed public key of a supported algorithm.
-pub fn key_is_valid(key_id: &KeyId) -> bool {
+fn key_is_valid(key_id: &KeyId) -> bool {
     match key_id {
         KeyId::P256(bytes) => p256::ecdsa::VerifyingKey::from_sec1_bytes(bytes).is_ok(),
         KeyId::Ed25519(bytes) => ed25519_dalek::VerifyingKey::from_bytes(bytes).is_ok(),
@@ -432,48 +410,8 @@ async fn send<S>(ws: &mut WebSocketStream<S>, message: &ServerMessage) -> Result
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let text = pair::encode_json(message).map_err(|_| ())?;
+    let text = serde_json::to_string(message).map_err(|_| ())?;
     ws.send(Message::Text(text.into())).await.map_err(|_| ())
-}
-
-/// The fingerprint shown for a key (`p256:<hex>`): byte-for-byte the
-/// `machine.key_id` the relay stores.
-pub fn fingerprint(key_id: &KeyId) -> String {
-    crate::store::format_key_id(key_id)
-}
-
-/// The person slug to propose for an account that has no person yet: a
-/// zone-unique slug derived from the account name.
-pub async fn propose_person_slug(
-    store: &Store,
-    account: &account::Model,
-) -> Result<String, String> {
-    let taken = store.list_person_names().await.map_err(|e| e.to_string())?;
-    let base = names::slugify_person(&account.name);
-    Ok(names::uniquify(&base, |candidate| {
-        taken.iter().any(|t| t == candidate)
-    }))
-}
-
-/// The machine name to propose (or to settle on) for `requested`: slugified,
-/// then uniquified against the person's machines — a collision becomes a digit
-/// suffix (`laptop`, `laptop2`) rather than a refusal.
-pub async fn unique_machine_name(
-    store: &Store,
-    person: Option<&person::Model>,
-    requested: &str,
-) -> Result<String, String> {
-    let base = names::slugify_machine(requested);
-    let Some(person) = person else {
-        return Ok(base);
-    };
-    let taken = store
-        .list_machine_names(person.id)
-        .await
-        .map_err(|e| e.to_string())?;
-    Ok(names::uniquify(&base, |candidate| {
-        taken.iter().any(|t| t == candidate)
-    }))
 }
 
 #[cfg(test)]
@@ -492,7 +430,7 @@ mod tests {
 
     #[test]
     fn handle_is_single_use() {
-        let pairings = Pairings::new();
+        let pairings = Pairings::default();
         let (handle, _rx) = pairings.register(key(1), new_machine());
         assert!(pairings.view(&handle).is_some());
         assert!(pairings.take(&handle).is_some());
@@ -503,7 +441,7 @@ mod tests {
 
     #[test]
     fn a_second_pairing_supersedes_the_first_for_the_same_key() {
-        let pairings = Pairings::new();
+        let pairings = Pairings::default();
         let (first, _r1) = pairings.register(key(2), new_machine());
         let (second, _r2) = pairings.register(key(2), Target::Existing { machine_id: 4 });
         assert!(pairings.view(&first).is_none());
@@ -511,12 +449,11 @@ mod tests {
             pairings.view(&second).unwrap().target,
             Target::Existing { machine_id: 4 }
         );
-        assert_eq!(pairings.len(), 1);
     }
 
     #[test]
     fn unregister_frees_the_key_again() {
-        let pairings = Pairings::new();
+        let pairings = Pairings::default();
         let (handle, _rx) = pairings.register(key(3), new_machine());
         pairings.unregister(&handle);
         assert!(pairings.is_empty());
@@ -526,7 +463,7 @@ mod tests {
 
     #[test]
     fn taken_pairings_report_their_outcome() {
-        let pairings = Pairings::new();
+        let pairings = Pairings::default();
         let (handle, mut rx) = pairings.register(key(4), new_machine());
         pairings
             .take(&handle)
@@ -539,17 +476,6 @@ mod tests {
                 message: "no".into()
             }
         );
-    }
-
-    #[test]
-    fn fingerprints_match_the_store_spelling() {
-        let mut bytes = [0u8; 33];
-        bytes[0] = 2;
-        bytes[32] = 0xab;
-        let text = fingerprint(&KeyId::P256(bytes));
-        assert!(text.starts_with("p256:02"));
-        assert!(text.ends_with("ab"));
-        assert_eq!(text.len(), 5 + 66);
     }
 
     #[test]

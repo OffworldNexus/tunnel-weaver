@@ -1,4 +1,4 @@
-//! `browser_session` table: server-side browser sessions (WVR-36).
+//! `browser_session` table: server-side browser sessions.
 //!
 //! The opaque cookie secret is stored only as a digest; `invalidated_at` retires
 //! a session without deleting the row, so a replayed cookie finds a dead row

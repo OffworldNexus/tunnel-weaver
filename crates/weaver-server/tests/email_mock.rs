@@ -1,4 +1,4 @@
-//! Mock-provider integration tests for OFF-193.
+//! Mock-provider integration tests for account email.
 //!
 //! A local hyper server records every request and returns a canned response,
 //! letting the resend transport, `send-a-joke`, and the `configure` two-step

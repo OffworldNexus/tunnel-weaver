@@ -1,4 +1,4 @@
-//! `altcha_proof` table: single-use proof markers (WVR-136).
+//! `altcha_proof` table: single-use proof markers.
 //!
 //! One row per consumed proof, unique on `(public_key, nonce)`. Consumption is
 //! an `INSERT … ON CONFLICT DO NOTHING`: the first insert wins, a replay hits

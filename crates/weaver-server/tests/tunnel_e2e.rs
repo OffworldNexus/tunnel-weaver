@@ -18,29 +18,100 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::time::sleep;
 use tokio_rustls::TlsConnector;
 use tokio_util::sync::CancellationToken;
-use weave::{ServiceSpec, SignerSpec, StartOptions, Target};
+use weave::{ServiceSpec, StartOptions, Target};
+use weaver_mux::testing::Ed25519TestSigner;
 use weaver_proto::control::RefusalCode;
 use weaver_server::cert::resolver::CertResolver;
 use weaver_server::cert::{CertManager, SystemClock};
 use weaver_server::config::Config;
 use weaver_server::edge::https::run_https_server_with_registry;
 use weaver_server::store::Store;
+use weaver_server::tunnel::StoreIdentityResolver;
 use weaver_server::tunnel::TunnelRegistry;
-use weaver_server::tunnel::{Identity, StoreIdentityResolver, derive_hostname};
 
-fn client_dev_key() -> weaver_mux::KeyId {
+/// The seed of the client's device key.
+const CLIENT_SEED: u64 = 7;
+
+fn client_key() -> weaver_mux::KeyId {
     use weaver_mux::auth::Signer as _;
-    weave::Ed25519Signer::dev().key_id()
+    Ed25519TestSigner::from_seed(CLIENT_SEED).key_id()
 }
 
-/// Enrols the development key as `poc`'s machine `laptop`, the identity the
-/// tests derive hostnames from.
-async fn enrol_dev_key(store: &Store) {
+/// Enrols the client's key as `poc`'s machine `laptop`, the identity the tests
+/// derive hostnames from.
+async fn enrol_client_key(store: &Store) {
     let poc = store.create_test_person("poc").await.unwrap();
     store
-        .create_machine(poc.id, "laptop", &client_dev_key())
+        .create_machine(poc.id, "laptop", &client_key())
         .await
         .unwrap();
+}
+
+/// A key agent holding the client's in-memory device key.
+struct TestAgent;
+
+#[async_trait::async_trait]
+impl weave::KeyAgent for TestAgent {
+    async fn open(
+        &self,
+        _remembered: Option<weaver_mux::KeyId>,
+        _provision: weave::Provision,
+        _reporter: Arc<dyn weave::Reporter>,
+    ) -> Result<weave::OpenedKey, weave::KeyError> {
+        Ok(weave::OpenedKey {
+            signer: Box::new(Ed25519TestSigner::from_seed(CLIENT_SEED)),
+            level: weave::SecurityLevel::File,
+            created: false,
+        })
+    }
+}
+
+/// A `weave` client paired with the relay at `server` under the client's key,
+/// trusting the relay's test CA. The directory holds its store.
+async fn paired_client(server: &str, ca: &std::path::Path) -> (tempfile::TempDir, weave::Client) {
+    paired_client_reporting(server, ca, Arc::new(weave::Silent)).await
+}
+
+/// [`paired_client`], reporting to `reporter`.
+async fn paired_client_reporting(
+    server: &str,
+    ca: &std::path::Path,
+    reporter: Arc<dyn weave::Reporter>,
+) -> (tempfile::TempDir, weave::Client) {
+    let dir = tempfile::tempdir().unwrap();
+    let store = weave::Store::open(dir.path().join("weave.db"))
+        .await
+        .unwrap();
+    let key = client_key().to_string();
+    store.record_pairing(server, 1, &key).await.unwrap();
+    store.set_device_key(&key).await.unwrap();
+    let client = weave::Client::new(store, Box::new(TestAgent), reporter)
+        .with_root_ca(Some(ca.to_path_buf()));
+    (dir, client)
+}
+
+/// A `weave start` run: which relay, trusting what, exposing what.
+struct StartRun {
+    server: String,
+    ca: std::path::PathBuf,
+    opts: StartOptions,
+}
+
+/// Runs `weave start` until `shutdown`.
+async fn run_start(run: StartRun, shutdown: CancellationToken) -> Result<(), weave::Error> {
+    run_start_releasing(run, shutdown, CancellationToken::new()).await
+}
+
+/// Runs `weave start` until `shutdown`; `release` drops the registrations.
+async fn run_start_releasing(
+    run: StartRun,
+    shutdown: CancellationToken,
+    release: CancellationToken,
+) -> Result<(), weave::Error> {
+    let (_dir, client) = paired_client(&run.server, &run.ca).await;
+    client
+        .start_with_release(&run.opts, shutdown, release)
+        .await
 }
 
 /// A trivial in-process HTTP/1.1 origin used by the proxy e2e tests. It
@@ -118,33 +189,28 @@ async fn spawn_test_origin_named(label: &'static str) -> TestOrigin {
     TestOrigin { addr, token }
 }
 
-fn start_options(server: String, ca: &std::path::Path, port: u16) -> StartOptions {
+fn start_options(server: String, ca: &std::path::Path, port: u16) -> StartRun {
     start_options_multi(server, ca, &[("web", port)])
 }
 
-/// Build `StartOptions` for several `<service>=<origin port>` mappings.
-fn start_options_multi(
-    server: String,
-    ca: &std::path::Path,
-    services: &[(&str, u16)],
-) -> StartOptions {
-    StartOptions {
-        specs: services
-            .iter()
-            .map(|(name, port)| ServiceSpec {
-                service: (*name).to_string(),
-                target: Target::parse(&format!("http://127.0.0.1:{port}")).unwrap(),
-            })
-            .collect(),
+/// A `weave start` run for several `<service>=<origin port>` mappings.
+fn start_options_multi(server: String, ca: &std::path::Path, services: &[(&str, u16)]) -> StartRun {
+    let services = services
+        .iter()
+        .map(|(name, port)| {
+            ServiceSpec::new(
+                *name,
+                Target::parse(&format!("http://127.0.0.1:{port}")).unwrap(),
+            )
+        })
+        .collect();
+    StartRun {
+        opts: StartOptions {
+            server: server.clone(),
+            services,
+        },
         server,
-        signer: SignerSpec::Dev,
-        insecure_root_ca: Some(ca.to_path_buf()),
-        insecure_targets: Vec::new(),
-        preserve_host: Vec::new(),
-        no_rewrite: Vec::new(),
-        append_forwarded: Vec::new(),
-        quiet: true,
-        verbose: false,
+        ca: ca.to_path_buf(),
     }
 }
 
@@ -244,7 +310,7 @@ async fn spawn_test_relay(tunnel_domain: &str) -> TestRelay {
 
     let temp_db = NamedTempFile::new().unwrap();
     let store = Arc::new(Store::open(temp_db.path()).await.unwrap());
-    enrol_dev_key(&store).await;
+    enrol_client_key(&store).await;
 
     let config = Arc::new(Config {
         tunnel_domain: tunnel_domain.to_string(),
@@ -360,10 +426,10 @@ async fn test_tunnel_registration_and_http1_http2_proxying() {
     let ca_path = relay.ca_pem_path.clone();
     let opts = start_options(server_addr, &ca_path, origin.port());
 
-    let client_task = tokio::spawn(async move { weave::run_start_with_token(opts, c_tok).await });
+    let client_task = tokio::spawn(async move { run_start(opts, c_tok).await });
 
     // 2. Wait for registration in registry
-    let expected_hostname = derive_hostname("web", &poc_identity(), root);
+    let expected_hostname = poc_hostname("web", root);
     let mut registered = false;
     for _ in 0..50 {
         if relay.registry.resolve(&expected_hostname).await.is_some() {
@@ -576,10 +642,9 @@ async fn test_control_stream_is_the_registration_lease() {
     let server_addr = format!("localhost:{}", relay.addr.port());
     let ca_path = relay.ca_pem_path.clone();
     let opts = start_options(server_addr, &ca_path, 1);
-    let client_task =
-        tokio::spawn(async move { weave::run_start_with_tokens(opts, s_tok, r_tok).await });
+    let client_task = tokio::spawn(async move { run_start_releasing(opts, s_tok, r_tok).await });
 
-    let hostname = derive_hostname("web", &poc_identity(), root);
+    let hostname = poc_hostname("web", root);
     let mut registered = false;
     for _ in 0..50 {
         if relay.registry.resolve(&hostname).await.is_some() {
@@ -631,10 +696,10 @@ async fn test_tunnel_supersession() {
 
     let task1 = tokio::spawn(async move {
         let opts = start_options(s_addr1, &ca_path1, 1);
-        weave::run_start_with_token(opts, c_tok1).await
+        run_start(opts, c_tok1).await
     });
 
-    let expected_hostname = derive_hostname("web", &poc_identity(), root);
+    let expected_hostname = poc_hostname("web", root);
     let mut reg1 = false;
     for _ in 0..50 {
         if relay.registry.resolve(&expected_hostname).await.is_some() {
@@ -653,7 +718,7 @@ async fn test_tunnel_supersession() {
 
     let task2 = tokio::spawn(async move {
         let opts = start_options(s_addr2, &ca_path2, 1);
-        weave::run_start_with_token(opts, c_tok2).await
+        run_start(opts, c_tok2).await
     });
 
     // Wait for instance 1 to terminate via supersession
@@ -687,19 +752,19 @@ async fn test_duplicate_registration_refusal() {
 
     let (proxy_tx, _) = tokio::sync::mpsc::channel(1);
     let (s_tx, _) = tokio::sync::oneshot::channel();
-    let conn_id = relay.registry.register_connection(client_dev_key(), s_tx);
+    let conn_id = relay.registry.register_connection(client_key(), s_tx);
 
     // First registration succeeds
     let res1 = relay
         .registry
-        .register_service(client_dev_key(), conn_id, "web", proxy_tx.clone())
+        .register_service(client_key(), conn_id, "web", proxy_tx.clone())
         .await;
     assert!(res1.is_ok());
 
     // Duplicate registration for same service returns AlreadyRegistered
     let res2 = relay
         .registry
-        .register_service(client_dev_key(), conn_id, "web", proxy_tx.clone())
+        .register_service(client_key(), conn_id, "web", proxy_tx.clone())
         .await;
     assert_eq!(res2, Err(RefusalCode::AlreadyRegistered));
 
@@ -731,10 +796,10 @@ async fn test_two_services_on_one_connection() {
         &ca,
         &[("alpha", alpha.port()), ("beta", beta.port())],
     );
-    let task = tokio::spawn(async move { weave::run_start_with_token(opts, c_tok).await });
+    let task = tokio::spawn(async move { run_start(opts, c_tok).await });
 
-    let host_a = derive_hostname("alpha", &poc_identity(), root);
-    let host_b = derive_hostname("beta", &poc_identity(), root);
+    let host_a = poc_hostname("alpha", root);
+    let host_b = poc_hostname("beta", root);
     for host in [&host_a, &host_b] {
         let mut ok = false;
         for _ in 0..50 {
@@ -840,9 +905,9 @@ async fn test_websocket_upgrade_h1_and_h2_extended_connect() {
     let server = format!("localhost:{}", relay.addr.port());
     let ca = relay.ca_pem_path.clone();
     let opts = start_options_multi(server, &ca, &[("ws", echo.port())]);
-    let task = tokio::spawn(async move { weave::run_start_with_token(opts, c_tok).await });
+    let task = tokio::spawn(async move { run_start(opts, c_tok).await });
 
-    let host = derive_hostname("ws", &poc_identity(), root);
+    let host = poc_hostname("ws", root);
     let mut ok = false;
     for _ in 0..50 {
         if relay.registry.resolve(&host).await.is_some() {
@@ -1067,9 +1132,9 @@ async fn test_websocket_abrupt_origin_close_reaches_visitor() {
     let server = format!("localhost:{}", relay.addr.port());
     let ca = relay.ca_pem_path.clone();
     let opts = start_options_multi(server, &ca, &[("ws", echo.port())]);
-    let task = tokio::spawn(async move { weave::run_start_with_token(opts, c_tok).await });
+    let task = tokio::spawn(async move { run_start(opts, c_tok).await });
 
-    let host = derive_hostname("ws", &poc_identity(), root);
+    let host = poc_hostname("ws", root);
     for _ in 0..50 {
         if relay.registry.resolve(&host).await.is_some() {
             break;
@@ -1162,9 +1227,9 @@ async fn test_websocket_origin_initiated_close_reaches_visitor() {
     let server = format!("localhost:{}", relay.addr.port());
     let ca = relay.ca_pem_path.clone();
     let opts = start_options_multi(server, &ca, &[("ws", echo.port())]);
-    let task = tokio::spawn(async move { weave::run_start_with_token(opts, c_tok).await });
+    let task = tokio::spawn(async move { run_start(opts, c_tok).await });
 
-    let host = derive_hostname("ws", &poc_identity(), root);
+    let host = poc_hostname("ws", root);
     for _ in 0..50 {
         if relay.registry.resolve(&host).await.is_some() {
             break;
@@ -1241,10 +1306,10 @@ async fn test_origin_down_502s_only_that_service() {
     let server = format!("localhost:{}", relay.addr.port());
     let ca = relay.ca_pem_path.clone();
     let opts = start_options_multi(server, &ca, &[("down", down.port()), ("up", up.port())]);
-    let task = tokio::spawn(async move { weave::run_start_with_token(opts, c_tok).await });
+    let task = tokio::spawn(async move { run_start(opts, c_tok).await });
 
-    let host_down = derive_hostname("down", &poc_identity(), root);
-    let host_up = derive_hostname("up", &poc_identity(), root);
+    let host_down = poc_hostname("down", root);
+    let host_up = poc_hostname("up", root);
     for host in [&host_down, &host_up] {
         let mut ok = false;
         for _ in 0..50 {
@@ -1669,9 +1734,9 @@ async fn test_translation_matrix_h1_and_h2() {
     let server = format!("localhost:{}", relay.addr.port());
     let ca = relay.ca_pem_path.clone();
     let opts = start_options_multi(server, &ca, &[("m", origin.addr.port())]);
-    let task = tokio::spawn(async move { weave::run_start_with_token(opts, c_tok).await });
+    let task = tokio::spawn(async move { run_start(opts, c_tok).await });
 
-    let host = derive_hostname("m", &poc_identity(), root);
+    let host = poc_hostname("m", root);
     let mut ok = false;
     for _ in 0..50 {
         if relay.registry.resolve(&host).await.is_some() {
@@ -1868,7 +1933,7 @@ async fn test_translation_matrix_h1_and_h2() {
     relay.shutdown_token.cancel();
 }
 
-/// Regression for OFF-101. An HTTP/2 client MAY split the `Cookie` field into
+/// An HTTP/2 client MAY split the `Cookie` field into
 /// several fields (Chrome does). RFC 9113 §8.2.3 requires an intermediary to
 /// concatenate them with `"; "` before the message enters an HTTP/1.1 context;
 /// `weave` is that intermediary toward the origin. Before the fix the origin
@@ -1886,9 +1951,9 @@ async fn test_h2_split_cookie_fields_reach_the_origin_joined() {
     let server = format!("localhost:{}", relay.addr.port());
     let ca = relay.ca_pem_path.clone();
     let opts = start_options_multi(server, &ca, &[("m", origin.addr.port())]);
-    let task = tokio::spawn(async move { weave::run_start_with_token(opts, c_tok).await });
+    let task = tokio::spawn(async move { run_start(opts, c_tok).await });
 
-    let host = derive_hostname("m", &poc_identity(), root);
+    let host = poc_hostname("m", root);
     let mut routed = false;
     for _ in 0..50 {
         if relay.registry.resolve(&host).await.is_some() {
@@ -1958,11 +2023,8 @@ async fn test_h2_split_cookie_fields_reach_the_origin_joined() {
     relay.shutdown_token.cancel();
 }
 
-fn poc_identity() -> Identity {
-    Identity {
-        person: "poc".into(),
-        machine: "laptop".into(),
-    }
+fn poc_hostname(service: &str, root: &str) -> String {
+    weaver_server::store::names::flat_hostname("poc", "laptop", service, root)
 }
 
 /// An origin that closes the TCP connection after every reply, like an
@@ -2021,9 +2083,9 @@ async fn assert_connection_close_closes(origin: TestOrigin) {
     let server_addr = format!("localhost:{}", relay.addr.port());
     let ca_path = relay.ca_pem_path.clone();
     let opts = start_options(server_addr, &ca_path, origin.port());
-    let client_task = tokio::spawn(async move { weave::run_start_with_token(opts, c_tok).await });
+    let client_task = tokio::spawn(async move { run_start(opts, c_tok).await });
 
-    let hostname = derive_hostname("web", &poc_identity(), root);
+    let hostname = poc_hostname("web", root);
     for _ in 0..50 {
         if relay.registry.resolve(&hostname).await.is_some() {
             break;
@@ -2089,7 +2151,7 @@ async fn test_client_leaving_during_cert_issuance_does_not_leave_hostname_active
     let root = "localhost";
     let temp_db = NamedTempFile::new().unwrap();
     let store = Arc::new(Store::open(temp_db.path()).await.unwrap());
-    enrol_dev_key(&store).await;
+    enrol_client_key(&store).await;
     let config = Arc::new(Config {
         tunnel_domain: root.to_string(),
         admin_domain: "relay-admin.test".to_string(),
@@ -2129,10 +2191,10 @@ async fn test_client_leaving_during_cert_issuance_does_not_leave_hostname_active
         )),
     ));
 
-    let key = client_dev_key();
+    let key = client_key();
     let (superseded_tx, _superseded_rx) = tokio::sync::oneshot::channel();
     let conn_id = registry.register_connection(key, superseded_tx);
-    let hostname = derive_hostname("web", &poc_identity(), root);
+    let hostname = poc_hostname("web", root);
 
     // Registration: the route is inserted immediately, then the call parks
     // in the ACME order.
@@ -2199,7 +2261,7 @@ async fn test_store_backed_auth_and_service_domain_persistence() {
     assert_eq!(identities.identity(&unknown_key).await, None);
     assert_eq!(identities.public_key(&unknown_key).await, None);
 
-    // 2. Start an origin and connect a real weave tunnel client with the dev key
+    // 2. Start an origin and connect a real weave tunnel client
     let origin = spawn_test_origin().await;
     let client_token = CancellationToken::new();
     let c_tok = client_token.clone();
@@ -2207,10 +2269,10 @@ async fn test_store_backed_auth_and_service_domain_persistence() {
     let ca_path = relay.ca_pem_path.clone();
     let opts = start_options_multi(server_addr, &ca_path, &[("myservice", origin.port())]);
 
-    let client_task = tokio::spawn(async move { weave::run_start_with_token(opts, c_tok).await });
+    let client_task = tokio::spawn(async move { run_start(opts, c_tok).await });
 
     // Wait until route appears in the registry
-    let expected_hostname = derive_hostname("myservice", &poc_identity(), root);
+    let expected_hostname = poc_hostname("myservice", root);
     let mut registered = false;
     for _ in 0..50 {
         if relay.registry.resolve(&expected_hostname).await.is_some() {
@@ -2223,10 +2285,10 @@ async fn test_store_backed_auth_and_service_domain_persistence() {
 
     // 3. Verify service was persisted under the connecting machine in SQLite
     let resolved = store
-        .machine_by_key(&client_dev_key())
+        .machine_by_key(&client_key())
         .await
         .unwrap()
-        .expect("enrolled dev key must resolve");
+        .expect("the enrolled client key must resolve");
     let (_pers, mach) = resolved;
 
     let svc_record = service::Entity::find()
@@ -2272,10 +2334,10 @@ async fn test_metering_attributes_traffic_per_service() {
         &ca_path,
         &[("web", web_origin.port()), ("api", api_origin.port())],
     );
-    let client_task = tokio::spawn(async move { weave::run_start_with_token(opts, c_tok).await });
+    let client_task = tokio::spawn(async move { run_start(opts, c_tok).await });
 
-    let web_host = derive_hostname("web", &poc_identity(), root);
-    let api_host = derive_hostname("api", &poc_identity(), root);
+    let web_host = poc_hostname("web", root);
+    let api_host = poc_hostname("api", root);
     for host in [&web_host, &api_host] {
         let mut registered = false;
         for _ in 0..50 {
@@ -2349,46 +2411,58 @@ async fn test_metering_attributes_traffic_per_service() {
     let _ = client_task.await;
 }
 
-/// Revoking over the mux deletes the machine, which is what makes unpairing
-/// bilateral.
+/// `weave unpair` revokes the machine over the mux, and forgets the relay only
+/// once the relay has confirmed.
 ///
-/// The authority is the handshake: the device key asks to withdraw itself, so no
-/// separate credential is needed. This drives the same `revoke_with_signer` the
-/// `weave unpair` command uses, with the in-memory development key.
+/// The authority is the handshake: the device key asks to withdraw itself, so
+/// no separate credential is needed. `revoked` is true only when the relay's
+/// `Revoked` reply arrived; the relay leaves closing the connection to the
+/// client, so the reply always comes first.
 #[tokio::test]
-async fn test_revoke_over_the_mux_deletes_the_machine() {
+async fn test_unpair_revokes_the_machine_then_forgets_the_relay() {
     let relay = spawn_test_relay("localhost").await;
-
-    // The development key is enrolled, so it resolves before the revoke and
-    // must not afterwards.
+    let edge = format!("localhost:{}", relay.addr.port());
     assert!(
         relay
             .store
-            .machine_by_key(&client_dev_key())
+            .machine_by_key(&client_key())
             .await
             .unwrap()
             .is_some(),
-        "the development key must be enrolled before the revoke"
+        "the client key must be enrolled before the revoke"
     );
 
-    let edge = format!("localhost:{}", relay.addr.port());
-    weave::revoke_with_signer(
-        &edge,
-        Some(&relay.ca_pem_path),
-        Box::new(weave::Ed25519Signer::dev()),
-    )
-    .await
-    .expect("revoke over the mux");
-
+    let (_dir, client) = paired_client(&edge, &relay.ca_pem_path).await;
+    let unpaired = client.unpair("").await.expect("unpair");
+    assert!(unpaired.revoked, "the relay must confirm the revoke");
+    assert_eq!(unpaired.host, edge);
+    assert_eq!(unpaired.remaining, 0);
+    assert!(client.relays().await.unwrap().is_empty());
     assert!(
         relay
             .store
-            .machine_by_key(&client_dev_key())
+            .machine_by_key(&client_key())
             .await
             .unwrap()
             .is_none(),
         "the machine must no longer be authorised after the revoke"
     );
+
+    // Unpairing again from a stale record: the relay no longer knows the key,
+    // so the pairing was not in effect; it is forgotten with a warning.
+    #[derive(Default)]
+    struct Warned(std::sync::atomic::AtomicBool);
+    impl weave::Reporter for Warned {
+        fn pairing_not_effective(&self, _host: &str, _reason: &str) {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    let warned = Arc::new(Warned::default());
+    let (_dir, client) = paired_client_reporting(&edge, &relay.ca_pem_path, warned.clone()).await;
+    let unpaired = client.unpair("").await.expect("unpair a stale pairing");
+    assert!(!unpaired.revoked);
+    assert!(warned.0.load(std::sync::atomic::Ordering::SeqCst));
+    assert!(client.relays().await.unwrap().is_empty());
 
     relay.shutdown_token.cancel();
 }

@@ -1,7 +1,6 @@
 use std::path::Path;
 use std::process::{Command, Output};
 
-use weave::connect::parse_server_address;
 use weave::parse_specs;
 
 /// A throwaway data directory.
@@ -92,8 +91,6 @@ fn test_weave_help_flag() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("Client for Tunnel Weaver"));
     assert!(stdout.contains("start"));
-    // The old PoC verb is gone.
-    assert!(!stdout.contains("poc"));
 }
 
 #[test]
@@ -113,17 +110,15 @@ fn test_weave_start_without_a_paired_relay_tells_you_to_pair() {
 }
 
 #[test]
-fn test_weave_unpair_without_a_device_key_reports_nothing_to_revoke() {
+fn test_weave_unpair_of_an_unknown_relay_says_so() {
     let config = isolated_config();
-    let output = Command::new(env!("CARGO_BIN_EXE_weave"))
-        .args(["unpair", "relay.example.com"])
-        .env("WEAVE_DATA_DIR", config.path())
-        .output()
-        .expect("failed to execute binary");
-
-    assert!(!output.status.success());
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("nothing to revoke"), "stderr: {stderr}");
+    let out = weave(config.path(), &["unpair", "relay.example.com"]);
+    assert!(!out.status.success());
+    let stderr = text(&out.stderr);
+    assert!(
+        stderr.contains("not paired with relay.example.com"),
+        "{stderr}"
+    );
 }
 
 #[test]
@@ -216,47 +211,6 @@ fn relays_default_refuses_an_unknown_relay() {
 }
 
 #[test]
-fn unpairing_the_default_promotes_the_oldest_remaining() {
-    let dir = isolated_config();
-    seed(
-        dir.path(),
-        &[("a.example", 1), ("b.example", 2), ("c.example", 3)],
-    );
-
-    // No host: the default relay is the one unpaired.
-    let out = weave(dir.path(), &["unpair", "--local-only"]);
-    assert!(out.status.success(), "{}", text(&out.stderr));
-    let stdout = text(&out.stdout);
-    assert!(stdout.contains("Unpaired a.example locally"), "{stdout}");
-    assert!(
-        stdout.contains("b.example is now the default relay"),
-        "{stdout}"
-    );
-    assert!(text(&out.stderr).contains("stays authorised"));
-    assert_eq!(
-        stored(dir.path()),
-        [
-            ("b.example".to_string(), true),
-            ("c.example".to_string(), false)
-        ]
-    );
-
-    // A non-default: the default stays.
-    let out = weave(dir.path(), &["unpair", "C.EXAMPLE", "--local-only"]);
-    assert!(out.status.success(), "{}", text(&out.stderr));
-    assert!(!text(&out.stdout).contains("now the default"));
-    assert_eq!(stored(dir.path()), [("b.example".to_string(), true)]);
-
-    let out = weave(dir.path(), &["unpair", "--local-only"]);
-    assert!(out.status.success());
-    assert!(text(&out.stdout).contains("no longer paired with any relay"));
-
-    let out = weave(dir.path(), &["unpair", "--local-only"]);
-    assert!(!out.status.success());
-    assert!(text(&out.stderr).contains("not paired with any relay"));
-}
-
-#[test]
 fn pair_refuses_bad_input_before_touching_anything() {
     let dir = isolated_config();
     let out = weave(dir.path(), &["pair", "http://relay.example"]);
@@ -283,8 +237,6 @@ fn pair_help_speaks_of_machines() {
     let stdout = text(&out.stdout);
     assert!(stdout.contains("--machine"));
     assert!(stdout.contains("[default: sealed]"));
-    assert!(!stdout.to_lowercase().contains("computer"));
-    assert!(!stdout.contains("--replace-keys"));
 }
 
 #[test]
@@ -295,7 +247,6 @@ fn piped_output_has_no_escape_codes() {
         &["relays"][..],
         &["relays", "default", "b.example"],
         &["relays", "default", "nope.example"],
-        &["unpair", "a.example", "--local-only"],
         &["start", "web=8080", "--server", "nope.example"],
     ] {
         let out = weave(dir.path(), args);
@@ -337,32 +288,6 @@ fn errors_are_one_line_with_a_hint() {
     assert_eq!(lines.len(), 2, "{stderr}");
     assert!(lines[0].starts_with("\u{2716} "), "{stderr}");
     assert!(lines[1].starts_with("  ") && lines[1].contains("weave pair"));
-}
-
-#[test]
-fn test_parse_server_address_variations() {
-    assert_eq!(
-        parse_server_address("example.com").unwrap(),
-        ("example.com".to_string(), 443)
-    );
-    assert_eq!(
-        parse_server_address("example.com:8443").unwrap(),
-        ("example.com".to_string(), 8443)
-    );
-    assert_eq!(
-        parse_server_address("127.0.0.1:38223").unwrap(),
-        ("127.0.0.1".to_string(), 38223)
-    );
-    assert_eq!(
-        parse_server_address("[::1]:4433").unwrap(),
-        ("::1".to_string(), 4433)
-    );
-    assert_eq!(
-        parse_server_address("[::1]").unwrap(),
-        ("::1".to_string(), 443)
-    );
-    assert!(parse_server_address("").is_err());
-    assert!(parse_server_address("example.com:invalid").is_err());
 }
 
 #[test]

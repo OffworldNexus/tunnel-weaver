@@ -25,7 +25,8 @@ pub struct Model {
     pub added_at: i64,
     pub retired_at: Option<i64>,
     /// [`REASON_REPLACED`] or [`REASON_REVOKED`]; null while the key is current.
-    pub retired_reason: Option<String>,
+    /// Empty while the key is current.
+    pub retired_reason: String,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

@@ -38,6 +38,7 @@ comfy-table = { workspace = true }
 crossterm = { workspace = true }
 ed25519-dalek = { workspace = true }
 futures-util = { workspace = true }
+hex = { workspace = true }
 http = { workspace = true }
 http-body-util = { workspace = true }
 hyper = { workspace = true }
@@ -82,6 +83,6 @@ weaver-server = { path = ".", features = ["test-util"] }
 hyper = { workspace = true, features = ["client"] }
 hyper-util = { workspace = true, features = ["client", "client-legacy"] }
 mailparse = "0.18"
-weave = { path = "../weave", features = ["dev-signer"] }
+weave = { path = "../weave" }
 weaver-abuse = { workspace = true, features = ["test-util"] }
 weaver-mux = { workspace = true, features = ["test-util"] }

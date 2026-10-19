@@ -16,8 +16,8 @@ use crate::http::{HttpHead, HttpResponseHead};
 
 /// Declared body size above which a visitor stream is opened as bulk
 /// outright, instead of waiting for the mux's own `bulk_threshold` to
-/// demote it.
-pub const BULK_THRESHOLD: u64 = 256 * 1024;
+/// demote it after that many bytes.
+const BULK_THRESHOLD: u64 = weaver_mux::DEFAULT_BULK_THRESHOLD;
 
 /// Scheduling class for a control stream. Control traffic is tiny, so the
 /// mux's bulk demotion never triggers on it.

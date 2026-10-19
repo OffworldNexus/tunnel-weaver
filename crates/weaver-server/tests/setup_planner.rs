@@ -45,7 +45,7 @@ fn test_happy_path_fresh_install() {
     );
 }
 
-// OFF-73: Unsupported host environment preflight — halts setup planning when systemd
+// Unsupported host environment preflight — halts setup planning when systemd
 // runtime (/run/systemd/system) or supported CPU architecture is absent.
 #[test]
 fn test_systemd_missing_aborts() {
@@ -92,7 +92,7 @@ fn test_existing_install_same_domain_succeeds_as_upgrade() {
     assert!(plan.is_upgrade);
 }
 
-// OFF-73: Conflicting existing installation protection — detects existing installation
+// Conflicting existing installation protection — detects existing installation
 // with a different root domain and aborts interactive setup unless confirmed.
 #[test]
 fn test_existing_install_different_domain_unconfirmed_aborts() {
@@ -182,7 +182,7 @@ fn test_dns_mismatch_aborts() {
     assert!(matches!(err, PlanAbort::DnsSetMismatch { .. }));
 }
 
-// OFF-73: Public IP and DNS consistency enforcement — rejects non-public IP ranges
+// Public IP and DNS consistency enforcement — rejects non-public IP ranges
 // (RFC1918, loopback, CGNAT, link-local, documentation, benchmarking, ULA) to prevent SSRF.
 #[test]
 fn test_dns_non_public_ip_aborts() {
@@ -219,7 +219,7 @@ fn test_dns_non_public_ip_aborts() {
     }
 }
 
-// OFF-73: Inbound port blockage abort — detects when port 80 or 443 fails to route back
+// Inbound port blockage abort — detects when port 80 or 443 fails to route back
 // to self and halts setup before requesting certificates or writing units, unless bypassed.
 #[test]
 fn test_port_80_blocked_aborts() {

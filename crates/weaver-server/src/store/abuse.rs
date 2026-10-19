@@ -1,4 +1,4 @@
-//! Persistent rate-limit buckets (WVR-135).
+//! Persistent rate-limit buckets.
 //!
 //! The GCRA arithmetic lives in `weaver-abuse`; this module is the store side:
 //! it loads each key's theoretical-arrival time, runs the pure

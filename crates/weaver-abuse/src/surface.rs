@@ -93,7 +93,7 @@ impl Surface {
 /// intentionally tiny and derived from routes the edge actually serves: the
 /// point is that no rule or budget can lock the relay out of its own health,
 /// ACME or mux endpoints — not that any host is bypassed wholesale.
-pub fn is_exempt(surface: Surface, method: &Method, path: &str) -> bool {
+pub(crate) fn is_exempt(surface: Surface, method: &Method, path: &str) -> bool {
     if method != Method::GET {
         return false;
     }

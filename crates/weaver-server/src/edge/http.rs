@@ -117,23 +117,22 @@ pub async fn handle_http_redirect(
     // answered above and is exempt; anything reaching here is ordinary redirect
     // traffic.
     let surface = Surface::cleartext();
-    let mut ctx = crate::abuse::context(
+    let ctx = crate::abuse::context(
         surface,
         &req,
         remote_addr,
         ViewId::RELAY_WEB,
-        crate::abuse::unix_ms(),
+        crate::wall_clock::unix_ms(),
     );
-    let decision = config.guard.evaluate(&mut ctx).await;
+    let decision = config.guard.evaluate(&ctx).await;
     match decision {
-        Decision::Block { verdict, rule } => debug!(
+        Decision::Block { verdict } => debug!(
             hostname = %host,
             visitor = %remote_addr.ip(),
             method = %req.method(),
             scheme = surface.scheme.as_str(),
             surface = surface.host.as_str(),
             path = %bounded_path(req.uri().path()),
-            rule,
             verdict = verdict.as_str(),
             "safety pipeline blocked request"
         ),
@@ -152,7 +151,7 @@ pub async fn handle_http_redirect(
             policy = policy.as_str(),
             "safety pipeline budget store unavailable; serving degraded"
         ),
-        Decision::Allow | Decision::Challenge { .. } | Decision::Unavailable { .. } => {}
+        Decision::Allow | Decision::Unavailable { .. } => {}
     }
     if let Some(refusal) = Refusal::from_decision(decision) {
         return Ok(refusal_response(refusal));
@@ -286,7 +285,7 @@ pub async fn run_http_server(
 /// Runs the HTTP cleartext edge server with a fully-populated [`HttpEdgeConfig`].
 ///
 /// The full form is what the daemon uses: it carries the relay-web request
-/// budget (WVR-135) in addition to the redirect/ACME configuration.
+/// budget in addition to the redirect/ACME configuration.
 pub async fn run_http_server_full(
     listener: TcpListener,
     config: HttpEdgeConfig,

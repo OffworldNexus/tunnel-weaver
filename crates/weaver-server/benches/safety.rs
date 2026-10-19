@@ -25,9 +25,9 @@ use http::Method;
 use tempfile::TempDir;
 use weaver_abuse::testing::MemoryStore;
 use weaver_abuse::{
-    Budget, BudgetPass, BudgetStore, CostRule, Gate, Host, Key, KeyKind, Pipeline, Policy,
-    PolicyId, PolicySet, Quota, Rate, RequestContext, Route, RouteTable, ScannerPass,
-    StoreErrorPolicy, Surface, ViewId, fingerprint,
+    Budget, BudgetPass, BudgetStore, Gate, Host, Key, KeyKind, Pipeline, Policy, PolicyId,
+    PolicySet, Quota, Rate, RequestContext, RouteTable, ScannerPass, StoreErrorPolicy, Surface,
+    ViewId, fingerprint,
 };
 use weaver_server::Store;
 use weaver_server::abuse::DbStore;
@@ -62,13 +62,7 @@ fn relay_policies() -> PolicySet {
 }
 
 fn relay_routes() -> RouteTable {
-    RouteTable::new(vec![(
-        ViewId::RELAY_WEB,
-        Route {
-            policy: PolicyId::RELAY_WEB,
-            cost: CostRule::Static(1),
-        },
-    )])
+    RouteTable::new(vec![(ViewId::RELAY_WEB, PolicyId::RELAY_WEB)])
 }
 
 fn memory_pipeline() -> Pipeline {
@@ -99,12 +93,9 @@ fn context<'a>(surface: Surface, view: ViewId, path: &'a str, peer: IpAddr) -> R
         method: Method::GET,
         path,
         raw_path: path,
-        body_len: None,
-        fingerprint: fingerprint(peer, None),
+        fingerprint: fingerprint(peer),
         view,
         now_ms: 1_000_000,
-        findings: Vec::new(),
-        cost: 0,
     }
 }
 
@@ -146,8 +137,8 @@ async fn run() {
     let mem_admit = measure(MEM_ITERS, MEM_ROUNDS, || {
         let memory = &memory;
         async move {
-            let mut ctx = context(apex, ViewId::RELAY_WEB, "/", peer);
-            black_box(memory.evaluate(&mut ctx).await);
+            let ctx = context(apex, ViewId::RELAY_WEB, "/", peer);
+            black_box(memory.evaluate(&ctx).await);
         }
     })
     .await;
@@ -155,8 +146,8 @@ async fn run() {
     let mem_probe = measure(MEM_ITERS, MEM_ROUNDS, || {
         let memory = &memory;
         async move {
-            let mut ctx = context(apex, ViewId::RELAY_WEB, "/.env", peer);
-            black_box(memory.evaluate(&mut ctx).await);
+            let ctx = context(apex, ViewId::RELAY_WEB, "/.env", peer);
+            black_box(memory.evaluate(&ctx).await);
         }
     })
     .await;
@@ -164,8 +155,8 @@ async fn run() {
     let scan_only = measure(MEM_ITERS, MEM_ROUNDS, || {
         let scanner_only = &scanner_only;
         async move {
-            let mut ctx = context(apex, ViewId::RELAY_WEB, "/", peer);
-            black_box(scanner_only.evaluate(&mut ctx).await);
+            let ctx = context(apex, ViewId::RELAY_WEB, "/", peer);
+            black_box(scanner_only.evaluate(&ctx).await);
         }
     })
     .await;
@@ -173,8 +164,8 @@ async fn run() {
     let scan_tunnel = measure(MEM_ITERS, MEM_ROUNDS, || {
         let memory = &memory;
         async move {
-            let mut ctx = context(tunneled, ViewId::TUNNEL, "/app", peer);
-            black_box(memory.evaluate(&mut ctx).await);
+            let ctx = context(tunneled, ViewId::TUNNEL, "/app", peer);
+            black_box(memory.evaluate(&ctx).await);
         }
     })
     .await;
@@ -203,8 +194,8 @@ async fn run() {
     let sqlite_admit = measure(DB_ITERS, DB_ROUNDS, || {
         let sqlite = &sqlite;
         async move {
-            let mut ctx = context(apex, ViewId::RELAY_WEB, "/", peer);
-            black_box(sqlite.evaluate(&mut ctx).await);
+            let ctx = context(apex, ViewId::RELAY_WEB, "/", peer);
+            black_box(sqlite.evaluate(&ctx).await);
         }
     })
     .await;

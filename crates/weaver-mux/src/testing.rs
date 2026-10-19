@@ -3,7 +3,7 @@
 //! Nothing here touches the wall clock or OS randomness: every helper is
 //! seeded so a failing test reproduces byte-for-byte.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
 use std::time::{Duration, Instant};
 
@@ -79,13 +79,6 @@ impl FakeClock {
     /// Move the clock forward.
     pub fn advance(&mut self, by: Duration) -> Instant {
         self.now += by;
-        self.now
-    }
-
-    /// Jump the clock to exactly `to` (must not go backwards).
-    pub fn set(&mut self, to: Instant) -> Instant {
-        assert!(to >= self.now, "FakeClock cannot go backwards");
-        self.now = to;
         self.now
     }
 }
@@ -189,31 +182,18 @@ impl Signer for FailingSigner {
 
 /// `Verifier` backed by a map. Keys can be marked invalid to exercise the
 /// `still_valid` re-check.
-#[derive(Default)]
 pub struct MapVerifier {
     keys: HashMap<KeyId, PublicKey>,
-    revoked: std::collections::HashSet<KeyId>,
-    /// Number of `still_valid` calls, for asserting the reverify cadence.
-    pub still_valid_calls: usize,
+    revoked: HashSet<KeyId>,
 }
 
 impl MapVerifier {
-    /// Empty verifier: every key is unknown.
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Register a key.
-    pub fn insert(&mut self, id: KeyId, pk: PublicKey) -> &mut Self {
-        self.keys.insert(id, pk);
-        self
-    }
-
-    /// Convenience: build a verifier that knows exactly this signer's key.
+    /// A verifier that knows exactly this one key.
     pub fn with_key(id: KeyId, pk: PublicKey) -> Self {
-        let mut v = Self::new();
-        v.insert(id, pk);
-        v
+        Self {
+            keys: HashMap::from([(id, pk)]),
+            revoked: HashSet::new(),
+        }
     }
 
     /// Make `still_valid` return `false` for this key from now on.
@@ -229,7 +209,6 @@ impl Verifier for MapVerifier {
     }
 
     async fn still_valid(&mut self, key_id: &KeyId) -> bool {
-        self.still_valid_calls += 1;
         !self.revoked.contains(key_id)
     }
 }

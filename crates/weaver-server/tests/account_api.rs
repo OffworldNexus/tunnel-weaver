@@ -1469,7 +1469,7 @@ impl Cli {
                 .expect("the channel is open")
                 .expect("a WebSocket message");
             if let Message::Text(text) = message {
-                return pair::decode_json(&text).expect("a server message");
+                return serde_json::from_str(&text).expect("a server message");
             }
         }
     }
@@ -1492,7 +1492,7 @@ impl Cli {
             key_id,
             target,
         };
-        self.send_text(pair::encode_json(&begin).unwrap()).await;
+        self.send_text(serde_json::to_string(&begin).unwrap()).await;
     }
 
     /// Challenge, solve, `Begin`: the relay's next message.
@@ -1595,12 +1595,7 @@ fn failure(message: ServerMessage) -> FailureCode {
 }
 
 /// Pairs a new machine for `browser`'s account and returns its id.
-async fn pair_new(
-    fixture: &Fixture,
-    browser: &Browser,
-    key_id: KeyId,
-    person_slug: Option<&str>,
-) -> i32 {
+async fn pair_new(fixture: &Fixture, browser: &Browser, key_id: KeyId, person_slug: &str) -> i32 {
     let (mut cli, handle) = Cli::handle(
         fixture,
         key_id,
@@ -1615,7 +1610,7 @@ async fn pair_new(
             serde_json::json!({ "handle": handle, "person_slug": person_slug }),
         )
         .await;
-    assert_eq!(reply, serde_json::json!({ "ok": true }));
+    assert_eq!(reply, serde_json::json!({ "ok": true, "message": "" }));
     match cli.recv().await {
         ServerMessage::Approved { machine_id, .. } => machine_id,
         other => panic!("expected approval, got {other:?}"),
@@ -1627,7 +1622,7 @@ async fn pairing_proves_work_before_anything_else() {
     let fixture = setup().await;
     let browser = Browser::new(&fixture, "Alice", "alice@example.com").await;
     let paired = device_key(1);
-    pair_new(&fixture, &browser, paired, Some("alice")).await;
+    pair_new(&fixture, &browser, paired, "alice").await;
 
     // A wrong solution for an already-paired key: the proof is what is
     // refused, so the channel says nothing about the key.
@@ -1734,7 +1729,7 @@ async fn pairing_a_new_machine_creates_the_person_and_the_machine() {
     assert_eq!(
         browser.lookup(&fixture, &handle).await,
         LookupResponse::Waiting {
-            fingerprint: pairing::fingerprint(&key),
+            fingerprint: key.to_string(),
             account: "Rémy Sanchez".into(),
             person: Proposed {
                 name: "remysanchez".into(),
@@ -1771,7 +1766,7 @@ async fn pairing_a_new_machine_creates_the_person_and_the_machine() {
             serde_json::json!({ "handle": handle, "person_slug": "remy", "machine_name": "Mac Book" }),
         )
         .await;
-    assert_eq!(accepted, serde_json::json!({ "ok": true }));
+    assert_eq!(accepted, serde_json::json!({ "ok": true, "message": "" }));
     let ServerMessage::Approved {
         machine_id,
         person,
@@ -1830,7 +1825,7 @@ async fn pairing_a_new_machine_creates_the_person_and_the_machine() {
     let accepted = browser
         .accept(&fixture, serde_json::json!({ "handle": handle }))
         .await;
-    assert_eq!(accepted, serde_json::json!({ "ok": true }));
+    assert_eq!(accepted, serde_json::json!({ "ok": true, "message": "" }));
     assert!(matches!(
         cli.recv().await,
         ServerMessage::Approved { machine, .. } if machine == "macbook2"
@@ -1842,7 +1837,7 @@ async fn pairing_an_existing_machine_moves_it_onto_the_new_key() {
     let fixture = setup().await;
     let browser = Browser::new(&fixture, "Alice", "alice@example.com").await;
     let old = device_key(1);
-    let machine_id = pair_new(&fixture, &browser, old, Some("alice")).await;
+    let machine_id = pair_new(&fixture, &browser, old, "alice").await;
 
     let new = device_key(2);
     let (mut cli, handle) = Cli::handle(&fixture, new, Target::Existing { machine_id }).await;
@@ -1876,7 +1871,7 @@ async fn pairing_an_existing_machine_moves_it_onto_the_new_key() {
     let accepted = browser
         .accept(&fixture, serde_json::json!({ "handle": handle }))
         .await;
-    assert_eq!(accepted, serde_json::json!({ "ok": true }));
+    assert_eq!(accepted, serde_json::json!({ "ok": true, "message": "" }));
     assert_eq!(
         cli.recv().await,
         ServerMessage::Approved {
@@ -1898,7 +1893,7 @@ async fn pairing_someone_elses_machine_is_refused() {
     let fixture = setup().await;
     let alice = Browser::new(&fixture, "Alice", "alice@example.com").await;
     let alice_key = device_key(1);
-    let machine_id = pair_new(&fixture, &alice, alice_key, Some("alice")).await;
+    let machine_id = pair_new(&fixture, &alice, alice_key, "alice").await;
     let mallory = Browser::new(&fixture, "Mallory", "mallory@example.com").await;
 
     // Mallory's browser is told it is not hers, and cannot accept it anyway.
@@ -1961,7 +1956,7 @@ async fn pairing_rejected_in_the_browser_tells_the_cli() {
     .await;
     assert_eq!(
         browser.reject(&fixture, &handle).await,
-        serde_json::json!({ "ok": true })
+        serde_json::json!({ "ok": true, "message": "" })
     );
     assert_eq!(failure(cli.recv().await), FailureCode::Rejected);
     assert_eq!(

@@ -115,7 +115,7 @@ impl AccountRuntime {
             passwords: Arc::new(passwords),
             sessions,
             config: config.clone(),
-            pairings: pairing::Pairings::new(),
+            pairings: pairing::Pairings::default(),
             base_url,
             dummy_hash,
             support_email,

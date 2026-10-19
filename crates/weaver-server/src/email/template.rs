@@ -240,7 +240,7 @@ impl EmailTemplate for Otp {
     }
 }
 
-// --- The email verification template (WVR-36) ------------------------------
+// --- The email verification template ------------------------------
 
 /// `verification.mjml`: the confirm-address body.
 #[derive(Template)]
@@ -333,7 +333,7 @@ impl EmailTemplate for Verification {
     }
 }
 
-// --- The password-reset template (WVR-41) ----------------------------------
+// --- The password-reset template ----------------------------------
 
 /// `reset.mjml`: the choose-a-new-password body.
 #[derive(Template)]
@@ -421,7 +421,7 @@ impl EmailTemplate for Reset {
     }
 }
 
-// --- The password-changed notification template (WVR-50) -------------------
+// --- The password-changed notification template -------------------
 
 /// `password-changed.mjml`: the security-notification body.
 #[derive(Template)]
@@ -448,7 +448,7 @@ const PASSWORD_CHANGED_SUBJECT: &str = "Your password was changed";
 const PASSWORD_CHANGED_PREVIEW: &str = "If this wasn't you, here's what to do.";
 const PASSWORD_CHANGED_HEADING: &str = "Your password was changed";
 
-/// The "your password was changed" security notification (WVR-50).
+/// The "your password was changed" security notification.
 ///
 /// Sent only *after* a change has committed — whether a reset or a signed-in
 /// change — so the copy can never describe an event that rolled back.
@@ -514,7 +514,7 @@ impl EmailTemplate for PasswordChanged {
     }
 }
 
-// --- The welcome template (WVR-36) -----------------------------------------
+// --- The welcome template -----------------------------------------
 /// `welcome.mjml`: the account-ready body.
 #[derive(Template)]
 #[template(path = "email/welcome.mjml", escape = "html", ext = "mjml")]

@@ -11,35 +11,6 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-/// HMAC digest algorithm used to sign a challenge.
-///
-/// Only SHA-256 is produced by this engine; the enum exists so a challenge
-/// signed by a peer with another digest still deserialises (and is then refused
-/// by verification if unsupported).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub enum HmacAlgorithm {
-    /// HMAC-SHA-256 (the engine's only signing algorithm).
-    #[serde(rename = "SHA-256")]
-    #[default]
-    Sha256,
-    /// HMAC-SHA-384.
-    #[serde(rename = "SHA-384")]
-    Sha384,
-    /// HMAC-SHA-512.
-    #[serde(rename = "SHA-512")]
-    Sha512,
-}
-
-/// How the counter is appended to the nonce to form the KDF password.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum CounterMode {
-    /// 4 big-endian bytes — the v2 default, used by this engine.
-    #[default]
-    Uint32,
-    /// Decimal UTF-8, for v1 compatibility.
-    String,
-}
-
 /// The signed parameters of a challenge.
 ///
 /// Serialises in alphabetical key order via the engine's canonical form; the
@@ -62,17 +33,8 @@ pub struct ChallengeParameters {
     /// Hex prefix the derived key must start with.
     #[serde(rename = "keyPrefix")]
     pub key_prefix: String,
-    /// Deterministic-mode signature of the derived key (unused here).
-    #[serde(rename = "keySignature", skip_serializing_if = "Option::is_none")]
-    pub key_signature: Option<String>,
-    /// Memory-hard algorithm parameter (unused here).
-    #[serde(rename = "memoryCost", skip_serializing_if = "Option::is_none")]
-    pub memory_cost: Option<u32>,
     /// Random per-challenge nonce (hex), the KDF password prefix.
     pub nonce: String,
-    /// Memory-hard algorithm parameter (unused here).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub parallelism: Option<u32>,
     /// Random per-challenge salt (hex).
     pub salt: String,
 }
@@ -111,9 +73,8 @@ pub struct Payload {
 
 /// Why a payload was refused.
 ///
-/// Fieldless so it can ride inside [`crate::Decision`]; the API layer maps each
-/// variant to a status/message. Expiry, signature presence and signature
-/// validity are checked before any key derivation, so a refusal here never
+/// The API layer maps each variant to a status/message. Expiry, signature
+/// presence and signature validity are checked before any key derivation, so a refusal here never
 /// implies the relay did unbounded work.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum ProofError {

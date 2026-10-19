@@ -23,12 +23,12 @@ use crate::error::{CloseReason, ProtocolError, RejectCode};
 use crate::frame::FrameType;
 
 /// Lowest protocol version this crate accepts.
-pub const MIN_VERSION: u16 = 1;
+pub(crate) const MIN_VERSION: u16 = 1;
 /// Highest protocol version this crate speaks.
-pub const MAX_VERSION: u16 = 1;
+pub(crate) const MAX_VERSION: u16 = 1;
 
 /// Domain-separation prefix of the handshake transcript.
-pub const TRANSCRIPT_PREFIX: &[u8] = b"weaver-mux-v1";
+pub(crate) const TRANSCRIPT_PREFIX: &[u8] = b"weaver-mux-v1";
 
 /// DATA payload flag: the remaining bytes are a zstd frame.
 pub const DATA_FLAG_COMPRESSED: u8 = 0x01;
@@ -37,7 +37,7 @@ pub const DATA_FLAG_COMPRESSED: u8 = 0x01;
 pub const DATA_FLAG_MORE: u8 = 0x02;
 /// Every DATA flag bit this version understands; anything else is a
 /// decode error.
-pub const DATA_FLAGS_KNOWN: u8 = DATA_FLAG_COMPRESSED | DATA_FLAG_MORE;
+pub(crate) const DATA_FLAGS_KNOWN: u8 = DATA_FLAG_COMPRESSED | DATA_FLAG_MORE;
 
 /// The single identity concept the mux knows about: the public key that
 /// signed the handshake. The variant is the algorithm; the bytes are the raw
@@ -48,6 +48,57 @@ pub enum KeyId {
     Ed25519([u8; 32]),
     /// ECDSA P-256 public key, SEC1 compressed encoding.
     P256(#[serde(with = "BigArray")] [u8; 33]),
+}
+
+/// The one text form of a key, `p256:<hex>` or `ed25519:<hex>` (lowercase
+/// hex of the public key bytes): what the relay stores and shows, and what
+/// the client remembers.
+impl std::fmt::Display for KeyId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (algorithm, bytes): (&str, &[u8]) = match self {
+            Self::P256(bytes) => ("p256", bytes),
+            Self::Ed25519(bytes) => ("ed25519", bytes),
+        };
+        f.write_str(algorithm)?;
+        f.write_str(":")?;
+        bytes.iter().try_for_each(|b| write!(f, "{b:02x}"))
+    }
+}
+
+/// Text that is not a [`KeyId`]'s [`Display`](std::fmt::Display) form.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("not a key: expected p256:<66 hex> or ed25519:<64 hex>")]
+pub struct ParseKeyIdError;
+
+impl std::str::FromStr for KeyId {
+    type Err = ParseKeyIdError;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        fn nibble(c: u8) -> Result<u8, ParseKeyIdError> {
+            match c {
+                b'0'..=b'9' => Ok(c - b'0'),
+                b'a'..=b'f' => Ok(c - b'a' + 10),
+                _ => Err(ParseKeyIdError),
+            }
+        }
+        let (algorithm, hex) = text.split_once(':').ok_or(ParseKeyIdError)?;
+        let hex = hex.as_bytes();
+        if hex.len() % 2 != 0 {
+            return Err(ParseKeyIdError);
+        }
+        let (pairs, _) = hex.as_chunks::<2>();
+        let bytes = pairs
+            .iter()
+            .map(|&[hi, lo]| Ok(nibble(hi)? << 4 | nibble(lo)?))
+            .collect::<Result<Vec<u8>, _>>()?;
+        match algorithm {
+            "p256" => Ok(Self::P256(bytes.try_into().map_err(|_| ParseKeyIdError)?)),
+            "ed25519" => Ok(Self::Ed25519(
+                bytes.try_into().map_err(|_| ParseKeyIdError)?,
+            )),
+            _ => Err(ParseKeyIdError),
+        }
+    }
 }
 
 /// A handshake signature. The variant must match the [`KeyId`] variant.
@@ -201,6 +252,31 @@ mod tests {
             code: crate::error::CloseCode::KeyRevoked,
             message: Some("bye".into()),
         });
+    }
+
+    #[test]
+    fn key_text_round_trips() {
+        let mut p256 = [0u8; 33];
+        p256[0] = 0x02;
+        p256[32] = 0xab;
+        for key in [KeyId::P256(p256), KeyId::Ed25519([0x42; 32])] {
+            let text = key.to_string();
+            assert_eq!(text.parse::<KeyId>(), Ok(key), "{text}");
+        }
+        let text = KeyId::P256(p256).to_string();
+        assert!(text.starts_with("p256:02") && text.ends_with("ab"));
+        assert_eq!(text.len(), "p256:".len() + 66);
+        for bad in [
+            "p256:zz",
+            "rsa:00",
+            "p256",
+            "p256:02",
+            &text.to_uppercase(),
+            &format!("{text}0"),
+            &format!("ed25519:{}", "é".repeat(32)),
+        ] {
+            assert_eq!(bad.parse::<KeyId>(), Err(ParseKeyIdError), "{bad}");
+        }
     }
 
     #[test]

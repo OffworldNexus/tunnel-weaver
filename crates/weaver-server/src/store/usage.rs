@@ -23,12 +23,24 @@ impl Store {
     /// already-written one — and the stored `unused_ms` is produced by
     /// [`unused_ms_from_open_ms`], the single place the inversion happens.
     /// `open_ms` outside `0..=60_000` is rejected, never silently clamped.
+    ///
+    /// Rows of a service deleted meanwhile (its machine was revoked) are
+    /// dropped: there is nothing left to bill, and one dangling `service_id`
+    /// must not fail the whole batch on its foreign key, forever.
     pub(crate) async fn upsert_usage_batch(&self, rows: &[UsageRow]) -> Result<(), StoreError> {
         if rows.is_empty() {
             return Ok(());
         }
+        let txn = self.db.begin().await?;
+        let live: Vec<i32> = service::Entity::find()
+            .select_only()
+            .column(service::Column::Id)
+            .filter(service::Column::Id.is_in(rows.iter().map(|row| row.service_id)))
+            .into_tuple()
+            .all(&txn)
+            .await?;
         let mut models = Vec::with_capacity(rows.len());
-        for row in rows {
+        for row in rows.iter().filter(|row| live.contains(&row.service_id)) {
             models.push(usage::ActiveModel {
                 service_id: Set(row.service_id),
                 minute: Set(row.minute),
@@ -71,7 +83,9 @@ impl Store {
                 Expr::col(usage::Column::UnusedMs).add(excluded(usage::Column::UnusedMs)),
             );
 
-        let txn = self.db.begin().await?;
+        if models.is_empty() {
+            return Ok(());
+        }
         usage::Entity::insert_many(models)
             .on_conflict(conflict)
             .exec_without_returning(&txn)
@@ -344,6 +358,46 @@ mod tests {
             1,
             "the rejected batch must not have written a row"
         );
+    }
+
+    #[tokio::test]
+    async fn rows_of_a_revoked_machine_do_not_sink_the_batch() {
+        let store = Store::connect("sqlite::memory:").await.expect("connect");
+        let alice = store.create_test_person("alice").await.expect("person");
+        let keep_key = weaver_mux::KeyId::Ed25519([1; 32]);
+        let gone_key = weaver_mux::KeyId::Ed25519([2; 32]);
+        let laptop = store
+            .create_machine(alice.id, "laptop", &keep_key)
+            .await
+            .expect("machine");
+        let desktop = store
+            .create_machine(alice.id, "desktop", &gone_key)
+            .await
+            .expect("machine");
+        let kept = store.get_or_create_service(laptop.id, "web").await.unwrap();
+        let gone = store
+            .get_or_create_service(desktop.id, "web")
+            .await
+            .unwrap();
+        store.revoke_machine(&gone_key).await.unwrap();
+
+        let row = |service_id| UsageRow {
+            service_id,
+            minute: 100,
+            bytes_in: 1,
+            bytes_out: 1,
+            tunnel_in: 1,
+            tunnel_out: 1,
+            requests: 1,
+            open_ms: 60_000,
+        };
+        store
+            .upsert_usage_batch(&[row(kept.id), row(gone.id)])
+            .await
+            .expect("the live service's row is still written");
+        let totals = store.query_usage(None, None, 0, 1_000).await.unwrap();
+        assert_eq!(totals.len(), 1);
+        assert_eq!(totals[0].machine, "laptop");
     }
 
     #[tokio::test]

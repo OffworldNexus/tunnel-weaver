@@ -83,7 +83,7 @@ async fn spawn_test_https_server(tunnel_domain: &str) -> (std::net::SocketAddr, 
     (addr, shutdown_token)
 }
 
-// OFF-70: Security rule — enforce strict HTTPS serving and hardened security headers
+// Security rule — enforce strict HTTPS serving and hardened security headers
 // (CSP, X-Frame-Options, X-Content-Type-Options, Referrer-Policy) on root domain responses.
 #[tokio::test]
 async fn test_https_tunnel_domain_endpoints() {
@@ -145,7 +145,7 @@ async fn test_https_tunnel_domain_endpoints() {
     shutdown_token.cancel();
 }
 
-// OFF-70: Failure mode — subdomain requests to unmapped tunnels return a branded 404 page
+// Failure mode — subdomain requests to unmapped tunnels return a branded 404 page
 // rather than leaking internal routing details or serving the root domain.
 #[tokio::test]
 async fn test_https_subdomain_branded_404() {
@@ -176,7 +176,7 @@ async fn test_https_subdomain_branded_404() {
     shutdown_token.cancel();
 }
 
-// OFF-70: Security rule — reject requests with mismatched TLS SNI and Host header,
+// Security rule — reject requests with mismatched TLS SNI and Host header,
 // unrecognized domains, or IP literals over HTTPS with status 421 Misdirected Request.
 #[tokio::test]
 async fn test_https_421_misdirected_requests() {
@@ -227,7 +227,7 @@ async fn test_https_421_misdirected_requests() {
     shutdown_token.cancel();
 }
 
-// OFF-86: RFC 9112 §3.2 — a request with no Host, more than one Host line,
+// RFC 9112 §3.2 — a request with no Host, more than one Host line,
 // or a malformed Host value MUST get 400, not be routed on a guess (and not
 // 421, which is for a well-formed host the edge does not serve).
 #[tokio::test]
@@ -283,7 +283,7 @@ async fn test_https_400_missing_duplicate_or_invalid_host() {
     shutdown_token.cancel();
 }
 
-// OFF-86: RFC 9113 §8.3.1 — on h2 a `host` header that disagrees with
+// RFC 9113 §8.3.1 — on h2 a `host` header that disagrees with
 // `:authority` is malformed (400); one that agrees is fine.
 #[tokio::test]
 async fn test_https_h2_host_authority_mismatch_is_400() {
@@ -382,7 +382,7 @@ async fn https_request(addr: std::net::SocketAddr, sni: &str, raw_request: &str)
     resp
 }
 
-// WVR-134: The relay's own web endpoints (tunnel apex and admin host) refuse
+// The relay's own web endpoints (tunnel apex and admin host) refuse
 // the same scanner probes the tunnelled surface already refuses, before any
 // handler runs — while readiness and ordinary paths stay reachable.
 #[tokio::test]
@@ -518,7 +518,7 @@ async fn spawn_admin_https_server(
     (addr, shutdown_token)
 }
 
-// WVR-134: the admin host's web surface gets the same firewall the tunnel
+// the admin host's web surface gets the same firewall the tunnel
 // surfaces get, with its own policy context (it never serves the mux path).
 #[tokio::test]
 async fn test_https_admin_refuses_scanner_probes() {

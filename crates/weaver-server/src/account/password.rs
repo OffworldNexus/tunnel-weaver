@@ -1,4 +1,4 @@
-//! Password policy: Argon2id hashing and breach screening (WVR-36).
+//! Password policy: Argon2id hashing and breach screening.
 //!
 //! Raw passwords are never persisted; the store keeps only the PHC-encoded
 //! Argon2id string, which embeds the algorithm, version, work parameters and

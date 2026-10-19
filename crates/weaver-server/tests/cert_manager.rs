@@ -16,7 +16,7 @@ use weaver_server::cert::providers::{
 };
 use weaver_server::cert::resolver::CertResolver;
 use weaver_server::cert::state::CertState;
-use weaver_server::cert::{CertManager, PROVIDERS, record_cert_event};
+use weaver_server::cert::{CertManager, PROVIDERS};
 use weaver_server::config::Config;
 use weaver_server::edge::https::run_https_server;
 use weaver_server::edge::tls::create_server_config;
@@ -165,14 +165,14 @@ fn test_providers_catalog() {
     assert!(table.contains("zerossl"));
     assert!(table.contains("custom"));
 
-    // Every catalogued provider is wildcard-capable (OFF-190 issues the tunnel
+    // Every catalogued provider is wildcard-capable (the relay issues the tunnel
     // wildcard unconditionally); the catalog no longer models the distinction.
     let letsencrypt = find_provider("letsencrypt").expect("letsencrypt provider");
     assert_eq!(letsencrypt.id, "letsencrypt");
     assert!(PROVIDERS.iter().all(|p| !p.id.is_empty()));
 }
 
-// OFF-79: Public TLS handshakes for uncertified, unknown, or missing SNI terminate immediately
+// Public TLS handshakes for uncertified, unknown, or missing SNI terminate immediately
 // at the TCP level without completing a handshake or serving placeholder certificates.
 #[tokio::test]
 async fn test_cert_resolver_placeholder_and_hsts() {
@@ -249,7 +249,7 @@ async fn test_cert_resolver_placeholder_and_hsts() {
     shutdown_token.cancel();
 }
 
-// OFF-79: In-progress certificate issuance holds incoming client TLS handshakes and completes
+// In-progress certificate issuance holds incoming client TLS handshakes and completes
 // successfully once the certificate is provisioned within the hold window.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_resolver_handshake_hold_unblocks_on_cert_insert() {
@@ -338,7 +338,6 @@ async fn test_sqlite_caching_and_server_restart_no_reorder() {
                 key_pem: key_pem.clone(),
                 not_before: 1_690_000_000,
                 not_after: 1_790_000_000, // valid until far in future
-                issuer: None,
                 directory: "https://acme-staging-v02.api.letsencrypt.org/directory".into(),
                 obtained_at: 1_700_000_000,
                 validation: "dns-01".to_string(),
@@ -452,7 +451,6 @@ async fn test_forced_expiration_triggers_renewal_flow_and_event() {
                 key_pem: key_pem.clone(),
                 not_before: 1_600_000_000,
                 not_after: 1_710_000_000,
-                issuer: None,
                 directory: "https://acme-staging-v02.api.letsencrypt.org/directory".into(),
                 obtained_at: 1_600_000_000,
                 validation: "dns-01".to_string(),
@@ -476,15 +474,10 @@ async fn test_forced_expiration_triggers_renewal_flow_and_event() {
     ));
 
     // Record renewal event
-    record_cert_event(
-        &store,
-        "example.com",
-        1_700_000_000,
-        "renewed",
-        Some("hot-swapped"),
-    )
-    .await
-    .unwrap();
+    store
+        .record_cert_event("example.com", 1_700_000_000, "renewed", "hot-swapped")
+        .await
+        .unwrap();
 
     let event_count = store
         .get_cert_events("example.com", 100)
@@ -575,7 +568,7 @@ async fn test_concurrent_ensure_deduplication() {
     assert!(res2.is_err());
 }
 
-// OFF-79: Incoming TLS handshake for a completely unknown SNI domain terminates immediately
+// Incoming TLS handshake for a completely unknown SNI domain terminates immediately
 // at the TCP level without completing a TLS handshake.
 #[tokio::test]
 async fn test_strict_tls_unknown_sni_terminates_tcp() {
@@ -613,7 +606,7 @@ async fn test_strict_tls_unknown_sni_terminates_tcp() {
     shutdown_token.cancel();
 }
 
-// OFF-79: Incoming TLS handshake with missing SNI terminates immediately at the TCP level.
+// Incoming TLS handshake with missing SNI terminates immediately at the TCP level.
 #[tokio::test]
 async fn test_strict_tls_missing_sni_terminates_tcp() {
     let resolver = Arc::new(CertResolver::new("example.com"));
@@ -645,7 +638,7 @@ async fn test_strict_tls_missing_sni_terminates_tcp() {
     shutdown_token.cancel();
 }
 
-// OFF-79: Incoming TLS handshake for a hostname whose certificate order has failed terminates
+// Incoming TLS handshake for a hostname whose certificate order has failed terminates
 // immediately at the TCP level without completing a TLS handshake.
 #[tokio::test]
 async fn test_strict_tls_failed_order_terminates_tcp() {
@@ -686,7 +679,7 @@ async fn test_strict_tls_failed_order_terminates_tcp() {
     shutdown_token.cancel();
 }
 
-// OFF-79: Incoming TLS handshake for a hostname in the Renewing state with an existing unexpired
+// Incoming TLS handshake for a hostname in the Renewing state with an existing unexpired
 // certificate completes immediately, serving the existing certificate without holding.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_strict_tls_renewing_serves_immediately_without_hold() {
@@ -741,7 +734,7 @@ async fn test_strict_tls_renewing_serves_immediately_without_hold() {
     shutdown_token.cancel();
 }
 
-// OFF-79: Incoming TLS handshake for a hostname whose certificate order exceeds the hold timeout
+// Incoming TLS handshake for a hostname whose certificate order exceeds the hold timeout
 // terminates at the TCP level without completing a TLS handshake.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_strict_tls_hold_timeout_terminates_tcp() {

@@ -1,4 +1,4 @@
-//! `email_identity` table: the account/address association (WVR-36).
+//! `email_identity` table: the account/address association.
 //!
 //! The unique `lookup_key` is the database-level guarantee that an address
 //! belongs to exactly one account, even when activations race. `email` keeps the

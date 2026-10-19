@@ -21,6 +21,7 @@ use tokio::sync::Mutex;
 use tokio_rustls::TlsConnector;
 use tokio_util::sync::CancellationToken;
 use weave::{ServiceSpec, StartOptions, Target};
+use weaver_mux::testing::Ed25519TestSigner;
 
 use weaver_server::cert::CertManager;
 use weaver_server::cert::clock::SystemClock;
@@ -31,6 +32,28 @@ use weaver_server::edge::http::run_http_server;
 use weaver_server::edge::https::run_https_server;
 use weaver_server::edge::tls::create_server_config;
 use weaver_server::store::Store;
+
+/// The seed of the client's device key.
+const CLIENT_SEED: u64 = 7;
+
+/// A key agent holding the client's in-memory device key.
+struct TestAgent;
+
+#[async_trait::async_trait]
+impl weave::KeyAgent for TestAgent {
+    async fn open(
+        &self,
+        _remembered: Option<weaver_mux::KeyId>,
+        _provision: weave::Provision,
+        _reporter: Arc<dyn weave::Reporter>,
+    ) -> Result<weave::OpenedKey, weave::KeyError> {
+        Ok(weave::OpenedKey {
+            signer: Box::new(Ed25519TestSigner::from_seed(CLIENT_SEED)),
+            level: weave::SecurityLevel::File,
+            created: false,
+        })
+    }
+}
 
 const PEBBLE_DIR: &str = "https://localhost:14000/dir";
 const PEBBLE_ROOT_CA: &str = include_str!("../../../ci/pebble/pebble.minica.pem");
@@ -45,7 +68,7 @@ async fn is_pebble_available() -> bool {
         .is_ok()
 }
 
-/// Serves the relay's authoritative DNS zone (OFF-190) on the port Pebble is
+/// Serves the relay's authoritative DNS zone on the port Pebble is
 /// pointed at (`-dnsserver 127.0.0.1:1053`). The responder reads DNS-01 TXT
 /// values straight from the shared `Store`, so the challenge the ACME engine
 /// publishes is visible to Pebble without a test-only stub.
@@ -340,13 +363,14 @@ async fn test_pebble_e2e_tunnel_registration_and_proxying() {
     let dir = tempdir().unwrap();
     let db_path = dir.path().join("weaver.db");
     let store = Arc::new(Store::open(&db_path).await.unwrap());
-    // The development key the client signs with, as `poc`'s machine `laptop`.
+    // The client's in-memory device key, as `poc`'s machine `laptop`.
+    let client_key = {
+        use weaver_mux::auth::Signer as _;
+        Ed25519TestSigner::from_seed(CLIENT_SEED).key_id()
+    };
     let poc = store.create_test_person("poc").await.unwrap();
     store
-        .create_machine(poc.id, "laptop", &{
-            use weaver_mux::auth::Signer as _;
-            weave::Ed25519Signer::dev().key_id()
-        })
+        .create_machine(poc.id, "laptop", &client_key)
         .await
         .unwrap();
 
@@ -501,22 +525,27 @@ async fn test_pebble_e2e_tunnel_registration_and_proxying() {
     let client_token = CancellationToken::new();
     let c_tok = client_token.clone();
     let ca_path = ca_file.path().to_path_buf();
+    let server = format!("pebble.test:{https_port}");
     let opts = StartOptions {
-        specs: vec![ServiceSpec {
-            service: "web".to_string(),
-            target: Target::parse(&format!("http://127.0.0.1:{origin_port}")).unwrap(),
-        }],
-        server: format!("pebble.test:{https_port}"),
-        signer: weave::SignerSpec::Dev,
-        insecure_root_ca: Some(ca_path),
-        insecure_targets: Vec::new(),
-        preserve_host: Vec::new(),
-        no_rewrite: Vec::new(),
-        append_forwarded: Vec::new(),
-        quiet: true,
-        verbose: false,
+        server: server.clone(),
+        services: vec![ServiceSpec::new(
+            "web",
+            Target::parse(&format!("http://127.0.0.1:{origin_port}")).unwrap(),
+        )],
     };
-    let client_task = tokio::spawn(async move { weave::run_start_with_token(opts, c_tok).await });
+    let client_dir = tempdir().unwrap();
+    let client_store = weave::Store::open(client_dir.path().join("weave.db"))
+        .await
+        .unwrap();
+    let fingerprint = client_key.to_string();
+    client_store
+        .record_pairing(&server, 1, &fingerprint)
+        .await
+        .unwrap();
+    client_store.set_device_key(&fingerprint).await.unwrap();
+    let client = weave::Client::new(client_store, Box::new(TestAgent), Arc::new(weave::Silent))
+        .with_root_ca(Some(ca_path));
+    let client_task = tokio::spawn(async move { client.start(&opts, c_tok).await });
 
     // Wait for certificate to be issued and service registered
     let target_hostname = "poc-laptop-web.pebble.test";

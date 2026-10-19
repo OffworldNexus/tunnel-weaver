@@ -22,7 +22,8 @@ use std::time::Duration;
 use sea_orm::sea_query::{Expr, OnConflict};
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectOptions, ConnectionTrait, Database, DatabaseConnection,
-    DbBackend, EntityTrait, QueryFilter, QueryOrder, QuerySelect, Set, Statement, TransactionTrait,
+    DbBackend, EntityTrait, QueryFilter, QueryOrder, QuerySelect, Select, Set, Statement,
+    TransactionTrait,
 };
 use sea_orm_migration::MigratorTrait;
 
@@ -30,6 +31,7 @@ pub use error::StoreError;
 pub use migration::Migrator;
 
 use crate::config::{Config, ConfigError};
+use crate::wall_clock::unix_secs;
 use entity::{
     acme_account, cert_event, certificate, challenge, config, domain, machine, machine_key_log,
     person, service,
@@ -164,10 +166,7 @@ impl Store {
         let model = config::ActiveModel {
             id: Set(config::SINGLETON_ID),
             config_json: Set(json_str),
-            updated_at: Set(std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs() as i64),
+            updated_at: Set(unix_secs()),
         };
         config::Entity::insert(model)
             .on_conflict(
@@ -308,19 +307,6 @@ impl Store {
             .await?)
     }
 
-    /// Fetches a domain by either integer ID or hostname.
-    pub async fn get_domain_by_id_or_name(
-        &self,
-        identifier: &str,
-    ) -> Result<Option<domain::Model>, StoreError> {
-        if let Ok(id) = identifier.parse::<i32>()
-            && let Some(d) = domain::Entity::find_by_id(id).one(&self.db).await?
-        {
-            return Ok(Some(d));
-        }
-        self.get_domain(identifier).await
-    }
-
     /// Inserts or replaces the certificate stored under `name`.
     ///
     /// A certificate is global and keyed by its own name (the tunnel apex or
@@ -338,7 +324,6 @@ impl Store {
             key_pem: Set(cert.key_pem),
             not_before: Set(cert.not_before),
             not_after: Set(cert.not_after),
-            issuer: Set(cert.issuer),
             directory: Set(cert.directory),
             obtained_at: Set(cert.obtained_at),
             validation: Set(cert.validation),
@@ -352,7 +337,6 @@ impl Store {
                         certificate::Column::KeyPem,
                         certificate::Column::NotBefore,
                         certificate::Column::NotAfter,
-                        certificate::Column::Issuer,
                         certificate::Column::Directory,
                         certificate::Column::ObtainedAt,
                         certificate::Column::Validation,
@@ -396,50 +380,26 @@ impl Store {
         Ok(row.map(to_cert_record))
     }
 
-    /// Fetches a certificate by integer certificate ID or by name.
-    pub async fn get_certificate_by_id_or_name(
-        &self,
-        identifier: &str,
-    ) -> Result<Option<CertRecord>, StoreError> {
-        if let Ok(id) = identifier.parse::<i32>() {
-            self.get_certificate_by_id(id).await
-        } else {
-            self.get_certificate(identifier).await
-        }
-    }
-
     /// Lists certificate records in name order.
-    ///
-    /// There is exactly one row per name, so there is nothing to rank or filter.
     pub async fn list_certificates(&self) -> Result<Vec<CertRecord>, StoreError> {
-        let mut results: Vec<CertRecord> = certificate::Entity::find()
+        Ok(certificate::Entity::find()
+            .order_by_asc(certificate::Column::Name)
             .all(&self.db)
             .await?
             .into_iter()
             .map(to_cert_record)
-            .collect();
-        results.sort_by(|a, b| {
-            a.name
-                .cmp(&b.name)
-                .then_with(|| b.not_after.cmp(&a.not_after))
-        });
-        Ok(results)
+            .collect())
     }
 
     /// Lists every certificate including PEM material, in name order.
     pub async fn list_certificates_full(&self) -> Result<Vec<FullCertRecord>, StoreError> {
-        let mut results: Vec<FullCertRecord> = certificate::Entity::find()
+        Ok(certificate::Entity::find()
+            .order_by_asc(certificate::Column::Name)
             .all(&self.db)
             .await?
             .into_iter()
             .map(to_full_cert_record)
-            .collect();
-        results.sort_by(|a, b| {
-            a.name
-                .cmp(&b.name)
-                .then_with(|| b.not_after.cmp(&a.not_after))
-        });
-        Ok(results)
+            .collect())
     }
 
     // ----- ACME challenge registry (DNS-01 TXT + HTTP-01 tokens) -----
@@ -453,14 +413,14 @@ impl Store {
         &self,
         name: &str,
         value: &str,
-        certificate: Option<&str>,
+        certificate: &str,
         at: i64,
     ) -> Result<(), StoreError> {
         let lower = name.to_ascii_lowercase();
         let active = challenge::ActiveModel {
             name: Set(lower),
             value: Set(value.to_string()),
-            certificate: Set(certificate.map(str::to_string)),
+            certificate: Set(certificate.to_string()),
             created_at: Set(at),
             kind: Set("dns-01".to_string()),
             ..Default::default()
@@ -482,17 +442,6 @@ impl Store {
         challenge::Entity::delete_many()
             .filter(challenge::Column::Name.eq(lower))
             .filter(challenge::Column::Value.eq(value))
-            .filter(challenge::Column::Kind.eq("dns-01"))
-            .exec(&self.db)
-            .await?;
-        Ok(())
-    }
-
-    /// Removes every DNS-01 TXT value for `name`.
-    pub async fn clear_challenges(&self, name: &str) -> Result<(), StoreError> {
-        let lower = name.to_ascii_lowercase();
-        challenge::Entity::delete_many()
-            .filter(challenge::Column::Name.eq(lower))
             .filter(challenge::Column::Kind.eq("dns-01"))
             .exec(&self.db)
             .await?;
@@ -523,7 +472,7 @@ impl Store {
         &self,
         token: &str,
         key_auth: &str,
-        certificate: Option<&str>,
+        certificate: &str,
         at: i64,
     ) -> Result<(), StoreError> {
         challenge::Entity::delete_many()
@@ -534,7 +483,7 @@ impl Store {
         let active = challenge::ActiveModel {
             name: Set(token.to_string()),
             value: Set(key_auth.to_string()),
-            certificate: Set(certificate.map(str::to_string)),
+            certificate: Set(certificate.to_string()),
             created_at: Set(at),
             kind: Set("http-01".to_string()),
             ..Default::default()
@@ -629,29 +578,32 @@ impl Store {
             .await?)
     }
 
-    /// Every person name, for slug uniqueness.
-    ///
-    /// Person slugs are globally unique (they are the zone's first label), so
-    /// the uniqueness probe needs the whole set. It is small: one row per
-    /// person, not per machine.
-    pub async fn list_person_names(&self) -> Result<Vec<String>, StoreError> {
-        Ok(person::Entity::find()
-            .all(&self.db)
-            .await?
-            .into_iter()
-            .map(|p| p.name)
-            .collect())
+    /// The person name to propose for an account called `account_name`: its
+    /// slug, or the first numbered variant no person has yet.
+    pub async fn propose_person_name(&self, account_name: &str) -> Result<String, StoreError> {
+        first_free_name(
+            &self.db,
+            person::Entity::find(),
+            person::Column::Name,
+            &names::slugify_person(account_name),
+        )
+        .await
     }
 
-    /// A person's machine names, for the per-person machine uniqueness rule.
-    pub async fn list_machine_names(&self, person_id: i32) -> Result<Vec<String>, StoreError> {
-        Ok(machine::Entity::find()
-            .filter(machine::Column::PersonId.eq(person_id))
-            .all(&self.db)
-            .await?
-            .into_iter()
-            .map(|m| m.name)
-            .collect())
+    /// The machine name to propose for `hostname` under a person: its slug, or
+    /// the first numbered variant none of the person's machines has yet.
+    pub async fn propose_machine_name(
+        &self,
+        person_id: i32,
+        hostname: &str,
+    ) -> Result<String, StoreError> {
+        first_free_name(
+            &self.db,
+            machine::Entity::find().filter(machine::Column::PersonId.eq(person_id)),
+            machine::Column::Name,
+            &names::slugify_machine(hostname),
+        )
+        .await
     }
 
     /// Creates a machine under a person, holding `key_id`, and opens its key
@@ -672,7 +624,7 @@ impl Store {
             )));
         }
         let now = unix_secs();
-        let key = format_key_id(key_id);
+        let key = key_id.to_string();
         let txn = self.db.begin().await?;
         let created = machine::ActiveModel {
             person_id: Set(person_id),
@@ -693,20 +645,6 @@ impl Store {
         Ok(machine::Entity::find_by_id(id).one(&self.db).await?)
     }
 
-    /// Fetches a machine by person ID and lowercase name.
-    pub async fn get_machine_by_name(
-        &self,
-        person_id: i32,
-        name: &str,
-    ) -> Result<Option<machine::Model>, StoreError> {
-        let lower = name.to_ascii_lowercase();
-        Ok(machine::Entity::find()
-            .filter(machine::Column::PersonId.eq(person_id))
-            .filter(machine::Column::Name.eq(&lower))
-            .one(&self.db)
-            .await?)
-    }
-
     /// Resolves a key to the machine holding it and that machine's person.
     ///
     /// This is the identity path: it reads `machine.key_id` and nothing else.
@@ -715,7 +653,7 @@ impl Store {
         key_id: &KeyId,
     ) -> Result<Option<(person::Model, machine::Model)>, StoreError> {
         let Some((mach, Some(pers))) = machine::Entity::find()
-            .filter(machine::Column::KeyId.eq(format_key_id(key_id)))
+            .filter(machine::Column::KeyId.eq(key_id.to_string()))
             .find_also_related(person::Entity)
             .one(&self.db)
             .await?
@@ -754,7 +692,7 @@ impl Store {
         )
         .await?;
         let mut active: machine::ActiveModel = current.into();
-        active.key_id = Set(format_key_id(new_key));
+        active.key_id = Set(new_key.to_string());
         let updated = active.update(&txn).await?;
         open_key_log(&txn, &updated, now).await?;
         txn.commit().await?;
@@ -775,7 +713,7 @@ impl Store {
         let now = unix_secs();
         let txn = self.db.begin().await?;
         let Some(found) = machine::Entity::find()
-            .filter(machine::Column::KeyId.eq(format_key_id(key_id)))
+            .filter(machine::Column::KeyId.eq(key_id.to_string()))
             .one(&txn)
             .await?
         else {
@@ -834,35 +772,31 @@ impl Store {
         self.create_person(account.id, name).await
     }
 
-    /// Fetches an existing service by machine ID and lowercase name, or creates a new one.
+    /// Fetches an existing service by machine ID and name, or creates a new one.
     pub async fn get_or_create_service(
         &self,
         machine_id: i32,
         name: &str,
     ) -> Result<service::Model, StoreError> {
-        let lower = name.to_ascii_lowercase();
-        if !names::is_valid_service(&lower) {
+        if !weaver_proto::is_valid_service_name(name) {
             return Err(StoreError::InvalidName(format!(
-                "service '{name}' must match ^[a-z0-9]+(?:-[a-z0-9]+)*$ and be 1-31 chars"
+                "service '{name}' must match ^[a-z0-9]+(-[a-z0-9]+)*$ and be 1-{} chars",
+                weaver_proto::SERVICE_NAME_MAX
             )));
         }
         if let Some(existing) = service::Entity::find()
             .filter(service::Column::MachineId.eq(machine_id))
-            .filter(service::Column::Name.eq(&lower))
+            .filter(service::Column::Name.eq(name))
             .one(&self.db)
             .await?
         {
             return Ok(existing);
         }
 
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64;
         let new_service = service::ActiveModel {
             machine_id: Set(machine_id),
-            name: Set(lower.clone()),
-            created_at: Set(now),
+            name: Set(name.to_string()),
+            created_at: Set(unix_secs()),
             ..Default::default()
         };
         match new_service.insert(&self.db).await {
@@ -870,7 +804,7 @@ impl Store {
             Err(e) => {
                 if let Some(existing) = service::Entity::find()
                     .filter(service::Column::MachineId.eq(machine_id))
-                    .filter(service::Column::Name.eq(&lower))
+                    .filter(service::Column::Name.eq(name))
                     .one(&self.db)
                     .await?
                 {
@@ -888,8 +822,8 @@ impl Store {
         domain_name: &str,
         service_id: i32,
     ) -> Result<domain::Model, StoreError> {
-        let lower = domain_name.to_ascii_lowercase();
-        let domain_model = self.get_or_create_domain(&lower, None).await?;
+        let name = domain_name.to_ascii_lowercase();
+        let domain_model = self.get_or_create_domain(&name, None).await?;
         if domain_model.service_id == Some(service_id) {
             return Ok(domain_model);
         }
@@ -899,66 +833,18 @@ impl Store {
         Ok(updated)
     }
 
-    /// Persists a service declared by the machine that owns `key_id` and links
-    /// it to `hostname`.
-    ///
-    /// This never enrols identities: the person and machine behind `key_id`
-    /// must already exist (they are resolved from `machine.key_id`), otherwise
-    /// [`StoreError::KeyNotEnrolled`] is returned. Declaring the same service
-    /// twice is idempotent — the existing `service` row is reused.
+    /// Persists a service declared by machine `machine_id` and links it to
+    /// `hostname`. Declaring the same service twice is idempotent — the
+    /// existing `service` row is reused.
     pub async fn register_declared_service(
         &self,
-        key_id: &KeyId,
+        machine_id: i32,
         hostname: &str,
         service: &str,
     ) -> Result<service::Model, StoreError> {
-        let Some((_, machine)) = self.machine_by_key(key_id).await? else {
-            return Err(StoreError::KeyNotEnrolled);
-        };
-        let svc = self.get_or_create_service(machine.id, service).await?;
+        let svc = self.get_or_create_service(machine_id, service).await?;
         self.set_domain_service(hostname, svc.id).await?;
         Ok(svc)
-    }
-
-    /// Recomputes every materialized `domains.name` from the current
-    /// `(person, machine, service)` names.
-    ///
-    /// The flat hostname is derived, so renaming a person or machine must
-    /// rewrite the affected rows; this is that sweep. It is intentionally
-    /// root-parameterized because the `Store` does not itself know the zone
-    /// apex. There is no public rename API yet (a follow-up ticket owns the
-    /// control/API surface); this exists so the invariant is enforced and
-    /// tested from day one.
-    pub async fn recompute_domain_names(&self, root: &str) -> Result<(), StoreError> {
-        let services = service::Entity::find()
-            .find_also_related(machine::Entity)
-            .all(&self.db)
-            .await?;
-
-        for (svc, machine) in services {
-            let Some(machine) = machine else {
-                continue;
-            };
-            let Some(person) = person::Entity::find_by_id(machine.person_id)
-                .one(&self.db)
-                .await?
-            else {
-                continue;
-            };
-            let new_name = names::flat_hostname(&person.name, &machine.name, &svc.name, root);
-
-            if let Some(domain) = domain::Entity::find()
-                .filter(domain::Column::ServiceId.eq(svc.id))
-                .one(&self.db)
-                .await?
-                && domain.name != new_name
-            {
-                let mut active: domain::ActiveModel = domain.into();
-                active.name = Set(new_name);
-                active.update(&self.db).await?;
-            }
-        }
-        Ok(())
     }
 
     // ----- certificate events -----
@@ -969,13 +855,13 @@ impl Store {
         name: &str,
         at: i64,
         kind: &str,
-        detail: Option<&str>,
+        detail: &str,
     ) -> Result<(), StoreError> {
         cert_event::ActiveModel {
             name: Set(name.to_string()),
             at: Set(at),
             kind: Set(kind.to_string()),
-            detail: Set(detail.map(str::to_string)),
+            detail: Set(detail.to_string()),
             ..Default::default()
         }
         .insert(&self.db)
@@ -1026,14 +912,12 @@ impl Store {
         directory: &str,
         email: &str,
         credentials_json: &str,
-        kid: Option<&str>,
         created_at: i64,
     ) -> Result<(), StoreError> {
         let model = acme_account::ActiveModel {
             directory: Set(directory.to_string()),
             email: Set(email.to_string()),
             credentials_json: Set(credentials_json.to_string()),
-            kid: Set(kid.map(str::to_string)),
             created_at: Set(created_at),
         };
         acme_account::Entity::insert(model)
@@ -1042,7 +926,6 @@ impl Store {
                     .update_columns([
                         acme_account::Column::Email,
                         acme_account::Column::CredentialsJson,
-                        acme_account::Column::Kid,
                         acme_account::Column::CreatedAt,
                     ])
                     .to_owned(),
@@ -1060,7 +943,6 @@ pub struct NewCertificate {
     pub key_pem: String,
     pub not_before: i64,
     pub not_after: i64,
-    pub issuer: Option<String>,
     pub directory: String,
     pub obtained_at: i64,
     /// ACME validation mechanism that produced this certificate
@@ -1075,7 +957,6 @@ fn to_cert_record(cert: certificate::Model) -> CertRecord {
         name: cert.name,
         not_before: cert.not_before,
         not_after: cert.not_after,
-        issuer: cert.issuer,
         directory: cert.directory,
         obtained_at: cert.obtained_at,
         validation: cert.validation,
@@ -1090,7 +971,6 @@ fn to_full_cert_record(cert: certificate::Model) -> FullCertRecord {
         key_pem: cert.key_pem,
         not_before: cert.not_before,
         not_after: cert.not_after,
-        issuer: cert.issuer,
         directory: cert.directory,
         obtained_at: cert.obtained_at,
         validation: cert.validation,
@@ -1104,7 +984,6 @@ pub struct CertRecord {
     pub name: String,
     pub not_before: i64,
     pub not_after: i64,
-    pub issuer: Option<String>,
     pub directory: String,
     pub obtained_at: i64,
     /// ACME validation mechanism that produced this row (`dns-01`/`http-01`).
@@ -1120,7 +999,6 @@ pub struct FullCertRecord {
     pub key_pem: String,
     pub not_before: i64,
     pub not_after: i64,
-    pub issuer: Option<String>,
     pub directory: String,
     pub obtained_at: i64,
     /// ACME validation mechanism that produced this row (`dns-01`/`http-01`).
@@ -1134,7 +1012,8 @@ pub struct CertEventRecord {
     pub name: String,
     pub at: i64,
     pub kind: String,
-    pub detail: Option<String>,
+    /// Empty when the event carries no detail.
+    pub detail: String,
 }
 
 impl From<cert_event::Model> for CertEventRecord {
@@ -1149,12 +1028,33 @@ impl From<cert_event::Model> for CertEventRecord {
     }
 }
 
-/// Unix seconds from the wall clock.
-fn unix_secs() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64
+/// How many numbered candidates one uniqueness probe asks about.
+const NAME_PROBE_BATCH: usize = 16;
+
+/// The first of [`names::candidates`]`(base)` that no row of `scope` has in
+/// `column`, asking the database about one batch of candidates at a time:
+/// `SELECT <column> FROM … WHERE <scope> AND <column> IN (<batch>)`.
+async fn first_free_name<E: EntityTrait>(
+    db: &DatabaseConnection,
+    scope: Select<E>,
+    column: E::Column,
+    base: &str,
+) -> Result<String, StoreError> {
+    let mut candidates = names::candidates(base);
+    loop {
+        let batch: Vec<String> = candidates.by_ref().take(NAME_PROBE_BATCH).collect();
+        let taken: Vec<String> = scope
+            .clone()
+            .select_only()
+            .column(column)
+            .filter(column.is_in(batch.iter().cloned()))
+            .into_tuple()
+            .all(db)
+            .await?;
+        if let Some(free) = batch.into_iter().find(|name| !taken.contains(name)) {
+            return Ok(free);
+        }
+    }
 }
 
 /// Opens the key log row for the key `machine` now holds.
@@ -1169,7 +1069,7 @@ async fn open_key_log(
         person_id: Set(machine.person_id),
         added_at: Set(now),
         retired_at: Set(None),
-        retired_reason: Set(None),
+        retired_reason: Set(String::new()),
         ..Default::default()
     }
     .insert(db)
@@ -1189,7 +1089,7 @@ async fn close_key_log(
         .col_expr(machine_key_log::Column::RetiredAt, Expr::value(Some(now)))
         .col_expr(
             machine_key_log::Column::RetiredReason,
-            Expr::value(Some(reason.to_string())),
+            Expr::value(reason.to_string()),
         )
         .filter(machine_key_log::Column::MachineId.eq(machine_id))
         .filter(machine_key_log::Column::KeyId.eq(key_id))
@@ -1197,55 +1097,4 @@ async fn close_key_log(
         .exec(db)
         .await?;
     Ok(())
-}
-
-/// Formats a `KeyId` into its canonical text form (`p256:<hex>`,
-/// `ed25519:<hex>`): the spelling `machine.key_id` stores and the fingerprint a
-/// person is shown.
-pub fn format_key_id(key_id: &KeyId) -> String {
-    use std::fmt::Write;
-    match key_id {
-        KeyId::Ed25519(bytes) => {
-            let mut hex = String::with_capacity(64);
-            for b in bytes {
-                let _ = write!(&mut hex, "{b:02x}");
-            }
-            format!("ed25519:{hex}")
-        }
-        KeyId::P256(bytes) => {
-            let mut hex = String::with_capacity(66);
-            for b in bytes {
-                let _ = write!(&mut hex, "{b:02x}");
-            }
-            format!("p256:{hex}")
-        }
-    }
-}
-
-/// Parses a stored `machine.key_id` back into a [`KeyId`].
-///
-/// This is the inverse of [`format_key_id`]; it lets callers (the identity
-/// resolver) serve the *stored* key material rather than trusting the key the
-/// peer claimed. Returns `None` for a malformed or unsupported value.
-pub fn parse_key_id(value: &str) -> Option<KeyId> {
-    let (scheme, hex) = value.split_once(':')?;
-    let decode = |hex: &str, len: usize| -> Option<Vec<u8>> {
-        if hex.len() != len * 2 {
-            return None;
-        }
-        (0..len)
-            .map(|i| u8::from_str_radix(hex.get(i * 2..i * 2 + 2)?, 16).ok())
-            .collect()
-    };
-    match scheme {
-        "ed25519" => {
-            let bytes: [u8; 32] = decode(hex, 32)?.try_into().ok()?;
-            Some(KeyId::Ed25519(bytes))
-        }
-        "p256" => {
-            let bytes: [u8; 33] = decode(hex, 33)?.try_into().ok()?;
-            Some(KeyId::P256(bytes))
-        }
-        _ => None,
-    }
 }

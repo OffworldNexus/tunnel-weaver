@@ -10,14 +10,13 @@
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use http::{Request, StatusCode};
 use weaver_abuse::{
-    Budget, BudgetPass, BudgetStore, Charge, CostRule, Decision, Gate, Key, KeyKind, Pass,
-    Pipeline, Policy, PolicyId, PolicySet, Quota, Rate, RequestContext, Route, RouteTable,
-    ScannerPass, StoreError, StoreErrorPolicy, Surface, ViewId, fingerprint,
+    Budget, BudgetPass, BudgetStore, Charge, Decision, Gate, Key, KeyKind, Pass, Pipeline, Policy,
+    PolicyId, PolicySet, Quota, Rate, RequestContext, RouteTable, ScannerPass, StoreError,
+    StoreErrorPolicy, Surface, ViewId, fingerprint,
 };
 
 use crate::config::{AltchaConfig, BudgetConfig, Config};
@@ -82,7 +81,7 @@ pub fn build(config: &Config, store: Store) -> Arc<Pipeline> {
     let mut passes: Vec<Box<dyn Pass>> = vec![Box::new(ScannerPass::default())];
 
     let mut policies: Vec<Policy> = Vec::new();
-    let mut routes: Vec<(ViewId, Route)> = Vec::new();
+    let mut routes: Vec<(ViewId, PolicyId)> = Vec::new();
 
     // The relay's own web surface budget is opt-in.
     if let Some(abuse) = config.abuse.as_ref().filter(|abuse| abuse.enabled) {
@@ -102,16 +101,10 @@ pub fn build(config: &Config, store: Store) -> Arc<Pipeline> {
             // is served and logged, never a silent bypass.
             on_store_error: StoreErrorPolicy::Degraded,
         });
-        routes.push((
-            ViewId::RELAY_WEB,
-            Route {
-                policy: PolicyId::RELAY_WEB,
-                cost: CostRule::Static(1),
-            },
-        ));
+        routes.push((ViewId::RELAY_WEB, PolicyId::RELAY_WEB));
     }
 
-    // WVR-136: the ALTCHA API is the relay's own service and is always served, so
+    // the ALTCHA API is the relay's own service and is always served, so
     // its budgets are always applied — one per endpoint, both fail-closed, so
     // exhausting challenge issuance cannot spend the verification budget or fall
     // through to unbudgeted work.
@@ -146,19 +139,10 @@ pub fn build(config: &Config, store: Store) -> Arc<Pipeline> {
             ],
             on_store_error: StoreErrorPolicy::FailClosed,
         });
-        routes.push((
-            view,
-            Route {
-                policy,
-                cost: CostRule::Weighted {
-                    base: 1,
-                    per_kib: 1,
-                },
-            },
-        ));
+        routes.push((view, policy));
     }
 
-    // WVR-36: the account plane is always served, so its budgets are always
+    // the account plane is always served, so its budgets are always
     // applied — one per action, all fail-closed. The per-registration resend
     // cooldown is enforced in the handler; these budgets bound whole networks.
     for (policy, view, budget) in [
@@ -197,13 +181,7 @@ pub fn build(config: &Config, store: Store) -> Arc<Pipeline> {
             ],
             on_store_error: StoreErrorPolicy::FailClosed,
         });
-        routes.push((
-            view,
-            Route {
-                policy,
-                cost: CostRule::Static(1),
-            },
-        ));
+        routes.push((view, policy));
     }
 
     let retry_cap_secs = config
@@ -238,12 +216,9 @@ pub fn context<'a, B>(
             .path_and_query()
             .map(|pq| pq.as_str())
             .unwrap_or_else(|| req.uri().path()),
-        body_len: None,
-        fingerprint: fingerprint(effective_peer(remote_addr), None),
+        fingerprint: fingerprint(effective_peer(remote_addr)),
         view,
         now_ms,
-        findings: Vec::new(),
-        cost: 0,
     }
 }
 
@@ -270,17 +245,6 @@ pub fn effective_peer(remote_addr: SocketAddr) -> IpAddr {
     remote_addr.ip()
 }
 
-/// Unix milliseconds from the wall clock.
-///
-/// The one place the server reads time for the pipeline, mirroring the metering
-/// bucket clock; the engine itself never reads a clock.
-pub fn unix_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
-}
-
 /// The refusal the edge must surface for a [`Decision`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Refusal {
@@ -305,7 +269,7 @@ impl Refusal {
     pub fn from_decision(decision: Decision) -> Option<Self> {
         Some(match decision {
             Decision::Allow | Decision::Degraded { .. } => return None,
-            Decision::Block { verdict, .. } => Self::Blocked {
+            Decision::Block { verdict } => Self::Blocked {
                 verdict: verdict.as_str(),
             },
             Decision::Throttle {
@@ -315,8 +279,7 @@ impl Refusal {
                 policy: policy.as_str(),
                 retry_after_secs: ms_to_secs_ceil(retry_after_ms),
             },
-            // A challenge is not wired as a gate yet; treat as fail-closed.
-            Decision::Unavailable { .. } | Decision::Challenge { .. } => Self::Unavailable,
+            Decision::Unavailable { .. } => Self::Unavailable,
         })
     }
 

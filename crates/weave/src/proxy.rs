@@ -12,7 +12,6 @@
 //! `Forwarded` / `X-Forwarded-*` stance, hop-by-hop stripping, and the
 //! opt-out URL/cookie rewriting.
 
-use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -25,15 +24,13 @@ use http_body_util::combinators::BoxBody;
 use hyper::body::Frame;
 use tokio::sync::mpsc;
 use weaver_proto::http::{HttpHead, HttpResponseHead};
-use weaver_proto::policy;
 use weaver_proto::{BodyFrame, ResetCode};
 
+use crate::error::BoxError;
 use crate::pool::{OriginConn, Pool};
 use crate::rewrite::rewrite_response_headers;
-use crate::target::Target;
+use crate::target::ServiceSpec;
 
-/// Boxed error used across the proxy boundary.
-pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 /// Visitor/origin body type: chunks of bytes with an opaque error.
 pub type Body = BoxBody<Bytes, BoxError>;
 
@@ -65,35 +62,17 @@ pub enum OutMsg {
     End,
 }
 
-/// Everything the origin task needs, cloned per exchange.
-pub struct ExchangeConfig {
+/// One visitor request and the service it is for.
+struct ExchangeConfig {
     /// The visitor request head as the relay sent it.
-    pub head: HttpHead,
-    /// The local origin behind this service.
-    pub target: Target,
-    /// Public origin the visitor used, e.g. `https://web.laptop.poc.example.com`.
-    pub public_origin: String,
-    /// Disable certificate verification for this target.
-    pub insecure: bool,
-    /// Keep the public hostname instead of rewriting `Host` to the target.
-    pub preserve_host: bool,
-    /// Disable URL/cookie rewriting.
-    pub no_rewrite: bool,
-    /// Keep visitor-supplied forwarding headers instead of replacing them
-    /// with the canonical ones.
-    pub append_forwarded: bool,
+    head: HttpHead,
+    /// The service's target and proxy policy.
+    spec: ServiceSpec,
 }
 
 /// A streaming request body fed chunk by chunk from the mux.
-pub struct ChannelBody {
+struct ChannelBody {
     rx: mpsc::Receiver<Result<Frame<Bytes>, BoxError>>,
-}
-
-impl ChannelBody {
-    /// Wrap the receiving end of the request-body channel.
-    pub fn new(rx: mpsc::Receiver<Result<Frame<Bytes>, BoxError>>) -> Self {
-        Self { rx }
-    }
 }
 
 impl hyper::body::Body for ChannelBody {
@@ -135,16 +114,18 @@ impl Outbox {
 /// mid-body failure it asks the relay to reset the stream with a
 /// [`ResetCode`].
 pub async fn run_exchange(
-    cfg: ExchangeConfig,
+    head: HttpHead,
+    spec: ServiceSpec,
     body_rx: mpsc::Receiver<Result<Frame<Bytes>, BoxError>>,
     pool: Pool,
     out: Outbox,
     reset: Arc<dyn Fn(u32) + Send + Sync>,
 ) {
+    let cfg = ExchangeConfig { head, spec };
     match run_exchange_inner(&cfg, body_rx, &pool, &out).await {
         Ok(()) => {}
         Err(ExchangeError::BeforeHead) => {
-            let html = weaver_assets::render_bad_gateway(&cfg.target.origin());
+            let html = weaver_assets::render_bad_gateway(&cfg.spec.target.origin());
             let head = bad_gateway_head(html.len());
             let _ = out.send(OutMsg::Head(head)).await;
             let _ = out
@@ -167,37 +148,25 @@ enum ExchangeError {
 
 async fn run_exchange_inner(
     cfg: &ExchangeConfig,
-    mut body_rx: mpsc::Receiver<Result<Frame<Bytes>, BoxError>>,
+    body_rx: mpsc::Receiver<Result<Frame<Bytes>, BoxError>>,
     pool: &Pool,
     out: &Outbox,
 ) -> Result<(), ExchangeError> {
-    let is_upgrade = cfg.head.header("upgrade").is_some();
-
-    // For an upgrade the mux stream carries the visitor's raw bytes after
-    // the 101, and those must go to the origin *socket*, not the hyper
-    // request body. Bridge the mux channel into the request body until then;
-    // once upgraded, the bridge stops and `body_rx` feeds the pipe directly.
-    // Non-upgrade requests hand the receiver straight to hyper.
-    let (hyper_body_rx, bridge) = if is_upgrade {
-        let (tx, rx) = mpsc::channel::<Result<Frame<Bytes>, BoxError>>(1);
-        // An upgrade request has no body; keep the sender alive until the
-        // 101 arrives so hyper sees an open-but-empty body, then drop it.
-        (rx, Some(tx))
+    // After an upgrade's 101 the mux stream carries the visitor's raw bytes,
+    // which go to the origin socket; otherwise it carries the request body.
+    let (request_body, pipe_input) = if cfg.head.header("upgrade").is_some() {
+        (None, Some(body_rx))
     } else {
-        let (tx, rx) = mpsc::channel(1);
-        drop(tx);
-        // Plain requests: swap so hyper owns the real receiver.
-        (std::mem::replace(&mut body_rx, rx), None)
+        (Some(body_rx), None)
     };
 
     let mut conn = pool
-        .acquire(&cfg.target, cfg.insecure)
+        .acquire(&cfg.spec.target, cfg.spec.insecure)
         .await
         .map_err(|_| ExchangeError::BeforeHead)?;
     let h2 = matches!(conn, OriginConn::Http2(_));
 
-    let request =
-        build_request(cfg, hyper_body_rx, is_upgrade, h2).map_err(|_| ExchangeError::BeforeHead)?;
+    let request = build_request(cfg, request_body, h2).map_err(|_| ExchangeError::BeforeHead)?;
 
     let response = match &mut conn {
         OriginConn::Http1(send) => send.send_request(request).await,
@@ -209,8 +178,9 @@ async fn run_exchange_inner(
     };
 
     // Upgrade accepted by the origin: switch to a raw byte pipe.
-    if is_upgrade && response.status() == http::StatusCode::SWITCHING_PROTOCOLS {
-        drop(bridge);
+    if let Some(pipe_input) = pipe_input
+        && response.status() == http::StatusCode::SWITCHING_PROTOCOLS
+    {
         let on_upgrade = hyper::upgrade::on(&mut response);
         let (parts, _) = response.into_parts();
         let resp_head = HttpResponseHead {
@@ -224,18 +194,18 @@ async fn run_exchange_inner(
         // gone; the connection is consumed by the pipe and never pooled.
         drop(conn);
         let upgraded = on_upgrade.await.map_err(|_| ExchangeError::MidBody)?;
-        pipe_upgraded(upgraded, body_rx, out).await;
+        pipe_upgraded(upgraded, pipe_input, out).await;
         return Ok(());
     }
-    drop(bridge);
 
     let (parts, mut incoming) = response.into_parts();
     let mut resp_head = HttpResponseHead {
         status: parts.status.as_u16(),
         headers: collect_headers(&parts.headers),
     };
-    if !cfg.no_rewrite {
-        rewrite_response_headers(&mut resp_head, &cfg.target, &cfg.public_origin);
+    if !cfg.spec.no_rewrite {
+        let public_origin = format!("https://{}", cfg.head.authority);
+        rewrite_response_headers(&mut resp_head, &cfg.spec.target, &public_origin);
     }
     if !out.send(OutMsg::Head(resp_head)).await {
         return Err(ExchangeError::MidBody);
@@ -273,7 +243,8 @@ async fn run_exchange_inner(
     // clean; return it for reuse. A truncated exchange drops it instead, as
     // does an origin that said `Connection: close` (HTTP/1.0 semantics).
     if origin_keeps_alive(&parts) {
-        pool.release(&cfg.target, cfg.insecure, conn).await;
+        pool.release(&cfg.spec.target, cfg.spec.insecure, conn)
+            .await;
     }
     let _ = out.send(OutMsg::End).await;
     Ok(())
@@ -283,19 +254,24 @@ async fn run_exchange_inner(
 /// unless it said `Connection: close`; HTTP/1.0 only with an explicit
 /// `Connection: keep-alive`; h2 always.
 fn origin_keeps_alive(parts: &http::response::Parts) -> bool {
-    let tokens: Vec<String> = parts
-        .headers
-        .get_all(http::header::CONNECTION)
-        .iter()
-        .filter_map(|v| v.to_str().ok())
-        .flat_map(|s| s.split(','))
-        .map(|t| t.trim().to_ascii_lowercase())
-        .collect();
+    let tokens = connection_tokens(&parts.headers);
     match parts.version {
         http::Version::HTTP_10 => tokens.iter().any(|t| t == "keep-alive"),
         http::Version::HTTP_11 => !tokens.iter().any(|t| t == "close"),
         _ => true,
     }
+}
+
+/// The lowercase tokens of every `Connection` header.
+fn connection_tokens(headers: &http::HeaderMap) -> Vec<String> {
+    headers
+        .get_all(http::header::CONNECTION)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|s| s.split(','))
+        .map(|t| t.trim().to_ascii_lowercase())
+        .filter(|t| !t.is_empty())
+        .collect()
 }
 
 /// After a `101`: copy visitor bytes (arriving as `BodyFrame::Chunk`s on the
@@ -343,15 +319,14 @@ async fn pipe_upgraded(
 }
 
 /// Build the outbound hyper request: method, absolute URI, policy-cleaned
-/// headers, streaming body.
+/// headers, streaming body (`None` for an upgrade).
 fn build_request(
     cfg: &ExchangeConfig,
-    body_rx: mpsc::Receiver<Result<Frame<Bytes>, BoxError>>,
-    is_upgrade: bool,
+    body: Option<mpsc::Receiver<Result<Frame<Bytes>, BoxError>>>,
     h2: bool,
 ) -> Result<Request<Body>, BoxError> {
     let head = &cfg.head;
-    let authority = cfg.target.authority();
+    let authority = cfg.spec.target.authority();
     // h1 gets an origin-form target (`GET /path`), never absolute-form: a
     // reverse proxy talks to the origin as a plain client, and simple
     // servers treat `GET http://host/path` as a different resource. h2 has
@@ -360,7 +335,7 @@ fn build_request(
     let uri: Uri = if h2 {
         format!(
             "{}://{}{}",
-            cfg.target.scheme.as_str(),
+            cfg.spec.target.scheme.as_str(),
             authority,
             head.path
         )
@@ -387,18 +362,15 @@ fn build_request(
                 headers.append(n, v);
             }
         }
-        apply_origin_headers(headers, cfg, is_upgrade)?;
+        apply_origin_headers(headers, cfg, body.is_none());
     }
-    // An upgrade request carries no body; sending the streaming body would
-    // make hyper emit `Transfer-Encoding: chunked`, which origins reject on
-    // an upgrade. Use an empty, sized body instead.
-    let body = if is_upgrade {
-        drop(body_rx);
-        http_body_util::Empty::<Bytes>::new()
+    // An upgrade request carries no body; a streaming one would make hyper
+    // emit `Transfer-Encoding: chunked`, which origins reject on an upgrade.
+    let body = match body {
+        Some(rx) => ChannelBody { rx }.boxed(),
+        None => http_body_util::Empty::<Bytes>::new()
             .map_err(|never| match never {})
-            .boxed()
-    } else {
-        ChannelBody::new(body_rx).boxed()
+            .boxed(),
     };
     Ok(builder.body(body)?)
 }
@@ -406,25 +378,16 @@ fn build_request(
 /// Header policy for the origin-facing request. For an upgrade the
 /// `Connection: upgrade` / `Upgrade:` pair is reconstructed after the
 /// hop-by-hop strip, since the origin must see the upgrade request.
-fn apply_origin_headers(
-    headers: &mut http::HeaderMap,
-    cfg: &ExchangeConfig,
-    is_upgrade: bool,
-) -> Result<(), BoxError> {
+fn apply_origin_headers(headers: &mut http::HeaderMap, cfg: &ExchangeConfig, is_upgrade: bool) {
     // Strip hop-by-hop headers and any header named by a `Connection` token.
-    let mut connection_tokens: Vec<String> = Vec::new();
-    for value in headers.get_all(http::header::CONNECTION).iter() {
-        if let Ok(s) = value.to_str() {
-            for token in s.split(',') {
-                let t = token.trim().to_ascii_lowercase();
-                if !t.is_empty() {
-                    connection_tokens.push(t);
-                }
-            }
-        }
-    }
-
-    let inbound = collect_forwarding(headers);
+    let connection_tokens = connection_tokens(headers);
+    // The relay appends the visitor's address last.
+    let visitor = headers
+        .get_all("x-forwarded-for")
+        .iter()
+        .next_back()
+        .map(|v| String::from_utf8_lossy(v.as_bytes()).into_owned())
+        .unwrap_or_else(|| "unknown".to_string());
     let public_host = cfg.head.authority.clone();
     let upgrade_protocol = if is_upgrade {
         headers.get(http::header::UPGRADE).cloned()
@@ -441,7 +404,7 @@ fn apply_origin_headers(
         if lname == "host" {
             continue;
         }
-        if !cfg.append_forwarded && is_forwarding_header(&lname) {
+        if !cfg.spec.append_forwarded && is_forwarding_header(&lname) {
             continue;
         }
         rebuilt.push((name.clone(), value.clone()));
@@ -466,52 +429,24 @@ fn apply_origin_headers(
         headers.insert(http::header::TE, HeaderValue::from_static("trailers"));
     }
 
-    let host_value = if cfg.preserve_host {
+    let host_value = if cfg.spec.preserve_host {
         public_host.clone()
     } else {
-        cfg.target.authority()
+        cfg.spec.target.authority()
     };
     if let Ok(v) = HeaderValue::from_str(&host_value) {
         headers.insert(http::header::HOST, v);
     }
 
-    if cfg.append_forwarded {
-        for (name, values) in inbound.values.iter() {
-            for value in values {
-                if let (Ok(n), Ok(v)) = (
-                    HeaderName::from_bytes(name.as_bytes()),
-                    HeaderValue::from_bytes(value),
-                ) {
-                    headers.append(n, v);
-                }
-            }
-        }
-    } else {
-        // Set/replace: drop every inbound copy and write the canonical trio,
-        // taking the relay's last (trustworthy) value for the visitor IP.
-        let for_value = inbound
-            .values
-            .get("x-forwarded-for")
-            .and_then(|v| v.last())
-            .cloned();
-        match &for_value {
-            Some(ip) => insert_bytes(headers, "x-forwarded-for", ip),
-            None => insert_bytes(headers, "x-forwarded-for", b"unknown"),
-        }
+    if !cfg.spec.append_forwarded {
+        // Replace: every inbound copy was dropped above; write the canonical
+        // trio and RFC 7239 `Forwarded`.
+        insert_bytes(headers, "x-forwarded-for", visitor.as_bytes());
         insert_bytes(headers, "x-forwarded-proto", b"https");
         insert_bytes(headers, "x-forwarded-host", public_host.as_bytes());
-        // RFC 7239 `Forwarded`, alongside the X-Forwarded-* trio.
-        let forwarded = format!(
-            "for=\"{}\";proto=https;host=\"{}\"",
-            for_value
-                .as_ref()
-                .map(|b| String::from_utf8_lossy(b).to_string())
-                .unwrap_or_else(|| "unknown".to_string()),
-            public_host
-        );
+        let forwarded = format!("for=\"{visitor}\";proto=https;host=\"{public_host}\"");
         insert_bytes(headers, "forwarded", forwarded.as_bytes());
     }
-    Ok(())
 }
 
 /// RFC 9113 §8.2.3: an HTTP/2 field section may carry several `Cookie` fields
@@ -571,32 +506,6 @@ fn is_forwarding_header(lname: &str) -> bool {
     lname == "forwarded" || lname.starts_with("x-forwarded-")
 }
 
-/// Snapshot of the inbound forwarding values, in order.
-#[derive(Default)]
-struct Forwarding {
-    values: HashMap<String, Vec<Vec<u8>>>,
-}
-
-fn collect_forwarding(headers: &http::HeaderMap) -> Forwarding {
-    let mut out = Forwarding::default();
-    for name in [
-        "x-forwarded-for",
-        "x-forwarded-proto",
-        "x-forwarded-host",
-        "forwarded",
-    ] {
-        let values: Vec<Vec<u8>> = headers
-            .get_all(name)
-            .iter()
-            .map(|v| v.as_bytes().to_vec())
-            .collect();
-        if !values.is_empty() {
-            out.values.insert(name.to_string(), values);
-        }
-    }
-    out
-}
-
 /// Response headers for the relay, minus hop-by-hop fields (RFC 9110
 /// §7.6.1). `Connection: close` in particular describes the *origin*
 /// connection — an HTTP/1.0 origin closing after each reply — and must not
@@ -609,19 +518,12 @@ fn collect_forwarding(headers: &http::HeaderMap) -> Forwarding {
 /// copy as well would duplicate the header, which strict WebSocket clients
 /// reject.
 fn collect_headers(headers: &http::HeaderMap) -> Vec<(String, Vec<u8>)> {
-    let connection_tokens: Vec<String> = headers
-        .get_all(http::header::CONNECTION)
-        .iter()
-        .filter_map(|v| v.to_str().ok())
-        .flat_map(|s| s.split(','))
-        .map(|t| t.trim().to_ascii_lowercase())
-        .filter(|t| !t.is_empty())
-        .collect();
+    let connection_tokens = connection_tokens(headers);
     headers
         .iter()
         .filter(|(n, _)| {
             let name = n.as_str();
-            !(HOP_BY_HOP.contains(&name) || connection_tokens.contains(&name.to_string()))
+            !(HOP_BY_HOP.contains(&name) || connection_tokens.iter().any(|t| t == name))
         })
         .map(|(n, v)| (n.as_str().to_string(), v.as_bytes().to_vec()))
         .collect()
@@ -646,15 +548,10 @@ fn bad_gateway_head(len: usize) -> HttpResponseHead {
     }
 }
 
-/// Compression stance for a response body chunk given the request and head.
-pub fn body_compress(req: &HttpHead, resp: &HttpResponseHead) -> weaver_mux::Compress {
-    policy::response_body_compress(req, resp)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::target::{Target, TargetScheme};
+    use crate::target::Target;
 
     fn cfg() -> ExchangeConfig {
         ExchangeConfig {
@@ -665,16 +562,7 @@ mod tests {
                 path: "/login".into(),
                 headers: vec![],
             },
-            target: Target {
-                scheme: TargetScheme::Http,
-                host: "localhost".into(),
-                port: 8000,
-            },
-            public_origin: "https://web.laptop.poc.example.com".into(),
-            insecure: false,
-            preserve_host: false,
-            no_rewrite: false,
-            append_forwarded: false,
+            spec: ServiceSpec::new("web", Target::parse("8000").unwrap()),
         }
     }
 
@@ -700,7 +588,7 @@ mod tests {
             http::header::COOKIE,
             HeaderValue::from_static("sessionid=def"),
         );
-        apply_origin_headers(&mut headers, &cfg(), false).unwrap();
+        apply_origin_headers(&mut headers, &cfg(), false);
         assert_eq!(cookies(&headers), vec!["csrftoken=abc; sessionid=def"]);
     }
 
@@ -711,7 +599,7 @@ mod tests {
             http::header::COOKIE,
             HeaderValue::from_static("csrftoken=abc; sessionid=def"),
         );
-        apply_origin_headers(&mut headers, &cfg(), false).unwrap();
+        apply_origin_headers(&mut headers, &cfg(), false);
         assert_eq!(cookies(&headers), vec!["csrftoken=abc; sessionid=def"]);
     }
 
@@ -730,7 +618,7 @@ mod tests {
             HeaderName::from_static("x-custom"),
             HeaderValue::from_static("two"),
         );
-        apply_origin_headers(&mut headers, &cfg(), false).unwrap();
+        apply_origin_headers(&mut headers, &cfg(), false);
         assert_eq!(cookies(&headers), vec!["a=1; b=2"]);
         let custom: Vec<&str> = headers
             .get_all("x-custom")

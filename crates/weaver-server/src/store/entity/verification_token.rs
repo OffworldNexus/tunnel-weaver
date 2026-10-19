@@ -1,4 +1,4 @@
-//! `verification_token` table: single-use proof-of-ownership tokens (WVR-36).
+//! `verification_token` table: single-use proof-of-ownership tokens.
 //!
 //! Only the digest is stored; the raw secret lives solely in the emailed link.
 //! Consumption and revocation are timestamps so the row (and the verification

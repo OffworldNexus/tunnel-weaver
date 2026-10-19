@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 pub enum RefusalCode {
     /// Service is already registered on this machine and cannot be duplicated.
     AlreadyRegistered,
-    /// Service name is not a valid DNS label.
+    /// Service name breaks [`is_valid_service_name`].
     InvalidName,
     /// Client identity is unauthorized to register services.
     Unauthorized,
@@ -20,8 +20,8 @@ pub enum RefusalCode {
         /// Highest version the relay speaks.
         max: u16,
     },
-    /// Other application-defined refusal reason.
-    Other(String),
+    /// Any other refusal; the reply's `message` says why.
+    Other,
 }
 
 /// First message the client sends on its control stream.
@@ -34,8 +34,8 @@ pub enum ControlHead {
         /// mux version: the relay refuses with
         /// [`RefusalCode::UnsupportedVersion`] if it cannot serve it.
         proto_version: u16,
-        /// Name of the service to register (e.g. "web"). A single DNS
-        /// label; see [`ControlHead::register`] and [`is_valid_dns_label`].
+        /// Name of the service to register (e.g. "web"); see
+        /// [`is_valid_service_name`].
         service: String,
     },
     /// Revoke this machine: delete the key this connection authenticated with,
@@ -52,12 +52,12 @@ pub enum ControlHead {
 
 impl ControlHead {
     /// Build a `Register` head for this build's protocol version, refusing
-    /// a service name that is not a valid DNS label. The relay applies the
+    /// an invalid service name. The relay applies the
     /// same check on receipt ([`ControlHead::validate`]) since the wire
     /// cannot enforce it.
     pub fn register(service: impl Into<String>) -> Result<Self, RefusalCode> {
         let service = service.into();
-        if !is_valid_dns_label(&service) {
+        if !is_valid_service_name(&service) {
             return Err(RefusalCode::InvalidName);
         }
         Ok(Self::Register {
@@ -82,7 +82,7 @@ impl ControlHead {
                 service,
             } => {
                 crate::accept_protocol_version(*proto_version)?;
-                if !is_valid_dns_label(service) {
+                if !is_valid_service_name(service) {
                     return Err(RefusalCode::InvalidName);
                 }
                 Ok(())
@@ -92,17 +92,25 @@ impl ControlHead {
     }
 }
 
-/// A valid service name is a single DNS label of at most 63 characters
-/// (RFC 1035 / RFC 1123): ASCII alphanumerics and hyphens, not starting or
-/// ending with a hyphen.
-pub fn is_valid_dns_label(label: &str) -> bool {
-    if label.is_empty() || label.len() > 63 {
-        return false;
-    }
-    if label.starts_with('-') || label.ends_with('-') {
-        return false;
-    }
-    label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+/// Longest service name: what is left of a 63-byte DNS label once the person
+/// and machine (up to 15 bytes each) and their two dashes are in front of it.
+pub const SERVICE_NAME_MAX: usize = 31;
+
+/// The one service-name rule, checked by the client before sending and by the
+/// relay on receipt: `^[a-z0-9]+(-[a-z0-9]+)*$`, 1 to [`SERVICE_NAME_MAX`]
+/// bytes.
+///
+/// The service is the tail of the flat hostname `<person>-<machine>-<service>`,
+/// which is split at its first two dashes; leading, trailing or doubled dashes
+/// and uppercase are refused so every name maps to exactly one hostname.
+pub fn is_valid_service_name(name: &str) -> bool {
+    name.len() <= SERVICE_NAME_MAX
+        && name.split('-').all(|run| {
+            !run.is_empty()
+                && run
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+        })
 }
 
 #[cfg(test)]
@@ -110,17 +118,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn dns_label_validation() {
-        assert!(is_valid_dns_label("web"));
-        assert!(is_valid_dns_label("api-1"));
-        assert!(is_valid_dns_label("a"));
-        assert!(!is_valid_dns_label(""));
-        assert!(!is_valid_dns_label("-leading"));
-        assert!(!is_valid_dns_label("trailing-"));
-        assert!(!is_valid_dns_label("with.dot"));
-        assert!(!is_valid_dns_label("with_underscore"));
-        assert!(!is_valid_dns_label(&"a".repeat(64)));
-        assert!(is_valid_dns_label(&"a".repeat(63)));
+    fn service_name_validation() {
+        assert!(is_valid_service_name("web"));
+        assert!(is_valid_service_name("api-1"));
+        assert!(is_valid_service_name("a-b-c-1"));
+        assert!(is_valid_service_name("a"));
+        assert!(is_valid_service_name(&"a".repeat(31)));
+        assert!(!is_valid_service_name(""));
+        assert!(!is_valid_service_name("-leading"));
+        assert!(!is_valid_service_name("trailing-"));
+        assert!(!is_valid_service_name("a--b"));
+        assert!(!is_valid_service_name("Web"));
+        assert!(!is_valid_service_name("with.dot"));
+        assert!(!is_valid_service_name("with_underscore"));
+        assert!(!is_valid_service_name(&"a".repeat(32)));
     }
 
     #[test]

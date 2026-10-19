@@ -121,7 +121,7 @@ async fn test_http_308_redirect_standard_https_port_443() {
     server_task.await.unwrap();
 }
 
-// OFF-86: RFC 9112 §3.2 on the cleartext edge too — no redirect is built
+// RFC 9112 §3.2 on the cleartext edge too — no redirect is built
 // from a missing, duplicated or malformed Host. HTTP/1.0 without Host is
 // the one legitimate hostless request and redirects to the root domain.
 #[tokio::test]
@@ -184,7 +184,7 @@ async fn test_http01_challenge_served_on_port_80() {
     let shutdown_token = CancellationToken::new();
     let store = test_store().await;
     store
-        .publish_http01("tok-abc", "key-auth-abc", None, 0)
+        .publish_http01("tok-abc", "key-auth-abc", "admin.example.com", 0)
         .await
         .unwrap();
 
@@ -246,7 +246,7 @@ async fn http_request(addr: std::net::SocketAddr, raw_request: &str) -> String {
     resp
 }
 
-// WVR-134: the cleartext surface refuses the same scanner probes the TLS
+// the cleartext surface refuses the same scanner probes the TLS
 // surface does, before the redirect, so port-80 probing is visible in the same
 // log stream (scheme=http). ACME HTTP-01 stays exempt; ordinary paths still
 // redirect.
@@ -257,7 +257,12 @@ async fn test_http_refuses_scanner_probes_and_keeps_acme_and_redirects() {
     let shutdown_token = CancellationToken::new();
     let store = test_store().await;
     store
-        .publish_http01("tok-cleartext", "key-auth-cleartext", None, 0)
+        .publish_http01(
+            "tok-cleartext",
+            "key-auth-cleartext",
+            "admin.example.com",
+            0,
+        )
         .await
         .unwrap();
 

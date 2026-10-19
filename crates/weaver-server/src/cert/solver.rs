@@ -19,6 +19,7 @@ use tracing::debug;
 
 use crate::cert::managed::Validation;
 use crate::store::Store;
+use crate::wall_clock::unix_secs;
 
 /// Errors a solver can return while provisioning a challenge response.
 #[derive(Debug, thiserror::Error)]
@@ -140,9 +141,9 @@ impl ChallengeSolver for Dns01Solver {
     ) -> Result<ChallengeGuard, SolverError> {
         let name = Self::owner_name(identifier);
         let value = Self::dns_value(key_authorization);
-        let now = now_unix();
+        let now = unix_secs();
         self.store
-            .publish_challenge(&name, &value, Some(certificate), now)
+            .publish_challenge(&name, &value, certificate, now)
             .await
             .map_err(|e| SolverError::Store(e.to_string()))?;
         Ok(ChallengeGuard {
@@ -175,9 +176,9 @@ impl ChallengeSolver for Http01Solver {
         key_authorization: &str,
         certificate: &str,
     ) -> Result<ChallengeGuard, SolverError> {
-        let now = now_unix();
+        let now = unix_secs();
         self.store
-            .publish_http01(token, key_authorization, Some(certificate), now)
+            .publish_http01(token, key_authorization, certificate, now)
             .await
             .map_err(|e| SolverError::Store(e.to_string()))?;
         Ok(ChallengeGuard {
@@ -229,14 +230,6 @@ impl Solvers {
             Validation::Http01 => Arc::clone(&self.http),
         }
     }
-}
-
-/// Current Unix time, for challenge row timestamps.
-fn now_unix() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64
 }
 
 #[cfg(test)]

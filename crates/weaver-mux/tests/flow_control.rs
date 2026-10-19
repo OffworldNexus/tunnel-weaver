@@ -47,10 +47,9 @@ async fn sender_never_exceeds_credit() {
         Err(StreamError::WouldBlock)
     );
     // Client alone (no WINDOW_UPDATEs come back): count wire bytes.
-    let now = p.clock.now();
     let mut buf = Vec::new();
     let mut wire_total = 0u32;
-    while p.client.poll_transmit(now, &mut buf) {
+    while p.client.poll_transmit(&mut buf) {
         let f = Frame::parse(&buf).unwrap();
         if f.frame_type == FrameType::Data {
             wire_total += f.payload.len() as u32;

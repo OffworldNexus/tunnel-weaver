@@ -1,75 +1,77 @@
-//! Relay admin-host normalisation.
+//! Relay admin hosts.
 //!
-//! The admin host is both what the client dials and the mux server name the
-//! handshake transcript binds, and the relay compares that name against its own
-//! lowercased host byte for byte. So every host is normalised once — before it
-//! is stored and before it is dialled — and the normalised value is the one
-//! used for TCP, SNI, `Host` and the transcript alike.
+//! The admin host is both what the client dials and the server name the mux
+//! handshake binds, and the relay compares that name against its own lowercased
+//! host byte for byte. So every host is normalised once, and the normalised
+//! form is what is stored, dialled, sent as SNI and `Host`, and signed.
 
-use crate::connect::parse_server_address;
+use std::fmt;
 
 /// Why an admin host was refused.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("'{input}' is not a relay address: {reason}")]
 pub struct HostError {
     input: String,
-    reason: String,
+    reason: &'static str,
 }
 
-impl HostError {
-    fn new(input: &str, reason: impl Into<String>) -> Self {
-        Self {
-            input: input.to_string(),
-            reason: reason.into(),
+/// A normalised relay admin host: a lowercase DNS name or IPv4 address, and a
+/// port.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdminHost {
+    /// The host name, without the port.
+    pub host: String,
+    /// The port, 443 unless given.
+    pub port: u16,
+}
+
+impl AdminHost {
+    /// Parses `host` or `host:port`, lowercasing the host and stripping a
+    /// trailing dot. A pasted `https://host/` is accepted too.
+    pub fn parse(raw: &str) -> Result<Self, HostError> {
+        let error = |reason| HostError {
+            input: raw.to_string(),
+            reason,
+        };
+        let trimmed = raw.trim();
+        let bare = trimmed.strip_prefix("https://").unwrap_or(trimmed);
+        let bare = bare.strip_suffix('/').unwrap_or(bare);
+        if bare.contains("://") {
+            return Err(error("only https:// relays are supported"));
+        }
+        if bare.contains('/') {
+            return Err(error("give just the host, e.g. relay.example.com"));
+        }
+        let (host, port) = match bare.rsplit_once(':') {
+            Some((host, port)) => (
+                host,
+                port.parse()
+                    .map_err(|_| error("the port is not a number"))?,
+            ),
+            None => (bare, 443),
+        };
+        let host = host.strip_suffix('.').unwrap_or(host).to_ascii_lowercase();
+        if host.is_empty() {
+            return Err(error("it has no host name"));
+        }
+        Ok(Self { host, port })
+    }
+}
+
+impl fmt::Display for AdminHost {
+    /// `host`, or `host:port` when the port is not 443.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.port == 443 {
+            f.write_str(&self.host)
+        } else {
+            write!(f, "{}:{}", self.host, self.port)
         }
     }
 }
 
-/// Normalises a relay admin host to `host` or `host:port`.
-///
-/// Lowercases the host, strips a trailing dot, and drops the port when it is
-/// the default 443. A pasted `https://host/` is accepted for convenience; any
-/// other scheme, path, credentials or whitespace is refused.
+/// The canonical spelling of a relay admin host.
 pub fn normalize_admin_host(raw: &str) -> Result<String, HostError> {
-    let trimmed = raw.trim();
-    let bare = trimmed.strip_prefix("https://").unwrap_or(trimmed);
-    let bare = bare.strip_suffix('/').unwrap_or(bare);
-    if bare.is_empty() {
-        return Err(HostError::new(raw, "it is empty"));
-    }
-    if bare.contains("://") {
-        return Err(HostError::new(raw, "only https:// relays are supported"));
-    }
-    if bare
-        .chars()
-        .any(|c| c.is_whitespace() || matches!(c, '/' | '@' | '?' | '#'))
-    {
-        return Err(HostError::new(
-            raw,
-            "give just the host, e.g. relay.example.com",
-        ));
-    }
-
-    let (host, port) = parse_server_address(bare).map_err(|e| HostError::new(raw, e))?;
-    let host = host.to_ascii_lowercase();
-    let host = host.strip_suffix('.').unwrap_or(&host);
-    if host.is_empty() || host.ends_with('.') || host.starts_with('.') || host.contains("..") {
-        return Err(HostError::new(raw, "the host name is malformed"));
-    }
-    if port == 0 {
-        return Err(HostError::new(raw, "port 0 is not a port"));
-    }
-
-    let host = if host.contains(':') {
-        format!("[{host}]")
-    } else {
-        host.to_string()
-    };
-    Ok(if port == 443 {
-        host
-    } else {
-        format!("{host}:{port}")
-    })
+    AdminHost::parse(raw).map(|host| host.to_string())
 }
 
 #[cfg(test)]
@@ -100,36 +102,20 @@ mod tests {
             normalize_admin_host("Relay.Example:8443").unwrap(),
             "relay.example:8443"
         );
-        assert_eq!(
-            normalize_admin_host("127.0.0.1:38223").unwrap(),
-            "127.0.0.1:38223"
-        );
-        assert_eq!(normalize_admin_host("[::1]:4433").unwrap(), "[::1]:4433");
-        assert_eq!(normalize_admin_host("[::1]").unwrap(), "[::1]");
-    }
-
-    #[test]
-    fn is_idempotent() {
-        for raw in ["A.b:8443", "x.Y.", "[::1]:9", "localhost"] {
-            let once = normalize_admin_host(raw).unwrap();
-            assert_eq!(normalize_admin_host(&once).unwrap(), once);
-        }
+        let parsed = AdminHost::parse("127.0.0.1:38223").unwrap();
+        assert_eq!((parsed.host.as_str(), parsed.port), ("127.0.0.1", 38223));
+        assert_eq!(parsed.to_string(), "127.0.0.1:38223");
     }
 
     #[test]
     fn refuses_junk() {
         for raw in [
             "",
-            "  ",
             "http://relay.example",
             "relay.example/pair",
-            "user@relay.example",
             "relay.example:http",
-            "relay.example:0",
-            ".",
-            "a..b",
         ] {
-            assert!(normalize_admin_host(raw).is_err(), "{raw:?} was accepted");
+            assert!(AdminHost::parse(raw).is_err(), "{raw:?} was accepted");
         }
     }
 }

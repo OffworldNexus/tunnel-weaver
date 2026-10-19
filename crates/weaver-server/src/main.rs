@@ -39,7 +39,7 @@ pub enum Commands {
     /// Sends a development joke to an address through the configured provider.
     ///
     /// Deliberately temporary and hidden: deleted once real account email
-    /// (OFF-194/OFF-191) ships.
+    /// ships.
     #[command(hide = true, name = "send-a-joke")]
     SendAJoke(Box<SendAJokeArgs>),
 
@@ -1349,14 +1349,6 @@ fn read_email_config_file(
     Ok(Some(cfg))
 }
 
-/// Current wall-clock time as absolute Unix seconds.
-fn now_secs() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64
-}
-
 /// Parses a `--from`/`--until` value: a bare Unix-seconds integer or an
 /// ISO-8601 timestamp.
 fn parse_instant(value: &str) -> Result<i64, String> {
@@ -1380,7 +1372,7 @@ fn resolve_usage_window(
     from: Option<&str>,
     until: Option<&str>,
 ) -> Result<(i64, i64), String> {
-    let now = now_secs();
+    let now = weaver_server::wall_clock::unix_secs();
     let since_secs = match (since, from) {
         (Some(duration), _) => {
             let span: jiff::Span = duration
@@ -1703,7 +1695,7 @@ async fn handle_altcha(command: AltchaCommands, db_path: PathBuf) -> i32 {
         .ok()
         .and_then(|config| config.abuse)
         .and_then(|abuse| abuse.altcha);
-    let now_ms = weaver_server::abuse::unix_ms();
+    let now_ms = weaver_server::wall_clock::unix_ms();
 
     let AltchaCommands::Clients { command } = command;
     match command {
@@ -1742,8 +1734,8 @@ async fn handle_altcha(command: AltchaCommands, db_path: PathBuf) -> i32 {
                     )
                 })
                 .unwrap_or((5_000, "00".to_string(), 300));
-            let public_key = format!("ak_{}", random_hex(16));
-            let secret = random_hex(32);
+            let public_key = format!("ak_{}", weaver_server::random_hex(16));
+            let secret = weaver_server::random_hex(32);
             let new = weaver_server::store::altcha::NewAltchaClient {
                 public_key,
                 secret: secret.clone(),
@@ -1767,7 +1759,7 @@ async fn handle_altcha(command: AltchaCommands, db_path: PathBuf) -> i32 {
             }
         }
         ClientsCommands::Rotate { public_key, json } => {
-            let secret = random_hex(32);
+            let secret = weaver_server::random_hex(32);
             match store
                 .altcha_client_rotate(&public_key, &secret, now_ms)
                 .await
@@ -1911,14 +1903,6 @@ fn report_client_list(models: &[weaver_server::store::entity::altcha_client::Mod
             model.ttl_secs,
         );
     }
-}
-
-/// A random lowercase-hex string of `n` bytes.
-fn random_hex(n: usize) -> String {
-    use rand::RngCore;
-    let mut bytes = vec![0u8; n];
-    rand::rng().fill_bytes(&mut bytes);
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 async fn handle_setup(args: SetupArgs, db_path: PathBuf) {

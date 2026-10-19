@@ -10,7 +10,8 @@ pub struct Model {
     pub name: String,
     pub at: i64,
     pub kind: String,
-    pub detail: Option<String>,
+    /// Empty when the event carries no detail.
+    pub detail: String,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

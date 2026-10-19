@@ -53,7 +53,7 @@ where
     });
 }
 
-// OFF-70: Server startup aborts immediately with exit code 78 and lists missing keys when database is unconfigured.
+// Server startup aborts immediately with exit code 78 and lists missing keys when database is unconfigured.
 #[test]
 fn test_startup_unconfigured_db_exits_78() {
     let dir = tempdir().unwrap();
@@ -79,7 +79,7 @@ fn test_startup_unconfigured_db_exits_78() {
     assert!(stderr.contains("listen_https"));
 }
 
-// OFF-70: Server startup aborts immediately with exit code 1 when either listen address is already in use.
+// Server startup aborts immediately with exit code 1 when either listen address is already in use.
 #[test]
 fn test_startup_address_in_use_exits_1() {
     let dir = tempdir().unwrap();
@@ -222,7 +222,7 @@ fn test_startup_listen_fds_and_systemd_notify_and_shutdown() {
     assert!(msg.contains("READY=1"));
     assert!(msg.contains("STATUS=listening; certificate: pending"));
 
-    // OFF-70: Happy path — verify server actively serves traffic using inherited LISTEN_FDS
+    // Happy path — verify server actively serves traffic using inherited LISTEN_FDS
     // before initiating shutdown.
     {
         use std::io::{Read, Write};

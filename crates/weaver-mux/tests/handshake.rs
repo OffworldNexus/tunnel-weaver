@@ -162,9 +162,9 @@ async fn replayed_hello_is_rejected() {
     let mut q = Pair::new(client_config(1), server);
     let now = q.clock.now();
     let mut buf = Vec::new();
-    assert!(q.server.poll_transmit(now, &mut buf)); // CHALLENGE
+    assert!(q.server.poll_transmit(&mut buf)); // CHALLENGE
     q.server.recv(now, &encode(&hello)).await.unwrap();
-    assert!(q.server.poll_transmit(now, &mut buf));
+    assert!(q.server.poll_transmit(&mut buf));
     assert_eq!(Frame::parse(&buf).unwrap().frame_type, FrameType::Reject);
     assert!(q.server.is_closed());
 }
@@ -182,7 +182,7 @@ async fn frame_before_welcome_is_a_protocol_error() {
     assert!(matches!(err, ProtocolError::StateViolation(_)));
     let mut buf = Vec::new();
     // Server has CHALLENGE queued but GOAWAY still jumps the line.
-    assert!(p.server.poll_transmit(now, &mut buf));
+    assert!(p.server.poll_transmit(&mut buf));
     assert_eq!(Frame::parse(&buf).unwrap().frame_type, FrameType::Goaway);
     assert!(matches!(
         p.server_event(),

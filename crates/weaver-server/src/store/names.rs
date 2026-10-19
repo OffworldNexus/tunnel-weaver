@@ -7,17 +7,14 @@
 //!
 //! Person and machine names cannot contain a dash, so the label splits at its
 //! first two dashes: person, then machine, then the rest is the service. The
-//! service may contain dashes. All three are validated at creation time and the
-//! resulting hostname is a database uniqueness constraint.
+//! service may contain dashes; its rule is the protocol's
+//! [`weaver_proto::is_valid_service_name`]. All three are validated at creation
+//! time and the resulting hostname is a database uniqueness constraint.
 //!
-//! This module holds the pure rules; the `Store` applies them and recomputes
-//! materialized `domains.name` rows when an entity is renamed.
+//! This module holds the pure rules; the `Store` applies them.
 
 /// Maximum length of a person or machine name.
 pub const PERSON_MACHINE_MAX: usize = 15;
-
-/// Maximum length of a service name.
-pub const SERVICE_MAX: usize = 31;
 
 /// Validates a person or machine name: `^[a-z0-9]{1,15}$`.
 ///
@@ -29,31 +26,6 @@ pub fn is_valid_person_or_machine(name: &str) -> bool {
         && bytes
             .iter()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
-}
-
-/// Validates a service name: `^(?=.{1,31}$)[a-z0-9]+(?:-[a-z0-9]+)*$`.
-///
-/// Dashes are allowed *between* alphanumeric runs but not leading, trailing, or
-/// doubled; that keeps the flat label unambiguous when split on the first two
-/// dashes.
-pub fn is_valid_service(name: &str) -> bool {
-    let bytes = name.as_bytes();
-    if bytes.is_empty() || bytes.len() > SERVICE_MAX {
-        return false;
-    }
-    let mut prev_dash = false;
-    for &b in bytes {
-        match b {
-            b'a'..=b'z' | b'0'..=b'9' => prev_dash = false,
-            b'-' if prev_dash => return false,
-            b'-' => prev_dash = true,
-            _ => return false,
-        }
-    }
-    // Reject a leading or trailing dash: `prev_dash` is still true at the end
-    // if the last byte was a dash, and a leading dash was recorded before any
-    // alphanumeric run.
-    !prev_dash && !name.starts_with('-')
 }
 
 /// Lowercases a domain and strips any trailing dot, for comparison.
@@ -102,7 +74,7 @@ fn fold_ascii(c: char) -> Option<char> {
 /// Lowercases, folds common accented Latin letters to ASCII, drops everything
 /// else (dashes, dots, spaces, punctuation) and truncates to the label limit.
 /// Input that yields nothing falls back to `fallback`.
-pub fn slugify(raw: &str, fallback: &str) -> String {
+fn slugify(raw: &str, fallback: &str) -> String {
     let mut out = String::with_capacity(PERSON_MACHINE_MAX);
     for c in raw.to_lowercase().chars() {
         if let Some(folded) = fold_ascii(c) {
@@ -130,39 +102,22 @@ pub fn slugify_machine(raw_hostname: &str) -> String {
     slugify(raw_hostname, "machine")
 }
 
-/// Returns `base`, or the first `<truncated base><n>` (with `n >= 2`) that
-/// `taken` reports as free.
+/// The names to try, in order, for a name derived from `base`: `base` itself,
+/// then `<truncated base><n>` for `n = 2, 3, …`.
 ///
 /// The suffix is a bare digit appended *after* truncation, so every candidate is
 /// still `^[a-z0-9]{1,15}$` and — crucially — contains no dash, which would
 /// break the flat label's split on the first two dashes.
-pub fn uniquify(base: &str, mut taken: impl FnMut(&str) -> bool) -> String {
-    if !taken(base) {
-        return base.to_string();
-    }
-    let mut n: u32 = 2;
-    loop {
+pub fn candidates(base: &str) -> impl Iterator<Item = String> + '_ {
+    std::iter::once(base.to_string()).chain((2u32..).map(move |n| {
         let suffix = n.to_string();
-        let keep = PERSON_MACHINE_MAX.saturating_sub(suffix.len());
-        let mut candidate: String = base.chars().take(keep).collect();
+        let mut candidate: String = base
+            .chars()
+            .take(PERSON_MACHINE_MAX - suffix.len())
+            .collect();
         candidate.push_str(&suffix);
-        if !taken(&candidate) {
-            return candidate;
-        }
-        n = n.saturating_add(1);
-    }
-}
-
-/// True if `name` is a label the authoritative responder owns and no entity
-/// may shadow: the apex itself, or `_acme-challenge.<root>`.
-///
-/// A derived flat name can never collide (underscores and dots are invalid in
-/// person/machine/service), but parent-zone records can, so `setup` checks this
-/// too.
-pub fn is_reserved_label(name: &str, root: &str) -> bool {
-    let name = name.to_ascii_lowercase();
-    let root = root.to_ascii_lowercase();
-    name == root || name == format!("_acme-challenge.{root}")
+        candidate
+    }))
 }
 
 #[cfg(test)]
@@ -179,21 +134,6 @@ mod tests {
         assert!(!is_valid_person_or_machine("has-dash"));
         assert!(!is_valid_person_or_machine("Upper"));
         assert!(!is_valid_person_or_machine("under_score"));
-    }
-
-    #[test]
-    fn service_rules() {
-        assert!(is_valid_service("web"));
-        assert!(is_valid_service("my-app"));
-        assert!(is_valid_service("a-b-c-1"));
-        assert!(is_valid_service(&"a".repeat(31)));
-        assert!(!is_valid_service(""));
-        assert!(!is_valid_service(&"a".repeat(32)));
-        assert!(!is_valid_service("-web"));
-        assert!(!is_valid_service("web-"));
-        assert!(!is_valid_service("a--b"));
-        assert!(!is_valid_service("a.b"));
-        assert!(!is_valid_service("Web"));
     }
 
     #[test]
@@ -223,30 +163,17 @@ mod tests {
     }
 
     #[test]
-    fn uniquify_appends_digits_without_dashes() {
-        let taken = |n: &str| n == "laptop" || n == "laptop2";
-        assert_eq!(uniquify("web", taken), "web");
-        assert_eq!(uniquify("laptop", taken), "laptop3");
+    fn candidates_append_digits_without_dashes() {
+        let first: Vec<String> = candidates("laptop").take(3).collect();
+        assert_eq!(first, ["laptop", "laptop2", "laptop3"]);
 
-        // A full-length base truncates to make room for the suffix, and the
-        // result stays within the 15-character limit and dash-free.
+        // A full-length base truncates to make room for the suffix, and every
+        // candidate stays within the 15-character limit and dash-free.
         let long = "a".repeat(15);
-        let only_long = |n: &str| n == long;
-        let next = uniquify(&long, only_long);
-        assert_eq!(next, format!("{}2", "a".repeat(14)));
-        assert!(is_valid_person_or_machine(&next));
-    }
-
-    #[test]
-    fn reserved_labels() {
-        assert!(is_reserved_label("example.com", "example.com"));
-        assert!(is_reserved_label(
-            "_acme-challenge.example.com",
-            "example.com"
-        ));
-        assert!(!is_reserved_label(
-            "poc-laptop-web.example.com",
-            "example.com"
-        ));
+        let mut numbered = candidates(&long).skip(1);
+        assert_eq!(numbered.next().unwrap(), format!("{}2", "a".repeat(14)));
+        let tenth = numbered.nth(7).unwrap();
+        assert_eq!(tenth, format!("{}10", "a".repeat(13)));
+        assert!(is_valid_person_or_machine(&tenth));
     }
 }

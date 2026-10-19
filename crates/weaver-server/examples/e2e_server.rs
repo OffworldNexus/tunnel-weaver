@@ -47,7 +47,6 @@ use weaver_mux::KeyId;
 use weaver_proto::pair::{ServerMessage, Target};
 
 use weaver_server::account::AccountRuntime;
-use weaver_server::account::pairing;
 use weaver_server::account::password::BreachCheck;
 use weaver_server::altcha::AltchaRuntime;
 use weaver_server::cert::managed::ManagedCerts;
@@ -236,7 +235,7 @@ async fn seed_pairing(
     });
     Ok(Json(SeededPairing {
         handle,
-        fingerprint: pairing::fingerprint(&key_id),
+        fingerprint: key_id.to_string(),
     }))
 }
 

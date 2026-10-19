@@ -14,8 +14,7 @@
 //! names out of CT in the first place (per-machine wildcard certs over DNS-01 —
 //! ADR 0007); it just takes the free hits away from the bots until those land.
 //!
-//! [`crate::rule::ScannerRule`] wraps [`inspect`] as a [`crate::Rule`], and
-//! [`crate::passes::ScannerPass`] runs it inside the pipeline.
+//! [`crate::passes::ScannerPass`] runs [`inspect`] inside the pipeline.
 
 use http::Method;
 
@@ -69,8 +68,7 @@ pub fn inspect(method: &Method, raw_path: &str) -> Option<ScanVerdict> {
     // Percent-decode only when needed, and run a second pass only when the
     // first actually produced a fresh escape (double-encoded scans like
     // `%252e%252e`). Paths without `%` — the vast majority — borrow the input
-    // and allocate nothing. Decoding twice unconditionally, as before, was one
-    // of the two per-request allocations on this hot path.
+    // and allocate nothing.
     let decoded_owned;
     let decoded: &str = if path.as_bytes().contains(&b'%') {
         let once = percent_decode_lossy(path);
@@ -93,8 +91,7 @@ pub fn inspect(method: &Method, raw_path: &str) -> Option<ScanVerdict> {
         return Some(ScanVerdict::Malformed);
     }
 
-    // Fold ASCII case only if the path actually has uppercase; this is the
-    // second allocation the old code always paid.
+    // Fold ASCII case only if the path actually has uppercase.
     let lower_owned;
     let lower: &str = if has_upper {
         lower_owned = decoded.to_ascii_lowercase();
@@ -106,9 +103,7 @@ pub fn inspect(method: &Method, raw_path: &str) -> Option<ScanVerdict> {
     // One pass settles everything: traversal, dotfiles, and the first/last
     // segments. Traversal outranks every path-shape rule, so it returns the
     // instant a `..` segment is seen; a risky dotfile is only *remembered*
-    // because a later `..` must still win. This replaces the previous two
-    // split passes (an existential traversal scan plus the classification
-    // scan) with a single traversal.
+    // because a later `..` must still win.
     let mut first = "";
     let mut second = "";
     let mut last = "";
@@ -149,9 +144,7 @@ pub fn inspect(method: &Method, raw_path: &str) -> Option<ScanVerdict> {
         return Some(ScanVerdict::Dotfile);
     }
 
-    // Classify the final segment by its extension instead of scanning the
-    // whole suffix table: one `match` dispatches on the bytes, where the two
-    // `iter().any(ends_with)` scans ran ~23 comparisons per request. A name
+    // Classify the final segment by its extension with one `match`. A name
     // with no dot can only be a backup (`~`) or an SSH private key.
     if !last.is_empty() {
         if last.ends_with('~') {

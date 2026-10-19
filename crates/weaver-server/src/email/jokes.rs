@@ -1,6 +1,6 @@
 //! A small embedded joke library for the temporary `send-a-joke` dev verb.
 //!
-//! DELETED alongside the verb once real account email ships (OFF-194/OFF-191).
+//! DELETED alongside the verb once real account email ships.
 
 use rand::seq::IndexedRandom;
 

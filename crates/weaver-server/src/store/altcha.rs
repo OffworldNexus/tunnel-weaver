@@ -1,4 +1,4 @@
-//! ALTCHA API clients and spent proofs (WVR-136).
+//! ALTCHA API clients and spent proofs.
 //!
 //! The pure challenge/verification arithmetic lives in `weaver-abuse`; this
 //! module is the store side. Clients are created, rotated and revoked by the

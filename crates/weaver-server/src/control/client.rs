@@ -1,5 +1,5 @@
 use std::path::Path;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use comfy_table::modifiers::UTF8_ROUND_CORNERS;
 use comfy_table::presets::UTF8_FULL;
@@ -380,10 +380,7 @@ pub async fn client_cert_status(
         return code;
     }
 
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64;
+    let now = crate::wall_clock::unix_secs();
 
     if !has_name {
         // Table view
@@ -550,10 +547,6 @@ pub async fn client_cert_status(
             Cell::new(&resp.provider),
         ]);
         table.add_row(vec![
-            Cell::new("Issuer").fg(Color::DarkCyan),
-            Cell::new(resp.issuer.as_deref().unwrap_or("-")),
-        ]);
-        table.add_row(vec![
             Cell::new("Valid From").fg(Color::DarkCyan),
             Cell::new(
                 resp.not_before
@@ -580,15 +573,6 @@ pub async fn client_cert_status(
         table.add_row(vec![
             Cell::new("Valid Until").fg(Color::DarkCyan),
             Cell::new(not_after_str).fg(not_after_color),
-        ]);
-
-        table.add_row(vec![
-            Cell::new("Last Active").fg(Color::DarkCyan),
-            Cell::new(
-                resp.last_active_at
-                    .map(format_unix_timestamp)
-                    .unwrap_or_else(|| "-".to_string()),
-            ),
         ]);
 
         if let Some(cert_id) = resp.cert_id {
@@ -628,7 +612,11 @@ pub async fn client_cert_status(
                 events_table.add_row(vec![
                     Cell::new(format_unix_timestamp(ev.at)),
                     kind_cell,
-                    Cell::new(ev.detail.as_deref().unwrap_or("-")),
+                    Cell::new(if ev.detail.is_empty() {
+                        "-"
+                    } else {
+                        &ev.detail
+                    }),
                 ]);
             }
             println!("{events_table}");

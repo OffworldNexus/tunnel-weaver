@@ -129,12 +129,11 @@ async fn serve_account(
     let bytes = match body.collect().await {
         Ok(collected) => collected.to_bytes(),
         Err(_) => {
-            let mut resp = Response::builder()
-                .status(StatusCode::INTERNAL_SERVER_ERROR)
-                .body(full_body("500 Internal Server Error\n"))
-                .unwrap();
-            apply_security_headers(&mut resp, include_hsts);
-            return resp;
+            return plain_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "500 Internal Server Error\n",
+                include_hsts,
+            );
         }
     };
     let mut response = Response::from_parts(parts, full_body(bytes));
@@ -153,87 +152,84 @@ async fn serve_account(
 
 pub use weaver_tokio::{set_tcp_nodelay, set_tcp_notsent_lowat};
 
-/// Serves `GET /_weaver/connect`: the tunnel WebSocket.
-///
-/// Reached on the tunnel root *and* on the admin host. A client only ever knows
-/// the admin host it paired with, so it dials that; the host it presents becomes
-/// the mux handshake name on both sides, and the client is never required to
-/// know — or guess — any other address.
-fn tunnel_upgrade(
-    req: &mut Request<hyper::body::Incoming>,
-    config: &HttpsEdgeConfig,
-    include_hsts: bool,
-    server_name: &str,
-) -> Response<BoxBody> {
-    if req.method() != Method::GET {
-        let mut resp = Response::builder()
-            .status(StatusCode::METHOD_NOT_ALLOWED)
-            .body(full_body("405 Method Not Allowed\n"))
-            .unwrap();
-        apply_security_headers(&mut resp, include_hsts);
-        return resp;
-    }
+/// The upgraded socket a WebSocket endpoint serves.
+type UpgradedWs = tokio_tungstenite::WebSocketStream<TokioIo<hyper::upgrade::Upgraded>>;
 
+/// A plain-text refusal with the security headers.
+fn plain_response(
+    status: StatusCode,
+    body: impl Into<Bytes>,
+    include_hsts: bool,
+) -> Response<BoxBody> {
+    let mut resp = Response::builder()
+        .status(status)
+        .body(full_body(body))
+        .unwrap();
+    apply_security_headers(&mut resp, include_hsts);
+    resp
+}
+
+/// Answers a `GET` WebSocket upgrade speaking `subprotocol` and hands the
+/// upgraded socket, opened with `ws_config`, to `serve`.
+fn websocket_upgrade<F, Fut>(
+    req: &mut Request<hyper::body::Incoming>,
+    subprotocol: &'static str,
+    ws_config: Option<tokio_tungstenite::tungstenite::protocol::WebSocketConfig>,
+    include_hsts: bool,
+    serve: F,
+) -> Response<BoxBody>
+where
+    F: FnOnce(UpgradedWs) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + Send,
+{
+    if req.method() != Method::GET {
+        return plain_response(
+            StatusCode::METHOD_NOT_ALLOWED,
+            "405 Method Not Allowed\n",
+            include_hsts,
+        );
+    }
     let ws_proto = req
         .headers()
         .get("sec-websocket-protocol")
         .and_then(|v| v.to_str().ok());
-    if ws_proto != Some("weaver-mux-v1") {
-        let mut resp = Response::builder()
-            .status(StatusCode::BAD_REQUEST)
-            .body(full_body(
-                "400 Bad Request: Sec-WebSocket-Protocol must be weaver-mux-v1\n",
-            ))
-            .unwrap();
-        apply_security_headers(&mut resp, include_hsts);
-        return resp;
+    if ws_proto != Some(subprotocol) {
+        return plain_response(
+            StatusCode::BAD_REQUEST,
+            format!("400 Bad Request: Sec-WebSocket-Protocol must be {subprotocol}\n"),
+            include_hsts,
+        );
     }
-
-    let Some(key) = req
-        .headers()
-        .get("sec-websocket-key")
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_owned)
-    else {
-        let mut resp = Response::builder()
-            .status(StatusCode::BAD_REQUEST)
-            .body(full_body("400 Bad Request: Missing Sec-WebSocket-Key\n"))
-            .unwrap();
-        apply_security_headers(&mut resp, include_hsts);
-        return resp;
+    let Some(key) = req.headers().get("sec-websocket-key") else {
+        return plain_response(
+            StatusCode::BAD_REQUEST,
+            "400 Bad Request: Missing Sec-WebSocket-Key\n",
+            include_hsts,
+        );
     };
-
     let accept = tokio_tungstenite::tungstenite::handshake::derive_accept_key(key.as_bytes());
     let on_upgrade = hyper::upgrade::on(&mut *req);
-
-    if let Some(reg) = &config.tunnel_registry {
-        let reg = Arc::clone(reg);
-        let name = server_name.to_string();
-        tokio::spawn(async move {
-            match on_upgrade.await {
-                Ok(upgraded) => {
-                    let io = TokioIo::new(upgraded);
-                    let ws_stream = tokio_tungstenite::WebSocketStream::from_raw_socket(
-                        io,
-                        tokio_tungstenite::tungstenite::protocol::Role::Server,
-                        None,
-                    )
-                    .await;
-                    crate::tunnel::spawn_tunnel_connection(ws_stream, reg, name);
-                }
-                Err(err) => {
-                    debug!(error = %err, "WebSocket upgrade failed");
-                }
+    tokio::spawn(async move {
+        match on_upgrade.await {
+            Ok(upgraded) => {
+                let ws = tokio_tungstenite::WebSocketStream::from_raw_socket(
+                    TokioIo::new(upgraded),
+                    tokio_tungstenite::tungstenite::protocol::Role::Server,
+                    ws_config,
+                )
+                .await;
+                serve(ws).await;
             }
-        });
-    }
+            Err(err) => debug!(error = %err, subprotocol, "WebSocket upgrade failed"),
+        }
+    });
 
     let mut resp = Response::builder()
         .status(StatusCode::SWITCHING_PROTOCOLS)
         .header(http::header::CONNECTION, "Upgrade")
         .header(http::header::UPGRADE, "websocket")
         .header("Sec-WebSocket-Accept", accept)
-        .header("Sec-WebSocket-Protocol", "weaver-mux-v1")
+        .header("Sec-WebSocket-Protocol", subprotocol)
         .body(empty_body())
         .unwrap();
     apply_security_headers(&mut resp, include_hsts);
@@ -377,18 +373,22 @@ pub async fn handle_https_request(
         } else {
             ViewId::RELAY_WEB
         };
-        let mut ctx =
-            crate::abuse::context(surface, &req, remote_addr, view, crate::abuse::unix_ms());
-        let decision = config.guard.evaluate(&mut ctx).await;
+        let ctx = crate::abuse::context(
+            surface,
+            &req,
+            remote_addr,
+            view,
+            crate::wall_clock::unix_ms(),
+        );
+        let decision = config.guard.evaluate(&ctx).await;
         match decision {
-            Decision::Block { verdict, rule } => debug!(
+            Decision::Block { verdict } => debug!(
                 hostname = %host_lower,
                 visitor = %remote_addr.ip(),
                 method = %req.method(),
                 scheme = surface.scheme.as_str(),
                 surface = surface.host.as_str(),
                 path = %bounded_path(req.uri().path()),
-                rule,
                 verdict = verdict.as_str(),
                 "safety pipeline blocked request"
             ),
@@ -407,19 +407,32 @@ pub async fn handle_https_request(
                 policy = policy.as_str(),
                 "safety pipeline budget store unavailable; serving degraded"
             ),
-            Decision::Allow | Decision::Challenge { .. } | Decision::Unavailable { .. } => {}
+            Decision::Allow | Decision::Unavailable { .. } => {}
         }
         if let Some(refusal) = Refusal::from_decision(decision) {
             return Ok(refusal_response(refusal, include_hsts));
         }
     }
 
-    // The tunnel WebSocket, on the tunnel root *or* the admin host. Doing this
-    // before the host split keeps one code path for the upgrade.
+    // The tunnel WebSocket, on the tunnel root *or* the admin host. A client
+    // only ever knows the admin host it paired with, so it dials that; the host
+    // it presents becomes the mux handshake name on both sides.
     let on_tunnel_endpoint = matches!(covering.map(|c| c.validation), Some(Validation::Http01))
         || config.managed.tunnel_domain() == Some(host_lower.as_str());
     if on_tunnel_endpoint && req.uri().path() == "/_weaver/connect" {
-        return Ok(tunnel_upgrade(&mut req, &config, include_hsts, &host_lower));
+        let registry = config.tunnel_registry.clone();
+        let name = host_lower.clone();
+        return Ok(websocket_upgrade(
+            &mut req,
+            "weaver-mux-v1",
+            None,
+            include_hsts,
+            move |ws| async move {
+                if let Some(registry) = registry {
+                    crate::tunnel::spawn_tunnel_connection(ws, registry, name);
+                }
+            },
+        ));
     }
 
     if matches!(covering.map(|c| c.validation), Some(Validation::Http01)) {
@@ -457,91 +470,25 @@ pub async fn handle_https_request(
         // the pairing budget. Handled on the raw edge because the account
         // router buffers response bodies and would strip the 101.
         if req.uri().path() == weaver_proto::pair::PAIR_CHANNEL_PATH {
-            if req.method() != Method::GET {
-                let mut resp = Response::builder()
-                    .status(StatusCode::METHOD_NOT_ALLOWED)
-                    .body(full_body("405 Method Not Allowed\n"))
-                    .unwrap();
-                apply_security_headers(&mut resp, include_hsts);
-                return Ok(resp);
-            }
-            let ws_proto = req
-                .headers()
-                .get("sec-websocket-protocol")
-                .and_then(|v| v.to_str().ok());
-            if ws_proto != Some(weaver_proto::pair::PAIR_SUBPROTOCOL) {
-                let mut resp = Response::builder()
-                    .status(StatusCode::BAD_REQUEST)
-                    .body(full_body(
-                        "400 Bad Request: Sec-WebSocket-Protocol must be weaver-pair-v1\n",
-                    ))
-                    .unwrap();
-                apply_security_headers(&mut resp, include_hsts);
-                return Ok(resp);
-            }
-            let Some(key) = req
-                .headers()
-                .get("sec-websocket-key")
-                .and_then(|v| v.to_str().ok())
-                .map(str::to_owned)
-            else {
-                let mut resp = Response::builder()
-                    .status(StatusCode::BAD_REQUEST)
-                    .body(full_body("400 Bad Request: Missing Sec-WebSocket-Key\n"))
-                    .unwrap();
-                apply_security_headers(&mut resp, include_hsts);
-                return Ok(resp);
+            let Some(account) = config.account.clone() else {
+                // No account plane on this relay, so there is nothing to pair with.
+                return Ok(plain_response(
+                    StatusCode::NOT_FOUND,
+                    "404 Not Found\n",
+                    include_hsts,
+                ));
             };
-
-            if let Some(account) = &config.account {
-                let accept =
-                    tokio_tungstenite::tungstenite::handshake::derive_accept_key(key.as_bytes());
-                let on_upgrade = hyper::upgrade::on(&mut req);
-                let account = Arc::clone(account);
-                let peer = crate::account::pairing::Peer {
-                    guard: Arc::clone(&config.guard),
-                    addr: remote_addr,
-                };
-                tokio::spawn(async move {
-                    match on_upgrade.await {
-                        Ok(upgraded) => {
-                            let io = TokioIo::new(upgraded);
-                            let ws_stream = tokio_tungstenite::WebSocketStream::from_raw_socket(
-                                io,
-                                tokio_tungstenite::tungstenite::protocol::Role::Server,
-                                Some(crate::account::pairing::channel_config()),
-                            )
-                            .await;
-                            crate::account::pairing::serve_channel(ws_stream, account, peer).await;
-                        }
-                        Err(err) => {
-                            debug!(error = %err, "pairing WebSocket upgrade failed");
-                        }
-                    }
-                });
-
-                let mut resp = Response::builder()
-                    .status(StatusCode::SWITCHING_PROTOCOLS)
-                    .header(http::header::CONNECTION, "Upgrade")
-                    .header(http::header::UPGRADE, "websocket")
-                    .header("Sec-WebSocket-Accept", accept)
-                    .header(
-                        "Sec-WebSocket-Protocol",
-                        weaver_proto::pair::PAIR_SUBPROTOCOL,
-                    )
-                    .body(empty_body())
-                    .unwrap();
-                apply_security_headers(&mut resp, include_hsts);
-                return Ok(resp);
-            }
-
-            // No account plane on this relay, so there is nothing to pair with.
-            let mut resp = Response::builder()
-                .status(StatusCode::NOT_FOUND)
-                .body(full_body("404 Not Found\n"))
-                .unwrap();
-            apply_security_headers(&mut resp, include_hsts);
-            return Ok(resp);
+            let peer = crate::account::pairing::Peer {
+                guard: Arc::clone(&config.guard),
+                addr: remote_addr,
+            };
+            return Ok(websocket_upgrade(
+                &mut req,
+                weaver_proto::pair::PAIR_SUBPROTOCOL,
+                Some(crate::account::pairing::channel_config()),
+                include_hsts,
+                move |ws| crate::account::pairing::serve_channel(ws, account, peer),
+            ));
         }
 
         // Everything else on the admin host is the SvelteKit account
@@ -578,14 +525,11 @@ pub async fn handle_https_request(
 
         // Standard root domain HTTP endpoints
         match (req.method(), req.uri().path()) {
-            (&Method::GET, "/") => {
-                let mut resp = Response::builder()
-                    .status(StatusCode::OK)
-                    .body(full_body(render_welcome()))
-                    .unwrap();
-                apply_security_headers(&mut resp, include_hsts);
-                Ok(resp)
-            }
+            (&Method::GET, "/") => Ok(plain_response(
+                StatusCode::OK,
+                render_welcome(),
+                include_hsts,
+            )),
             (&Method::GET, "/healthz") => {
                 let mut resp = Response::builder()
                     .status(StatusCode::OK)

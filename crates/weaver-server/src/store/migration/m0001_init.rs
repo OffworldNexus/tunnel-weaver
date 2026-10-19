@@ -34,7 +34,6 @@ enum AcmeAccount {
     Directory,
     Email,
     CredentialsJson,
-    Kid,
     CreatedAt,
 }
 
@@ -181,7 +180,6 @@ enum Certificates {
     KeyPem,
     NotBefore,
     NotAfter,
-    Issuer,
     Directory,
     ObtainedAt,
     Validation,
@@ -296,7 +294,6 @@ impl MigrationTrait for Migration {
                     .col(text(AcmeAccount::Directory).primary_key())
                     .col(text(AcmeAccount::Email))
                     .col(text(AcmeAccount::CredentialsJson))
-                    .col(text_null(AcmeAccount::Kid))
                     .col(big_integer(AcmeAccount::CreatedAt))
                     .to_owned(),
             )
@@ -672,7 +669,7 @@ impl MigrationTrait for Migration {
                     .col(integer(MachineKeyLog::PersonId))
                     .col(big_integer(MachineKeyLog::AddedAt))
                     .col(big_integer_null(MachineKeyLog::RetiredAt))
-                    .col(text_null(MachineKeyLog::RetiredReason))
+                    .col(text(MachineKeyLog::RetiredReason))
                     .to_owned(),
             )
             .await?;
@@ -736,7 +733,6 @@ impl MigrationTrait for Migration {
                     .col(text(Certificates::KeyPem))
                     .col(big_integer(Certificates::NotBefore))
                     .col(big_integer(Certificates::NotAfter))
-                    .col(text_null(Certificates::Issuer))
                     .col(text(Certificates::Directory))
                     .col(big_integer(Certificates::ObtainedAt))
                     .col(text(Certificates::Validation).default("dns-01"))
@@ -797,7 +793,7 @@ impl MigrationTrait for Migration {
                     .col(text(CertEvents::Name))
                     .col(big_integer(CertEvents::At))
                     .col(text(CertEvents::Kind))
-                    .col(text_null(CertEvents::Detail))
+                    .col(text(CertEvents::Detail))
                     .to_owned(),
             )
             .await?;
@@ -862,7 +858,7 @@ impl MigrationTrait for Migration {
                     .col(big_pk_auto(Challenge::Id))
                     .col(text(Challenge::Name))
                     .col(text(Challenge::Value))
-                    .col(text_null(Challenge::Certificate))
+                    .col(text(Challenge::Certificate))
                     .col(big_integer(Challenge::CreatedAt))
                     .col(text(Challenge::Kind).default("dns-01"))
                     .to_owned(),

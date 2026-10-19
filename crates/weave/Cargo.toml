@@ -8,25 +8,18 @@ repository.workspace = true
 
 [[bin]]
 name = "weave"
-path = "src/main.rs"
+path = "src/bin/weave/main.rs"
 
 [lib]
 name = "weave"
 path = "src/lib.rs"
 
-[features]
-# The hard-coded development Ed25519 signer (see `src/identity.rs`). On for the
-# PoC integration tests, which authenticate as the key the relay's initial
-# migration seeds; off for a real build, which uses the tpmd device key.
-dev-signer = []
-
 [dependencies]
 bytes = { workspace = true }
 clap = { workspace = true }
-crossterm = { workspace = true }
 jiff = { workspace = true }
 async-trait = { workspace = true }
-ed25519-dalek = { workspace = true }
+inquire = { workspace = true }
 futures-util = { workspace = true }
 http = { workspace = true }
 http-body-util = { workspace = true }
@@ -35,8 +28,6 @@ hyper-util = { workspace = true }
 hostname = "0.4"
 rustls = { workspace = true }
 rustls-platform-verifier = { workspace = true }
-serde = { workspace = true }
-serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-rustls = { workspace = true }
@@ -49,6 +40,7 @@ weaver-proto = { workspace = true }
 weaver-tokio = { workspace = true }
 sea-orm = { workspace = true }
 sea-orm-migration = { workspace = true }
+serde_json = { workspace = true }
 sqlx = { workspace = true }
 directories = "6"
 # The device key is held by tpmd, the local key agent: `weave` links its
@@ -59,6 +51,8 @@ directories = "6"
 # still uses the old `/run/tpmd.sock`. Move to `branch = "develop"` once the new
 # path lands there.
 tpmd-client = { git = "https://github.com/OffworldNexus/tpmd", rev = "90cb2db45b3ea6bc065918f11c7e0fd23b4ce837" }
+# For the endpoint list `Client::connect_within` takes.
+tpmd-ipc = { git = "https://github.com/OffworldNexus/tpmd", rev = "90cb2db45b3ea6bc065918f11c7e0fd23b4ce837" }
 # Terminal output: spinners, colour, and OSC 8 hyperlink detection.
 indicatif = "0.18"
 console = "0.16"
@@ -66,3 +60,4 @@ supports-hyperlinks = "3"
 
 [dev-dependencies]
 tempfile = { workspace = true }
+weaver-mux = { workspace = true, features = ["test-util"] }

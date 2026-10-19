@@ -1,9 +1,7 @@
 //! Passes: the ordered stages of the safety pipeline.
 //!
-//! A pass sees the whole [`RequestContext`] — including findings left by earlier
-//! passes — and either continues or stops the pipeline with a [`Decision`].
-//! Passes are the collaboration point: one pass's finding becomes another's
-//! input (for example, an abuse signal raising the budget a later pass charges).
+//! A pass sees the whole [`RequestContext`] and either continues or stops the
+//! pipeline with a [`Decision`].
 //!
 //! The built-in passes are in [`crate::passes`].
 
@@ -22,8 +20,6 @@ pub enum Decision {
     Block {
         /// The firewall verdict that fired.
         verdict: ScanVerdict,
-        /// The rule that produced it.
-        rule: &'static str,
     },
     /// Too many requests: `429` plus `Retry-After`.
     Throttle {
@@ -31,11 +27,6 @@ pub enum Decision {
         policy: PolicyId,
         /// Milliseconds to wait, already bounded by the configured cap.
         retry_after_ms: i64,
-    },
-    /// A proof-of-work challenge is required (reserved for a future gate).
-    Challenge {
-        /// The policy that requires the challenge.
-        policy: PolicyId,
     },
     /// The store failed and the policy fails closed: `503`.
     Unavailable {
@@ -63,8 +54,8 @@ pub enum PassOutcome {
 pub trait Pass: Send + Sync {
     /// Stable name, for logs and observability.
     fn name(&self) -> &'static str;
-    /// Inspect/annotate the context, or stop the pipeline.
-    async fn run(&self, ctx: &mut RequestContext<'_>) -> PassOutcome;
+    /// Inspect the context, or stop the pipeline.
+    async fn run(&self, ctx: &RequestContext<'_>) -> PassOutcome;
 }
 
 /// The ordered passes that protect the relay, run in order until one stops.
@@ -81,11 +72,11 @@ impl Pipeline {
     /// A pipeline with only the scanner firewall pass (no budget). Useful where
     /// no store is available, and as the base every real pipeline extends.
     pub fn scanner_only() -> Self {
-        Self::new(vec![Box::new(crate::passes::ScannerPass::default())])
+        Self::new(vec![Box::new(crate::passes::ScannerPass)])
     }
 
     /// Run the passes in order; the first non-[`PassOutcome::Continue`] wins.
-    pub async fn evaluate(&self, ctx: &mut RequestContext<'_>) -> Decision {
+    pub async fn evaluate(&self, ctx: &RequestContext<'_>) -> Decision {
         for pass in &self.passes {
             if let PassOutcome::Stop(decision) = pass.run(ctx).await {
                 return decision;

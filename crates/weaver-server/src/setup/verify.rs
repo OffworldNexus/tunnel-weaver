@@ -12,7 +12,6 @@ use std::time::Duration;
 use crossterm::style::Stylize;
 
 use crate::control::client::client_cert_wait;
-use crate::setup::dns::generate_random_hex;
 
 /// Outcome of one `curl` HTTPS probe.
 enum HttpsProbe {
@@ -229,7 +228,7 @@ pub async fn verify_setup(
     // 4. Wildcard coverage: a random single-label name must complete a TLS
     //    handshake. Any HTTP response (even 404) proves the wildcard
     //    certificate covers the name; only a TLS failure is a problem.
-    let sample_name = format!("sample-{}", generate_random_hex(4));
+    let sample_name = format!("sample-{}", crate::random_hex(4));
     let sample_url = format!("https://{sample_name}.{tunnel_domain}/");
     print!(
         "  {} Testing wildcard HTTPS GET {}/...",

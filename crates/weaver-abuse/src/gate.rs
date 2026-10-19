@@ -1,16 +1,9 @@
 //! The admission gate: charge a fingerprint's budgets for a policy.
 
-use crate::gcra::Quota;
+use crate::gcra::{Outcome, Quota};
 use crate::key::{Fingerprint, Key};
 use crate::policy::{PolicyId, PolicySet, StoreErrorPolicy};
 use crate::store::BudgetStore;
-
-/// A granted request, carrying the budget left on the tightest key.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Admission {
-    /// Remaining unit-cost requests on the tightest budget, after charging.
-    pub remaining: u32,
-}
 
 /// Why a request was refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -21,8 +14,6 @@ pub enum GateError {
         policy: PolicyId,
         /// Milliseconds to wait, already bounded by the configured cap.
         retry_after_ms: i64,
-        /// Always 0 for a refusal; present for symmetry with [`Admission`].
-        remaining: u32,
     },
     /// The budget store failed; `decision` is the policy's configured stance.
     Store {
@@ -50,11 +41,6 @@ impl<S: BudgetStore> Gate<S> {
         }
     }
 
-    /// The underlying store.
-    pub fn store(&self) -> &S {
-        &self.store
-    }
-
     /// Charge every budget `policy` selects for `fp`, at `cost` units.
     ///
     /// A request is admitted only if every selected budget admits; the longest
@@ -66,9 +52,9 @@ impl<S: BudgetStore> Gate<S> {
         fp: &Fingerprint,
         cost: u32,
         now_ms: i64,
-    ) -> Result<Admission, GateError> {
+    ) -> Result<(), GateError> {
         let Some(configured) = self.policies.get(policy) else {
-            return Ok(Admission { remaining: 0 });
+            return Ok(());
         };
         let selected: Vec<(Key, Quota)> = configured
             .budgets
@@ -76,41 +62,29 @@ impl<S: BudgetStore> Gate<S> {
             .filter_map(|budget| fp.get(budget.key).map(|key| (key, budget.quota)))
             .collect();
         if selected.is_empty() {
-            return Ok(Admission { remaining: 0 });
+            return Ok(());
         }
 
-        let decisions = match self
+        let charges = self
             .store
             .check_all(policy, &selected, cost, now_ms, self.retry_cap_ms)
             .await
-        {
-            Ok(decisions) => decisions,
-            Err(_) => {
-                return Err(GateError::Store {
-                    policy,
-                    decision: configured.on_store_error,
-                });
-            }
-        };
+            .map_err(|_| GateError::Store {
+                policy,
+                decision: configured.on_store_error,
+            })?;
 
-        let mut retry_after_ms = 0i64;
-        let mut remaining = u32::MAX;
-        for decision in &decisions {
-            if decision.outcome == crate::gcra::Outcome::Throttled {
-                retry_after_ms = retry_after_ms.max(decision.retry_after_ms);
-            }
-            remaining = remaining.min(decision.remaining);
-        }
-
-        if retry_after_ms > 0 {
-            return Err(GateError::Throttled {
+        let retry_after_ms = charges
+            .iter()
+            .filter(|charge| charge.outcome == Outcome::Throttled)
+            .map(|charge| charge.retry_after_ms)
+            .max();
+        match retry_after_ms {
+            Some(retry_after_ms) => Err(GateError::Throttled {
                 policy,
                 retry_after_ms,
-                remaining: 0,
-            });
+            }),
+            None => Ok(()),
         }
-        Ok(Admission {
-            remaining: if remaining == u32::MAX { 0 } else { remaining },
-        })
     }
 }

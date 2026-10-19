@@ -1,7 +1,6 @@
 //! Policies: the budgets a request is charged against, the views that select
 //! them, and how store failures count.
 
-use crate::context::RequestContext;
 use crate::gcra::Quota;
 use crate::key::KeyKind;
 
@@ -32,7 +31,7 @@ impl PolicyId {
     /// Resending a verification link (admin host account plane).
     pub const ACCOUNT_RESEND: PolicyId = PolicyId("account-resend");
 
-    /// The pairing channel and its browser API (admin host, WVR-13).
+    /// The pairing channel and its browser API (admin host).
     pub const ACCOUNT_PAIR: PolicyId = PolicyId("account-pair");
 
     /// Build a policy id from a static string.
@@ -49,7 +48,7 @@ impl PolicyId {
 /// A protected thing a request targets.
 ///
 /// Views decouple "what is being protected" from "which budget applies": a
-/// future signup handler names its own view, and the route table maps it to a
+/// each handler names its own view, and the route table maps it to a
 /// policy and a cost without the engine hard-coding it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ViewId(&'static str);
@@ -69,13 +68,8 @@ impl ViewId {
     pub const ACCOUNT_LOGIN: ViewId = ViewId("account-login");
     /// Resending a verification link (admin host account plane).
     pub const ACCOUNT_RESEND: ViewId = ViewId("account-resend");
-    /// The pairing channel and its browser API (admin host, WVR-13).
+    /// The pairing channel and its browser API (admin host).
     pub const ACCOUNT_PAIR: ViewId = ViewId("account-pair");
-
-    /// Build a view id from a static string.
-    pub const fn new(id: &'static str) -> Self {
-        Self(id)
-    }
 
     /// The stable string form.
     pub const fn as_str(self) -> &'static str {
@@ -128,114 +122,32 @@ impl PolicySet {
     pub fn get(&self, id: PolicyId) -> Option<&Policy> {
         self.policies.iter().find(|policy| policy.id == id)
     }
-
-    /// Iterate the configured policies.
-    pub fn iter(&self) -> impl Iterator<Item = &Policy> {
-        self.policies.iter()
-    }
 }
 
-/// How much a request costs a view's budget.
-///
-/// The cost must be decidable *before* the protected work runs, so it can only
-/// use pre-handler facts (declared body size, method). IO-derived signals are
-/// resolved by the caller and passed in, never computed here.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CostRule {
-    /// A fixed number of units.
-    Static(u32),
-    /// A base plus a per-KiB surcharge on the declared body.
-    Weighted {
-        /// Fixed units charged to any request.
-        base: u32,
-        /// Additional units per KiB of declared body.
-        per_kib: u32,
-    },
-}
-
-impl CostRule {
-    /// The units this request costs.
-    pub fn units(&self, ctx: &RequestContext<'_>) -> u32 {
-        match *self {
-            Self::Static(units) => units,
-            Self::Weighted { base, per_kib } => {
-                let kib = ctx.body_len.unwrap_or(0).div_ceil(1024) as u32;
-                base.saturating_add(per_kib.saturating_mul(kib))
-            }
-        }
-    }
-}
-
-/// Which policy and cost apply to a view.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Route {
-    /// The budget policy to charge.
-    pub policy: PolicyId,
-    /// The cost rule for the view.
-    pub cost: CostRule,
-}
-
-/// The view→route mapping consulted by [`crate::passes::BudgetPass`].
+/// The view→policy mapping consulted by [`crate::passes::BudgetPass`].
 #[derive(Debug, Clone, Default)]
 pub struct RouteTable {
-    routes: Vec<(ViewId, Route)>,
+    routes: Vec<(ViewId, PolicyId)>,
 }
 
 impl RouteTable {
-    /// Wrap a list of `(view, route)` pairs.
-    pub fn new(routes: Vec<(ViewId, Route)>) -> Self {
+    /// Wrap a list of `(view, policy)` pairs.
+    pub fn new(routes: Vec<(ViewId, PolicyId)>) -> Self {
         Self { routes }
     }
 
-    /// The route for a view, if it is budgeted.
-    pub fn get(&self, view: ViewId) -> Option<&Route> {
+    /// The policy for a view, if it is budgeted.
+    pub fn get(&self, view: ViewId) -> Option<PolicyId> {
         self.routes
             .iter()
             .find(|(candidate, _)| *candidate == view)
-            .map(|(_, route)| route)
+            .map(|&(_, policy)| policy)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn cost_rule_static_and_weighted() {
-        let base = |body_len| {
-            let ctx = RequestContext {
-                surface: crate::surface::Surface::cleartext(),
-                method: http::Method::GET,
-                path: "/",
-                raw_path: "/",
-                body_len,
-                fingerprint: crate::fingerprint("10.0.0.1".parse().unwrap(), None),
-                view: ViewId::RELAY_WEB,
-                now_ms: 0,
-                findings: Vec::new(),
-                cost: 0,
-            };
-            (
-                ctx,
-                CostRule::Weighted {
-                    base: 1,
-                    per_kib: 2,
-                },
-            )
-        };
-        let weighted = CostRule::Weighted {
-            base: 1,
-            per_kib: 2,
-        };
-        let (ctx, _) = base(None);
-        assert_eq!(weighted.units(&ctx), 1);
-        let (ctx, _) = base(Some(1024));
-        assert_eq!(weighted.units(&ctx), 3);
-        let (ctx, _) = base(Some(1025));
-        assert_eq!(weighted.units(&ctx), 5);
-        let (ctx, _) = base(Some(0));
-        assert_eq!(CostRule::Static(4).units(&ctx), 4);
-    }
 
     #[test]
     fn policy_and_route_lookup() {
@@ -247,13 +159,7 @@ mod tests {
         assert!(set.get(PolicyId::RELAY_WEB).is_some());
         assert!(set.get(PolicyId::new("other")).is_none());
 
-        let routes = RouteTable::new(vec![(
-            ViewId::RELAY_WEB,
-            Route {
-                policy: PolicyId::RELAY_WEB,
-                cost: CostRule::Static(1),
-            },
-        )]);
+        let routes = RouteTable::new(vec![(ViewId::RELAY_WEB, PolicyId::RELAY_WEB)]);
         assert!(routes.get(ViewId::RELAY_WEB).is_some());
         assert!(routes.get(ViewId::TUNNEL).is_none());
     }

@@ -141,7 +141,7 @@ fn test_weaver_server_configure_command() {
         "[::]:8443".parse::<std::net::SocketAddr>().unwrap()
     );
 
-    // OFF-73: Non-root headless configure — verify headless flag writes config to SQLite database
+    // Non-root headless configure — verify headless flag writes config to SQLite database
     // without requiring root privileges or systemd, persisting domain, email, and default provider.
     let headless_output = Command::new(bin_path)
         .arg("--db")
@@ -167,7 +167,7 @@ fn test_weaver_server_configure_command() {
     assert_eq!(config2.acme_provider, "letsencrypt");
 }
 
-// OFF-73: Missing required options in headless mode — invoking setup --headless or
+// Missing required options in headless mode — invoking setup --headless or
 // configure --headless without --tunnel-domain or --email terminates immediately with exit code 2 naming the missing option.
 #[test]
 fn test_setup_headless_missing_tunnel_domain_exits_2() {
@@ -295,7 +295,7 @@ fn test_setup_headless_sudo_password_required_exits_2_no_hang() {
         "Expected error message mentioning sudo or root privileges, got: {stderr}"
     );
 
-    // OFF-73: Privilege escalation boundary in headless mode — uninstall --headless also terminates
+    // Privilege escalation boundary in headless mode — uninstall --headless also terminates
     // immediately with exit code 2 when passwordless sudo fails, avoiding hangs in automated runs.
     let uninstall_output = Command::new(bin_path)
         .env("PATH", &new_path)
@@ -317,7 +317,7 @@ fn test_setup_headless_sudo_password_required_exits_2_no_hang() {
     );
 }
 
-// OFF-73: EAB credential enforcement in headless mode — selecting an ACME provider requiring
+// EAB credential enforcement in headless mode — selecting an ACME provider requiring
 // External Account Binding (e.g. Google Trust Services or ZeroSSL) without providing both
 // KID and HMAC terminates immediately with exit code 2.
 #[test]

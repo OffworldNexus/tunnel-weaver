@@ -1,21 +1,18 @@
 //! The client's own state, in SQLite.
 //!
-//! A `weave` machine keeps one row per relay it is paired with: the admin host
-//! it dials, the machine id the relay assigned, and the device-key fingerprint
-//! authorised there — plus which relay is the default. It is deliberately
-//! ignorant of everything the relay owns (names, hostnames, the tunnel root),
-//! because the relay is the authority for those and reports them when asked.
+//! A `weave` machine keeps its device-key fingerprint and one row per relay it
+//! is paired with: the admin host it dials, the machine id the relay assigned,
+//! and the fingerprint authorised there, plus which relay is the default.
 //!
-//! Where the file lives is a platform question, not a Unix one: the OS data
-//! directory on every platform (`directories`), overridable with
-//! `WEAVE_DATA_DIR` so tests and embedding never touch real state.
+//! The file lives in the OS data directory, or in `WEAVE_DATA_DIR` when set so
+//! tests never touch real state.
 
 pub mod entity;
 pub mod migration;
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-use sea_orm::sea_query::Expr;
+use sea_orm::sea_query::{Expr, OnConflict};
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectOptions, ConnectionTrait, Database, DatabaseConnection,
     EntityTrait, QueryFilter, QueryOrder, Set, TransactionTrait,
@@ -25,151 +22,74 @@ use sea_orm_migration::MigratorTrait;
 pub use entity::relay::Model as Relay;
 pub use error::StoreError;
 
-use entity::relay;
+use entity::{device, relay};
 
 use crate::host::normalize_admin_host;
 
 mod error;
 
-/// How many pooled connections the client keeps. It is a single-user process;
-/// two is enough for a concurrent read while a write is in flight.
-const MAX_CONNECTIONS: u32 = 2;
-
-/// How long SQLite waits for a competing writer before giving up.
-const SQLITE_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
-
-/// The directory holding the client's database.
-///
-/// `WEAVE_DATA_DIR` wins when set (tests, embedding); otherwise the platform's
-/// per-user data directory.
-pub fn data_dir() -> Result<PathBuf, StoreError> {
-    if let Some(dir) = std::env::var_os("WEAVE_DATA_DIR")
-        && !dir.is_empty()
-    {
-        return Ok(PathBuf::from(dir));
-    }
-    directories::ProjectDirs::from("dev", "offworld", "weave")
-        .map(|dirs| dirs.data_dir().to_path_buf())
-        .ok_or(StoreError::NoDataDir)
-}
-
-/// The default database path: `<data dir>/weave.db`.
-pub fn default_path() -> Result<PathBuf, StoreError> {
-    Ok(data_dir()?.join("weave.db"))
-}
-
 /// The client store.
+#[derive(Debug)]
 pub struct Store {
-    url: String,
-    /// Filesystem location when the backend is a file-based SQLite database.
-    path: Option<PathBuf>,
     db: DatabaseConnection,
 }
 
-impl std::fmt::Debug for Store {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Store")
-            .field("url", &self.url)
-            .finish_non_exhaustive()
-    }
-}
-
 impl Store {
-    /// Opens the database in the platform's data directory.
+    /// Opens `weave.db` in `WEAVE_DATA_DIR`, else the platform's data directory.
     pub async fn open_default() -> Result<Self, StoreError> {
-        Self::open(default_path()?).await
+        let dir = match std::env::var_os("WEAVE_DATA_DIR").filter(|d| !d.is_empty()) {
+            Some(dir) => dir.into(),
+            None => directories::ProjectDirs::from("dev", "offworld", "weave")
+                .ok_or(StoreError::NoDataDir)?
+                .data_dir()
+                .to_path_buf(),
+        };
+        Self::open(dir.join("weave.db")).await
     }
 
-    /// Opens (creating if needed) the SQLite database file at `path`.
-    ///
-    /// Creates parent directories with mode 0700 and forces the file to 0600 on
-    /// Unix: the store records which machine this is on each relay, and which
-    /// key is authorised there.
+    /// Opens (creating if needed) the SQLite database at `path`.
     pub async fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
-        let path = path.as_ref().to_path_buf();
-
-        if let Some(parent) = path.parent()
-            && !parent.as_os_str().is_empty()
-            && !parent.exists()
-        {
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::DirBuilderExt;
-                let mut builder = std::fs::DirBuilder::new();
-                builder.recursive(true);
-                builder.mode(0o700);
-                builder.create(parent)?;
-            }
-            #[cfg(not(unix))]
-            {
-                std::fs::create_dir_all(parent)?;
-            }
+        let path = path.as_ref();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
         }
-
-        let path_str = path
-            .to_str()
-            .ok_or_else(|| StoreError::InvalidPath("database path is not valid UTF-8".into()))?;
-        let url = format!("sqlite://{path_str}?mode=rwc");
-
-        let store = Self::connect(&url).await?;
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let metadata = std::fs::metadata(&path)?;
-            let mut perms = metadata.permissions();
-            if perms.mode() & 0o777 != 0o600 {
-                perms.set_mode(0o600);
-                std::fs::set_permissions(&path, perms)?;
-            }
-        }
-
-        Ok(Self {
-            path: Some(path),
-            ..store
-        })
-    }
-
-    /// Connects to a database URL and runs pending migrations.
-    pub async fn connect(url: &str) -> Result<Self, StoreError> {
-        let mut opts = ConnectOptions::new(url);
-        opts.max_connections(MAX_CONNECTIONS).sqlx_logging(false);
-
-        // Pragmas are per pooled connection, so they belong to the sqlx options
-        // rather than a one-off statement after connect.
+        let mut opts = ConnectOptions::new(format!("sqlite://{}?mode=rwc", path.display()));
+        opts.sqlx_logging(false);
+        // `weave start` runs for hours while other commands read and write.
         opts.map_sqlx_sqlite_opts(|o| {
-            use sqlx::sqlite::{SqliteJournalMode, SqliteSynchronous};
-            o.journal_mode(SqliteJournalMode::Wal)
-                .synchronous(SqliteSynchronous::Normal)
-                .foreign_keys(true)
-                .busy_timeout(SQLITE_BUSY_TIMEOUT)
-                .pragma("wal_autocheckpoint", "1000")
-                .pragma("temp_store", "MEMORY")
+            o.journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+                .busy_timeout(std::time::Duration::from_secs(5))
         });
-
         let db = Database::connect(opts).await?;
         migration::Migrator::up(&db, None).await?;
+        Ok(Self { db })
+    }
 
-        Ok(Self {
-            url: url.to_string(),
-            path: None,
-            db,
+    // ----- device key -------------------------------------------------------
+
+    /// The current device key's fingerprint; empty when none was ever opened.
+    pub async fn device_key(&self) -> Result<String, StoreError> {
+        Ok(device::Entity::find_by_id(device::ROW)
+            .one(&self.db)
+            .await?
+            .map(|row| row.key_id)
+            .unwrap_or_default())
+    }
+
+    /// Remembers `key_id` as the current device key.
+    pub async fn set_device_key(&self, key_id: &str) -> Result<(), StoreError> {
+        device::Entity::insert(device::ActiveModel {
+            id: Set(device::ROW),
+            key_id: Set(key_id.to_string()),
         })
-    }
-
-    /// The database file, when the backend is file-based SQLite.
-    pub fn path(&self) -> Option<&Path> {
-        self.path.as_deref()
-    }
-
-    /// The connection URL the store was opened with.
-    pub fn url(&self) -> &str {
-        &self.url
-    }
-
-    /// The underlying connection (tests, seeding).
-    pub fn db(&self) -> &DatabaseConnection {
-        &self.db
+        .on_conflict(
+            OnConflict::column(device::Column::Id)
+                .update_column(device::Column::KeyId)
+                .to_owned(),
+        )
+        .exec(&self.db)
+        .await?;
+        Ok(())
     }
 
     // ----- relays -----------------------------------------------------------
@@ -185,7 +105,7 @@ impl Store {
         machine_id: i32,
         key_id: &str,
     ) -> Result<Relay, StoreError> {
-        let admin_host = normalize(admin_host)?;
+        let admin_host = normalize_admin_host(admin_host)?;
         let txn = self.db.begin().await?;
         let saved = match find_host(&txn, &admin_host).await? {
             Some(existing) => {
@@ -213,10 +133,7 @@ impl Store {
 
     /// The relay paired at `admin_host`, if any.
     pub async fn relay(&self, admin_host: &str) -> Result<Option<Relay>, StoreError> {
-        let Ok(admin_host) = normalize(admin_host) else {
-            return Ok(None);
-        };
-        find_host(&self.db, &admin_host).await
+        find_host(&self.db, &normalize_admin_host(admin_host)?).await
     }
 
     /// The relay used when a command is given none.
@@ -235,16 +152,18 @@ impl Store {
 
     /// Makes `admin_host` the default relay. `None` when it is not paired.
     pub async fn set_default(&self, admin_host: &str) -> Result<Option<Relay>, StoreError> {
-        let Ok(admin_host) = normalize(admin_host) else {
-            return Ok(None);
-        };
+        let admin_host = normalize_admin_host(admin_host)?;
         let txn = self.db.begin().await?;
         let Some(target) = find_host(&txn, &admin_host).await? else {
             return Ok(None);
         };
         // Clear first: the partial unique index allows one default at a time,
         // statement by statement.
-        clear_default(&txn).await?;
+        relay::Entity::update_many()
+            .col_expr(relay::Column::IsDefault, Expr::value(false))
+            .filter(relay::Column::IsDefault.eq(true))
+            .exec(&txn)
+            .await?;
         let mut active: relay::ActiveModel = target.into();
         active.is_default = Set(true);
         let saved = active.update(&txn).await?;
@@ -253,66 +172,28 @@ impl Store {
     }
 
     /// Forgets `admin_host`. When it was the default, the oldest remaining
-    /// relay takes over. `None` when it was not paired.
-    pub async fn forget(&self, admin_host: &str) -> Result<Option<Forgotten>, StoreError> {
-        let Ok(admin_host) = normalize(admin_host) else {
-            return Ok(None);
-        };
+    /// relay takes over and is returned.
+    pub async fn forget(&self, admin_host: &str) -> Result<Option<Relay>, StoreError> {
+        let admin_host = normalize_admin_host(admin_host)?;
         let txn = self.db.begin().await?;
         let Some(removed) = find_host(&txn, &admin_host).await? else {
             return Ok(None);
         };
         relay::Entity::delete_by_id(removed.id).exec(&txn).await?;
-        let new_default = if removed.is_default {
-            match relay::Entity::find()
+        let mut new_default = None;
+        if removed.is_default
+            && let Some(next) = relay::Entity::find()
                 .order_by_asc(relay::Column::Id)
                 .one(&txn)
                 .await?
-            {
-                Some(next) => {
-                    let mut active: relay::ActiveModel = next.into();
-                    active.is_default = Set(true);
-                    Some(active.update(&txn).await?)
-                }
-                None => None,
-            }
-        } else {
-            None
-        };
-        txn.commit().await?;
-        Ok(Some(Forgotten {
-            relay: removed,
-            new_default,
-        }))
-    }
-
-    /// Every distinct key fingerprint recorded, the default relay's first.
-    ///
-    /// All relays share the one device key in the key agent, so any of these
-    /// may be the one it still holds.
-    pub async fn key_ids(&self) -> Result<Vec<String>, StoreError> {
-        let mut out: Vec<String> = Vec::new();
-        for relay in self.relays().await? {
-            if !out.contains(&relay.key_id) {
-                out.push(relay.key_id);
-            }
+        {
+            let mut active: relay::ActiveModel = next.into();
+            active.is_default = Set(true);
+            new_default = Some(active.update(&txn).await?);
         }
-        Ok(out)
+        txn.commit().await?;
+        Ok(new_default)
     }
-}
-
-/// What [`Store::forget`] removed, and who became the default instead.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Forgotten {
-    /// The row that was deleted.
-    pub relay: Relay,
-    /// The relay promoted to default, when the forgotten one was the default
-    /// and another remains.
-    pub new_default: Option<Relay>,
-}
-
-fn normalize(admin_host: &str) -> Result<String, StoreError> {
-    normalize_admin_host(admin_host).map_err(|e| StoreError::InvalidHost(e.to_string()))
 }
 
 async fn find_host<C: ConnectionTrait>(
@@ -330,15 +211,6 @@ async fn find_default<C: ConnectionTrait>(db: &C) -> Result<Option<Relay>, Store
         .filter(relay::Column::IsDefault.eq(true))
         .one(db)
         .await?)
-}
-
-async fn clear_default<C: ConnectionTrait>(db: &C) -> Result<(), StoreError> {
-    relay::Entity::update_many()
-        .col_expr(relay::Column::IsDefault, Expr::value(false))
-        .filter(relay::Column::IsDefault.eq(true))
-        .exec(db)
-        .await?;
-    Ok(())
 }
 
 #[cfg(test)]
@@ -444,40 +316,39 @@ mod tests {
     #[tokio::test]
     async fn forgetting_the_default_promotes_the_oldest_remaining() {
         let (_dir, store) = store().await;
-        store
-            .record_pairing("a.example", 1, "p256:aa")
-            .await
-            .unwrap();
-        store
-            .record_pairing("b.example", 2, "p256:aa")
-            .await
-            .unwrap();
-        store
-            .record_pairing("c.example", 3, "p256:aa")
-            .await
-            .unwrap();
+        for (host, machine) in [("a.example", 1), ("b.example", 2), ("c.example", 3)] {
+            store
+                .record_pairing(host, machine, "p256:aa")
+                .await
+                .unwrap();
+        }
         store.set_default("b.example").await.unwrap();
 
-        let gone = store.forget("b.example").await.unwrap().unwrap();
-        assert_eq!(gone.relay.admin_host, "b.example");
-        assert_eq!(gone.new_default.unwrap().admin_host, "a.example");
+        let promoted = store.forget("b.example").await.unwrap();
+        assert_eq!(promoted.unwrap().admin_host, "a.example");
         assert_eq!(
             hosts(&store.relays().await.unwrap()),
             [("a.example", true), ("c.example", false)]
         );
 
         // Forgetting a non-default leaves the default alone.
-        let gone = store.forget("c.example").await.unwrap().unwrap();
-        assert!(gone.new_default.is_none());
+        assert!(store.forget("c.example").await.unwrap().is_none());
         assert_eq!(
             store.default_relay().await.unwrap().unwrap().admin_host,
             "a.example"
         );
 
-        let gone = store.forget("a.example").await.unwrap().unwrap();
-        assert!(gone.new_default.is_none());
-        assert!(store.default_relay().await.unwrap().is_none());
         assert!(store.forget("a.example").await.unwrap().is_none());
+        assert!(store.default_relay().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn the_device_key_is_one_row() {
+        let (_dir, store) = store().await;
+        assert_eq!(store.device_key().await.unwrap(), "");
+        store.set_device_key("p256:aa").await.unwrap();
+        store.set_device_key("p256:bb").await.unwrap();
+        assert_eq!(store.device_key().await.unwrap(), "p256:bb");
     }
 
     #[tokio::test]
@@ -494,7 +365,7 @@ mod tests {
             is_default: Set(true),
             ..Default::default()
         }
-        .insert(store.db())
+        .insert(&store.db)
         .await;
         assert!(second.is_err(), "two defaults were accepted");
     }
@@ -526,40 +397,5 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-    }
-
-    #[tokio::test]
-    async fn key_ids_are_distinct_default_first() {
-        let (_dir, store) = store().await;
-        store
-            .record_pairing("a.example", 1, "p256:aa")
-            .await
-            .unwrap();
-        store
-            .record_pairing("b.example", 2, "p256:bb")
-            .await
-            .unwrap();
-        store
-            .record_pairing("c.example", 3, "p256:aa")
-            .await
-            .unwrap();
-        store.set_default("b.example").await.unwrap();
-        assert_eq!(store.key_ids().await.unwrap(), ["p256:bb", "p256:aa"]);
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn database_file_is_private() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("nested/weave.db");
-        let _store = Store::open(&path).await.unwrap();
-        let file = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-        let parent = std::fs::metadata(path.parent().unwrap())
-            .unwrap()
-            .permissions()
-            .mode()
-            & 0o777;
-        assert_eq!((file, parent), (0o600, 0o700));
     }
 }

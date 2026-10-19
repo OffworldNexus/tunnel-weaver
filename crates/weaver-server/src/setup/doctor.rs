@@ -418,7 +418,7 @@ impl SelfConnectReachability {
         let target = SocketAddr::new(ip, port);
         let name = Name::from_str(&format!("{}.", self.tunnel_domain))
             .map_err(|err| format!("invalid apex name: {err}"))?;
-        let id = u16::from_str_radix(&dns::generate_random_hex(2), 16).unwrap_or(0);
+        let id = rand::random::<u16>();
         let mut message = Message::new(id, MessageType::Query, OpCode::Query);
         message.metadata.recursion_desired = false;
         message.add_query(Query::query(name, RecordType::A));

@@ -1,4 +1,4 @@
-//! `pending_registration` table: in-flight signups (WVR-36).
+//! `pending_registration` table: in-flight signups.
 //!
 //! A pending registration owns the proposed name/email until ownership is
 //! proven. It is never an account and cannot take over an existing address

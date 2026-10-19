@@ -12,7 +12,6 @@ pub struct Model {
     pub directory: String,
     pub email: String,
     pub credentials_json: String,
-    pub kid: Option<String>,
     pub created_at: i64,
 }
 

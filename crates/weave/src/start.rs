@@ -1,109 +1,43 @@
-//! Implementation of `weave start`: register one or more services on a single
-//! mux connection and proxy real HTTP traffic to their local origins.
+//! `weave start`: register services on one mux connection and proxy their
+//! visitors to the local origins.
 //!
-//! This replaces the fixed-redirect `weave poc` proof of concept. The client
-//! connects once, authenticates, opens one control stream per service, and
-//! then answers every visitor stream by driving the origin-facing half in
-//! [`crate::proxy`]. Registration replies are printed as they arrive; a
-//! refusal for one service leaves the others running, and the process exits
-//! non-zero once the connection ends if any service failed to register.
+//! The client connects once, opens one control stream per service (the
+//! registration lease), and answers every visitor stream by driving the
+//! origin-facing half in [`crate::proxy`]. A refusal for one service leaves the
+//! others running; the command fails once the connection ends if any did.
 
 use std::collections::{HashMap, VecDeque};
-use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Instant, SystemTime};
 
 use bytes::Bytes;
 use http::header::{HeaderName, HeaderValue};
 use hyper::body::Frame;
 use tokio::sync::mpsc::{self, error::TryRecvError};
-use weaver_mux::{CloseCode, CloseReason, Config, Connection, Event, StreamError, StreamId};
+use tokio_util::sync::CancellationToken;
+use weaver_mux::{CloseCode, CloseReason, Connection, Event, StreamError, StreamId};
 use weaver_proto::control::{ControlHead, ControlReply};
 use weaver_proto::http::{HttpHead, HttpResponseHead};
 use weaver_proto::policy::{self, HEAD_COMPRESS};
 use weaver_proto::{BodyFrame, Head, ResetCode, encode};
-use weaver_tokio::{Driver, DriverError, Handle, StreamHandler, SystemRng, WsTransport};
+use weaver_tokio::{DriverError, Handle, StreamHandler};
 
-use crate::connect::dial_relay;
-#[cfg(feature = "dev-signer")]
-use crate::identity::Ed25519Signer;
-use crate::log::{Entry, LogStyle, Phase};
+use crate::client::{Client, PairedKey, open_control};
+use crate::error::BoxError;
+use crate::error::Error;
+use crate::host::AdminHost;
 use crate::pool::Pool;
-use crate::proxy::{BoxError, ExchangeConfig, OutMsg, run_exchange};
-use crate::status::StatusFooter;
-use crate::target::{ServiceSpec, Target};
-use crate::ui::Spinner;
+use crate::proxy::{OutMsg, Outbox, run_exchange};
+use crate::report::{Phase, Reporter, RequestEvent};
+use crate::target::ServiceSpec;
 
-/// Sec-WebSocket-Protocol token both ends must agree on.
-pub const WS_SUBPROTOCOL: &str = "weaver-mux-v1";
-
-/// Where the mux handshake's signature comes from.
-#[derive(Debug, Clone)]
-pub enum SignerSpec {
-    /// The device key held by `tpmd`, resumed by its stored fingerprint.
-    Tpmd {
-        /// The stored `p256:<hex>` fingerprint.
-        key_id: String,
-    },
-    /// The hard-coded development key (feature `dev-signer` only).
-    #[cfg(feature = "dev-signer")]
-    Dev,
-}
-
-/// Builds the mux signer the handshake will use.
-///
-/// The tpmd key is *resumed*, never provisioned: `weave start` must sign with
-/// the key the relay already authorised, so a vanished key is an error the user
-/// resolves by pairing again.
-async fn build_signer(
-    spec: &SignerSpec,
-) -> Result<Box<dyn weaver_mux::auth::Signer + Send>, Box<dyn std::error::Error + Send + Sync>> {
-    match spec {
-        SignerSpec::Tpmd { key_id } => {
-            let key = crate::tpm::resume(key_id).await.map_err(|e| match e {
-                crate::tpm::TpmError::Unavailable(_) => crate::pair::tpm_error(e),
-                other => crate::ui::hinted(
-                    other.to_string(),
-                    "run `weave pair <admin-host>` again to pair a new key",
-                ),
-            })?;
-            if key.created() {
-                return Err(crate::ui::hinted(
-                    "the key agent no longer holds this machine's device key",
-                    "run `weave pair <admin-host>` again to pair a new key",
-                ));
-            }
-            Ok(Box::new(key))
-        }
-        #[cfg(feature = "dev-signer")]
-        SignerSpec::Dev => Ok(Box::new(Ed25519Signer::dev())),
-    }
-}
-
-/// Options for one `weave start` invocation, already parsed from the CLI.
+/// What to expose, and where.
 #[derive(Debug, Clone)]
 pub struct StartOptions {
-    /// One `<service>=<target>` per service to expose.
-    pub specs: Vec<ServiceSpec>,
-    /// Relay server address (`host` or `host:port`), resolved by the CLI from
-    /// `--server` or the configured default.
+    /// The paired relay to use; the default one when empty.
     pub server: String,
-    /// Where the device key and its signature come from.
-    pub signer: SignerSpec,
-    /// Extra root CA (PEM) for the relay connection.
-    pub insecure_root_ca: Option<PathBuf>,
-    /// Services whose target certificate verification is disabled.
-    pub insecure_targets: Vec<String>,
-    /// Services that keep the public hostname as `Host`.
-    pub preserve_host: Vec<String>,
-    /// Services with URL/cookie rewriting disabled.
-    pub no_rewrite: Vec<String>,
-    /// Services that keep visitor-supplied forwarding headers.
-    pub append_forwarded: Vec<String>,
-    /// Silence the per-request log.
-    pub quiet: bool,
-    /// Add request and response headers to the per-request log.
-    pub verbose: bool,
+    /// The services to register.
+    pub services: Vec<ServiceSpec>,
 }
 
 /// How many request-body frames may be queued toward the origin before the
@@ -113,147 +47,73 @@ const REQ_BODY_QUEUE: usize = 4;
 /// task awaits.
 const OUT_QUEUE: usize = 4;
 
-/// Executes `weave start`, installing a Ctrl-C handler.
-pub async fn run_start(opts: StartOptions) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let cancel = tokio_util::sync::CancellationToken::new();
-    let cancel_clone = cancel.clone();
-    tokio::spawn(async move {
-        if tokio::signal::ctrl_c().await.is_ok() {
-            cancel_clone.cancel();
-        }
-    });
-    run_start_with_token(opts, cancel).await
-}
+impl Client {
+    /// Runs the tunnel until `shutdown` is cancelled or the connection ends.
+    pub async fn start(
+        &self,
+        opts: &StartOptions,
+        shutdown: CancellationToken,
+    ) -> Result<(), Error> {
+        self.start_with_release(opts, shutdown, CancellationToken::new())
+            .await
+    }
 
-/// Executes `weave start` with an explicit shutdown token (tests, embedding).
-pub async fn run_start_with_token(
-    opts: StartOptions,
-    shutdown_token: tokio_util::sync::CancellationToken,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    run_start_with_tokens(
-        opts,
-        shutdown_token,
-        tokio_util::sync::CancellationToken::new(),
-    )
-    .await
-}
+    /// Like [`Client::start`], plus `release`: cancelling it finishes every
+    /// control stream, dropping the registrations while the connection stays
+    /// up.
+    pub async fn start_with_release(
+        &self,
+        opts: &StartOptions,
+        shutdown: CancellationToken,
+        release: CancellationToken,
+    ) -> Result<(), Error> {
+        let relay = self.paired_relay(&opts.server).await?;
+        let host = AdminHost::parse(&relay.admin_host)?;
+        let host_name = relay.admin_host.clone();
 
-/// Like [`run_start_with_token`], plus a `release_token` that finishes every
-/// control stream — dropping the registration leases — while keeping the
-/// connection up. Exercises the relay's lease semantics end to end.
-pub async fn run_start_with_tokens(
-    opts: StartOptions,
-    shutdown_token: tokio_util::sync::CancellationToken,
-    release_token: tokio_util::sync::CancellationToken,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let server = crate::host::normalize_admin_host(&opts.server)?;
+        let setup = async {
+            let PairedKey::Valid(signer) = self.open_paired_key(&relay).await? else {
+                return Err(Error::KeyGone {
+                    host: host_name.clone(),
+                });
+            };
+            self.reporter.connecting(&host_name);
+            let handler = ProxyHandler::new(
+                host_name.clone(),
+                opts.services.clone(),
+                Arc::clone(&self.reporter),
+            );
+            self.mux(&host, signer, handler).await
+        };
+        // The key store may be locked indefinitely: let the user stop waiting.
+        let driver = tokio::select! {
+            driver = setup => driver?,
+            () = shutdown.cancelled() => return Ok(()),
+        };
 
-    let spinner = Spinner::new("Contacting the key agent\u{2026}");
-    let signer = build_signer(&opts.signer).await?;
-    spinner.set_message(format!("Connecting to {server}\u{2026}"));
-    let (ws_stream, host) = dial_relay(
-        &server,
-        crate::unpair::CONNECT_PATH,
-        WS_SUBPROTOCOL,
-        opts.insecure_root_ca.as_deref(),
-    )
-    .await
-    .map_err(|e| crate::pair::connect_error(&server, e))?;
-    spinner.set_message(format!("Authenticating with {server}\u{2026}"));
-
-    // The normalised host is the server name the relay's transcript binds.
-    let cfg = Config::client(signer, host, Box::new(SystemRng));
-    let conn = Connection::new(cfg, Instant::now());
-    let mut handler = ProxyHandler::new(&opts);
-    handler.server = server.clone();
-    handler.spinner = Some(spinner);
-    let driver = Driver::new(conn, WsTransport::new(ws_stream), handler);
-    let handle = driver.handle();
-
-    tokio::spawn({
-        let handle = handle.clone();
-        let release_token = release_token.clone();
-        async move {
-            release_token.cancelled().await;
-            handle.spawn_on(|conn, h| {
-                let ids: Vec<StreamId> = h.control.keys().copied().collect();
-                for id in ids {
-                    h.control.remove(&id);
-                    let _ = conn.finish(id);
+        let handle = driver.handle();
+        let run = driver.run();
+        tokio::pin!(run);
+        let (mut stopping, mut released) = (false, false);
+        let (handler, result) = loop {
+            tokio::select! {
+                outcome = &mut run => break outcome,
+                () = shutdown.cancelled(), if !stopping => {
+                    stopping = true;
+                    handle.spawn_on(|conn, h| h.shutdown(conn));
                 }
-            });
-        }
-    });
-
-    tokio::spawn({
-        let handle = handle.clone();
-        async move {
-            shutdown_token.cancelled().await;
-            handle.spawn_on(|conn, h| h.shutdown(conn));
-        }
-    });
-
-    let (mut handler, result) = driver.run().await;
-    // Give the terminal back before printing any outcome.
-    if let Some(spinner) = handler.spinner.take() {
-        spinner.clear();
+                () = release.cancelled(), if !released => {
+                    released = true;
+                    handle.spawn_on(|conn, h| {
+                        for (id, _) in h.control.drain() {
+                            let _ = conn.finish(id);
+                        }
+                    });
+                }
+            }
+        };
+        handler.outcome(result)
     }
-    handler.footer.uninstall();
-    if let Some(err) = handler.failure {
-        if handler.rejected {
-            return Err(crate::ui::hinted(
-                err,
-                format!("if this machine was unpaired there, run `weave pair {server}`"),
-            ));
-        }
-        return Err(err.into());
-    }
-    if !handler.failures.is_empty() {
-        return Err(format!(
-            "{} of {} service(s) failed to register: {}",
-            handler.failures.len(),
-            handler.services.len(),
-            handler.failures.join("; ")
-        )
-        .into());
-    }
-    let lost = |what: String| -> Box<dyn std::error::Error + Send + Sync> {
-        crate::ui::hinted(
-            format!("disconnected from {server}: {what}"),
-            "run `weave start` again to reconnect",
-        )
-    };
-    match result {
-        Ok(reason) if handler.shutting_down => {
-            debug_assert_eq!(reason.code, CloseCode::Shutdown);
-            crate::ui::done(&format!("Disconnected from {server}"));
-            Ok(())
-        }
-        Ok(reason) if reason.code == CloseCode::KeyRevoked => Err(crate::ui::hinted(
-            format!("{server} revoked this machine's key"),
-            format!("run `weave pair {server}` to pair it again"),
-        )),
-        Ok(reason) => Err(lost(format!(
-            "the relay closed the connection ({:?})",
-            reason.code
-        ))),
-        Err(DriverError::TransportClosed) if handler.shutting_down => {
-            crate::ui::done(&format!("Disconnected from {server}"));
-            Ok(())
-        }
-        Err(DriverError::TransportClosed) => Err(lost("the connection dropped".into())),
-        Err(DriverError::Protocol(e)) => Err(lost(format!("protocol error: {e}"))),
-        Err(DriverError::Transport(e)) => Err(lost(format!("WebSocket error: {e}"))),
-    }
-}
-
-/// Per-service runtime state, including flags and the assigned hostname.
-struct ServiceRuntime {
-    target: Target,
-    insecure: bool,
-    preserve_host: bool,
-    no_rewrite: bool,
-    append_forwarded: bool,
 }
 
 /// A visitor exchange in progress on one stream.
@@ -261,8 +121,7 @@ struct Exchange {
     service: String,
     req: HttpHead,
     started: Instant,
-    /// Wall-clock arrival, for the log timestamp.
-    started_at: std::time::SystemTime,
+    started_at: SystemTime,
     status: Option<u16>,
     bytes: u64,
     /// Response frames from the origin task.
@@ -279,82 +138,71 @@ struct Exchange {
     req_paused: bool,
     /// Our FIN has gone out; the exchange may outlive it on a pipe.
     fin_sent: bool,
-    /// Log line already printed (long-lived streams log at head, then at close).
-    logged_at_head: bool,
+    /// An upgrade or event stream: logged when it opens and when it closes.
     long_lived: bool,
-    /// Final response head, kept for the `--verbose` header block.
     resp_headers: Vec<(String, Vec<u8>)>,
 }
 
-/// The relay's [`StreamHandler`]: registration on the control streams and
-/// origin proxying on every visitor stream.
-pub struct ProxyHandler {
-    services: HashMap<String, ServiceRuntime>,
-    hostname_to_service: HashMap<String, String>,
+/// Registration on the control streams, origin proxying on every visitor
+/// stream.
+struct ProxyHandler {
+    host: String,
+    services: Vec<ServiceSpec>,
     control: HashMap<StreamId, String>,
     inflight: HashMap<StreamId, Exchange>,
     pool: Pool,
     handle: Option<Handle<ProxyHandler>>,
-    style: LogStyle,
-    footer: StatusFooter,
+    reporter: Arc<dyn Reporter>,
+    /// `service: reason` for each service that did not register.
     failures: Vec<String>,
-    failure: Option<String>,
+    /// What ended the connection, when it was not the relay or the user.
+    failure: Option<Error>,
     shutting_down: bool,
-    /// The normalised admin host, for status lines.
-    server: String,
-    /// The connecting spinner, until the handshake settles.
-    spinner: Option<Spinner>,
-    /// The relay refused the handshake.
-    rejected: bool,
 }
 
 impl ProxyHandler {
-    /// Build a handler from parsed options.
-    pub fn new(opts: &StartOptions) -> Self {
-        let flag = |list: &[String]| list.to_vec();
-        let insecure = flag(&opts.insecure_targets);
-        let preserve = flag(&opts.preserve_host);
-        let no_rewrite = flag(&opts.no_rewrite);
-        let append = flag(&opts.append_forwarded);
-        let services = opts
-            .specs
-            .iter()
-            .map(|spec| {
-                (
-                    spec.service.clone(),
-                    ServiceRuntime {
-                        target: spec.target.clone(),
-                        insecure: insecure.iter().any(|s| s == &spec.service),
-                        preserve_host: preserve.iter().any(|s| s == &spec.service),
-                        no_rewrite: no_rewrite.iter().any(|s| s == &spec.service),
-                        append_forwarded: append.iter().any(|s| s == &spec.service),
-                    },
-                )
-            })
-            .collect();
-        let style = LogStyle::detect(opts.quiet, opts.verbose);
-        let footer = StatusFooter::new(
-            style,
-            opts.specs
-                .iter()
-                .map(|s| (s.service.clone(), s.target.to_string())),
-        );
+    fn new(host: String, services: Vec<ServiceSpec>, reporter: Arc<dyn Reporter>) -> Self {
         Self {
+            host,
             services,
-            hostname_to_service: HashMap::new(),
             control: HashMap::new(),
             inflight: HashMap::new(),
-            pool: Pool::new(),
+            pool: Pool::default(),
             handle: None,
-            style,
-            footer,
+            reporter,
             failures: Vec::new(),
             failure: None,
             shutting_down: false,
-            server: opts.server.clone(),
-            spinner: None,
-            rejected: false,
         }
+    }
+
+    /// How the connection's end reads to the user.
+    fn outcome(self, result: Result<CloseReason, DriverError>) -> Result<(), Error> {
+        if let Some(failure) = self.failure {
+            return Err(failure);
+        }
+        if !self.failures.is_empty() {
+            return Err(Error::Registration {
+                total: self.services.len(),
+                failures: self.failures,
+            });
+        }
+        let reason = match result {
+            Ok(_) | Err(DriverError::TransportClosed) if self.shutting_down => return Ok(()),
+            Ok(reason) if reason.code == CloseCode::KeyRevoked => {
+                return Err(Error::Revoked { host: self.host });
+            }
+            Ok(reason) if reason.code == CloseCode::Superseded => {
+                "another `weave start` with this machine's key took over".to_string()
+            }
+            Ok(reason) => format!("the relay closed the connection ({:?})", reason.code),
+            Err(DriverError::TransportClosed) => "the connection dropped".to_string(),
+            Err(e) => e.to_string(),
+        };
+        Err(Error::Disconnected {
+            host: self.host,
+            reason,
+        })
     }
 
     fn handle(&self) -> Handle<ProxyHandler> {
@@ -371,43 +219,22 @@ impl ProxyHandler {
         conn.close(CloseReason::new(CloseCode::Shutdown));
     }
 
-    fn fail(&mut self, conn: &mut Connection, msg: String) {
-        self.failure = Some(msg);
+    fn fail(&mut self, conn: &mut Connection, error: Error) {
+        self.failure = Some(error);
         conn.close(CloseReason::new(CloseCode::Shutdown));
     }
 
-    /// Open one control stream per service and send its `Register` head.
+    /// Opens one control stream per service and sends its `Register` head.
     fn register_services(&mut self, conn: &mut Connection) {
-        let specs: Vec<(String, Target)> = self
-            .services
-            .iter()
-            .map(|(name, rt)| (name.clone(), rt.target.clone()))
-            .collect();
-        for (service, _target) in specs {
-            let head = match ControlHead::register(service.clone()) {
-                Ok(h) => h,
-                Err(code) => {
-                    self.failures
-                        .push(format!("{service}: invalid service name ({code:?})"));
-                    continue;
-                }
-            };
-            let bytes = match encode(&Head::Control(head)) {
-                Ok(b) => b,
-                Err(e) => {
-                    self.failures.push(format!("{service}: encode failed: {e}"));
-                    continue;
-                }
-            };
-            match conn.open(policy::CONTROL_CLASS) {
+        for spec in &self.services {
+            let opened = ControlHead::register(spec.service.clone())
+                .map_err(|code| format!("invalid service name ({code:?})"))
+                .and_then(|head| open_control(conn, &head));
+            match opened {
                 Ok(id) => {
-                    if let Err(e) = conn.send(id, &bytes, policy::CONTROL_COMPRESS) {
-                        self.failures.push(format!("{service}: send failed: {e}"));
-                    } else {
-                        self.control.insert(id, service);
-                    }
+                    self.control.insert(id, spec.service.clone());
                 }
-                Err(e) => self.failures.push(format!("{service}: open failed: {e}")),
+                Err(e) => self.failures.push(format!("{}: {e}", spec.service)),
             }
         }
     }
@@ -415,115 +242,49 @@ impl ProxyHandler {
     fn on_control_reply(&mut self, conn: &mut Connection, id: StreamId, msg: &[u8]) {
         let service = self.control.get(&id).cloned().unwrap_or_default();
         match weaver_proto::decode::<ControlReply>(msg) {
-            // Not sent on a registration stream; `weave unpair` uses it.
-            Ok(ControlReply::Revoked) => {}
             Ok(ControlReply::Registered { hostname }) => {
-                let target = self
-                    .services
-                    .get(&service)
-                    .map(|rt| rt.target.clone())
-                    .unwrap_or_else(|| {
-                        Target::parse("localhost:80").expect("valid fallback target")
-                    });
-                let url = format!("https://{hostname}/");
-                // On a TTY the sticky footer carries this; otherwise print
-                // it as a plain line so piped output still records it.
-                if self.footer.is_active() {
-                    self.footer.registered(&service, url);
-                } else {
-                    println!(
-                        "{}",
-                        crate::log::registered_line(
-                            &self.style,
-                            &service,
-                            &url,
-                            &target.to_string(),
-                        )
-                    );
-                }
-                self.hostname_to_service
-                    .insert(hostname.to_ascii_lowercase(), service);
+                self.reporter
+                    .registered(&service, &format!("https://{hostname}/"));
             }
             Ok(ControlReply::Refused { code, message }) => {
                 let detail = format!("{message} ({code:?})");
-                if self.footer.is_active() {
-                    self.footer.refused(&service, detail.clone());
-                } else {
-                    eprintln!(
-                        "{}",
-                        crate::log::refused_line(&self.style, &service, &detail)
-                    );
-                }
+                self.reporter.refused(&service, &detail);
                 self.failures.push(format!("{service}: {detail}"));
             }
-            Ok(ControlReply::CertState { state }) => {
-                if self.footer.is_active() {
-                    self.footer.cert(&service, state);
-                } else {
-                    println!("{}", crate::log::cert_line(&self.style, &service, state));
-                }
-            }
-            Err(e) => self.fail(conn, format!("{service}: bad control reply: {e}")),
+            Ok(ControlReply::CertState { state }) => self.reporter.certificate(&service, state),
+            // The answer to a revoke, which a registration stream never sends.
+            Ok(ControlReply::Revoked) => self.fail(
+                conn,
+                Error::Protocol(format!("{service}: `Revoked` on a registration stream")),
+            ),
+            Err(e) => self.fail(conn, Error::Protocol(format!("{service}: {e}"))),
         }
     }
 
-    /// Resolve the service a visitor stream belongs to from the request
-    /// authority.
+    /// The service a visitor stream is for, from the request authority.
     ///
-    /// A visitor can arrive in the window between the relay registering the
-    /// service and the client processing the `Registered` reply, so this must
-    /// not depend on the hostname reply. The public hostname is the flat
-    /// `<person>-<machine>-<service>.<root>` (see `derive_hostname`); person
-    /// and machine may not contain a dash, so the service is everything after
-    /// the first two dash-separated segments. The exact hostname map is
-    /// consulted first for the common case.
-    fn resolve_service(&self, authority: &str) -> Option<String> {
-        let authority = authority.to_ascii_lowercase();
-        if let Some(service) = self.hostname_to_service.get(&authority) {
-            return Some(service.clone());
-        }
-        let host = authority.split(':').next().unwrap_or(&authority);
-        let label = host.split('.').next()?;
-        // Flat service hostname: `<person>-<machine>-<service>`.
-        let mut segments = label.splitn(3, '-');
-        let _person = segments.next()?;
-        let _machine = segments.next()?;
-        let service = segments.next()?;
-        if self.services.contains_key(service) {
-            return Some(service.to_string());
-        }
-        None
+    /// Read from the hostname itself, `<person>-<machine>-<service>.<root>`
+    /// (person and machine hold no dash), because a visitor can arrive before
+    /// the `Registered` reply does.
+    fn resolve_service(&self, authority: &str) -> Option<&ServiceSpec> {
+        let label = authority.split(['.', ':']).next()?.to_ascii_lowercase();
+        let service = label.splitn(3, '-').nth(2)?;
+        self.services.iter().find(|s| s.service == service)
     }
 
-    /// A new visitor stream: decode its head, resolve the service, spawn the
-    /// origin task, and remember the exchange.
+    /// A new visitor stream: decode its head, spawn the origin task, and
+    /// remember the exchange.
     fn start_exchange(&mut self, conn: &mut Connection, id: StreamId, first: &[u8]) {
-        let head = match weaver_proto::decode::<Head>(first) {
-            Ok(Head::Http(h)) => h,
-            _ => {
-                let _ = conn.reset(id, ResetCode::Cancelled.as_u32());
-                return;
-            }
+        let resolved = match weaver_proto::decode::<Head>(first) {
+            Ok(Head::Http(head)) => self
+                .resolve_service(&head.authority)
+                .cloned()
+                .map(|spec| (head, spec)),
+            _ => None,
         };
-        let Some(service) = self.resolve_service(&head.authority) else {
+        let Some((head, spec)) = resolved else {
             let _ = conn.reset(id, ResetCode::Cancelled.as_u32());
             return;
-        };
-        let Some(rt) = self.services.get(&service) else {
-            let _ = conn.reset(id, ResetCode::Cancelled.as_u32());
-            return;
-        };
-        // The public origin is exactly the host the visitor used; the
-        // registered hostname is only needed for the startup log line.
-        let public_origin = format!("https://{}", head.authority);
-        let cfg = ExchangeConfig {
-            head: head.clone(),
-            target: rt.target.clone(),
-            public_origin,
-            insecure: rt.insecure,
-            preserve_host: rt.preserve_host,
-            no_rewrite: rt.no_rewrite,
-            append_forwarded: rt.append_forwarded,
         };
 
         let (req_tx, req_rx) = mpsc::channel(REQ_BODY_QUEUE);
@@ -531,28 +292,22 @@ impl ProxyHandler {
         let handle = self.handle();
         let notify: Arc<dyn Fn() + Send + Sync> = {
             let handle = handle.clone();
-            Arc::new(move || {
-                let handle = handle.clone();
-                handle.spawn_on(move |conn, h| h.pump_out(conn, id));
-            })
+            Arc::new(move || handle.spawn_on(move |conn, h| h.pump_out(conn, id)))
         };
-        let reset: Arc<dyn Fn(u32) + Send + Sync> = {
-            let handle = handle.clone();
-            Arc::new(move |code| {
-                let handle = handle.clone();
-                handle.spawn_on(move |conn, h| {
-                    if h.inflight.remove(&id).is_some() {
-                        let _ = conn.reset(id, code);
-                    }
-                });
-            })
-        };
-        let pool = self.pool.clone();
+        let reset: Arc<dyn Fn(u32) + Send + Sync> = Arc::new(move |code| {
+            handle.spawn_on(move |conn, h| {
+                if h.inflight.remove(&id).is_some() {
+                    let _ = conn.reset(id, code);
+                }
+            });
+        });
+        let service = spec.service.clone();
         tokio::spawn(run_exchange(
-            cfg,
+            head.clone(),
+            spec,
             req_rx,
-            pool,
-            crate::proxy::Outbox::new(out_tx, notify),
+            self.pool.clone(),
+            Outbox::new(out_tx, notify),
             reset,
         ));
 
@@ -562,7 +317,7 @@ impl ProxyHandler {
                 service,
                 req: head,
                 started: Instant::now(),
-                started_at: std::time::SystemTime::now(),
+                started_at: SystemTime::now(),
                 status: None,
                 bytes: 0,
                 out_rx,
@@ -574,50 +329,32 @@ impl ProxyHandler {
                 req_done: false,
                 req_paused: false,
                 fin_sent: false,
-                logged_at_head: false,
-                resp_headers: Vec::new(),
                 long_lived: false,
+                resp_headers: Vec::new(),
             },
         );
     }
 
-    /// Drain available messages on a visitor stream, applying request-body
-    /// backpressure by pausing when the origin-side queue is full.
+    /// Drains available messages on a visitor stream, pausing while the
+    /// origin-side queue is full.
     fn drain_stream(&mut self, conn: &mut Connection, id: StreamId) {
-        loop {
-            if self
-                .inflight
-                .get(&id)
-                .map(|ex| ex.req_paused)
-                .unwrap_or(true)
-            {
-                return;
-            }
+        while self.inflight.get(&id).is_some_and(|ex| !ex.req_paused) {
             match conn.recv_msg(id) {
-                Ok(msg) => self.on_visitor_body(conn, id, msg),
-                Err(StreamError::WouldBlock) => return,
+                Ok(msg) => self.on_visitor_body(id, msg),
                 Err(_) => return,
             }
         }
     }
 
-    /// Handle one body message from the relay: a [`BodyFrame`] chunk or
-    /// trailers. If the origin-side queue is full, the frame is handed to a
-    /// task that awaits capacity and then resumes the drain.
-    fn on_visitor_body(&mut self, _conn: &mut Connection, id: StreamId, msg: Vec<u8>) {
-        let frame: BodyFrame = match weaver_proto::decode(&msg) {
-            Ok(f) => f,
-            Err(_) => {
-                if let Some(ex) = self.inflight.get_mut(&id) {
-                    ex.req_done = true;
-                    ex.req_body_tx = None;
-                }
-                return;
-            }
+    /// One body message from the relay: a chunk or trailers. When the
+    /// origin-side queue is full, a task awaits capacity and resumes the drain.
+    fn on_visitor_body(&mut self, id: StreamId, msg: Vec<u8>) {
+        let Some(ex) = self.inflight.get_mut(&id) else {
+            return;
         };
-        let body_frame = match frame {
-            BodyFrame::Chunk(data) => Frame::data(Bytes::from(data)),
-            BodyFrame::Trailers(fields) => {
+        let frame = match weaver_proto::decode::<BodyFrame>(&msg) {
+            Ok(BodyFrame::Chunk(data)) => Frame::data(Bytes::from(data)),
+            Ok(BodyFrame::Trailers(fields)) => {
                 let mut map = http::HeaderMap::new();
                 for (n, v) in fields {
                     if let (Ok(name), Ok(value)) = (
@@ -629,36 +366,33 @@ impl ProxyHandler {
                 }
                 Frame::trailers(map)
             }
-        };
-        let Some(ex) = self.inflight.get_mut(&id) else {
-            return;
+            Err(_) => {
+                ex.req_done = true;
+                ex.req_body_tx = None;
+                return;
+            }
         };
         let Some(tx) = ex.req_body_tx.clone() else {
             return;
         };
-        match tx.try_send(Ok(body_frame)) {
-            Ok(()) => {}
-            Err(mpsc::error::TrySendError::Full(frame)) => {
-                ex.req_paused = true;
-                let handle = self.handle();
-                tokio::spawn(async move {
-                    let _ = tx.send(frame).await;
-                    handle.spawn_on(move |conn, h| {
-                        if let Some(ex) = h.inflight.get_mut(&id) {
-                            ex.req_paused = false;
-                        }
-                        h.drain_stream(conn, id);
-                    });
+        if let Err(mpsc::error::TrySendError::Full(frame)) = tx.try_send(Ok(frame)) {
+            ex.req_paused = true;
+            let handle = self.handle();
+            tokio::spawn(async move {
+                let _ = tx.send(frame).await;
+                handle.spawn_on(move |conn, h| {
+                    if let Some(ex) = h.inflight.get_mut(&id) {
+                        ex.req_paused = false;
+                    }
+                    h.drain_stream(conn, id);
                 });
-            }
-            Err(mpsc::error::TrySendError::Closed(_)) => {}
+            });
         }
     }
 
-    /// Flush the origin's response toward the relay, respecting mux credit,
-    /// and FIN the stream once the response is complete.
+    /// Flushes the origin's response toward the relay within mux credit, and
+    /// FINs the stream once the response is complete.
     fn pump_out(&mut self, conn: &mut Connection, id: StreamId) {
-        let style = self.style;
         let Some(ex) = self.inflight.get_mut(&id) else {
             return;
         };
@@ -689,57 +423,47 @@ impl ProxyHandler {
                     }
                 }
             }
-            match ex.out_rx.try_recv() {
+            let encoded = match ex.out_rx.try_recv() {
                 Ok(OutMsg::Head(head)) => {
                     ex.status = Some(head.status);
-                    ex.compress = crate::proxy::body_compress(&ex.req, &head);
-                    ex.resp_headers = head.headers.clone();
+                    ex.compress = policy::response_body_compress(&ex.req, &head);
                     ex.long_lived = is_long_lived(&ex.req, &head);
-                    if ex.long_lived && !ex.logged_at_head {
-                        ex.log_line(&style, Phase::Opened);
-                        ex.logged_at_head = true;
+                    ex.resp_headers = head.headers.clone();
+                    if ex.long_lived {
+                        ex.report(self.reporter.as_ref(), Phase::Opened);
                     }
-                    match encode(&head) {
-                        Ok(bytes) => {
-                            ex.out_head = Some(bytes);
-                            // Flush now: the head must not wait for the next
-                            // wake-up, or a 101/long-poll head sits unsent.
-                            continue;
-                        }
-                        Err(_) => {
-                            self.inflight.remove(&id);
-                            return;
-                        }
-                    }
+                    // Flushed on the next turn: a 101 or long-poll head must
+                    // not wait for another wake-up.
+                    encode(&head).map(|bytes| ex.out_head = Some(bytes))
                 }
-                Ok(OutMsg::Frame(frame)) => match encode(&frame) {
-                    Ok(bytes) => ex.pending_bytes.push_back((bytes, ex.compress)),
-                    Err(_) => {
-                        self.inflight.remove(&id);
-                        return;
-                    }
-                },
-                Ok(OutMsg::End) | Err(TryRecvError::Disconnected) => ex.out_done = true,
+                Ok(OutMsg::Frame(frame)) => {
+                    encode(&frame).map(|bytes| ex.pending_bytes.push_back((bytes, ex.compress)))
+                }
+                Ok(OutMsg::End) | Err(TryRecvError::Disconnected) => {
+                    ex.out_done = true;
+                    Ok(())
+                }
                 Err(TryRecvError::Empty) => return,
+            };
+            if encoded.is_err() {
+                self.inflight.remove(&id);
+                return;
             }
             if ex.out_done && ex.pending_bytes.is_empty() && ex.out_head.is_none() {
                 if !ex.fin_sent {
                     let _ = conn.finish(id);
                     ex.fin_sent = true;
-                    ex.log_line(
-                        &style,
-                        if ex.long_lived {
-                            Phase::Closed
-                        } else {
-                            Phase::Done
-                        },
-                    );
+                    let phase = if ex.long_lived {
+                        Phase::Closed
+                    } else {
+                        Phase::Done
+                    };
+                    ex.report(self.reporter.as_ref(), phase);
                 }
-                // Our direction is done, but on an upgraded pipe the relay
-                // may still be forwarding visitor bytes (its WebSocket Close
-                // reply, typically) that must reach the origin: keep the
-                // exchange — and its request-body channel — until the relay
-                // FINs too. Non-upgrade exchanges have `req_done` already.
+                // On an upgraded pipe the relay may still be forwarding
+                // visitor bytes (its WebSocket Close reply, typically) that
+                // must reach the origin: keep the exchange until the relay
+                // FINs too. Other exchanges have `req_done` already.
                 if ex.req_done {
                     self.inflight.remove(&id);
                 }
@@ -750,33 +474,27 @@ impl ProxyHandler {
 }
 
 impl Exchange {
-    /// Print one request line (and, in verbose mode, the headers). Visitor
-    /// IP and protocol come from what the relay stamped on the head.
-    fn log_line(&self, style: &LogStyle, phase: Phase) {
-        let visitor = self
-            .req
-            .header("x-forwarded-for")
-            .and_then(|v| std::str::from_utf8(v).ok());
-        // The relay records the visitor's HTTP version in `Via` (RFC 9110
-        // §7.6.3): `2 weaver`, `1.1 weaver`.
-        let via = self
-            .req
-            .header("via")
-            .and_then(|v| std::str::from_utf8(v).ok())
-            .unwrap_or("");
-        let proto = if self.req.header("upgrade").is_some() {
+    fn report(&self, reporter: &dyn Reporter, phase: Phase) {
+        let header = |name| {
+            self.req
+                .header(name)
+                .and_then(|v| std::str::from_utf8(v).ok())
+        };
+        // The relay records the visitor's HTTP version in `Via`: `2 weaver`.
+        let via = header("via").unwrap_or("");
+        let proto = if header("upgrade").is_some() {
             "ws"
-        } else if via.starts_with("2") {
+        } else if via.starts_with('2') {
             "h2"
-        } else if via.starts_with("3") {
+        } else if via.starts_with('3') {
             "h3"
         } else {
             "h1"
         };
-        let entry = Entry {
+        reporter.request(&RequestEvent {
             at: self.started_at,
             service: &self.service,
-            visitor,
+            visitor: header("x-forwarded-for").unwrap_or(""),
             proto,
             method: &self.req.method,
             path: &self.req.path,
@@ -784,25 +502,13 @@ impl Exchange {
             bytes: self.bytes,
             elapsed: self.started.elapsed(),
             phase,
-        };
-        if let Some(line) = crate::log::request_line(style, &entry) {
-            println!("{line}");
-            if style.verbose && phase != Phase::Closed {
-                print!(
-                    "{}",
-                    crate::log::header_block(style, ">", &self.req.headers)
-                );
-                print!(
-                    "{}",
-                    crate::log::header_block(style, "<", &self.resp_headers)
-                );
-            }
-        }
+            request_headers: &self.req.headers,
+            response_headers: &self.resp_headers,
+        });
     }
 }
 
-/// A response is long-lived if it is an event stream or the exchange is a
-/// realtime (upgrade/SSE) one; such streams log at head and again at close.
+/// An upgrade or a realtime (event stream) response.
 fn is_long_lived(req: &HttpHead, head: &HttpResponseHead) -> bool {
     policy::response_class(req, head) == Some(weaver_mux::Class::Realtime)
         || req.header("upgrade").is_some()
@@ -816,24 +522,15 @@ impl StreamHandler for ProxyHandler {
     fn on_event(&mut self, conn: &mut Connection, event: Event) {
         match event {
             Event::Authenticated { .. } => {
-                if let Some(spinner) = self.spinner.take() {
-                    spinner.done(&format!(
-                        "Connected to {}",
-                        crate::ui::accent(crate::ui::Stream::Err, &self.server)
-                    ));
-                }
-                self.footer.install();
+                self.reporter.tunnel_up(&self.host, &self.services);
                 self.register_services(conn);
             }
             Event::Rejected { code, message } => {
-                if let Some(spinner) = self.spinner.take() {
-                    spinner.clear();
-                }
-                self.rejected = true;
-                self.failure = Some(format!(
-                    "{} refused the connection: {message} ({code:?})",
-                    self.server
-                ));
+                self.failure = Some(Error::Rejected {
+                    host: self.host.clone(),
+                    code,
+                    message,
+                });
             }
             Event::Readable(id) => {
                 if self.control.contains_key(&id) {
@@ -847,23 +544,16 @@ impl StreamHandler for ProxyHandler {
                     self.drain_stream(conn, id);
                 }
             }
-            Event::Writable { id, .. } => {
-                if self.inflight.contains_key(&id) {
-                    self.pump_out(conn, id);
-                }
-            }
+            Event::Writable { id, .. } => self.pump_out(conn, id),
             Event::Finished(id) => {
-                let done = if let Some(ex) = self.inflight.get_mut(&id) {
+                if let Some(ex) = self.inflight.get_mut(&id) {
                     ex.req_done = true;
                     // Dropping the sender ends the request body / pipe input.
                     ex.req_body_tx = None;
-                    ex.fin_sent
-                } else {
-                    false
-                };
-                // Both directions finished (ours went first): tear down.
-                if done {
-                    self.inflight.remove(&id);
+                    // Both directions finished (ours went first): tear down.
+                    if ex.fin_sent {
+                        self.inflight.remove(&id);
+                    }
                 }
             }
             Event::Reset { id, .. } => {
@@ -871,5 +561,36 @@ impl StreamHandler for ProxyHandler {
             }
             Event::StreamOpened { .. } | Event::Closed { .. } => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::report::Silent;
+    use crate::target::Target;
+
+    #[test]
+    fn the_service_is_read_from_the_hostname() {
+        let handler = ProxyHandler::new(
+            "relay.example".into(),
+            vec![
+                ServiceSpec::new("web", Target::parse("8080").unwrap()),
+                ServiceSpec::new("my-api", Target::parse("9090").unwrap()),
+            ],
+            Arc::new(Silent),
+        );
+        let service = |authority| {
+            handler
+                .resolve_service(authority)
+                .map(|s| s.service.as_str())
+        };
+        assert_eq!(service("ann-laptop-web.tunnel.example"), Some("web"));
+        assert_eq!(
+            service("Ann-Laptop-My-Api.tunnel.example:443"),
+            Some("my-api")
+        );
+        assert_eq!(service("ann-laptop-docs.tunnel.example"), None);
+        assert_eq!(service("tunnel.example"), None);
     }
 }

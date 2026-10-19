@@ -17,16 +17,16 @@ async fn next_timeout_is_last_activity_plus_ping_interval() {
 }
 
 #[tokio::test]
-async fn ping_emitted_exactly_once_and_pong_measures_rtt() {
+async fn ping_emitted_exactly_once_and_pong_rearms_it() {
     let mut p = Pair::authenticated().await;
     let t0 = p.clock.now();
     p.advance(PING).await;
     let mut buf = Vec::new();
     let now = p.clock.now();
-    assert!(p.client.poll_transmit(now, &mut buf));
+    assert!(p.client.poll_transmit(&mut buf));
     assert_eq!(Frame::parse(&buf).unwrap().frame_type, FrameType::Ping);
     let ping = buf.clone();
-    assert!(!p.client.poll_transmit(now, &mut buf), "exactly one PING");
+    assert!(!p.client.poll_transmit(&mut buf), "exactly one PING");
     buf = ping;
     // With a PING outstanding, the only remaining deadline is idle,
     // measured from the last frame *received* (WELCOME at t0).
@@ -34,25 +34,24 @@ async fn ping_emitted_exactly_once_and_pong_measures_rtt() {
     // Calling handle_timeout again does not re-ping.
     p.client.handle_timeout(now).await;
     let mut scratch = Vec::new();
-    assert!(!p.client.poll_transmit(now, &mut scratch));
+    assert!(!p.client.poll_transmit(&mut scratch));
 
     // Deliver the PING 250ms later, PONG comes back 250ms after that.
     let t1 = p.clock.advance(Duration::from_millis(250));
     // The server has been idle just as long and has its own PING queued;
     // skip that so we isolate the PONG for ours.
     let mut server_ping = Vec::new();
-    assert!(p.server.poll_transmit(t1, &mut server_ping));
+    assert!(p.server.poll_transmit(&mut server_ping));
     assert_eq!(
         Frame::parse(&server_ping).unwrap().frame_type,
         FrameType::Ping
     );
     p.server.recv(t1, &buf).await.unwrap();
     let mut pong = Vec::new();
-    assert!(p.server.poll_transmit(t1, &mut pong));
+    assert!(p.server.poll_transmit(&mut pong));
     assert_eq!(Frame::parse(&pong).unwrap().frame_type, FrameType::Pong);
     let t2 = p.clock.advance(Duration::from_millis(250));
     p.client.recv(t2, &pong).await.unwrap();
-    assert_eq!(p.client.rtt(), Some(Duration::from_millis(500)));
     // Ping cadence re-armed from the last activity.
     assert_eq!(p.client.next_timeout(), Some(t2 + PING));
 }
@@ -62,7 +61,7 @@ async fn no_pong_within_idle_timeout_closes_once() {
     let mut p = Pair::authenticated().await;
     p.advance(PING).await;
     let mut buf = Vec::new();
-    assert!(p.client.poll_transmit(p.clock.now(), &mut buf)); // PING, never delivered
+    assert!(p.client.poll_transmit(&mut buf)); // PING, never delivered
     p.advance(IDLE - PING - Duration::from_millis(1)).await;
     assert!(!p.client.is_closed());
     p.advance(Duration::from_millis(1)).await;
@@ -75,9 +74,9 @@ async fn no_pong_within_idle_timeout_closes_once() {
         }]
     );
     // GOAWAY goes out so the peer learns why.
-    assert!(p.client.poll_transmit(p.clock.now(), &mut buf));
+    assert!(p.client.poll_transmit(&mut buf));
     assert_eq!(Frame::parse(&buf).unwrap().frame_type, FrameType::Goaway);
-    assert!(!p.client.poll_transmit(p.clock.now(), &mut buf));
+    assert!(!p.client.poll_transmit(&mut buf));
 }
 
 #[tokio::test]
@@ -126,8 +125,7 @@ async fn never_fin_stream_survives_pings() {
 
 #[tokio::test]
 async fn reverify_polls_and_revokes() {
-    let mut server = server_config(1);
-    set_reverify(&mut server, Duration::from_secs(5));
+    let server = server_config(1).with_reverify_interval(Duration::from_secs(5));
     let mut p = Pair::new(client_config(1), server);
     p.pump().await;
     let now = p.clock.now();
@@ -143,12 +141,12 @@ async fn reverify_polls_and_revokes() {
         signer.public_key(),
     );
     verifier.revoke(weaver_mux::Signer::key_id(&signer));
-    let mut server = weaver_mux::Config::server(
+    let server = weaver_mux::Config::server(
         Box::new(verifier),
         SERVER_NAME,
         Box::new(weaver_mux::testing::SeededRng::new(7)),
-    );
-    set_reverify(&mut server, Duration::from_secs(5));
+    )
+    .with_reverify_interval(Duration::from_secs(5));
     let mut q = Pair::new(client_config(1), server);
     q.pump().await;
     assert!(matches!(
@@ -167,15 +165,6 @@ async fn reverify_polls_and_revokes() {
             .iter()
             .any(|e| matches!(e, Event::Closed { reason } if reason.code == CloseCode::KeyRevoked))
     );
-}
-
-fn set_reverify(cfg: &mut weaver_mux::Config, every: Duration) {
-    match &mut cfg.role {
-        weaver_mux::Role::Server {
-            reverify_interval, ..
-        } => *reverify_interval = Some(every),
-        weaver_mux::Role::Client { .. } => unreachable!(),
-    }
 }
 
 /// Regression: a side that only *sends* (a long bulk upload) must still
@@ -199,7 +188,7 @@ async fn one_way_bulk_sender_still_pings() {
         p.client.handle_timeout(now).await;
         // Drain what the client wants to send; deliver DATA to the server,
         // and stop at the first PING.
-        while p.client.poll_transmit(now, &mut buf) {
+        while p.client.poll_transmit(&mut buf) {
             let ty = Frame::parse(&buf).unwrap().frame_type;
             if ty == FrameType::Ping {
                 return; // pinged while never idle by its own clock: good.

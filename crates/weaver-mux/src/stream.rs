@@ -44,7 +44,8 @@ pub const RST_CODE_CONNECTION_CLOSED: u32 = 0;
 pub(crate) struct Stream {
     /// Current scheduling class.
     pub class: Class,
-    /// We may still send DATA/FIN (no local FIN or RST yet).
+    /// We may still send DATA (no local FIN or RST yet). Once `false`, FIN
+    /// is queued as soon as the outbox drains.
     pub local_open: bool,
     /// The peer may still send DATA/FIN (no remote FIN or RST yet).
     pub remote_open: bool,
@@ -52,19 +53,11 @@ pub(crate) struct Stream {
     /// scheduled before it, otherwise the peer sees DATA for an unknown
     /// stream.
     pub open_sent: bool,
-    /// `finish()` was called; FIN is queued as soon as the outbox drains.
-    pub fin_requested: bool,
-    /// FIN has been handed to the control queue.
-    pub fin_queued: bool,
-    /// `Event::Finished` was emitted: remote FIN seen and inbox drained.
-    pub finished_delivered: bool,
     /// DATA payloads (flag byte + body), already compressed, waiting for
     /// the scheduler. Every entry already fits inside `send` credit.
     pub outbox: VecDeque<Vec<u8>>,
     /// Sum of `outbox` payload lengths.
     pub outbox_bytes: u32,
-    /// Registered as backlogged in the scheduler.
-    pub sched_active: bool,
     /// Complete messages waiting for `recv_msg`, with the wire credit each
     /// one occupied.
     pub inbox: VecDeque<(Vec<u8>, u32)>,
@@ -87,12 +80,8 @@ impl Stream {
             local_open: true,
             remote_open: true,
             open_sent,
-            fin_requested: false,
-            fin_queued: false,
-            finished_delivered: false,
             outbox: VecDeque::new(),
             outbox_bytes: 0,
-            sched_active: false,
             inbox: VecDeque::new(),
             partial: Vec::new(),
             partial_wire: 0,
@@ -120,19 +109,10 @@ impl Stream {
         !self.remote_open && self.inbox.is_empty()
     }
 
-    /// True once both directions are done and nothing is left to deliver;
-    /// the connection then forgets the stream.
+    /// True once both directions are done and nothing is left to send or
+    /// deliver (our FIN is queued the moment the outbox of a finished
+    /// stream drains); the connection then forgets the stream.
     pub fn is_finished(&self) -> bool {
-        !self.local_open
-            && self.remote_drained()
-            && self.outbox.is_empty()
-            && self.finished_delivered
-            && (!self.fin_requested || self.fin_queued)
-    }
-
-    /// Complete messages waiting for `recv_msg`.
-    #[cfg(any(test, feature = "test-util"))]
-    pub fn pending_messages(&self) -> usize {
-        self.inbox.len()
+        !self.local_open && self.outbox.is_empty() && self.remote_drained()
     }
 }

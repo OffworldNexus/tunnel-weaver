@@ -15,7 +15,6 @@ use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::broadcast;
 use tracing::{debug, warn};
 
-use super::dns::generate_random_hex;
 use super::planner::{Port, PortReachability};
 
 /// Scans `/proc/net/tcp{,6}` and `/proc/net/udp{,6}` for socket inodes bound
@@ -336,7 +335,7 @@ pub async fn verify_reachability(public_ips: &[IpAddr]) -> [PortReachability; 3]
         ];
     }
 
-    let token = generate_random_hex(16);
+    let token = crate::random_hex(16);
     let challenge = Arc::new(format!("weaver-reachability-{token}"));
     let udp_challenge = format!("weaver-reachability-udp-{token}");
 
@@ -359,7 +358,7 @@ pub async fn verify_reachability(public_ips: &[IpAddr]) -> [PortReachability; 3]
     let listener_53 = {
         // Port 53 must be bound on the explicit relay addresses, never a
         // wildcard: `[::]:53`/`0.0.0.0:53` collides with the systemd-resolved
-        // stub on `127.0.0.53:53`, the exact failure OFF-190 avoids. We
+        // stub on `127.0.0.53:53`, a known failure. We
         // therefore bind one listener per public IP.
         let mut listeners = Vec::new();
         for &ip in public_ips {
