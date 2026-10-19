@@ -1,14 +1,7 @@
-// Global stylesheet — the design system entry point.
-//
-// It only holds what is genuinely global: the tokens, a reset, the base
-// typography and the few primitives shared by unrelated routes (links, form
-// controls, the action row). Everything component- or route-specific lives in
-// that component's SFC `<style lang="scss">` block instead.
-//
-// Imported once, from the root layout.
+// The genuinely global styles: tokens, a reset, base typography and the
+// primitives shared by unrelated routes. Imported once, from the root layout.
 
 @use 'tokens';
-@use 'mixins' as *;
 
 // ---- reset ----------------------------------------------------------------
 
@@ -27,7 +20,6 @@ body {
 // ---- base typography ------------------------------------------------------
 
 body {
-	// The deck is the whole page background for the account pages.
 	background: var(--tw-deck);
 	color: var(--tw-text);
 	font: 400 16px/1.6 var(--tw-sans);
@@ -99,10 +91,6 @@ input:focus-visible,
 	margin-top: 12px;
 }
 
-.lede + .lede {
-	margin-top: 10px;
-}
-
 .hint {
 	margin: 0;
 	color: var(--tw-muted);
@@ -135,12 +123,6 @@ input:focus-visible,
 	font-size: 16px;
 	font-weight: 700;
 	line-height: 1.4;
-}
-
-.field__row {
-	display: flex;
-	flex-direction: column;
-	gap: 8px;
 }
 
 .field input {
@@ -176,9 +158,11 @@ input:focus-visible,
 }
 
 .toggle {
+	display: flex;
+	align-items: center;
 	align-self: flex-start;
-	min-height: 32px;
-	padding: 4px 0;
+	min-height: 44px;
+	padding: 0;
 	border: 0;
 	background: none;
 	color: var(--tw-accent);

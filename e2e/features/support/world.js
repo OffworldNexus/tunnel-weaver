@@ -1,67 +1,29 @@
-/**
- * The Cucumber World for the account-relay suite.
- *
- * One instance per scenario. It holds the browser page (created per scenario by
- * the hooks) plus the harness origins and a few thin conveniences. Mailbox
- * access is delegated to the harness module so scenarios never touch HTTP
- * details directly.
- */
+/** The per-scenario World: the browser page plus what the scenario has seeded. */
 
 import { setWorldConstructor, World } from '@cucumber/cucumber';
-import {
-  clearMail as clearCapturedMail,
-  harness,
-  latestMailBySubject as readLatestMailBySubject,
-  latestResetLink as readLatestResetLink,
-  latestVerificationLink as readLatestVerificationLink,
-  messages as readMessages,
-  pairingOutcome,
-  pairingUrl,
-  resetLinks as readResetLinks,
-  seedPairing
-} from './harness.js';
+import { harness } from './harness.js';
 
-export class WeaverWorld extends World {
-  constructor(options) {
-    super(options);
-    this.baseUrl = harness.baseUrl ?? '';
-    this.mailUrl = harness.mailUrl ?? '';
-    /** @type {import('playwright').Page | undefined} */
-    this.page = undefined;
-    /** @type {import('playwright').BrowserContext | undefined} */
-    this.context = undefined;
-    /** Per-scenario identity, seeded by the Background step. */
-    this.name = '';
-    this.email = '';
-    this.password = '';
-    /** The reset link taken from the capture mailbox (WVR-41). */
-    this.resetLink = '';
-    /** The pairing seeded for this scenario, and machines approved in it by name. */
-    this.pairingFingerprint = '';
-    this.pairingHandle = '';
-    this.pairedMachines = {};
-    /** Every request URL the page issued, so a handle leak can be disproved. */
-    this.requestUrls = [];
+class WeaverWorld extends World {
+  /** @type {import('playwright').Page} */
+  page;
+  /** @type {import('playwright').BrowserContext} */
+  context;
+  /** The identity the Background seeds. */
+  name = '';
+  email = '';
+  /** The reset link taken from the mailbox. */
+  resetLink = '';
+  /** The pending pairing, and the approvals of earlier ones keyed by machine. */
+  pairing = { handle: '', fingerprint: '' };
+  paired = {};
+  /** Every request URL the page issued, so a handle leak can be disproved. */
+  requestUrls = [];
 
-    // Bind mailbox helpers so they can be pulled off `this` in steps.
-    this.messages = readMessages;
-    this.clearMail = clearCapturedMail;
-    this.latestVerificationLink = readLatestVerificationLink;
-    this.latestResetLink = readLatestResetLink;
-    this.latestMailBySubject = readLatestMailBySubject;
-    this.resetLinks = readResetLinks;
-    this.seedPairing = seedPairing;
-    this.pairingUrl = pairingUrl;
-    this.pairingOutcome = pairingOutcome;
+  url(pathname) {
+    return new URL(pathname, harness.baseUrl).toString();
   }
 
-  /** An absolute URL for a route path (`/`, `/sign-up`, …). */
-  url(pathname = '/') {
-    return new URL(pathname, this.baseUrl).toString();
-  }
-
-  /** Navigates the scenario page to a route path. */
-  async open(pathname = '/') {
+  async open(pathname) {
     await this.page.goto(this.url(pathname));
   }
 }

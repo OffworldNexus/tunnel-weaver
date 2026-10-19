@@ -11,7 +11,7 @@
 	export let rel: string | undefined = undefined;
 	export let onclick: ((event: MouseEvent) => void) | undefined = undefined;
 
-	$: isLink = typeof href === 'string' && href.length > 0;
+	$: isLink = Boolean(href);
 	$: classes = `keycap keycap--${variant}${wide ? ' keycap--wide' : ''}`;
 	$: deactivated = disabled || loading;
 </script>
@@ -19,6 +19,7 @@
 <!-- The shape is built from layered, identically-clipped spans (pedestal, focus
      ring, cap frame, cap face) so the border and the focus ring both follow the
      10px cut corner. The label stays real text for the accessible name. -->
+<!-- svelte-ignore a11y_no_static_element_interactions (it is always an <a> or a <button>) -->
 <svelte:element
 	this={isLink ? 'a' : 'button'}
 	class={classes}
@@ -142,24 +143,20 @@
 	}
 
 	/* Disabled / busy */
-	.keycap:disabled,
-	.keycap[aria-disabled='true'] {
+	.keycap:disabled {
 		cursor: not-allowed;
 		color: var(--tw-muted);
 	}
 
-	.keycap:disabled .keycap__pedestal,
-	.keycap[aria-disabled='true'] .keycap__pedestal {
+	.keycap:disabled .keycap__pedestal {
 		background: transparent;
 	}
 
-	.keycap:disabled .keycap__cap,
-	.keycap[aria-disabled='true'] .keycap__cap {
+	.keycap:disabled .keycap__cap {
 		background: var(--tw-border);
 	}
 
-	.keycap:disabled .keycap__face,
-	.keycap[aria-disabled='true'] .keycap__face {
+	.keycap:disabled .keycap__face {
 		background: var(--tw-well);
 		box-shadow: none;
 	}

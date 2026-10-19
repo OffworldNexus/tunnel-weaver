@@ -1,13 +1,30 @@
 <script lang="ts">
 	import Icon from '#lib/ui/Icon.svelte';
+
 	import Section from './Section.svelte';
 
 	// Landing copy, kept next to the section that renders it.
 	const benefits = [
-		{ icon: 'plug', title: 'No port-forwarding', text: 'The weaver dials out. Keep your firewall closed.' },
-		{ icon: 'lock', title: 'TLS by default', text: 'Every hostname is served over HTTPS automatically.' },
-		{ icon: 'globe', title: 'One hostname per service', text: 'A flat, readable name for each thing you run.' },
-		{ icon: 'battery', title: 'Batteries included', text: 'TLS, DNS, certificates and abuse protection ship with the relay — nothing extra to run.' }
+		{
+			icon: 'plug',
+			title: 'No port-forwarding',
+			text: 'The weaver dials out. Keep your firewall closed.'
+		},
+		{
+			icon: 'lock',
+			title: 'TLS by default',
+			text: 'Every hostname is served over HTTPS automatically.'
+		},
+		{
+			icon: 'globe',
+			title: 'One hostname per service',
+			text: 'A flat, readable name for each thing you run.'
+		},
+		{
+			icon: 'battery',
+			title: 'Batteries included',
+			text: 'TLS, DNS, certificates and abuse protection ship with the relay — nothing extra to run.'
+		}
 	] as const;
 </script>
 
@@ -17,7 +34,7 @@
 	lede="Small pieces that keep the operation boring."
 	cardsMin="220px"
 >
-	{#each benefits as benefit}
+	{#each benefits as benefit (benefit.title)}
 		<li class="benefit">
 			<span class="benefit__icon"><Icon name={benefit.icon} /></span>
 			<div>

@@ -1,81 +1,45 @@
 /**
- * Small, loud assertions layered on Playwright's own auto-waiting.
- *
- * The `playwright` package has no `expect`; these helpers wrap `locator.waitFor`
- * so a miss fails with the page URL, title and the locator that was expected —
- * enough to debug from CI output alone. No arbitrary sleeps: every assertion is
- * a real visibility wait.
+ * Assertions over Playwright's auto-waiting (the `playwright` package has no
+ * `expect`). A miss fails with the page URL, enough to debug from CI output.
  */
 
-const DEFAULT_TIMEOUT = 20_000;
-
-/** Waits for `locator` to become visible, else throws a context-rich error. */
 async function waitVisible(page, locator, description) {
   try {
-    await locator.waitFor({ state: 'visible', timeout: DEFAULT_TIMEOUT });
+    await locator.waitFor({ state: 'visible' });
   } catch (error) {
-    const url = page.url();
-    const title = await page.title().catch(() => '');
-    throw new Error(
-      `Expected to see ${description}, but it did not become visible.\n` +
-        `  url:   ${url}\n` +
-        `  title: ${title}\n` +
-        `  cause: ${error.message}`
-    );
+    throw new Error(`Expected to see ${description} at ${page.url()}.\n  cause: ${error.message}`);
   }
 }
 
-/** An exact-text heading. */
-export async function seeHeading(page, name) {
-  await waitVisible(page, page.getByRole('heading', { name, exact: true }), `heading "${name}"`);
-}
+export const seeHeading = (page, name) =>
+  waitVisible(page, page.getByRole('heading', { name, exact: true }), `the heading "${name}"`);
 
-/** An exact-text link. Uses `.first()` because CTAs repeat across the page. */
-export async function seeLink(page, name) {
-  await waitVisible(page, page.getByRole('link', { name, exact: true }).first(), `link "${name}"`);
-}
+export const seeLink = (page, name) =>
+  waitVisible(page, page.getByRole('link', { name, exact: true }).first(), `the link "${name}"`);
 
-/** Text appearing anywhere on the page. */
-export async function seeText(page, text, { exact = false } = {}) {
-  await waitVisible(page, page.getByText(text, { exact }).first(), `text "${text}"`);
-}
+export const seeText = (page, text, { exact = false } = {}) =>
+  waitVisible(page, page.getByText(text, { exact }).first(), `the text "${text}"`);
 
-/** An ARIA alert containing `text`. */
-export async function seeAlert(page, text) {
-  await waitVisible(
-    page,
-    page.getByRole('alert').filter({ hasText: text }),
-    `alert containing "${text}"`
-  );
-}
+export const seeAlert = (page, text) =>
+  waitVisible(page, page.getByRole('alert').filter({ hasText: text }), `an alert with "${text}"`);
 
-/** A `<dd>` (ARIA `definition`) whose text contains `text`. */
-export async function seeDefinition(page, text) {
-  await waitVisible(
+export const seeDefinition = (page, text) =>
+  waitVisible(
     page,
     page.getByRole('definition').filter({ hasText: text }).first(),
-    `definition containing "${text}"`
+    `a definition with "${text}"`
   );
-}
 
-/** A labelled ARIA region — a `<section aria-labelledby>` named from its heading. */
-export async function seeRegion(page, name) {
-  await waitVisible(page, page.getByRole('region', { name, exact: true }), `region "${name}"`);
-}
-
-/** A form control carrying an exact accessible label. */
-export async function seeLabel(page, name) {
-  await waitVisible(page, page.getByLabel(name, { exact: true }), `field labelled "${name}"`);
-}
-
-/** Asserts a field's current value, failing with both values in the message. */
-export async function seeFieldValue(page, locator, expected, description) {
-  await waitVisible(page, locator, description);
-  const actual = await locator.inputValue();
+export async function seeFieldValue(page, label, expected) {
+  const field = page.getByLabel(label, { exact: true });
+  await waitVisible(page, field, `the field "${label}"`);
+  const actual = await field.inputValue();
   if (actual !== expected) {
-    throw new Error(
-      `Expected ${description} to be "${expected}", but it was "${actual}".\n` +
-        `  url: ${page.url()}`
-    );
+    throw new Error(`Expected the field "${label}" to hold "${expected}", but it held "${actual}".`);
   }
+}
+
+export async function seeNoField(page, label) {
+  const count = await page.getByLabel(label, { exact: true }).count();
+  if (count !== 0) throw new Error(`Expected no field "${label}" at ${page.url()}.`);
 }

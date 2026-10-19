@@ -81,27 +81,12 @@ async function openBrowser({ state }) {
   return { browser, context, page };
 }
 
-/** Submits a Keycap form control once it has been enabled by the PoW widget. */
-async function clickWhenEnabled(page, name, screenshotPath) {
-  const button = page.getByRole('button', { name, exact: true });
+/** Presses a button; a proof-of-work submit stays disabled until the widget solves. */
+async function press(page, name, screenshotPath) {
   try {
-    await button.waitFor({ state: 'visible', timeout: 30_000 });
-    // The submit stays disabled until the invisible ALTCHA widget reports a
-    // proof; waiting for enabled is waiting for the widget to solve.
-    await expectEnabled(button, 45_000);
-    await button.click({ force: true });
+    await page.getByRole('button', { name, exact: true }).click({ timeout: 45_000 });
   } catch (error) {
-    await fail(`could not submit "${name}": ${error.message}`, page, screenshotPath);
-  }
-}
-
-/** Polls `locator` until it reports enabled, or throws after `timeoutMs`. */
-async function expectEnabled(locator, timeoutMs) {
-  const deadline = Date.now() + timeoutMs;
-  for (;;) {
-    if (await locator.isEnabled().catch(() => false)) return;
-    if (Date.now() >= deadline) throw new Error('control stayed disabled (proof of work)');
-    await new Promise((resolve) => setTimeout(resolve, 100));
+    await fail(`could not press "${name}": ${error.message}`, page, screenshotPath);
   }
 }
 
@@ -142,9 +127,9 @@ async function signup(opts) {
   try {
     await page.goto(new URL('/sign-up', opts.base).toString());
     await waitForHeading(page, 'Create your account', 'sign-up', opts.screenshot);
-    await page.getByLabel('Name').fill(opts.name);
-    await page.getByLabel('Email').fill(opts.email);
-    await clickWhenEnabled(page, 'Continue with email', opts.screenshot);
+    await page.getByLabel('Name', { exact: true }).fill(opts.name);
+    await page.getByLabel('Email', { exact: true }).fill(opts.email);
+    await press(page, 'Continue with email', opts.screenshot);
     await waitForHeading(page, 'Check your email', 'check-email', opts.screenshot);
     await context.storageState({ path: opts.state });
     console.log(`provision: signup started for ${opts.email}`);
@@ -165,19 +150,19 @@ async function verify(opts) {
   const { browser, context, page } = await openBrowser(opts);
   try {
     await page.goto(opts.link);
-    await waitForPath(page, /\/(set-password|existing-account)(\?.*)?$/, 'set-password', opts.screenshot);
+    await waitForPath(page, /\/(set-password|existing-account)$/, 'set-password', opts.screenshot);
     if (new URL(page.url()).pathname.startsWith('/existing-account')) {
       await fail(`the address already had an account: ${opts.email}`, page, opts.screenshot);
     }
     await waitForHeading(page, 'Set your password', 'set-password', opts.screenshot);
     await page.getByLabel('New password', { exact: true }).fill(opts.password);
-    await clickWhenEnabled(page, 'Save password', opts.screenshot);
+    await press(page, 'Save password', opts.screenshot);
     await waitForHeading(page, 'Sign in', 'sign-in', opts.screenshot);
 
     await page.getByLabel('Email', { exact: true }).fill(opts.email);
     await page.getByLabel('Password', { exact: true }).fill(opts.password);
-    await clickWhenEnabled(page, 'Sign in', opts.screenshot);
-    await waitForPath(page, /\/app(\?.*)?$/, 'the signed-in shell', opts.screenshot);
+    await press(page, 'Sign in', opts.screenshot);
+    await waitForPath(page, /\/app$/, 'the signed-in shell', opts.screenshot);
     await context.storageState({ path: opts.state });
     console.log(`provision: verified and signed in as ${opts.email}`);
   } catch (error) {
@@ -204,7 +189,7 @@ async function approve(opts) {
     if ((await page.getByLabel('Person slug', { exact: true }).count()) > 0) {
       await page.getByLabel('Person slug', { exact: true }).fill(opts.person);
     }
-    await page.getByRole('button', { name: 'Approve this machine', exact: true }).click({ force: true });
+    await press(page, 'Approve this machine', opts.screenshot);
     await waitForHeading(page, 'Machine approved', 'machine-approved', opts.screenshot);
     console.log(`provision: approved machine ${opts.person}/${opts.machine}`);
   } catch (error) {

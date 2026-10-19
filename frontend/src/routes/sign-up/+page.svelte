@@ -1,70 +1,33 @@
 <script lang="ts">
 	/**
-	 * Create-account form.
-	 *
-	 * Collects a name and email, then starts a registration on the relay. The
-	 * reply carries a flow id (not a session) that the later verification steps
-	 * resume from, kept in session state so a mid-flow refresh doesn't lose it.
-	 * Submission is gated behind a proof-of-work challenge.
+	 * Starts a registration. The reply carries a flow id (not a session) that
+	 * the verification steps resume from.
 	 */
-
-	import { goto } from '$app/navigation';
-	import { superForm } from 'sveltekit-superforms';
-	import { valibot } from 'sveltekit-superforms/adapters';
-	import { api, messageOf } from '#lib/account/api';
-	import { saveFlow } from '#lib/account/flow';
-	import { signUpSchema } from '#lib/account/schemas';
-	import { href } from '#lib/app/paths';
 	import Altcha from '#lib/account/Altcha.svelte';
+	import { api } from '#lib/account/api';
+	import EmailField from '#lib/account/EmailField.svelte';
+	import { jsonForm } from '#lib/account/form';
+	import { signUpSchema } from '#lib/account/schemas';
+	import { flow } from '#lib/account/state';
 	import Keycap from '#lib/ui/Keycap.svelte';
 	import Page from '#lib/ui/Page.svelte';
+	import { goto } from '$app/navigation';
+	import { resolve } from '$app/paths';
 
-	let altchaPayload = '';
-	let proofReset = 0;
+	let altcha: { reset(): void };
+	let proof = '';
 
-	// Start the registration; the returned flow id drives the verification steps
-	// that follow.
-	const sf = superForm(
-		{ name: '', email: '' },
-		{
-			validators: valibot(signUpSchema),
-			clearOnSubmit: 'errors-and-message',
-			onSubmit: async ({ cancel }) => {
-				cancel();
-				const result = await sf.validateForm({ update: true });
-				if (!result.valid || !altchaPayload) return;
-				try {
-					const res = await api<{ status: string; flow: string }>('/api/account/signup', {
-						method: 'POST',
-						body: {
-							name: result.data.name,
-							email: result.data.email,
-							altcha: altchaPayload
-						}
-					});
-					if (res.ok && res.data?.flow) {
-						saveFlow({ flow: res.data.flow, email: result.data.email, name: result.data.name });
-						await goto(href('/check-email'));
-						return;
-					}
-					sf.message.set(messageOf(res.data, 'We could not start your signup. Please try again.'));
-				} catch {
-					sf.message.set('We could not reach the server. Check your connection and try again.');
-				} finally {
-					resetProof();
-				}
-			}
+	const sf = jsonForm(signUpSchema, { name: '', email: '' }, async (data) => {
+		const res = await api<{ flow: string }>('/api/account/signup', { ...data, altcha: proof });
+		altcha.reset();
+		if (!res.ok || !res.data) {
+			return res.error ?? 'We could not start your signup. Please try again.';
 		}
-	);
+		flow.save({ flow: res.data.flow, email: data.email });
+		await goto(resolve('/check-email'));
+	});
 
 	const { form, errors, message, submitting, enhance } = sf;
-
-	// A proof is single-use: after any attempt (success or failure) the widget
-	// must solve a fresh one before the next submit.
-	function resetProof() {
-		altchaPayload = '';
-		proofReset += 1;
-	}
 </script>
 
 <svelte:head>
@@ -91,40 +54,18 @@
 			{#if $errors.name}<p class="field__error" aria-live="polite">{$errors.name[0]}</p>{/if}
 		</div>
 
-		<div class="field">
-			<label for="email">Email</label>
-			<input
-				id="email"
-				name="email"
-				type="email"
-				autocomplete="username"
-				inputmode="email"
-				autocapitalize="none"
-				spellcheck="false"
-				placeholder="you@example.com"
-				bind:value={$form.email}
-				disabled={$submitting}
-				aria-invalid={$errors.email ? 'true' : undefined}
-			/>
-			{#if $errors.email}<p class="field__error" aria-live="polite">{$errors.email[0]}</p>{/if}
-		</div>
+		<EmailField bind:value={$form.email} error={$errors.email?.[0]} disabled={$submitting} />
 
-		<!-- Proof-of-work gate: the submit stays disabled until a proof is solved. -->
-		<Altcha
-			purpose="signup"
-			resetSignal={proofReset}
-			onSolved={(payload) => (altchaPayload = payload)}
-			onExpired={() => (altchaPayload = '')}
-		/>
+		<Altcha purpose="signup" bind:this={altcha} bind:payload={proof} />
 
 		{#if $message}
-			<p class="notice-error" role="alert" aria-live="assertive">{$message}</p>
+			<p class="notice-error" role="alert">{$message}</p>
 		{/if}
 
-		<Keycap type="submit" loading={$submitting} disabled={!altchaPayload || $submitting} wide>
+		<Keycap type="submit" loading={$submitting} disabled={!proof || $submitting} wide>
 			{$submitting ? 'Creating…' : 'Continue with email'}
 		</Keycap>
 	</form>
 
-	<p class="switch">Already have an account? <a href={href('/sign-in')}>Sign in</a></p>
+	<p class="switch">Already have an account? <a href={resolve('/sign-in')}>Sign in</a></p>
 </Page>

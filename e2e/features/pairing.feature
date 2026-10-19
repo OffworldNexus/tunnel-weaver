@@ -10,22 +10,20 @@ Feature: Pairing a machine to the relay
   the person may edit; a machine that lost its key moves onto a new one with its
   name fixed.
 
-  The terminal half (`weave pair`, `weave start`, Ctrl-C, the key floor) is
-  CLI-only and lives in the Rust tests. Here the harness seeds a pending pairing,
-  the scenario opens the link the CLI would have printed, and the harness reports
-  what the terminal would have received.
+  The terminal half (`weave pair`, `weave start`, Ctrl-C) lives in the Rust
+  tests. Here the harness seeds a pending pairing, the scenario opens the link
+  the CLI would have printed, and the harness reports what the terminal would
+  have received.
 
   Background:
     Given a unique email address for "Ada Lovelace"
 
-  # The fragment rule is asserted inside this journey rather than as a test of
-  # its own: the page that strips the handle is the page this scenario is on.
-  Scenario: Approving a seeded pairing and the handle never leaving the fragment
+  Scenario: Approving a pairing, the handle never leaving the fragment
     Given an account exists for "Ada Lovelace" with the password "correct-horse-battery-staple"
     When I sign in with the password "correct-horse-battery-staple"
     Then I see the signed-in identity for "Ada Lovelace"
     Given a pending pairing is seeded for the machine "laptop"
-    When I open the pairing link from the fragment
+    When I open the pairing link
     Then I see the "Approve a machine" heading
     And the confirmation proposes the machine "laptop" and a person slug
     And the pairing key fingerprint is shown
@@ -34,57 +32,66 @@ Feature: Pairing a machine to the relay
     When I approve the machine
     Then I see the "Machine approved" heading
     And the terminal is told it is paired as the machine "laptop"
-    And I see a link to "Go to your account"
     When I follow the "Go to your account" link
     Then I see the signed-in identity for "Ada Lovelace"
 
   Scenario: Opening a pairing link while signed out returns to the confirmation after signing in
     Given an account exists for "Ada Lovelace" with the password "correct-horse-battery-staple"
-    Given a pending pairing is seeded for the machine "laptop"
-    When I open the pairing link from the fragment
+    And a pending pairing is seeded for the machine "laptop"
+    When I open the pairing link
     Then I see the "Sign in" heading
     And the address bar carries no pairing handle
     When I sign in with the password "correct-horse-battery-staple"
     Then I see the "Approve a machine" heading
     And the confirmation proposes the machine "laptop" and a person slug
 
-  # The sign-up form of the detour: someone with no account at all. The pending
-  # pairing survives the whole registration, including a verification link that
-  # may open in another tab, and the sign-in that ends it returns here.
+  # The pending pairing survives the whole registration, including a
+  # verification link that may open in another tab.
   Scenario: Opening a pairing link with no account, then creating one, returns to the confirmation
     Given a pending pairing is seeded for the machine "laptop"
-    When I open the pairing link from the fragment
+    When I open the pairing link
     Then I see the "Sign in" heading
-    When I follow the "Create an account" call to action
+    When I follow the "Create an account" link
     And I create an account for "Ada Lovelace"
-    Then I see the "Check your email" heading
-    When I open the verification link from the latest email
-    Then I see the "Set your password" heading
-    When I set the password to "correct-horse-battery-staple"
-    Then I see the "Sign in" heading
-    When I sign in with the password "correct-horse-battery-staple"
+    And I open the verification link from the latest email
+    And I set the password to "correct-horse-battery-staple"
+    And I sign in with the password "correct-horse-battery-staple"
     Then I see the "Approve a machine" heading
     And the confirmation proposes the machine "laptop" and a person slug
     When I approve the machine
     Then I see the "Machine approved" heading
+    And the terminal is told it is paired as the machine "laptop"
+
+  # A refused name is checked before the handle is spent, so the person can fix it.
+  Scenario: A person slug the relay refuses can be corrected before approving
+    Given an account exists for "Ada Lovelace" with the password "correct-horse-battery-staple"
+    When I sign in with the password "correct-horse-battery-staple"
+    Then I see the signed-in identity for "Ada Lovelace"
+    Given a pending pairing is seeded for the machine "laptop"
+    When I open the pairing link
+    And I set the person slug to "Not a slug!"
+    And I approve the machine
+    Then I see the error "A person name is 1 to 15 lowercase letters or digits."
+    When I set the person slug to a fresh one
+    And I approve the machine
+    Then I see the "Machine approved" heading
+    And the terminal is told it is paired as the machine "laptop"
 
   Scenario: Rejecting a pairing refuses the machine and spends the handle
     Given an account exists for "Ada Lovelace" with the password "correct-horse-battery-staple"
     When I sign in with the password "correct-horse-battery-staple"
     Then I see the signed-in identity for "Ada Lovelace"
     Given a pending pairing is seeded for the machine "laptop"
-    When I open the pairing link from the fragment
+    When I open the pairing link
     Then I see the "Approve a machine" heading
     When I reject the machine
     Then I see the "Pairing rejected" heading
     And the terminal is told the pairing failed with "rejected"
-    And I see the instruction to re-run "weave pair"
-    And I see a link to "Go to your account"
+    And I see "Re-run weave pair to try again."
     When I open the same pairing link again
     Then I see the "Request no longer waiting" heading
 
-  # The browser-visible half of "Ctrl-C leaves nothing behind": a handle that was
-  # never seeded renders the same dead state the channel's death produces.
+  # What a closed terminal leaves behind: a handle nobody is waiting on.
   Scenario: An unknown pairing handle reports that the request is no longer waiting
     Given an account exists for "Ada Lovelace" with the password "correct-horse-battery-staple"
     When I sign in with the password "correct-horse-battery-staple"
@@ -99,7 +106,7 @@ Feature: Pairing a machine to the relay
     Then I see the signed-in identity for "Ada Lovelace"
     Given the machine "laptop" is paired
     And a pending pairing is seeded for the machine "desktop"
-    When I open the pairing link from the fragment
+    When I open the pairing link
     Then I see the "Approve a machine" heading
     And the confirmation proposes the machine "desktop" under the existing person
     When I approve the machine
@@ -111,7 +118,7 @@ Feature: Pairing a machine to the relay
     Then I see the signed-in identity for "Ada Lovelace"
     Given the machine "laptop" is paired
     And "laptop" lost its key and asks to pair again
-    When I open the pairing link from the fragment
+    When I open the pairing link
     Then I see the "Move a machine to a new key" heading
     And the confirmation names "laptop" with nothing to edit
     And the pairing key fingerprint is shown
@@ -130,7 +137,7 @@ Feature: Pairing a machine to the relay
     When I sign in with the password "correct-horse-battery-staple"
     Then I see the signed-in identity for "Grace Hopper"
     Given "laptop" lost its key and asks to pair again
-    When I open the pairing link from the fragment
+    When I open the pairing link
     Then I see the "Not one of your machines" heading
     When I reject the machine
     Then the terminal is told the pairing failed with "rejected"

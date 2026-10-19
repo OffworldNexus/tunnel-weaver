@@ -1,23 +1,14 @@
 <script lang="ts">
-	/**
-	 * The global toast viewport, mounted once in the layout.
-	 *
-	 * Renders Ark UI's Toast primitive so notices queue, stack, animate in and
-	 * out, and announce politely. The app raises them imperatively through
-	 * `notify()` (see `#lib/account/notices`); Ark UI owns the timers and the
-	 * accessibility wiring, so there is nothing to hand-roll here.
-	 */
-	import { Toast, Toaster } from '@ark-ui/svelte';
+	/** The toast viewport, mounted once in the root layout; see `notify()`. */
+	import { Toast, Toaster, type ToastOptions } from '@ark-ui/svelte';
+
 	import { toaster } from '#lib/account/notices';
 </script>
 
 <Toaster {toaster} class="toaster">
-	{#snippet children(toast)}
+	{#snippet children(toast: () => ToastOptions)}
 		<Toast.Root class="toast">
 			<Toast.Title class="toast__title">{toast().title}</Toast.Title>
-			{#if toast().description}
-				<Toast.Description class="toast__description">{toast().description}</Toast.Description>
-			{/if}
 			<Toast.CloseTrigger class="toast__close" aria-label="Dismiss message">×</Toast.CloseTrigger>
 		</Toast.Root>
 	{/snippet}
@@ -78,11 +69,6 @@
 
 	:global([data-scope='toast'][data-part='title']) {
 		flex: 1;
-	}
-
-	:global([data-scope='toast'][data-part='description']) {
-		flex: 1;
-		opacity: 0.85;
 	}
 
 	:global([data-scope='toast'][data-part='close-trigger']) {

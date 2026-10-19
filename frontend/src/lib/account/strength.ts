@@ -1,30 +1,51 @@
 /**
- * A rough password-strength heuristic, for display only.
+ * Password-strength estimation for the "New password" meter, backed by zxcvbn.
  *
- * The relay owns the real policy — a minimum length plus a breach check — and
- * enforces it authoritatively on submit. This exists purely to give the user a
- * live hint while typing, so a "strong" label here is never a guarantee.
+ * Display only: the relay owns the real policy (a minimum length plus a breach
+ * check) and decides on submit, so a "Strong" rating here is never a promise
+ * that the password will be accepted.
+ *
+ * zxcvbn and its dictionaries weigh several hundred kilobytes, so they are
+ * fetched on first use (see {@link loadEstimator}) rather than shipped in the
+ * initial bundle.
  */
 
-export interface Strength {
-	level: 'weak' | 'fair' | 'strong';
-	/** Fill percentage for the meter. */
-	pct: number;
-	/** Short label, or empty for an empty password. */
-	label: string;
+export interface Estimate {
+	/** zxcvbn's score: 0 (trivially guessable) to 4 (very unguessable). */
+	score: 0 | 1 | 2 | 3 | 4;
+	/** What makes the password weak, or empty when nothing stands out. */
+	warning: string;
+	/** How to make it stronger; empty when zxcvbn has nothing to add. */
+	suggestions: string[];
 }
 
-/** Scores a password on length and character-class variety. */
-export function passwordStrength(value: string): Strength {
-	let score = 0;
-	if (value.length >= 8) score++;
-	if (value.length >= 12) score++;
-	if (/[a-z]/.test(value) && /[A-Z]/.test(value)) score++;
-	if (/\d/.test(value)) score++;
-	if (/[^A-Za-z0-9]/.test(value)) score++;
+export type Estimator = (password: string) => Estimate;
 
-	if (value.length === 0) return { level: 'weak', pct: 0, label: '' };
-	if (score <= 2) return { level: 'weak', pct: 33, label: 'Weak' };
-	if (score === 3) return { level: 'fair', pct: 66, label: 'Fair' };
-	return { level: 'strong', pct: 100, label: 'Strong' };
+let loading: Promise<Estimator> | undefined;
+
+/** Loads zxcvbn with the common and English packs, once; later calls share it. */
+export function loadEstimator(): Promise<Estimator> {
+	loading ??= build().catch((error: unknown) => {
+		// A failed fetch (offline, a deploy swapped the chunks) must not stick.
+		loading = undefined;
+		throw error;
+	});
+	return loading;
+}
+
+async function build(): Promise<Estimator> {
+	const [{ ZxcvbnFactory }, common, en] = await Promise.all([
+		import('@zxcvbn-ts/core'),
+		import('@zxcvbn-ts/language-common'),
+		import('@zxcvbn-ts/language-en')
+	]);
+	const zxcvbn = new ZxcvbnFactory({
+		dictionary: { ...common.dictionary, ...en.dictionary },
+		graphs: common.adjacencyGraphs,
+		translations: en.translations
+	});
+	return (password) => {
+		const { score, feedback } = zxcvbn.check(password);
+		return { score, warning: feedback.warning ?? '', suggestions: feedback.suggestions };
+	};
 }

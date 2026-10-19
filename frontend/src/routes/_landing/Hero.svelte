@@ -1,7 +1,7 @@
 <script lang="ts">
 	import WeaverMark from '#lib/brand/WeaverMark.svelte';
 	import Keycap from '#lib/ui/Keycap.svelte';
-	import { href } from '#lib/app/paths';
+	import { resolve } from '$app/paths';
 </script>
 
 <!-- Full-viewport hero: decorative CSS-only tunnel art around the weaver mark,
@@ -23,13 +23,13 @@
 	<p class="hero__eyebrow">Tunnel Weaver</p>
 	<h1 id="hero-title" class="hero__title">Your services, on the open web.</h1>
 	<p class="hero__lede">
-		Secure tunnels to the services running on your machines — reachable at a stable public
-		hostname, with no port-forwarding and nothing exposed at home.
+		Secure tunnels to the services running on your machines — reachable at a stable public hostname,
+		with no port-forwarding and nothing exposed at home.
 	</p>
 
 	<div class="hero__actions">
-		<Keycap wide href={href('/sign-up')}>Create account</Keycap>
-		<Keycap wide variant="ghost" href={href('/sign-in')}>Sign in</Keycap>
+		<Keycap wide href={resolve('/sign-up')}>Create account</Keycap>
+		<Keycap wide variant="ghost" href={resolve('/sign-in')}>Sign in</Keycap>
 	</div>
 
 	<p class="hero__tagline">Small bird. Strong connections.</p>
@@ -39,9 +39,7 @@
 	.hero {
 		position: relative;
 		width: 100%;
-		/* A true full-viewport intro: exactly one viewport tall (with a `100vh`
-		   fallback for engines without `svh`), content centred inside it. */
-		min-height: 100vh;
+		/* A full-viewport intro, content centred inside it. */
 		min-height: 100svh;
 		display: flex;
 		flex-direction: column;
@@ -58,8 +56,7 @@
 
 	.hero__art {
 		position: relative;
-		/* Fluid brand moment: grows with both width and available height, with a
-		   ceiling well above the old 220px so tall/large screens get generous art. */
+		/* Grows with both width and available height. */
 		width: min(56vw, 30vh, 340px);
 		aspect-ratio: 1;
 		display: grid;
