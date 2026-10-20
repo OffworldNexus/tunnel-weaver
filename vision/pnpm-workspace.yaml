@@ -1,0 +1,7 @@
+# pnpm 12 keeps install settings in pnpm-workspace.yaml even for a single
+# package (the `pnpm` field in package.json is no longer read). @parcel/watcher
+# is a transitive Sass file-watcher that ships prebuilt native binaries as
+# optional dependencies; its from-source install script is irrelevant to the
+# one-shot `vite build` we run, so skip it explicitly instead of approving it.
+allowBuilds:
+  '@parcel/watcher': false

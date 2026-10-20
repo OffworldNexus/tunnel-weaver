@@ -1,0 +1,118 @@
+// Shape primitives shared by the keycap and the cut-corner surfaces.
+//
+// The brand's signature is a rectangle with a 45° cut on the top-right. A plain
+// CSS `border` is clipped away on that diagonal (and `outline` draws a plain
+// rounded rectangle for focus), so every edge — border and focus ring — is
+// drawn as an outer clipped layer with an identically-clipped layer on top.
+
+/// A rectangle with the brand's 45° cut on the top-right corner.
+@mixin cut-corner($cut: 10px) {
+	clip-path: polygon(0 0, calc(100% - (#{$cut})) 0, 100% calc(#{$cut}), 100% 100%, 0 100%);
+}
+
+/// The tightened cut of an inset fill: the diagonal is pulled in from the outer
+/// edge by `$inset`, so its edge sits the same distance from the outline as the
+/// straight sides (for the 1.5px border the surfaces use, ≈ border × (2 − √2)).
+@mixin cut-inset($cut: 10px, $inset: 0.88px) {
+	@include cut-corner(calc(#{$cut} - #{$inset}));
+}
+
+/// A reusable cut-corner surface: an edge layer (`::before`) plus an inset fill
+/// layer (`::after`). Both follow the diagonal, so the border is visible along
+/// the cut as well as the straight edges. The surface itself is clipped to the
+/// outer cut so flush children (table headers, toolbars, banners) cannot bleed
+/// into the missing corner.
+@mixin cut-panel($cut: 16px, $fill: var(--tw-well), $edge: var(--tw-border), $border: 1.5px) {
+	position: relative;
+	isolation: isolate;
+	@include cut-corner($cut);
+
+	&::before,
+	&::after {
+		content: '';
+		position: absolute;
+		pointer-events: none;
+	}
+
+	&::before {
+		inset: 0;
+		z-index: -2;
+		background: $edge;
+		@include cut-corner($cut);
+	}
+
+	&::after {
+		inset: $border;
+		z-index: -1;
+		background: $fill;
+		@include cut-inset($cut);
+	}
+}
+
+/// The physical keycap: a 34px cap resting 4px above a pedestal on a 44px hit
+/// area, all clipped to the 10px cut. Geometry only — the component colours the
+/// layers and adds interaction states.
+@mixin keycap-layers {
+	.keycap__art {
+		position: absolute;
+		inset: 0;
+		pointer-events: none;
+	}
+
+	.keycap__pedestal {
+		position: absolute;
+		top: 7px;
+		left: 2px;
+		right: 2px;
+		height: 34px;
+		@include cut-corner(10px);
+	}
+
+	.keycap__cap {
+		position: absolute;
+		top: 3px;
+		left: 2px;
+		right: 2px;
+		height: 34px;
+		@include cut-corner(10px);
+		transition:
+			top 100ms ease,
+			background-color 100ms ease;
+	}
+
+	.keycap__face {
+		position: absolute;
+		inset: 1.5px;
+		@include cut-inset(10px, 0.9px);
+		transition: background-color 100ms ease;
+	}
+
+	.keycap__label {
+		position: relative;
+		z-index: 1;
+	}
+}
+
+/// The keycap's shaped focus ring: an outer focus-coloured layer with the cap
+/// carved out of the middle, so the ring follows the cut rather than drawing a
+/// plain rectangle.
+@mixin keycap-focus-ring {
+	.keycap__ring {
+		position: absolute;
+		top: 1px;
+		left: 0;
+		right: 0;
+		height: 38px;
+		background: var(--tw-focus);
+		@include cut-corner(11.17px);
+		opacity: 0;
+		transition: opacity 90ms ease;
+	}
+
+	.keycap__ring-hole {
+		position: absolute;
+		inset: 2px;
+		background: var(--tw-deck);
+		@include cut-corner(10px);
+	}
+}
