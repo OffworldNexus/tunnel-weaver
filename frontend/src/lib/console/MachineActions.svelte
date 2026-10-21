@@ -3,10 +3,14 @@
 	 * The per-machine actions, shared by the overview's short list and the full
 	 * list: kick, rename and revoke, each behind the confirmation it deserves.
 	 *
-	 * The component owns its dialogs and its in-flight state, and tells the page
-	 * to reload only once a machine actually changed. A kick drops the live
-	 * tunnel and keeps the key, so the machine stays down until `weave start`
-	 * runs on it again; revoking drops the key for good.
+	 * The component owns its dialogs and its in-flight state. Once a machine
+	 * actually changed it invalidates the shared `app:machines` key, so every
+	 * page that depends on it — the overview's stats and list, the full list,
+	 * the machine's own page — reloads from the relay. No callback plumbing, and
+	 * no page left showing a stale row.
+	 *
+	 * A kick drops the live tunnel and keeps the key, so the machine stays down
+	 * until `weave start` runs on it again; revoking drops the key for good.
 	 */
 	import { notify } from '#lib/account/notices';
 	import { disconnectMachine, type Machine, renameMachine, revokeMachine } from '#lib/app/machines';
@@ -14,8 +18,9 @@
 	import Dialog from '#lib/ui/Dialog.svelte';
 	import Icon from '#lib/ui/Icon.svelte';
 	import Keycap from '#lib/ui/Keycap.svelte';
+	import { invalidate } from '$app/navigation';
 
-	let { machine, onchange }: { machine: Machine; onchange: () => void } = $props();
+	let { machine }: { machine: Machine } = $props();
 
 	let renaming = $state(false);
 	let renameValue = $state('');
@@ -41,7 +46,7 @@
 		}
 		renaming = false;
 		notify('success', `Renamed to ${res.data.name}. Its hostnames follow immediately.`);
-		onchange();
+		await invalidate('app:machines');
 	}
 
 	async function confirmKick() {
@@ -59,7 +64,7 @@
 				? `Kicked ${machine.name}. Run \`weave start\` on it to bring it back.`
 				: `${machine.name} was already offline.`
 		);
-		onchange();
+		await invalidate('app:machines');
 	}
 
 	async function confirmRevoke() {
@@ -75,7 +80,7 @@
 			'success',
 			`Revoked ${machine.name}. Its tunnel dropped and its hostnames stop serving.`
 		);
-		onchange();
+		await invalidate('app:machines');
 	}
 </script>
 

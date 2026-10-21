@@ -1,20 +1,24 @@
 <script lang="ts">
 	/**
 	 * The machines list: one page of the signed-in person's machines. Paging, the
-	 * name search and the health filter are served by the relay — the browser only
-	 * ever holds the page it is showing — and all three live in the address bar,
-	 * so a filtered page is linkable and the back button works.
+	 * name search and the health filter live in the address bar — the route's
+	 * `load` reads them back and the URL is the single source of truth — so a
+	 * filtered page is linkable and the back button works.
+	 *
+	 * Only typing is debounced, and the debounce now delays the URL write rather
+	 * than a fetch: the first paint, the health filter and the pager are single
+	 * deliberate acts and stay immediate.
 	 */
-	import { onDestroy, onMount } from 'svelte';
+	import { onDestroy } from 'svelte';
 
-	import { ensureConfig } from '#lib/account/config';
 	import { notify } from '#lib/account/notices';
 	import { bytes } from '#lib/app/format';
 	import {
 		disconnectMachine,
-		listMachines,
 		type Machine,
-		type MachineQuery,
+		type MachineHealth,
+		readHealth,
+		readPage,
 		renameMachine,
 		revokeMachine
 	} from '#lib/app/machines';
@@ -30,60 +34,31 @@
 	import Keycap from '#lib/ui/Keycap.svelte';
 	import Pagination from '#lib/ui/Pagination.svelte';
 	import Panel from '#lib/ui/Panel.svelte';
-	import { afterNavigate, goto } from '$app/navigation';
+	import { afterNavigate, goto, invalidate } from '$app/navigation';
 	import { resolve } from '$app/paths';
-	import { page as url } from '$app/state';
+	import { navigating, page } from '$app/state';
 
-	type Health = NonNullable<MachineQuery['health']>;
+	import type { PageProps } from './$types';
 
-	/**
-	 * A deliberately large page: a person with an ordinary handful of machines
-	 * never sees a second one, and the overview points here for the rest.
-	 */
-	const SIZE = 60;
-	/** How long typing settles before the query is sent. */
+	/** The list state the address bar carries. */
+	interface ListState {
+		q: string;
+		health: MachineHealth;
+		page: number;
+	}
+
+	/** How long typing settles before the query reaches the address bar. */
 	const SETTLE_MS = 150;
 
-	let machines: Machine[] = [];
-	let total = 0;
-	let pageCount = 1;
-	let loading = true;
-	let error = '';
+	let { data }: PageProps = $props();
 
-	/** The page the list is asking for. Written only by the pager and the filter. */
-	let page = 1;
-	/** The page the relay actually served: it clamps, so this can differ. */
-	let currentPage = 1;
-
-	let status: Health = 'all';
-
-	let pairing = false;
-	let renaming: Machine | null = null;
-	let renameValue = '';
-	let disconnecting: Machine | null = null;
-	let revoking: Machine | null = null;
-	let busy = false;
-
+	let pairing = $state(false);
+	let renaming = $state<Machine | null>(null);
+	let renameValue = $state('');
+	let disconnecting = $state<Machine | null>(null);
+	let revoking = $state<Machine | null>(null);
+	let busy = $state(false);
 	let timer: ReturnType<typeof setTimeout> | undefined;
-	/** Whether one load has landed: the very first one must not wait on a timer. */
-	let loadedOnce = false;
-	/** The query the rows on screen belong to, so only a *new* query debounces. */
-	let loadedQuery = '';
-
-	/** Only the two health values the collection accepts; anything else is `all`. */
-	function readHealth(raw: string | null): Health {
-		return raw === 'online' || raw === 'offline' ? raw : 'all';
-	}
-
-	function readPage(raw: string | null): number {
-		return Math.max(1, Number(raw) || 1);
-	}
-
-	// Seed from the URL before the first fetch, so a link opens where it says.
-	const initial = url.url.searchParams;
-	page = readPage(initial.get('page'));
-	status = readHealth(initial.get('health'));
-	searchQuery.set(initial.get('q') ?? '');
 
 	setMeta({
 		title: 'Machines',
@@ -91,98 +66,79 @@
 		crumbs: [{ label: 'Machines' }]
 	});
 
-	// Back and forward land on the list with the state the URL carries.
-	afterNavigate((navigation) => {
-		const params = navigation.to?.url.searchParams;
-		if (!params) {
+	/** The list's state as the address bar carries it. */
+	function address(): ListState {
+		return {
+			q: page.url.searchParams.get('q') ?? '',
+			health: readHealth(page.url.searchParams.get('health')),
+			page: readPage(page.url.searchParams.get('page'))
+		};
+	}
+
+	/** The query string for a list state, in a stable order. */
+	function query(state: ListState): string {
+		const parts: string[] = [];
+		if (state.q) {
+			parts.push(`q=${encodeURIComponent(state.q)}`);
+		}
+		if (state.health !== 'all') {
+			parts.push(`health=${state.health}`);
+		}
+		if (state.page > 1) {
+			parts.push(`page=${state.page}`);
+		}
+		return parts.length ? `?${parts.join('&')}` : '';
+	}
+
+	/** Writes a list state into the address bar, without reloading the page. */
+	function write(state: ListState) {
+		const suffix = query(state);
+		if (`${page.url.pathname}${page.url.search}` === `/app/machines${suffix}`) {
 			return;
 		}
-		const wanted = readPage(params.get('page'));
-		if (wanted !== page) {
-			page = wanted;
-		}
-		const health = readHealth(params.get('health'));
-		if (health !== status) {
-			status = health;
-		}
-		const query = params.get('q') ?? '';
-		if (query !== $searchQuery) {
-			searchQuery.set(query);
-		}
+		// `resolve()` is typed against route ids and cannot carry a query
+		// string, so the list route is resolved and the query appended.
+		// eslint-disable-next-line svelte/no-navigation-without-resolve -- the path is the resolved list route
+		void goto(resolve('/app/machines') + suffix, {
+			replace: true,
+			// SvelteKit 3 folds the old `keepFocus`/`noScroll` pair into this:
+			// leave the caret in the search field and the scroll position alone.
+			reset: false
+		});
+	}
+
+	// Adopt the URL's query into the shared top-bar store whenever the loader
+	// brings a new one, so a deep link — or the back button — opens the field on
+	// what the address says. It reads only `data.q`, so typing never retriggers it.
+	$effect(() => {
+		searchQuery.set(data.q);
 	});
 
-	// Any change to the query, the filter or the page refetches that page. Only
-	// *typing* settles for a beat: the first load, the health filter and the pager
-	// are single deliberate acts, and parking them on a keystroke timer is pure
-	// added latency on a request that already answers in tens of milliseconds.
-	$: schedule($searchQuery, status, page);
-
-	function schedule(query: string, health: Health, wanted: number) {
-		clearTimeout(timer);
-		if (!loadedOnce || query === loadedQuery) {
-			void load(query, health, wanted);
+	// Back and forward land on the list with the state the URL carries; settling
+	// the parts the relay clamps — a page past the end, an unknown health — keeps
+	// the address bar matching the rows on screen.
+	afterNavigate(() => {
+		if (page.url.pathname !== '/app/machines') {
 			return;
 		}
-		timer = setTimeout(() => void load(query, health, wanted), SETTLE_MS);
-	}
+		write({ q: data.q, health: data.health, page: data.page });
+	});
+
+	// Only typing settles for a beat. This tracks just the store, so a
+	// navigation changes the URL without scheduling a write of its own.
+	$effect(() => {
+		const q = $searchQuery;
+		clearTimeout(timer);
+		timer = setTimeout(() => write({ ...address(), q }), SETTLE_MS);
+	});
 
 	onDestroy(() => clearTimeout(timer));
 
-	onMount(() => {
-		void ensureConfig().catch(() => {});
-	});
+	/** Whether a navigation is landing on this list, for the loading line. */
+	const loading = $derived(navigating.to?.route.id === '/app/machines');
 
-	async function load(query: string, health: Health, wanted: number) {
-		loading = true;
-		error = '';
-		loadedOnce = true;
-		loadedQuery = query;
-		const res = await listMachines({ page: wanted, perPage: SIZE, q: query, health });
-		loading = false;
-		if (!res.ok || !res.data) {
-			error = res.error ?? 'We could not load your machines. Please try again.';
-			machines = [];
-			total = 0;
-			pageCount = 1;
-			return;
-		}
-		machines = res.data.machines;
-		total = res.data.total;
-		pageCount = res.data.page_count;
-		// The relay clamps the page it returns; the pager follows that, while the
-		// request cursor is left alone so this never re-triggers the fetch.
-		currentPage = res.data.page;
-		syncUrl();
-	}
-
-	/** Re-read the page the list is on, after an action changed it. */
-	function reload() {
-		void load($searchQuery, status, currentPage);
-	}
-
-	/** Writes the list's state into the address bar, without re-running the page. */
-	function syncUrl() {
-		const parts: string[] = [];
-		if ($searchQuery) {
-			parts.push(`q=${encodeURIComponent($searchQuery)}`);
-		}
-		if (status !== 'all') {
-			parts.push(`health=${status}`);
-		}
-		if (currentPage > 1) {
-			parts.push(`page=${currentPage}`);
-		}
-		const suffix = parts.length ? `?${parts.join('&')}` : '';
-		if (`${url.url.pathname}${url.url.search}` !== `/app/machines${suffix}`) {
-			// `resolve()` is typed against route ids and cannot carry a query
-			// string, so the list route is resolved and the query appended.
-			// eslint-disable-next-line svelte/no-navigation-without-resolve -- the path is the resolved list route
-			void goto(resolve('/app/machines') + suffix, { replace: true, shallow: true });
-		}
-	}
-
-	$: from = total === 0 ? 0 : (currentPage - 1) * SIZE + 1;
-	$: to = Math.min(currentPage * SIZE, total);
+	const from = $derived(data.total === 0 ? 0 : (data.page - 1) * data.perPage + 1);
+	const to = $derived(Math.min(data.page * data.perPage, data.total));
 
 	function startRename(machine: Machine) {
 		renaming = machine;
@@ -203,7 +159,7 @@
 		}
 		renaming = null;
 		notify('success', `Renamed to ${res.data.name}. Its hostnames follow immediately.`);
-		reload();
+		await invalidate('app:machines');
 	}
 
 	async function confirmDisconnect() {
@@ -225,7 +181,7 @@
 				? `Kicked ${target.name}. Run \`weave start\` on it to bring it back.`
 				: `${target.name} was already offline.`
 		);
-		reload();
+		await invalidate('app:machines');
 	}
 
 	async function confirmRevoke() {
@@ -242,15 +198,11 @@
 			return;
 		}
 		notify('success', `Revoked ${target.name}. Its tunnel dropped and its hostnames stop serving.`);
-		reload();
+		await invalidate('app:machines');
 	}
 </script>
 
-{#if error}
-	<p class="notice-error" role="alert">{error}</p>
-{/if}
-
-<Panel flush title="Machines" subtitle="{total} paired · click a row to open a machine">
+<Panel flush title="Machines" subtitle="{data.total} paired · click a row to open a machine">
 	<svelte:fragment slot="actions">
 		<Keycap type="button" size="sm" variant="primary" onclick={() => (pairing = true)}>
 			<Icon name="plus" size={15} /> Pair a machine
@@ -260,8 +212,15 @@
 	<div class="toolbar">
 		<select
 			class="control control--sm"
-			bind:value={status}
-			on:change={() => (page = 1)}
+			value={data.health}
+			onchange={(event) => {
+				write({
+					...address(),
+					q: $searchQuery,
+					health: readHealth(event.currentTarget.value),
+					page: 1
+				});
+			}}
 			aria-label="Filter by health"
 		>
 			<option value="all">Any health</option>
@@ -273,7 +232,7 @@
 
 	{#if loading}
 		<p class="state" aria-live="polite">Loading your machines…</p>
-	{:else if machines.length}
+	{:else if data.machines.length}
 		<div class="table-wrap">
 			<table class="table">
 				<colgroup>
@@ -293,14 +252,14 @@
 					</tr>
 				</thead>
 				<tbody>
-					{#each machines as machine (machine.id)}
+					{#each data.machines as machine (machine.id)}
 						<tr
 							class="row-link"
 							role="link"
 							tabindex="0"
-							on:click={() =>
+							onclick={() =>
 								void goto(resolve('/app/machines/[machine]', { machine: `${machine.id}` }))}
-							on:keydown={(event) => {
+							onkeydown={(event) => {
 								if (event.key === 'Enter' || event.key === ' ') {
 									event.preventDefault();
 									void goto(resolve('/app/machines/[machine]', { machine: `${machine.id}` }));
@@ -313,7 +272,7 @@
 							<td class="mono nowrap right">
 								{bytes(machine.usage_30d.bytes_in + machine.usage_30d.bytes_out)}
 							</td>
-							<td class="right" on:click|stopPropagation>
+							<td class="right" onclick={(event) => event.stopPropagation()}>
 								<div class="row-actions">
 									{#if machine.online}
 										<Keycap
@@ -357,8 +316,8 @@
 	{:else}
 		<EmptyState
 			icon="machine"
-			title={$searchQuery || status !== 'all' ? 'No machines match' : 'No machines yet'}
-			text={$searchQuery || status !== 'all'
+			title={$searchQuery || data.health !== 'all' ? 'No machines match' : 'No machines yet'}
+			text={$searchQuery || data.health !== 'all'
 				? 'Adjust the filter, or clear the search, to find a machine.'
 				: 'Pair a machine with `weave pair` to expose a service through the relay.'}
 		/>
@@ -367,13 +326,15 @@
 	<svelte:fragment slot="footer">
 		<Pagination
 			bare
-			page={currentPage}
-			{pageCount}
-			{total}
+			page={data.page}
+			pageCount={data.pageCount}
+			total={data.total}
 			{from}
 			{to}
 			unit="machines"
-			onPage={(next: number) => (page = next)}
+			onPage={(next: number) => {
+				write({ ...address(), q: $searchQuery, page: next });
+			}}
 		/>
 	</svelte:fragment>
 </Panel>
@@ -392,7 +353,7 @@
 			id="mach-rename"
 			class="control mono"
 			bind:value={renameValue}
-			on:input={() =>
+			oninput={() =>
 				(renameValue = renameValue
 					.toLowerCase()
 					.replace(/[^a-z0-9]/g, '')
@@ -454,10 +415,6 @@
 </ConfirmDeleteDialog>
 
 <style lang="scss">
-	.notice-error {
-		margin-bottom: 12px;
-	}
-
 	.state {
 		padding: 24px 16px;
 		color: var(--tw-muted);

@@ -54,6 +54,9 @@ export interface MachinePage {
 	page_count: number;
 }
 
+/** The health filters the machines collection accepts; `all` is the default. */
+export type MachineHealth = 'all' | 'online' | 'offline';
+
 /** The filters and paging the machines collection accepts. */
 export interface MachineQuery {
 	page?: number;
@@ -61,7 +64,17 @@ export interface MachineQuery {
 	/** A case-insensitive substring of the machine name. */
 	q?: string;
 	/** `all` (the default), `online` or `offline`. */
-	health?: 'all' | 'online' | 'offline';
+	health?: MachineHealth;
+}
+
+/** Only the two health values the collection accepts; anything else is `all`. */
+export function readHealth(raw: string | null): MachineHealth {
+	return raw === 'online' || raw === 'offline' ? raw : 'all';
+}
+
+/** The 1-based page a list URL asks for, clamped to at least 1. */
+export function readPage(raw: string | null): number {
+	return Math.max(1, Number(raw) || 1);
 }
 
 /** `GET /api/account/machines` — one page of the signed-in person's machines. */
