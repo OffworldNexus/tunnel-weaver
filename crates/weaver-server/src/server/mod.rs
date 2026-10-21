@@ -161,9 +161,10 @@ pub async fn run_server(
     cert_manager.start_renewal_loop(shutdown_token.clone());
 
     let identity_resolver = Arc::new(crate::tunnel::StoreIdentityResolver::new(store.clone()));
-    let metering = Arc::new(crate::metering::MeteringManager::new(
+    let metering = Arc::new(crate::metering::MeteringManager::with_retention(
         store.clone(),
         Duration::from_secs(config.usage_flush_interval_secs),
+        Duration::from_secs(config.usage_retention_secs),
     ));
     let tunnel_registry = Arc::new(crate::tunnel::TunnelRegistry::new(
         config.tunnel_domain.clone(),
@@ -321,6 +322,7 @@ pub async fn run_server(
             cert_resolver: Some(Arc::clone(&resolver)),
             cert_manager: Some(Arc::clone(&cert_manager)),
             tunnel_registry: Some(tunnel_registry),
+            metering: Some(Arc::clone(&metering)),
             guard: guard.clone(),
             altcha: Some(altcha.clone()),
             account: Some(account.clone()),

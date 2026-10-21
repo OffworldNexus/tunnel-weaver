@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use tokio::sync::{mpsc, oneshot};
 use tracing::info;
-use weaver_mux::KeyId;
+use weaver_mux::{CloseCode, KeyId};
 use weaver_proto::control::RefusalCode;
 
 use crate::cert::CertManager;
@@ -32,7 +32,11 @@ pub struct TunnelRoute {
 
 struct ActiveConnection {
     connection_id: u64,
-    superseded_tx: Option<oneshot::Sender<()>>,
+    /// How the relay asks this connection to end itself. The driver task on the
+    /// other end sends a GOAWAY with whatever [`CloseCode`] it receives here,
+    /// so a supersede, a web-side disconnect and a web-side revoke each close
+    /// the live tunnel without the client having to ask. `None` once taken.
+    close_tx: Option<oneshot::Sender<CloseCode>>,
     services: HashSet<String>,
 }
 
@@ -117,7 +121,12 @@ impl TunnelRegistry {
     ///
     /// If an existing connection with the same `KeyId` is currently active, it is
     /// marked as superseded and its registered services are evicted immediately.
-    pub fn register_connection(&self, key_id: KeyId, superseded_tx: oneshot::Sender<()>) -> u64 {
+    ///
+    /// `close_tx` is how the relay later ends this connection — a supersede, a
+    /// web-side disconnect or a web-side revoke. The driver task on the other
+    /// end sends it a [`CloseCode`] and closes the tunnel with it, so an
+    /// operator can drop a live tunnel without the client asking.
+    pub fn register_connection(&self, key_id: KeyId, close_tx: oneshot::Sender<CloseCode>) -> u64 {
         let conn_id = self.next_conn_id.fetch_add(1, Ordering::Relaxed);
         let mut conns = self.connections.lock().unwrap();
 
@@ -125,13 +134,13 @@ impl TunnelRegistry {
             key_id,
             ActiveConnection {
                 connection_id: conn_id,
-                superseded_tx: Some(superseded_tx),
+                close_tx: Some(close_tx),
                 services: HashSet::new(),
             },
         ) {
             info!(?key_id, "Tunnel connection superseded by newer connection");
-            if let Some(tx) = old_conn.superseded_tx {
-                let _ = tx.send(());
+            if let Some(tx) = old_conn.close_tx {
+                let _ = tx.send(CloseCode::Superseded);
             }
             let mut routes = self.routes.write().unwrap();
             for hostname in old_conn.services {
@@ -144,6 +153,86 @@ impl TunnelRegistry {
         }
 
         conn_id
+    }
+
+    /// Whether `key_id` currently holds a live tunnel connection.
+    ///
+    /// The account plane's only source of "online"; the state is never
+    /// persisted, so it can never disagree with the connections that exist.
+    pub fn is_connected(&self, key_id: &KeyId) -> bool {
+        self.connections.lock().unwrap().contains_key(key_id)
+    }
+
+    /// Asks the live connection holding `key_id` to close with `code`.
+    ///
+    /// The web-side counterpart of the client-driven revoke:
+    /// [`CloseCode::Rejected`](weaver_mux::CloseCode::Rejected) drops a tunnel
+    /// on a web-side **disconnect** (the key stays; the client exits and the
+    /// machine must be restarted with `weave start`), and
+    /// [`CloseCode::KeyRevoked`](weaver_mux::CloseCode::KeyRevoked) on a
+    /// **revoke**. The close itself runs in the connection's driver loop, whose
+    /// `Closed` event evicts the connection's routes. Returns `true` iff a live
+    /// connection was signalled; an unknown or already-closing key is a no-op.
+    pub fn close_connection(&self, key_id: &KeyId, code: CloseCode) -> bool {
+        let mut conns = self.connections.lock().unwrap();
+        match conns.get_mut(key_id).and_then(|conn| conn.close_tx.take()) {
+            Some(tx) => tx.send(code).is_ok(),
+            None => false,
+        }
+    }
+
+    /// Re-derives the live route hostnames of `key_id` after its machine was
+    /// renamed, mirroring the change to `active_hosts` and the connection's
+    /// service set.
+    ///
+    /// The caller renames the machine and its `domains` rows in the store
+    /// first; this then re-resolves the identity (which reports the new machine
+    /// name) and remaps every route the connection owns to the hostname that
+    /// name derives. The old hostnames stop routing at once, so they stop
+    /// serving without waiting for a reconnect. Returns the number of routes
+    /// remapped (`0` when the machine is offline — the `domains` rows already
+    /// carry the new names for whenever it reconnects).
+    pub async fn rename_machine(&self, key_id: &KeyId) -> usize {
+        let Some(identity) = self.identities.identity(key_id).await else {
+            return 0;
+        };
+        // Remap under the routes lock, then release it before touching the
+        // connections lock: `register_connection` takes them in the opposite
+        // order, so the two must never be held at once.
+        let (remapped, live) = {
+            let mut routes = self.routes.write().unwrap();
+            let old_hosts: Vec<String> = routes
+                .iter()
+                .filter(|(_, route)| route.key_id == *key_id)
+                .map(|(host, _)| host.clone())
+                .collect();
+            let mut remapped = 0;
+            for old in old_hosts {
+                let Some(mut route) = routes.remove(&old) else {
+                    continue;
+                };
+                let new = identity.hostname(&route.service, &self.tunnel_domain);
+                if new != old {
+                    let was_active = self.is_active(&old);
+                    self.set_active(&old, false);
+                    self.set_active(&new, was_active);
+                }
+                route.hostname = new.clone();
+                info!(%old, %new, "Remapped tunnel route after rename");
+                routes.insert(new, route);
+                remapped += 1;
+            }
+            let live: HashSet<String> = routes
+                .iter()
+                .filter(|(_, route)| route.key_id == *key_id)
+                .map(|(host, _)| host.clone())
+                .collect();
+            (remapped, live)
+        };
+        if let Some(conn) = self.connections.lock().unwrap().get_mut(key_id) {
+            conn.services = live;
+        }
+        remapped
     }
 
     /// Unregisters a connection if it matches the current `connection_id`, evicting its services.

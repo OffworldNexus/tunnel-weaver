@@ -208,13 +208,16 @@ impl StreamHandler for RelayHandler {
             Event::Authenticated { key_id, version } => {
                 info!(?key_id, version, "Tunnel connection authenticated");
                 self.key = Some(key_id);
-                let (s_tx, s_rx) = oneshot::channel();
-                self.conn_id = Some(self.registry.register_connection(key_id, s_tx));
+                let (close_tx, close_rx) = oneshot::channel::<CloseCode>();
+                self.conn_id = Some(self.registry.register_connection(key_id, close_tx));
                 let h = self.handle();
                 tokio::spawn(async move {
-                    if s_rx.await.is_ok() {
-                        info!("Tunnel connection superseded, closing");
-                        h.close(CloseReason::new(CloseCode::Superseded));
+                    // The relay names the code — a supersede, a web-side
+                    // disconnect (`Rejected`) or a revoke (`KeyRevoked`) — and
+                    // the driver task carries the close out.
+                    if let Ok(code) = close_rx.await {
+                        info!(?code, "Relay closing the tunnel connection");
+                        h.close(CloseReason::new(code));
                     }
                 });
             }

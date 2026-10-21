@@ -5,7 +5,8 @@
 //! from a URL. Today only SQLite is compiled in; enabling PostgreSQL is a
 //! matter of adding the `sqlx-postgres` feature and passing a `postgres://`
 //! URL to [`Store::connect`]. The handful of SQLite-only niceties (pragmas,
-//! file permissions, `VACUUM INTO` backups) are gated on the detected backend.
+//! file permissions, `VACUUM INTO` backups, and the in-place `usage_live` slot
+//! writes) are gated on the detected backend.
 
 pub mod abuse;
 pub mod account;
@@ -15,6 +16,7 @@ pub mod error;
 pub mod migration;
 pub mod names;
 pub mod usage;
+pub mod usage_live;
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -742,6 +744,154 @@ impl Store {
             .exec(&self.db)
             .await?;
         Ok(result.rows_affected)
+    }
+
+    // ----- machines: listing, presence and rename -----
+
+    /// Lists a person's machines, ordered by name for a stable list view.
+    pub async fn list_machines(&self, person_id: i32) -> Result<Vec<machine::Model>, StoreError> {
+        Ok(machine::Entity::find()
+            .filter(machine::Column::PersonId.eq(person_id))
+            .order_by_asc(machine::Column::Name)
+            .all(&self.db)
+            .await?)
+    }
+
+    /// The given machines' services, each with the hostnames currently linked
+    /// to it, ordered by service name for a stable view.
+    ///
+    /// Hostnames are read from the materialized `domains` rows rather than
+    /// re-derived, so what the list and detail show is exactly what routes. One
+    /// query for a whole list, so the caller never runs an N+1.
+    pub async fn services_with_hostnames(
+        &self,
+        machine_ids: &[i32],
+    ) -> Result<Vec<(service::Model, Vec<String>)>, StoreError> {
+        if machine_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let rows = service::Entity::find()
+            .filter(service::Column::MachineId.is_in(machine_ids.iter().copied()))
+            .order_by_asc(service::Column::Name)
+            .find_with_related(domain::Entity)
+            .all(&self.db)
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(svc, domains)| {
+                let mut hosts: Vec<String> = domains.into_iter().map(|d| d.name).collect();
+                hosts.sort();
+                (svc, hosts)
+            })
+            .collect())
+    }
+
+    // Presence ("last seen") is a metrics concern now: it is derived from the
+    // live day's `open_ms_slots` array (and, for folded days, the rollup's
+    // per-minute blob), which only
+    // [`crate::metrics::MetricsStore::last_open_minutes`] can decode. The account
+    // router resolves a person's service ids here and asks the metrics store.
+
+    /// Renames a machine and re-derives every hostname it serves, atomically.
+    ///
+    /// The person and machine labels hold no dash, so a hostname
+    /// `<person>-<machine>-<service>.<root>` splits at its first two dashes;
+    /// each of the machine's `domains` rows is moved from the old prefix to the
+    /// new one (leaving the service and root untouched, so the tunnel root is
+    /// never needed here). The old row is deleted and the new hostname linked
+    /// to the service, so the old name stops being served the moment this
+    /// commits. A re-created name that already has an unowned `domains` row
+    /// (left by a revoked machine) is reused rather than colliding with the
+    /// unique index.
+    ///
+    /// The live registry is remapped separately by the caller
+    /// ([`TunnelRegistry::rename_machine`](crate::tunnel::registry::TunnelRegistry::rename_machine)),
+    /// DB first, so the two never disagree about what is served.
+    #[allow(clippy::too_many_lines)] // one transaction, deliberately linear
+    pub async fn rename_machine(
+        &self,
+        machine_id: i32,
+        new_name: &str,
+    ) -> Result<machine::Model, StoreError> {
+        let new_lower = new_name.to_ascii_lowercase();
+        if !names::is_valid_person_or_machine(&new_lower) {
+            return Err(StoreError::InvalidName(format!(
+                "machine '{new_name}' must match ^[a-z0-9]{{1,15}}$"
+            )));
+        }
+        let txn = self.db.begin().await?;
+        let Some(current) = machine::Entity::find_by_id(machine_id).one(&txn).await? else {
+            txn.rollback().await?;
+            return Err(StoreError::Conflict(format!(
+                "no machine with id {machine_id}"
+            )));
+        };
+        if current.name == new_lower {
+            // A rename to the current name is a no-op, not an error.
+            txn.commit().await?;
+            return Ok(current);
+        }
+        let Some(pers) = person::Entity::find_by_id(current.person_id)
+            .one(&txn)
+            .await?
+        else {
+            txn.rollback().await?;
+            return Err(StoreError::Conflict(format!(
+                "machine {machine_id} has no person {}",
+                current.person_id
+            )));
+        };
+
+        let old_prefix = format!("{}-{}-", pers.name, current.name);
+        let services = service::Entity::find()
+            .filter(service::Column::MachineId.eq(machine_id))
+            .all(&txn)
+            .await?;
+        for svc in &services {
+            let domains = domain::Entity::find()
+                .filter(domain::Column::ServiceId.eq(svc.id))
+                .all(&txn)
+                .await?;
+            for old in domains {
+                let Some(rest) = old.name.strip_prefix(&old_prefix) else {
+                    continue;
+                };
+                let new_host = format!("{}-{}-{}", pers.name, new_lower, rest);
+                if new_host == old.name {
+                    continue;
+                }
+                // Reuse a row already carrying the new name (an unowned row
+                // from an earlier revoke), else create one; then drop the old
+                // row so its hostname stops resolving.
+                let last_active_at = old.last_active_at;
+                if let Some(existing) = domain::Entity::find()
+                    .filter(domain::Column::Name.eq(&new_host))
+                    .one(&txn)
+                    .await?
+                {
+                    let mut active: domain::ActiveModel = existing.into();
+                    active.service_id = Set(Some(svc.id));
+                    active.last_active_at = Set(last_active_at);
+                    active.update(&txn).await?;
+                } else {
+                    domain::ActiveModel {
+                        name: Set(new_host),
+                        last_active_at: Set(last_active_at),
+                        service_id: Set(Some(svc.id)),
+                        ..Default::default()
+                    }
+                    .insert(&txn)
+                    .await?;
+                }
+                domain::Entity::delete_by_id(old.id).exec(&txn).await?;
+            }
+        }
+
+        let mut active: machine::ActiveModel = current.into();
+        active.name = Set(new_lower);
+        let updated = active.update(&txn).await?;
+        txn.commit().await?;
+        Ok(updated)
     }
 
     /// Creates an active account with no email identity and no password, so

@@ -9,6 +9,8 @@ export interface AccountConfig {
 	min_password_length: number;
 	resend_cooldown_secs: number;
 	support_email: string | null;
+	/** The admin host the CLI dials to pair, for the `weave pair <host>` hint. */
+	relay_host: string;
 }
 
 export const config = writable<AccountConfig | null>(null);

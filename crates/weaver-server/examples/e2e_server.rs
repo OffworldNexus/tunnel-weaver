@@ -146,6 +146,7 @@ fn sample_config(https_port: u16) -> Config {
         acme_root_ca_pem: None,
         acme_fallback_providers: Vec::new(),
         usage_flush_interval_secs: 60,
+        usage_retention_secs: 31_536_000,
         relay_ips: Vec::new(),
         setup_complete: false,
         email: None,
@@ -379,6 +380,12 @@ async fn main() {
         cert_resolver: None,
         cert_manager: None,
         tunnel_registry: None,
+        // The harness meters for real: the console's traffic figures come from
+        // the same store the tests seed usage rows into.
+        metering: Some(Arc::new(weaver_server::metering::MeteringManager::new(
+            store.clone(),
+            std::time::Duration::from_secs(60),
+        ))),
         guard: abuse::build(&config, store.clone()),
         altcha: Some(altcha),
         account: Some(Arc::clone(&account)),

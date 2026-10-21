@@ -261,8 +261,8 @@ pub struct UsageService {
     /// Tunnel-leg compressed bytes: `client -> relay` and `relay -> client`.
     pub tunnel_in: i64,
     pub tunnel_out: i64,
-    /// Milliseconds the service was registered across the window. The store's
-    /// inverted `unused_ms` storage never appears on the wire.
+    /// Milliseconds the service was registered across the window. The store
+    /// keeps open time directly, so there is no `unused_ms` inversion to hide.
     pub open_ms: i64,
     pub requests: i64,
     pub covered_minutes: i64,

@@ -30,6 +30,7 @@ fn create_valid_test_config(http_port: u16, https_port: u16) -> Config {
         acme_root_ca_pem: None,
         acme_fallback_providers: Vec::new(),
         usage_flush_interval_secs: 60,
+        usage_retention_secs: 31_536_000,
         relay_ips: Vec::new(),
         setup_complete: false,
         email: None,

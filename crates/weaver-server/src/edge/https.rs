@@ -52,6 +52,9 @@ pub struct HttpsEdgeConfig {
     pub cert_manager: Option<Arc<CertManager>>,
     /// Active tunnel registry for routing subdomain requests and handling connection upgrades.
     pub tunnel_registry: Option<Arc<TunnelRegistry>>,
+    /// The usage meter, when the process has one: the account plane reads the
+    /// console's traffic figures from it.
+    pub metering: Option<Arc<crate::metering::MeteringManager>>,
     /// The safety pipeline run at the request boundary (scanner + budget).
     pub guard: Arc<Pipeline>,
     /// The ALTCHA proof-of-work runtime, when `abuse.altcha` is enabled.
@@ -67,6 +70,7 @@ impl std::fmt::Debug for HttpsEdgeConfig {
             .field("has_cert_resolver", &self.cert_resolver.is_some())
             .field("has_cert_manager", &self.cert_manager.is_some())
             .field("has_tunnel_registry", &self.tunnel_registry.is_some())
+            .field("has_metering", &self.metering.is_some())
             .field("passes", &self.guard.pass_names())
             .field("altcha", &self.altcha.is_some())
             .field("account", &self.account.is_some())
@@ -111,12 +115,13 @@ async fn collect_body(req: Request<hyper::body::Incoming>) -> Option<Bytes> {
 /// JSON/asset headers, which do not touch `Content-Type`.
 async fn serve_account(
     account: &Arc<crate::account::AccountRuntime>,
+    tunnel: Option<Arc<TunnelRegistry>>,
     req: Request<hyper::body::Incoming>,
     include_hsts: bool,
 ) -> Response<BoxBody> {
     use tower::ServiceExt as _;
 
-    let router = crate::account::router::router(account.clone());
+    let router = crate::account::router::router(account.clone(), tunnel);
     let (parts, body) = req.into_parts();
     let request = Request::from_parts(parts, axum::body::Body::new(body));
     let response = match router.oneshot(request).await {
@@ -495,7 +500,9 @@ pub async fn handle_https_request(
         // plane — the landing page at `/`, the auth routes, the account API and
         // the vendored ALTCHA widget.
         if let Some(account) = &config.account {
-            return Ok(serve_account(account, req, include_hsts).await);
+            return Ok(
+                serve_account(account, config.tunnel_registry.clone(), req, include_hsts).await,
+            );
         }
         return Ok(static_host_response(&req, include_hsts));
     }
@@ -685,6 +692,7 @@ pub async fn run_https_server_with_registry(
             cert_resolver,
             cert_manager: None,
             tunnel_registry,
+            metering: None,
             guard: Arc::new(Pipeline::scanner_only()),
             altcha: None,
             account: None,

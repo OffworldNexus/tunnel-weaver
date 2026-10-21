@@ -24,5 +24,6 @@ pub mod password_reset_token;
 pub mod pending_registration;
 pub mod person;
 pub mod service;
-pub mod usage;
+pub mod usage_daily;
+pub mod usage_live;
 pub mod verification_token;

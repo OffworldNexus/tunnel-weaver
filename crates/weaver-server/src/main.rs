@@ -739,6 +739,13 @@ async fn main() {
                 .map(|cfg| cfg.relay_ips.clone())
                 .unwrap_or_default();
             let existing_email = existing_config.as_ref().and_then(|cfg| cfg.email.clone());
+            // Usage retention is a config-file knob, so re-configuring carries
+            // whatever the previous config held (the default when it predates
+            // the key, which serde fills in when it parses).
+            let usage_retention_secs = existing_config
+                .as_ref()
+                .map(|cfg| cfg.usage_retention_secs)
+                .unwrap_or_else(weaver_server::config::default_usage_retention);
 
             let root_ca_pem = match acme_root_ca {
                 Some(path) => match std::fs::read_to_string(&path) {
@@ -774,6 +781,7 @@ async fn main() {
                 acme_root_ca_pem: root_ca_pem,
                 acme_fallback_providers: Vec::new(),
                 usage_flush_interval_secs: args.usage_flush_interval,
+                usage_retention_secs,
                 relay_ips: existing_relay_ips,
                 // `configure` is the non-systemd (container) flavour: there is no
                 // interactive preflight to gate on, and the operator owns DNS.

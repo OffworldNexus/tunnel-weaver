@@ -526,6 +526,11 @@ dependencies = [
 ]
 
 [[package]]
+name = "bird-id"
+version = "0.1.0"
+source = "git+https://github.com/OffworldNexus/bird-id?branch=develop#bf1b0ecf73e9daef029141634f3ffa5f10860671"
+
+[[package]]
 name = "bit-vec"
 version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4882,6 +4887,7 @@ dependencies = [
  "async-trait",
  "axum",
  "base64 0.22.1",
+ "bird-id",
  "bytes",
  "clap",
  "comfy-table",
@@ -4900,6 +4906,7 @@ dependencies = [
  "jiff",
  "lettre",
  "libc",
+ "libsqlite3-sys",
  "mailparse",
  "mrml",
  "p256",
@@ -4930,6 +4937,7 @@ dependencies = [
  "weaver-proto",
  "weaver-server",
  "weaver-tokio",
+ "zstd",
 ]
 
 [[package]]

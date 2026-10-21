@@ -15,6 +15,7 @@
 
 	import { api } from '#lib/account/api';
 	import { pairing } from '#lib/account/state';
+	import { fingerprint } from '#lib/app/fingerprint';
 	import { ensureMe } from '#lib/app/me';
 	import Keycap from '#lib/ui/Keycap.svelte';
 	import Page from '#lib/ui/Page.svelte';
@@ -153,7 +154,7 @@
 
 		<p class="fingerprint">
 			New key fingerprint<br />
-			<code>{request.fingerprint}</code>
+			<code>{fingerprint(request.fingerprint)}</code>
 		</p>
 
 		<div class="actions">

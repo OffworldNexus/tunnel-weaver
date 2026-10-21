@@ -2,7 +2,7 @@
 	import Brand from '#lib/brand/Brand.svelte';
 	import SiteFooter from '#lib/ui/SiteFooter.svelte';
 
-	/** Centre the brand (account pages); the signed-in shell keeps it left-aligned. */
+	/** Centre the brand; account pages do, and the holding page does too. */
 	export let center = true;
 	/** id of the page's `<h1>`, wired to `<main aria-labelledby>`. */
 	export let labelledby: string | undefined = undefined;
