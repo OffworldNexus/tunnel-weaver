@@ -16,7 +16,7 @@
 	import { api } from '#lib/account/api';
 	import { pairing } from '#lib/account/state';
 	import { fingerprint } from '#lib/app/fingerprint';
-	import { ensureMe } from '#lib/app/me';
+	import { ensureMe } from '#lib/app/me.svelte';
 	import Keycap from '#lib/ui/Keycap.svelte';
 	import Page from '#lib/ui/Page.svelte';
 	import { goto } from '$app/navigation';

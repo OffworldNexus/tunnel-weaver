@@ -14,7 +14,7 @@
 	import { bytes, count } from '#lib/app/format';
 	import { timeAgo } from '#lib/app/time';
 	import MachineActions from '#lib/console/MachineActions.svelte';
-	import { setMeta } from '#lib/console/meta';
+	import { setMeta } from '#lib/console/meta.svelte';
 	import PairMachineDialog from '#lib/console/PairMachineDialog.svelte';
 	import EmptyState from '#lib/ui/EmptyState.svelte';
 	import HealthDot from '#lib/ui/HealthDot.svelte';

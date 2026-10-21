@@ -4,14 +4,18 @@
 	 * overview: the command to run, with the relay host the account plane
 	 * reports, and a link to the setup docs.
 	 */
-	import { config } from '#lib/account/config';
+	import { config } from '#lib/account/config.svelte';
 	import { REPO_URL } from '#lib/app/links';
 	import Dialog from '#lib/ui/Dialog.svelte';
 	import Icon from '#lib/ui/Icon.svelte';
 	import Keycap from '#lib/ui/Keycap.svelte';
 
-	export let open = false;
-	export let onClose: (() => void) | undefined = undefined;
+	interface Props {
+		open?: boolean;
+		onClose?: () => void;
+	}
+
+	let { open = $bindable(false), onClose = undefined }: Props = $props();
 </script>
 
 <Dialog bind:open title="Pair a machine" width={560} {onClose}>
@@ -19,7 +23,7 @@
 		Run this on the machine you want to expose. It dials out to the relay — nothing new is exposed
 		on your network.
 	</p>
-	<pre class="code mono">weave pair {$config?.relay_host ?? '<relay-host>'}</pre>
+	<pre class="code mono">weave pair {config.value?.relay_host ?? '<relay-host>'}</pre>
 	<Keycap
 		type="button"
 		variant="ghost"

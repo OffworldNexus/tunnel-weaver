@@ -8,8 +8,8 @@
 	import NewPassword from '#lib/account/NewPassword.svelte';
 	import { changePasswordSchema } from '#lib/account/schemas';
 	import { flow } from '#lib/account/state';
-	import { me } from '#lib/app/me';
-	import { setMeta } from '#lib/console/meta';
+	import { me } from '#lib/app/me.svelte';
+	import { setMeta } from '#lib/console/meta.svelte';
 	import Keycap from '#lib/ui/Keycap.svelte';
 	import Panel from '#lib/ui/Panel.svelte';
 	import { goto } from '$app/navigation';
@@ -35,7 +35,7 @@
 			if (res.ok) {
 				flow.save({
 					notice: 'Your password has been changed. Sign in with your new password.',
-					email: $me?.email
+					email: me.value?.email
 				});
 				await goto(resolve('/sign-in'));
 				return;

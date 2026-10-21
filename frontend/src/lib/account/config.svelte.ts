@@ -1,5 +1,3 @@
-import { derived, writable } from 'svelte/store';
-
 import { api } from '#lib/account/api';
 
 /** Client-facing constants the account SPA reads from the relay. */
@@ -13,10 +11,13 @@ export interface AccountConfig {
 	relay_host: string;
 }
 
-export const config = writable<AccountConfig | null>(null);
+export const config = $state<{ value: AccountConfig | null }>({ value: null });
 
-/** The relay's minimum, mirrored for guidance; the relay enforces it on submit. */
-export const minPasswordLength = derived(config, ($config) => $config?.min_password_length ?? 8);
+/**
+ * The relay's minimum, mirrored for guidance; the relay enforces it on submit.
+ * A function, not a value, so a read from inside a `$derived` is still tracked.
+ */
+export const minPasswordLength = (): number => config.value?.min_password_length ?? 8;
 
 let loading: Promise<AccountConfig> | null = null;
 
@@ -27,7 +28,7 @@ export function ensureConfig(): Promise<AccountConfig> {
 			loading = null;
 			throw new Error(res.error ?? 'config unavailable');
 		}
-		config.set(res.data);
+		config.value = res.data;
 		return res.data;
 	});
 	return loading;

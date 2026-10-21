@@ -14,7 +14,7 @@
 	import { bytes } from '#lib/app/format';
 	import { disconnectMachine, renameMachine, revokeMachine } from '#lib/app/machines';
 	import { date, timeAgo } from '#lib/app/time';
-	import { setMeta } from '#lib/console/meta';
+	import { setMeta } from '#lib/console/meta.svelte';
 	import Badge from '#lib/ui/Badge.svelte';
 	import ConfirmDeleteDialog from '#lib/ui/ConfirmDeleteDialog.svelte';
 	import Dialog from '#lib/ui/Dialog.svelte';

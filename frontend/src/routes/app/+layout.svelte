@@ -7,8 +7,8 @@
 	import { onMount } from 'svelte';
 
 	import { notify } from '#lib/account/notices';
-	import { ensureMe, me } from '#lib/app/me';
-	import { meta } from '#lib/console/meta';
+	import { ensureMe, me } from '#lib/app/me.svelte';
+	import { meta } from '#lib/console/meta.svelte';
 	import Shell from '#lib/console/Shell.svelte';
 	import Keycap from '#lib/ui/Keycap.svelte';
 	import Page from '#lib/ui/Page.svelte';
@@ -38,8 +38,8 @@
 	<title>Console · Tunnel Weaver</title>
 </svelte:head>
 
-{#if $me}
-	<Shell title={$meta.title} subtitle={$meta.subtitle} crumbs={$meta.crumbs}>
+{#if me.value}
+	<Shell title={meta.title} subtitle={meta.subtitle} crumbs={meta.crumbs}>
 		<slot />
 	</Shell>
 {:else}

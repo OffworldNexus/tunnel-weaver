@@ -5,20 +5,27 @@
 	 * is ready.
 	 */
 	import { loadAltcha } from '#lib/account/altcha';
-	import { ensureConfig } from '#lib/account/config';
+	import { ensureConfig } from '#lib/account/config.svelte';
 
-	/** The signed purpose the challenge is bound to. */
-	export let purpose: 'login' | 'signup' | 'reset';
-	export let payload = '';
+	interface Props {
+		/** The signed purpose the challenge is bound to. */
+		purpose: 'login' | 'signup' | 'reset';
+		payload?: string;
+	}
+
+	// `payload` is an output prop: the parent binds it and reads the solved
+	// proof; the component itself only ever writes it.
+	// eslint-disable-next-line no-useless-assignment -- see above
+	let { purpose, payload = $bindable('') }: Props = $props();
 
 	interface AltchaWidget extends HTMLElement {
 		reset: () => void;
 		verify: () => Promise<unknown>;
 	}
 
-	let element: AltchaWidget | null = null;
-	let challenge = '';
-	let status: 'loading' | 'solving' | 'ready' | 'error' = 'loading';
+	let element = $state<AltchaWidget | null>(null);
+	let challenge = $state('');
+	let status = $state<'loading' | 'solving' | 'ready' | 'error'>('loading');
 
 	async function start(): Promise<void> {
 		status = 'loading';
@@ -90,7 +97,7 @@
 		{/if}
 	</span>
 	{#if status === 'error'}
-		<button type="button" class="linklike" on:click={retry}>Try again</button>
+		<button type="button" class="linklike" onclick={retry}>Try again</button>
 	{/if}
 </p>
 

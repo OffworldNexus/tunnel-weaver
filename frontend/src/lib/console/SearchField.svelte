@@ -3,20 +3,20 @@
 	 * The top-bar search. The console has one searchable collection — the
 	 * signed-in person's machines — so the field drives that list: the first
 	 * keystroke lands on the list and the results update as you type, the query
-	 * itself living in the shared `searchQuery` store.
+	 * itself living in the shared `search` state.
 	 */
-	import { searchQuery } from '#lib/console/search';
+	import { search } from '#lib/console/search.svelte';
 	import Icon from '#lib/ui/Icon.svelte';
 	import { goto } from '$app/navigation';
 	import { resolve } from '$app/paths';
 	import { page } from '$app/state';
 
-	let input: HTMLInputElement;
+	let input = $state<HTMLInputElement>();
 
 	async function onInput() {
 		if (!page.url.pathname.startsWith('/app/machines')) {
 			// Carry the query over, so the list opens on what was typed.
-			const query = $searchQuery;
+			const query = search.q;
 			const suffix = query ? `?q=${encodeURIComponent(query)}` : '';
 			// eslint-disable-next-line svelte/no-navigation-without-resolve -- the path is the resolved list route
 			await goto(resolve('/app/machines') + suffix);
@@ -32,7 +32,7 @@
 			void onInput();
 		}
 		if (event.key === 'Escape') {
-			searchQuery.set('');
+			search.q = '';
 			input?.blur();
 		}
 	}
@@ -54,20 +54,20 @@
 		class="lookup__input"
 		type="text"
 		placeholder="Search machines…"
-		bind:value={$searchQuery}
+		bind:value={search.q}
 		oninput={onInput}
 		onkeydown={onKey}
 		autocomplete="off"
 		spellcheck="false"
 		aria-label="Search machines"
 	/>
-	{#if $searchQuery}
+	{#if search.q}
 		<button
 			class="lookup__clear"
 			type="button"
 			aria-label="Clear search"
 			onclick={() => {
-				searchQuery.set('');
+				search.q = '';
 				input?.focus();
 			}}
 		>

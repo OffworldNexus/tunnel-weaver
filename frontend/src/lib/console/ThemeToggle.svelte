@@ -1,11 +1,15 @@
 <script lang="ts">
 	/** Cycles the theme preference: auto → light → dark. */
-	import { cycleTheme, type Theme, theme } from '#lib/console/theme';
+	import { cycleTheme, type Theme, theme } from '#lib/console/theme.svelte';
 	import Icon from '#lib/ui/Icon.svelte';
 	import type { IconName } from '#lib/ui/icons';
 
-	/** `icon` is the bare top-bar form; `footer` is the labelled sidebar one. */
-	export let variant: 'icon' | 'footer' = 'icon';
+	interface Props {
+		/** `icon` is the bare top-bar form; `footer` is the labelled sidebar one. */
+		variant?: 'icon' | 'footer';
+	}
+
+	let { variant = 'icon' }: Props = $props();
 
 	const LABELS: Record<Theme, string> = {
 		auto: 'Theme: system',
@@ -14,8 +18,8 @@
 	};
 	const ICONS: Record<Theme, IconName> = { auto: 'layers', light: 'sun', dark: 'moon' };
 
-	$: label = LABELS[$theme];
-	$: icon = ICONS[$theme];
+	const label = $derived(LABELS[theme.value]);
+	const icon = $derived(ICONS[theme.value]);
 </script>
 
 <button

@@ -8,7 +8,7 @@
 	import { onDestroy } from 'svelte';
 
 	import { api } from '#lib/account/api';
-	import { ensureConfig } from '#lib/account/config';
+	import { ensureConfig } from '#lib/account/config.svelte';
 	import { flow } from '#lib/account/state';
 	import Keycap from '#lib/ui/Keycap.svelte';
 	import Page from '#lib/ui/Page.svelte';

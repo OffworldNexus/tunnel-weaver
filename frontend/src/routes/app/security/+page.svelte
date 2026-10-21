@@ -1,7 +1,7 @@
 <script lang="ts">
 	/** Security overview: what the account signs in with. */
-	import { me } from '#lib/app/me';
-	import { setMeta } from '#lib/console/meta';
+	import { me } from '#lib/app/me.svelte';
+	import { setMeta } from '#lib/console/meta.svelte';
 	import Icon from '#lib/ui/Icon.svelte';
 	import Keycap from '#lib/ui/Keycap.svelte';
 	import Panel from '#lib/ui/Panel.svelte';
@@ -24,7 +24,7 @@
 		</Keycap>
 	{/snippet}
 
-	{#if $me?.has_password}
+	{#if me.value?.has_password}
 		<p class="state"><Icon name="check" size={16} /> Password is set</p>
 	{:else}
 		<p class="state">No password is set</p>

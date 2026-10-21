@@ -4,20 +4,24 @@
 	 * a show/hide toggle. The meter only guides; the relay owns the real policy
 	 * (a minimum length plus a breach check) and decides on submit.
 	 */
-	import { minPasswordLength } from '#lib/account/config';
+	import { minPasswordLength } from '#lib/account/config.svelte';
 	import { type Estimate, type Estimator, loadEstimator } from '#lib/account/strength';
 
-	export let id: string;
-	export let value: string;
-	export let error: string | undefined = undefined;
-	export let disabled = false;
+	interface Props {
+		id: string;
+		value: string;
+		error?: string;
+		disabled?: boolean;
+	}
 
-	let show = false;
+	let { id, value = $bindable(), error = undefined, disabled = false }: Props = $props();
+
+	let show = $state(false);
 
 	// zxcvbn is fetched the first time the field is focused or typed into.
-	let requested = false;
+	let requested = $state(false);
 	// Unset until zxcvbn has loaded.
-	let estimate: Estimator | undefined;
+	let estimate = $state<Estimator>();
 
 	function load(): void {
 		if (requested) {
@@ -70,10 +74,11 @@
 		return `Use at least ${min} characters. A longer, unique passphrase beats a short, complicated one.`;
 	}
 
-	$: meter =
+	const meter = $derived(
 		estimate && value !== ''
-			? rate(value, estimate(value), $minPasswordLength)
-			: { level: 'weak', pct: 0, label: '', hint: defaultHint($minPasswordLength) };
+			? rate(value, estimate(value), minPasswordLength())
+			: { level: 'weak', pct: 0, label: '', hint: defaultHint(minPasswordLength()) }
+	);
 </script>
 
 <div class="field">
@@ -85,8 +90,8 @@
 		autocomplete="new-password"
 		placeholder="Create a unique password"
 		bind:value
-		on:focus={load}
-		on:input={load}
+		onfocus={load}
+		oninput={load}
 		{disabled}
 		aria-invalid={error ? 'true' : undefined}
 		aria-describedby={error ? `${id}-hint ${id}-error` : `${id}-hint`}
@@ -103,7 +108,7 @@
 
 	<p id={`${id}-hint`} class="hint">{meter.hint}</p>
 
-	<button type="button" class="toggle" aria-pressed={show} on:click={() => (show = !show)}>
+	<button type="button" class="toggle" aria-pressed={show} onclick={() => (show = !show)}>
 		{show ? 'Hide password' : 'Show password'}
 	</button>
 </div>

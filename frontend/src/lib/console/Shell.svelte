@@ -5,9 +5,11 @@
 	 * search, and a wide content column whose head comes from the page's
 	 * `setMeta`. The session guard lives in the `/app` layout above it.
 	 */
+	import type { Snippet } from 'svelte';
+
 	import { api } from '#lib/account/api';
 	import { notify } from '#lib/account/notices';
-	import { me } from '#lib/app/me';
+	import { me } from '#lib/app/me.svelte';
 	import WeaverMark from '#lib/brand/WeaverMark.svelte';
 	import BirdAvatar from '#lib/console/BirdAvatar.svelte';
 	import { navSections } from '#lib/console/nav';
@@ -18,15 +20,21 @@
 	import { resolve } from '$app/paths';
 	import { page } from '$app/state';
 
-	export let title = '';
-	export let subtitle = '';
-	export let crumbs: { label: string; href?: string }[] = [];
+	export interface Props {
+		title?: string;
+		subtitle?: string;
+		crumbs?: { label: string; href?: string }[];
+		actions?: Snippet;
+		children?: Snippet;
+	}
+
+	let { title = '', subtitle = '', crumbs = [], actions, children }: Props = $props();
 
 	const sections = navSections();
 	const hrefs = sections.flatMap((section) => section.items.map((item) => item.href));
 
-	let mobileOpen = false;
-	let signingOut = false;
+	let mobileOpen = $state(false);
+	let signingOut = $state(false);
 
 	/** The longest nav href the current path sits under. */
 	function activeFor(pathname: string): string | undefined {
@@ -86,12 +94,13 @@
 		</nav>
 
 		<div class="sidebar__foot">
-			{#if $me}
+			{#if me.value}
+				{@const account = me.value}
 				<div class="who">
 					<BirdAvatar size={36} />
 					<div class="who__text">
-						<span class="who__name">{$me.name}</span>
-						<span class="who__role">{$me.email || 'Signed in'}</span>
+						<span class="who__name">{account.name}</span>
+						<span class="who__role">{account.email || 'Signed in'}</span>
 					</div>
 				</div>
 			{/if}
@@ -146,9 +155,9 @@
 					{#if title}<h1 class="page-head__title">{title}</h1>{/if}
 					{#if subtitle}<p class="page-head__sub">{subtitle}</p>{/if}
 				</div>
-				<div class="page-head__actions"><slot name="actions" /></div>
+				<div class="page-head__actions">{@render actions?.()}</div>
 			</div>
-			<slot />
+			{@render children?.()}
 		</main>
 	</div>
 </div>

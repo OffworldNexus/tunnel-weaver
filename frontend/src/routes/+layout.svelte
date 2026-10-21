@@ -1,7 +1,7 @@
 <script lang="ts">
 	import '../styles/global.scss';
 
-	import { ensureConfig } from '#lib/account/config';
+	import { ensureConfig } from '#lib/account/config.svelte';
 	import Toaster from '#lib/ui/Toaster.svelte';
 
 	// Warm the constants; the pages that need them report a failure themselves.

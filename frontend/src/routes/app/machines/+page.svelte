@@ -25,9 +25,9 @@
 		revokeMachine
 	} from '#lib/app/machines';
 	import { timeAgo } from '#lib/app/time';
-	import { setMeta } from '#lib/console/meta';
+	import { setMeta } from '#lib/console/meta.svelte';
 	import PairMachineDialog from '#lib/console/PairMachineDialog.svelte';
-	import { searchQuery } from '#lib/console/search';
+	import { search } from '#lib/console/search.svelte';
 	import ConfirmDeleteDialog from '#lib/ui/ConfirmDeleteDialog.svelte';
 	import Dialog from '#lib/ui/Dialog.svelte';
 	import EmptyState from '#lib/ui/EmptyState.svelte';
@@ -105,11 +105,11 @@
 		});
 	}
 
-	// Adopt the URL's query into the shared top-bar store whenever the loader
+	// Adopt the URL's query into the shared top-bar state whenever the loader
 	// brings a new one, so a deep link — or the back button — opens the field on
 	// what the address says. It reads only `data.q`, so typing never retriggers it.
 	$effect(() => {
-		searchQuery.set(data.q);
+		search.q = data.q;
 	});
 
 	// Back and forward land on the list with the state the URL carries; settling
@@ -127,7 +127,7 @@
 	// forward, a deep link — changes the address without scheduling a write of
 	// its own that would fight it.
 	$effect(() => {
-		const q = $searchQuery;
+		const q = search.q;
 		untrack(() => write({ ...address(), q }));
 	});
 
@@ -210,7 +210,7 @@
 			onchange={(event) => {
 				write({
 					...address(),
-					q: $searchQuery,
+					q: search.q,
 					health: readHealth(event.currentTarget.value),
 					page: 1
 				});
@@ -308,8 +308,8 @@
 	{:else}
 		<EmptyState
 			icon="machine"
-			title={$searchQuery || data.health !== 'all' ? 'No machines match' : 'No machines yet'}
-			text={$searchQuery || data.health !== 'all'
+			title={search.q || data.health !== 'all' ? 'No machines match' : 'No machines yet'}
+			text={search.q || data.health !== 'all'
 				? 'Adjust the filter, or clear the search, to find a machine.'
 				: 'Pair a machine with `weave pair` to expose a service through the relay.'}
 		/>
@@ -325,7 +325,7 @@
 			{to}
 			unit="machines"
 			onPage={(next: number) => {
-				write({ ...address(), q: $searchQuery, page: next });
+				write({ ...address(), q: search.q, page: next });
 			}}
 		/>
 	{/snippet}

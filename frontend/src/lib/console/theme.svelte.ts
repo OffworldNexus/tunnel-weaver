@@ -1,5 +1,4 @@
 /** The console theme preference: follow the OS, or force light/dark. */
-import { writable } from 'svelte/store';
 
 export type Theme = 'auto' | 'light' | 'dark';
 
@@ -13,9 +12,13 @@ function initial(): Theme {
 	return stored === 'light' || stored === 'dark' ? stored : 'auto';
 }
 
-export const theme = writable<Theme>(initial());
+export const theme = $state<{ value: Theme }>({ value: initial() });
 
-theme.subscribe((value) => {
+/**
+ * Applies a preference to the document and remembers it. A module cannot use
+ * `$effect`, so the DOM attribute and persistence happen here, in the setter.
+ */
+function apply(value: Theme): void {
 	if (typeof document === 'undefined') {
 		return;
 	}
@@ -29,16 +32,23 @@ theme.subscribe((value) => {
 	} catch {
 		// Private mode: the attribute still applies for this session.
 	}
-});
+}
+
+export function setTheme(value: Theme): void {
+	theme.value = value;
+	apply(value);
+}
 
 export function cycleTheme(): void {
-	theme.update((current) => {
-		if (current === 'auto') {
-			return 'light';
-		}
-		if (current === 'light') {
-			return 'dark';
-		}
-		return 'auto';
-	});
+	if (theme.value === 'auto') {
+		setTheme('light');
+	} else if (theme.value === 'light') {
+		setTheme('dark');
+	} else {
+		setTheme('auto');
+	}
 }
+
+// The store applied the stored preference as soon as the module loaded (its
+// `subscribe` ran the callback immediately); apply the initial value the same way.
+apply(theme.value);

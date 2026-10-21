@@ -2,8 +2,6 @@
  * The signed-in identity. `GET /api/account/me` is the session check; the
  * `/app` layout and the pairing page run it and publish the result here.
  */
-import { writable } from 'svelte/store';
-
 import { api } from '#lib/account/api';
 
 export interface Me {
@@ -15,14 +13,14 @@ export interface Me {
 	has_password: boolean;
 }
 
-export const me = writable<Me | null>(null);
+export const me = $state<{ value: Me | null }>({ value: null });
 
 export type MeOutcome =
 	{ status: 'ok' } | { status: 'unauthenticated' } | { status: 'error'; message: string };
 
 export async function ensureMe(): Promise<MeOutcome> {
 	const res = await api<Me>('/api/account/me');
-	me.set(res.ok ? res.data : null);
+	me.value = res.ok ? res.data : null;
 	if (res.ok) {
 		return { status: 'ok' };
 	}

@@ -2,10 +2,9 @@
  * Valibot schemas for the account forms: immediate field-level guidance. The
  * relay validates again, authoritatively.
  */
-import { get } from 'svelte/store';
 import * as v from 'valibot';
 
-import { minPasswordLength } from '#lib/account/config';
+import { minPasswordLength } from '#lib/account/config.svelte';
 
 const NAME_MAX = 80;
 
@@ -23,8 +22,8 @@ const required = (message: string) => v.pipe(v.string(), v.nonEmpty(message));
 const newPassword = v.pipe(
 	v.string(),
 	v.check(
-		(value) => value.length >= get(minPasswordLength),
-		() => `Use at least ${get(minPasswordLength)} characters.`
+		(value) => value.length >= minPasswordLength(),
+		() => `Use at least ${minPasswordLength()} characters.`
 	),
 	v.maxLength(1024, 'That password is too long.')
 );
