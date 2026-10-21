@@ -65,7 +65,10 @@ Then('the verified email is shown as the account address', async function () {
 });
 
 Then('I see the signed-in identity for {string}', async function (name) {
-  await assert.seeHeading(this.page, 'Your account');
-  await assert.seeDefinition(this.page, name);
-  await assert.seeDefinition(this.page, this.email);
+  // The console's own chrome: the overview's page title is the heading, and the
+  // identity lives in the sidebar rather than the old account-denormalised
+  // definition list this branch replaced.
+  await assert.seeHeading(this.page, 'Overview');
+  await assert.seeText(this.page, name);
+  await assert.seeText(this.page, this.email);
 });

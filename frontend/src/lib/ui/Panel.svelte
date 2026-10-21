@@ -13,7 +13,7 @@
 	export let scroll = false;
 </script>
 
-<section class="panel" style="--cut: {cut}px">
+<section class="panel" style="--cut: {cut}px" aria-label={title || undefined}>
 	{#if title || $$slots.actions}
 		<header class="panel__head">
 			<div class="panel__titles">
