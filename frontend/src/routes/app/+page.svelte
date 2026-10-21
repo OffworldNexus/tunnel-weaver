@@ -16,6 +16,7 @@
 	import { listMachines, type Machine } from '#lib/app/machines';
 	import { getOverview, type OverviewStats } from '#lib/app/overview';
 	import { timeAgo } from '#lib/app/time';
+	import MachineActions from '#lib/console/MachineActions.svelte';
 	import { setMeta } from '#lib/console/meta';
 	import PairMachineDialog from '#lib/console/PairMachineDialog.svelte';
 	import EmptyState from '#lib/ui/EmptyState.svelte';
@@ -100,6 +101,20 @@
 			total = page.data.total;
 		}
 	});
+
+	/**
+	 * Re-reads the short list after an action changed a machine. A failure is
+	 * surfaced rather than leaving the old rows on screen as if nothing happened.
+	 */
+	async function reload() {
+		const page = await listMachines({ perPage: ROWS });
+		if (!page.ok || !page.data) {
+			error = page.error ?? 'We could not reload your machines. Please try again.';
+			return;
+		}
+		machines = page.data.machines;
+		total = page.data.total;
+	}
 </script>
 
 {#if error}
@@ -165,10 +180,11 @@
 		<div class="table-wrap">
 			<table class="table">
 				<colgroup>
-					<col style="width: 34%" />
-					<col style="width: 18%" />
-					<col style="width: 22%" />
-					<col style="width: 26%" />
+					<col style="width: 30%" />
+					<col style="width: 15%" />
+					<col style="width: 20%" />
+					<col style="width: 25%" />
+					<col style="width: 10%" />
 				</colgroup>
 				<thead>
 					<tr>
@@ -176,6 +192,7 @@
 						<th>Health</th>
 						<th>Last seen</th>
 						<th class="right">Bandwidth · 30d</th>
+						<th class="right"></th>
 					</tr>
 				</thead>
 				<tbody>
@@ -184,9 +201,16 @@
 							class="row-link"
 							role="link"
 							tabindex="0"
-							onclick={() =>
-								void goto(resolve('/app/machines/[machine]', { machine: `${machine.id}` }))}
+							onclick={(event) => {
+								if ((event.target as HTMLElement).closest('.row-actions')) {
+									return;
+								}
+								void goto(resolve('/app/machines/[machine]', { machine: `${machine.id}` }));
+							}}
 							onkeydown={(event) => {
+								if ((event.target as HTMLElement).closest('.row-actions')) {
+									return;
+								}
 								if (event.key === 'Enter' || event.key === ' ') {
 									event.preventDefault();
 									void goto(resolve('/app/machines/[machine]', { machine: `${machine.id}` }));
@@ -198,6 +222,9 @@
 							<td class="mono nowrap">{timeAgo(machine.last_seen_at)}</td>
 							<td class="mono nowrap right">
 								{bytes(machine.usage_30d.bytes_in + machine.usage_30d.bytes_out)}
+							</td>
+							<td class="right">
+								<MachineActions {machine} onchange={reload} />
 							</td>
 						</tr>
 					{/each}

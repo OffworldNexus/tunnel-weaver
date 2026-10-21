@@ -216,13 +216,13 @@
 		busy = false;
 		disconnecting = null;
 		if (!res.ok || !res.data) {
-			notify('error', res.error ?? 'We could not disconnect that machine. Please try again.');
+			notify('error', res.error ?? 'We could not kick that machine. Please try again.');
 			return;
 		}
 		notify(
 			'success',
 			res.data.disconnected
-				? `Disconnected ${target.name}. Run \`weave start\` on it to reconnect.`
+				? `Kicked ${target.name}. Run \`weave start\` on it to bring it back.`
 				: `${target.name} was already offline.`
 		);
 		reload();
@@ -320,11 +320,11 @@
 											type="button"
 											size="sm"
 											variant="ghost"
-											title="Disconnect {machine.name}"
-											ariaLabel="Disconnect {machine.name}"
+											title="Kick {machine.name}"
+											ariaLabel="Kick {machine.name}"
 											onclick={() => (disconnecting = machine)}
 										>
-											<Icon name="power" size={14} /> Disconnect
+											<Icon name="power" size={14} /> Kick
 										</Keycap>
 									{/if}
 									<Keycap
@@ -418,7 +418,7 @@
 
 <Dialog
 	open={disconnecting !== null}
-	title="Disconnect {disconnecting?.name ?? 'machine'}?"
+	title="Kick {disconnecting?.name ?? 'machine'}?"
 	width={460}
 	onClose={() => (disconnecting = null)}
 >
@@ -432,7 +432,7 @@
 			No, keep it connected
 		</Keycap>
 		<Keycap type="button" variant="danger" disabled={busy} onclick={confirmDisconnect}>
-			<Icon name="power" size={14} /> Disconnect machine
+			<Icon name="power" size={14} /> Kick machine
 		</Keycap>
 	</svelte:fragment>
 </Dialog>
