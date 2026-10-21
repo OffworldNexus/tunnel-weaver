@@ -2216,6 +2216,7 @@ async fn revoking_a_machine_removes_it_and_frees_its_hostname() {
 #[tokio::test]
 async fn machines_report_their_metered_usage() {
     use sea_orm::ConnectionTrait as _;
+    use weaver_server::metrics::encode_blob;
 
     let fixture = setup().await;
     let (browser, _person, machine_id) = machines_fixture(&fixture).await;
@@ -2225,13 +2226,23 @@ async fn machines_report_their_metered_usage() {
         .await
         .unwrap();
     // One day inside the window, with real bytes and requests. The console reads
-    // the wide day rollup, which the flush maintains; without a blob read, the
-    // total columns are all that matter, so empty blobs stand in.
+    // the wide day rollup, which the flush maintains; the total columns are all
+    // the traffic figures need. The detail view also reads `open_ms_minutes`
+    // back to report when the machine was last seen, so the presence blobs must
+    // be real frames, not the empty stand-ins the totals alone would tolerate:
+    // an empty `open_ms_minutes` is corrupt and fails the read. One open minute
+    // carrying the day's 60 000 ms keeps the total column and the array in step.
     let day = (std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs()
         / 86_400) as i64;
+    let mut open_minutes = vec![0_i64; 1440];
+    open_minutes[0] = 60_000;
+    let open_minutes_blob = hex(&encode_blob(&open_minutes));
+    let mut open_hours = vec![0_i64; 24];
+    open_hours[0] = 60_000;
+    let open_hours_blob = hex(&encode_blob(&open_hours));
     store
         .db()
         .execute_unprepared(&format!(
@@ -2239,7 +2250,7 @@ async fn machines_report_their_metered_usage() {
                 bytes_out, bytes_out_hours, bytes_out_minutes, tunnel_in, tunnel_in_hours, tunnel_in_minutes, \
                 tunnel_out, tunnel_out_hours, tunnel_out_minutes, requests, requests_hours, requests_minutes, \
                 open_ms, open_ms_hours, open_ms_minutes) VALUES \
-             ({}, {}, 500, X'', X'', 1000, X'', X'', 20, X'', X'', 30, X'', X'', 7, X'', X'', 60000, X'', X'')",
+             ({}, {}, 500, X'', X'', 1000, X'', X'', 20, X'', X'', 30, X'', X'', 7, X'', X'', 60000, X'{open_hours_blob}', X'{open_minutes_blob}')",
             service.id, day
         ))
         .await
