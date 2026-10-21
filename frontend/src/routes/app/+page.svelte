@@ -108,7 +108,9 @@
 	 */
 	async function reload() {
 		const [overview, page] = await Promise.all([getOverview(), listMachines({ perPage: ROWS })]);
-		if (overview.ok && overview.data) {stats = overview.data;}
+		if (overview.ok && overview.data) {
+			stats = overview.data;
+		}
 		if (!page.ok || !page.data) {
 			error = page.error ?? 'We could not reload your machines. Please try again.';
 			return;
