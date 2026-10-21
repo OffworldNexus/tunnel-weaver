@@ -22,8 +22,8 @@
 	});
 
 	// Refusals the relay scoped to one input, rendered on that field.
-	let currentError = '';
-	let newError = '';
+	let currentError = $state('');
+	let newError = $state('');
 
 	const sf = jsonForm(
 		changePasswordSchema,
@@ -53,7 +53,7 @@
 
 	const { form, errors, message, submitting, enhance } = sf;
 
-	$: currentInvalid = $errors.current_password?.[0] ?? currentError;
+	const currentInvalid = $derived($errors.current_password?.[0] ?? currentError);
 </script>
 
 <div class="narrow">

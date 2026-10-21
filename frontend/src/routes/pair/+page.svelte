@@ -10,8 +10,14 @@
 	 * A **new machine** has a name — and, on a first pairing, a person slug —
 	 * the person may edit. An **existing machine** whose key was lost has fixed
 	 * names: the person only confirms that it moves onto the new key.
+	 *
+	 * This is a fragment-carried, one-shot workflow, not a load: the handle rides
+	 * in the URL fragment and is exchanged here (and may detour through sign-in),
+	 * so it stays an explicit one-shot effect rather than a route loader — a
+	 * loader could re-run and would have to answer again about a workflow that is
+	 * already spent. `untrack` keeps it from ever re-running.
 	 */
-	import { onMount } from 'svelte';
+	import { untrack } from 'svelte';
 
 	import { api } from '#lib/account/api';
 	import { pairing } from '#lib/account/state';
@@ -38,14 +44,15 @@
 		| { state: 'not_your_machine' }
 		| { state: 'gone' };
 
-	let phase: 'checking' | 'form' | 'not-yours' | 'gone' | 'done' | 'rejected' | 'error' =
-		'checking';
-	let handle = '';
-	let request: Extract<Lookup, { state: 'waiting' }> | null = null;
-	let personSlug = '';
-	let machineName = '';
-	let message = '';
-	let busy = false;
+	let phase = $state<'checking' | 'form' | 'not-yours' | 'gone' | 'done' | 'rejected' | 'error'>(
+		'checking'
+	);
+	let handle = $state('');
+	let request = $state<Extract<Lookup, { state: 'waiting' }> | null>(null);
+	let personSlug = $state('');
+	let machineName = $state('');
+	let message = $state('');
+	let busy = $state(false);
 
 	async function load(): Promise<void> {
 		phase = 'checking';
@@ -87,7 +94,11 @@
 		}
 	}
 
-	onMount(load);
+	$effect(() => {
+		untrack(() => {
+			void load();
+		});
+	});
 
 	/** Runs a verdict. A refused accept leaves the request waiting, so the form stays. */
 	async function act(path: string, body: object, success: 'done' | 'rejected'): Promise<void> {

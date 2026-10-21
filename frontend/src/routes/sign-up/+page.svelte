@@ -14,12 +14,12 @@
 	import { goto } from '$app/navigation';
 	import { resolve } from '$app/paths';
 
-	let altcha: { reset(): void };
-	let proof = '';
+	let altcha = $state<{ reset(): void }>();
+	let proof = $state('');
 
 	const sf = jsonForm(signUpSchema, { name: '', email: '' }, async (data) => {
 		const res = await api<{ flow: string }>('/api/account/signup', { ...data, altcha: proof });
-		altcha.reset();
+		altcha?.reset();
 		if (!res.ok || !res.data) {
 			return res.error ?? 'We could not start your signup. Please try again.';
 		}

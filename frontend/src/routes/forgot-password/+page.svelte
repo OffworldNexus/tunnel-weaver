@@ -12,13 +12,13 @@
 	import Page from '#lib/ui/Page.svelte';
 	import { resolve } from '$app/paths';
 
-	let altcha: { reset(): void };
-	let proof = '';
-	let sent = false;
+	let altcha = $state<{ reset(): void }>();
+	let proof = $state('');
+	let sent = $state(false);
 
 	const sf = jsonForm(resetRequestSchema, { email: '' }, async (data) => {
 		const res = await api('/api/account/reset/request', { ...data, altcha: proof });
-		altcha.reset();
+		altcha?.reset();
 		if (!res.ok) {
 			return res.error ?? 'We could not send the reset link. Please try again.';
 		}

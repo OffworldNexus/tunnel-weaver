@@ -17,10 +17,10 @@
 
 	const carried = flow.load();
 
-	let remaining = 0;
-	let busy = false;
-	let info = '';
-	let error = '';
+	let remaining = $state(0);
+	let busy = $state(false);
+	let info = $state('');
+	let error = $state('');
 	let timer: ReturnType<typeof setInterval> | undefined;
 
 	async function startCooldown() {

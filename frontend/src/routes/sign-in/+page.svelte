@@ -17,13 +17,13 @@
 		flow.save({ notice: undefined });
 	}
 
-	let altcha: { reset(): void };
-	let proof = '';
-	let showPassword = false;
+	let altcha = $state<{ reset(): void }>();
+	let proof = $state('');
+	let showPassword = $state(false);
 
 	const sf = jsonForm(signInSchema, { email: carried.email ?? '', password: '' }, async (data) => {
 		const res = await api('/api/account/login', { ...data, altcha: proof });
-		altcha.reset();
+		altcha?.reset();
 		if (!res.ok) {
 			return res.error ?? 'That email and password did not match.';
 		}

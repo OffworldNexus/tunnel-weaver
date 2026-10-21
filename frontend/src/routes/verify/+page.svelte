@@ -4,8 +4,13 @@
 	 * goes on to set a password; an address that already has an account is only
 	 * disclosed now that ownership is proven. Either way the link is spent, so a
 	 * failure is terminal.
+	 *
+	 * This is a one-shot mutation, not a load: the token in the URL is consumed
+	 * here, so it stays an explicit one-shot effect rather than a route loader —
+	 * a loader could re-run and would have to ask about a token that is already
+	 * spent. `untrack` keeps it from ever re-running.
 	 */
-	import { onMount } from 'svelte';
+	import { untrack } from 'svelte';
 
 	import { api } from '#lib/account/api';
 	import { flow } from '#lib/account/state';
@@ -19,10 +24,10 @@
 		| { outcome: 'set_password'; completion_token: string; email: string }
 		| { outcome: 'existing_account'; email: string };
 
-	let message = '';
+	let message = $state('');
 	const canResend = Boolean(flow.load().flow);
 
-	onMount(async () => {
+	async function run() {
 		const token = page.url.searchParams.get('token');
 		if (!token) {
 			message = 'This link is missing its token.';
@@ -40,6 +45,12 @@
 			flow.save({ email: res.data.email });
 			await goto(resolve('/existing-account'));
 		}
+	}
+
+	$effect(() => {
+		untrack(() => {
+			void run();
+		});
 	});
 </script>
 

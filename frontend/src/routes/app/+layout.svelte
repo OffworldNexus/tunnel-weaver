@@ -4,7 +4,8 @@
 	 * mounts the shell for every `/app` route. A signed-out visitor is sent to
 	 * sign-in; until the session is known a bare holding page is shown.
 	 */
-	import { onMount } from 'svelte';
+	import type { Snippet } from 'svelte';
+	import { untrack } from 'svelte';
 
 	import { notify } from '#lib/account/notices';
 	import { ensureMe, me } from '#lib/app/me.svelte';
@@ -15,8 +16,14 @@
 	import { goto } from '$app/navigation';
 	import { resolve } from '$app/paths';
 
-	let checking = true;
-	let error = '';
+	interface Props {
+		children: Snippet;
+	}
+
+	let { children }: Props = $props();
+
+	let checking = $state(true);
+	let error = $state('');
 
 	async function check() {
 		checking = true;
@@ -31,7 +38,13 @@
 		checking = false;
 	}
 
-	onMount(check);
+	// One-shot: the session is confirmed once on entry, so the effect reads
+	// nothing reactively (`untrack`) and never re-runs.
+	$effect(() => {
+		untrack(() => {
+			void check();
+		});
+	});
 </script>
 
 <svelte:head>
@@ -40,7 +53,7 @@
 
 {#if me.value}
 	<Shell title={meta.title} subtitle={meta.subtitle} crumbs={meta.crumbs}>
-		<slot />
+		{@render children()}
 	</Shell>
 {:else}
 	<Page labelledby="app-title">
