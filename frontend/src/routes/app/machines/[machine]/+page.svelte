@@ -2,7 +2,7 @@
 	/**
 	 * One machine: its identity and key fingerprint, and the public hostnames it
 	 * serves. Everything shown is read from the relay; the actions rename,
-	 * disconnect or revoke it.
+	 * kick or revoke it.
 	 *
 	 * The machine arrives from the route's `load`, so it is always present — an
 	 * id that is not this account's machine is an error, not an empty page. An
@@ -75,13 +75,13 @@
 		busy = false;
 		disconnecting = false;
 		if (!res.ok || !res.data) {
-			notify('error', res.error ?? 'We could not disconnect that machine. Please try again.');
+			notify('error', res.error ?? 'We could not kick that machine. Please try again.');
 			return;
 		}
 		notify(
 			'success',
 			res.data.disconnected
-				? `Disconnected ${target.name}. Run \`weave start\` on it to reconnect.`
+				? `Kicked ${target.name}. Run \`weave start\` on it to bring it back.`
 				: `${target.name} was already offline.`
 		);
 		await invalidate('app:machines');
@@ -110,10 +110,10 @@
 					type="button"
 					size="sm"
 					variant="ghost"
-					ariaLabel="Disconnect {machine.name}"
+					ariaLabel="Kick {machine.name}"
 					onclick={() => (disconnecting = true)}
 				>
-					<Icon name="power" size={14} /> Disconnect
+					<Icon name="power" size={14} /> Kick
 				</Keycap>
 			{/if}
 			<Keycap
@@ -245,7 +245,7 @@
 
 <Dialog
 	open={disconnecting}
-	title="Disconnect {machine.name}?"
+	title="Kick {machine.name}?"
 	width={460}
 	onClose={() => (disconnecting = false)}
 >
@@ -259,7 +259,7 @@
 			No, keep it connected
 		</Keycap>
 		<Keycap type="button" variant="danger" disabled={busy} onclick={confirmDisconnect}>
-			<Icon name="power" size={14} /> Disconnect machine
+			<Icon name="power" size={14} /> Kick machine
 		</Keycap>
 	</svelte:fragment>
 </Dialog>

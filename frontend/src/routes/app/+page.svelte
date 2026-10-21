@@ -113,12 +113,21 @@
 	{#if data.machines.length}
 		<div class="table-wrap">
 			<table class="table">
+				<!-- Fixed widths, so no column moves as the list reloads. The last
+				     column is the 17% MachineActions' action cluster needs: at the
+				     console's narrowest desktop width (a 980px viewport) that is
+				     ~159px, enough for its three 38px icon keycaps, their two 6px
+				     gaps and the cell's 11px padding (148px). Percentages rather
+				     than a pixel width because a fixed layout cannot mix the two
+				     without the columns overshooting the table; keeping the five at
+				     100% means they rebudget as the window resizes and
+				     `.table-wrap` never grows a horizontal scrollbar. -->
 				<colgroup>
-					<col style="width: 30%" />
-					<col style="width: 15%" />
-					<col style="width: 20%" />
-					<col style="width: 25%" />
-					<col style="width: 10%" />
+					<col style="width: 32%" />
+					<col style="width: 12%" />
+					<col style="width: 16%" />
+					<col style="width: 23%" />
+					<col style="width: 17%" />
 				</colgroup>
 				<thead>
 					<tr>

@@ -84,6 +84,11 @@
 	}
 </script>
 
+<!-- Every action is icon-only: the overview's actions column is only as wide as
+     the table can spare, and a worded label would push the cluster past it and
+     make `.table-wrap` scroll sideways. Each icon keeps a `title` and an
+     `ariaLabel`, so the actions stay named for pointer users and screen readers
+     alike. -->
 <div class="row-actions">
 	{#if machine.online}
 		<Keycap
@@ -94,7 +99,7 @@
 			ariaLabel="Kick {machine.name}"
 			onclick={() => (kicking = true)}
 		>
-			<Icon name="power" size={14} /> Kick
+			<Icon name="power" size={14} />
 		</Keycap>
 	{/if}
 	<Keycap
