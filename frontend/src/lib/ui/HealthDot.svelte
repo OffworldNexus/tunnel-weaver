@@ -1,11 +1,15 @@
 <script lang="ts">
 	/** A coloured presence dot, optionally with its label. */
-	export let online = false;
-	export let showLabel = true;
-	export let pulse = true;
+	interface Props {
+		online?: boolean;
+		showLabel?: boolean;
+		pulse?: boolean;
+	}
 
-	$: label = online ? 'Online' : 'Offline';
-	$: color = online ? 'var(--tw-online)' : 'var(--tw-offline)';
+	let { online = false, showLabel = true, pulse = true }: Props = $props();
+
+	const label = $derived(online ? 'Online' : 'Offline');
+	const color = $derived(online ? 'var(--tw-online)' : 'var(--tw-offline)');
 </script>
 
 <span class="dot-wrap" style="--dot-color: {color}">

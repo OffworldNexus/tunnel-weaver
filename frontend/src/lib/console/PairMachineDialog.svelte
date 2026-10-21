@@ -31,9 +31,9 @@
 		<Icon name="github" size={15} /> Setup instructions
 	</Keycap>
 
-	<svelte:fragment slot="footer">
+	{#snippet footer()}
 		<Keycap type="button" variant="key" onclick={() => (open = false)}>Done</Keycap>
-	</svelte:fragment>
+	{/snippet}
 </Dialog>
 
 <style lang="scss">

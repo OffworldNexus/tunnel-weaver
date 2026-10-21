@@ -4,17 +4,30 @@
 	import Icon from '#lib/ui/Icon.svelte';
 	import Keycap from '#lib/ui/Keycap.svelte';
 
-	export let page = 1;
-	export let pageCount = 1;
-	export let total = 0;
-	export let from = 0;
-	export let to = 0;
-	export let unit = 'rows';
-	export let onPage: (page: number) => void = () => {};
-	/** Drop the pager's own chrome, for use inside a panel footer. */
-	export let bare = false;
+	interface Props {
+		page?: number;
+		pageCount?: number;
+		total?: number;
+		from?: number;
+		to?: number;
+		unit?: string;
+		onPage?: (page: number) => void;
+		/** Drop the pager's own chrome, for use inside a panel footer. */
+		bare?: boolean;
+	}
 
-	$: buttons = pageWindow(page, pageCount);
+	let {
+		page = 1,
+		pageCount = 1,
+		total = 0,
+		from = 0,
+		to = 0,
+		unit = 'rows',
+		onPage = () => {},
+		bare = false
+	}: Props = $props();
+
+	const buttons = $derived(pageWindow(page, pageCount));
 </script>
 
 {#if pageCount > 1 || total > 0}

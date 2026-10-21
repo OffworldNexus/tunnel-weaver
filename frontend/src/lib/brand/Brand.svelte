@@ -2,8 +2,12 @@
 	import WeaverMark from '#lib/brand/WeaverMark.svelte';
 	import { resolve } from '$app/paths';
 
-	/** Centre the mark + wordmark (account pages); left-align for the shell. */
-	export let center = false;
+	interface Props {
+		/** Centre the mark + wordmark (account pages); left-align for the shell. */
+		center?: boolean;
+	}
+
+	let { center = false }: Props = $props();
 </script>
 
 <header class="brand" class:brand--center={center}>

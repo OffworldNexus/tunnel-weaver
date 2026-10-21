@@ -21,7 +21,7 @@
 <button
 	class="theme theme--{variant}"
 	type="button"
-	on:click={cycleTheme}
+	onclick={cycleTheme}
 	title={label}
 	aria-label={label}
 >

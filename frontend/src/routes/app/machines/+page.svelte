@@ -5,11 +5,13 @@
 	 * `load` reads them back and the URL is the single source of truth — so a
 	 * filtered page is linkable and the back button works.
 	 *
-	 * Only typing is debounced, and the debounce now delays the URL write rather
-	 * than a fetch: the first paint, the health filter and the pager are single
-	 * deliberate acts and stay immediate.
+	 * Nothing here waits: a keystroke reaches the address bar at once, and the
+	 * route's `load` answers in milliseconds — well within a frame — so there is
+	 * nothing to settle. While a response is in flight the panel keeps the rows
+	 * it already has, which are the previous page's real ones, instead of
+	 * blanking itself for a frame.
 	 */
-	import { onDestroy } from 'svelte';
+	import { untrack } from 'svelte';
 
 	import { notify } from '#lib/account/notices';
 	import { bytes } from '#lib/app/format';
@@ -36,7 +38,7 @@
 	import Panel from '#lib/ui/Panel.svelte';
 	import { afterNavigate, goto, invalidate } from '$app/navigation';
 	import { resolve } from '$app/paths';
-	import { navigating, page } from '$app/state';
+	import { page } from '$app/state';
 
 	import type { PageProps } from './$types';
 
@@ -47,9 +49,6 @@
 		page: number;
 	}
 
-	/** How long typing settles before the query reaches the address bar. */
-	const SETTLE_MS = 150;
-
 	let { data }: PageProps = $props();
 
 	let pairing = $state(false);
@@ -58,7 +57,6 @@
 	let disconnecting = $state<Machine | null>(null);
 	let revoking = $state<Machine | null>(null);
 	let busy = $state(false);
-	let timer: ReturnType<typeof setTimeout> | undefined;
 
 	setMeta({
 		title: 'Machines',
@@ -124,18 +122,14 @@
 		write({ q: data.q, health: data.health, page: data.page });
 	});
 
-	// Only typing settles for a beat. This tracks just the store, so a
-	// navigation changes the URL without scheduling a write of its own.
+	// A keystroke reaches the address bar at once. The write reads the URL
+	// untracked, and only the store is tracked, so landing on the list — back,
+	// forward, a deep link — changes the address without scheduling a write of
+	// its own that would fight it.
 	$effect(() => {
 		const q = $searchQuery;
-		clearTimeout(timer);
-		timer = setTimeout(() => write({ ...address(), q }), SETTLE_MS);
+		untrack(() => write({ ...address(), q }));
 	});
-
-	onDestroy(() => clearTimeout(timer));
-
-	/** Whether a navigation is landing on this list, for the loading line. */
-	const loading = $derived(navigating.to?.route.id === '/app/machines');
 
 	const from = $derived(data.total === 0 ? 0 : (data.page - 1) * data.perPage + 1);
 	const to = $derived(Math.min(data.page * data.perPage, data.total));
@@ -203,11 +197,11 @@
 </script>
 
 <Panel flush title="Machines" subtitle="{data.total} paired · click a row to open a machine">
-	<svelte:fragment slot="actions">
+	{#snippet actions()}
 		<Keycap type="button" size="sm" variant="primary" onclick={() => (pairing = true)}>
 			<Icon name="plus" size={15} /> Pair a machine
 		</Keycap>
-	</svelte:fragment>
+	{/snippet}
 
 	<div class="toolbar">
 		<select
@@ -230,9 +224,7 @@
 		<span class="toolbar__spacer"></span>
 	</div>
 
-	{#if loading}
-		<p class="state" aria-live="polite">Loading your machines…</p>
-	{:else if data.machines.length}
+	{#if data.machines.length}
 		<div class="table-wrap">
 			<table class="table">
 				<colgroup>
@@ -323,7 +315,7 @@
 		/>
 	{/if}
 
-	<svelte:fragment slot="footer">
+	{#snippet footer()}
 		<Pagination
 			bare
 			page={data.page}
@@ -336,7 +328,7 @@
 				write({ ...address(), q: $searchQuery, page: next });
 			}}
 		/>
-	</svelte:fragment>
+	{/snippet}
 </Panel>
 
 <PairMachineDialog bind:open={pairing} />
@@ -364,7 +356,7 @@
 			name immediately.
 		</p>
 	</div>
-	<svelte:fragment slot="footer">
+	{#snippet footer()}
 		<Keycap type="button" variant="key" onclick={() => (renaming = null)}>Cancel</Keycap>
 		<Keycap
 			type="button"
@@ -374,7 +366,7 @@
 		>
 			Rename
 		</Keycap>
-	</svelte:fragment>
+	{/snippet}
 </Dialog>
 
 <Dialog
@@ -388,14 +380,14 @@
 		not reconnect on its own — run <code class="mono">weave start</code> on the machine to bring it back.
 		Its hostnames keep their names.
 	</p>
-	<svelte:fragment slot="footer">
+	{#snippet footer()}
 		<Keycap type="button" variant="key" onclick={() => (disconnecting = null)}>
 			No, keep it connected
 		</Keycap>
 		<Keycap type="button" variant="danger" disabled={busy} onclick={confirmDisconnect}>
 			<Icon name="power" size={14} /> Kick machine
 		</Keycap>
-	</svelte:fragment>
+	{/snippet}
 </Dialog>
 
 <ConfirmDeleteDialog
@@ -415,11 +407,6 @@
 </ConfirmDeleteDialog>
 
 <style lang="scss">
-	.state {
-		padding: 24px 16px;
-		color: var(--tw-muted);
-	}
-
 	.toolbar {
 		padding-top: 12px;
 	}

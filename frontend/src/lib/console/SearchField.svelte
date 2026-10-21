@@ -45,7 +45,7 @@
 	}
 </script>
 
-<svelte:window on:keydown={onWindowKey} />
+<svelte:window onkeydown={onWindowKey} />
 
 <div class="lookup">
 	<Icon name="search" size={16} />
@@ -55,8 +55,8 @@
 		type="text"
 		placeholder="Search machines…"
 		bind:value={$searchQuery}
-		on:input={onInput}
-		on:keydown={onKey}
+		oninput={onInput}
+		onkeydown={onKey}
 		autocomplete="off"
 		spellcheck="false"
 		aria-label="Search machines"
@@ -66,7 +66,7 @@
 			class="lookup__clear"
 			type="button"
 			aria-label="Clear search"
-			on:click={() => {
+			onclick={() => {
 				searchQuery.set('');
 				input?.focus();
 			}}

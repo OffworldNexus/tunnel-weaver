@@ -6,9 +6,13 @@
 	 */
 	import type { BarGroup } from '#lib/app/chart';
 
-	export let groups: BarGroup[] = [];
-	export let activeLabel = 'Active';
-	export let restLabel = 'Inactive';
+	interface Props {
+		groups?: BarGroup[];
+		activeLabel?: string;
+		restLabel?: string;
+	}
+
+	let { groups = [], activeLabel = 'Active', restLabel = 'Inactive' }: Props = $props();
 
 	/** The active share of a group's total, as a percentage. */
 	function share(group: BarGroup): number {

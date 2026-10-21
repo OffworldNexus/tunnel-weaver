@@ -2,10 +2,14 @@
 	/** Inline stroke icons, `currentColor` only. Names live in `icons.ts`. */
 	import { ICON_PATHS, type IconName } from './icons';
 
-	export let name: IconName;
-	export let size = 24;
+	interface Props {
+		name: IconName;
+		size?: number;
+	}
 
-	$: paths = ICON_PATHS[name];
+	let { name, size = 24 }: Props = $props();
+
+	const paths = $derived(ICON_PATHS[name]);
 </script>
 
 <svg

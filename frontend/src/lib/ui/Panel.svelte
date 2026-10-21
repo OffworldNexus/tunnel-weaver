@@ -1,35 +1,53 @@
 <script lang="ts">
+	import type { Snippet } from 'svelte';
+
 	/**
 	 * A cut-corner surface. The header is optional; when a `title` or an
-	 * `actions` slot is present it renders a bordered strip above the body.
+	 * `actions` snippet is present it renders a bordered strip above the body.
 	 */
-	export let title = '';
-	export let subtitle = '';
-	/** Remove the body padding (for tables and full-bleed content). */
-	export let flush = false;
-	/** The corner cut in px; smaller panels use a tighter cut. */
-	export let cut = 16;
-	/** Keep the body at a fixed height and scroll (for feeds). */
-	export let scroll = false;
+	interface Props {
+		title?: string;
+		subtitle?: string;
+		/** Remove the body padding (for tables and full-bleed content). */
+		flush?: boolean;
+		/** The corner cut in px; smaller panels use a tighter cut. */
+		cut?: number;
+		/** Keep the body at a fixed height and scroll (for feeds). */
+		scroll?: boolean;
+		actions?: Snippet;
+		footer?: Snippet;
+		children?: Snippet;
+	}
+
+	let {
+		title = '',
+		subtitle = '',
+		flush = false,
+		cut = 16,
+		scroll = false,
+		actions,
+		footer,
+		children
+	}: Props = $props();
 </script>
 
 <section class="panel" style="--cut: {cut}px" aria-label={title || undefined}>
-	{#if title || $$slots.actions}
+	{#if title || actions !== undefined}
 		<header class="panel__head">
 			<div class="panel__titles">
 				{#if title}<h2 class="panel__title">{title}</h2>{/if}
 				{#if subtitle}<p class="panel__subtitle">{subtitle}</p>{/if}
 			</div>
 			<div class="panel__actions">
-				<slot name="actions" />
+				{@render actions?.()}
 			</div>
 		</header>
 	{/if}
 	<div class="panel__body" class:flush class:scroll>
-		<slot />
+		{@render children?.()}
 	</div>
-	{#if $$slots.footer}
-		<footer class="panel__foot"><slot name="footer" /></footer>
+	{#if footer !== undefined}
+		<footer class="panel__foot">{@render footer?.()}</footer>
 	{/if}
 </section>
 

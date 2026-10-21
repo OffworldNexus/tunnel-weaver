@@ -104,11 +104,11 @@
 </div>
 
 <Panel flush title="Machines" subtitle="{data.total} paired · click a row to open a machine">
-	<svelte:fragment slot="actions">
+	{#snippet actions()}
 		<Keycap type="button" size="sm" variant="primary" onclick={() => (pairing = true)}>
 			<Icon name="plus" size={15} /> Pair a machine
 		</Keycap>
-	</svelte:fragment>
+	{/snippet}
 
 	{#if data.machines.length}
 		<div class="table-wrap">
@@ -182,7 +182,7 @@
 		/>
 	{/if}
 
-	<svelte:fragment slot="footer">
+	{#snippet footer()}
 		{#if data.total > data.machines.length}
 			<div class="more">
 				<span>
@@ -194,7 +194,7 @@
 				</Keycap>
 			</div>
 		{/if}
-	</svelte:fragment>
+	{/snippet}
 </Panel>
 
 <PairMachineDialog bind:open={pairing} />

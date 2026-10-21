@@ -18,11 +18,11 @@
 	title="Password"
 	subtitle="Your password signs you in and authorises changes to the account."
 >
-	<svelte:fragment slot="actions">
+	{#snippet actions()}
 		<Keycap href={resolve('/app/security/password')} variant="key" size="sm">
 			<Icon name="lock" size={14} /> Change password
 		</Keycap>
-	</svelte:fragment>
+	{/snippet}
 
 	{#if $me?.has_password}
 		<p class="state"><Icon name="check" size={16} /> Password is set</p>

@@ -143,7 +143,7 @@
 			name immediately.
 		</p>
 	</div>
-	<svelte:fragment slot="footer">
+	{#snippet footer()}
 		<Keycap type="button" variant="key" onclick={() => (renaming = false)}>Cancel</Keycap>
 		<Keycap
 			type="button"
@@ -153,7 +153,7 @@
 		>
 			Rename
 		</Keycap>
-	</svelte:fragment>
+	{/snippet}
 </Dialog>
 
 <Dialog open={kicking} title="Kick {machine.name}?" width={460} onClose={() => (kicking = false)}>
@@ -162,14 +162,14 @@
 		reconnect on its own — run <code class="mono">weave start</code> on the machine to bring it back.
 		Its hostnames keep their names.
 	</p>
-	<svelte:fragment slot="footer">
+	{#snippet footer()}
 		<Keycap type="button" variant="key" onclick={() => (kicking = false)}>
 			No, leave it connected
 		</Keycap>
 		<Keycap type="button" variant="danger" disabled={busy} onclick={confirmKick}>
 			<Icon name="power" size={14} /> Kick machine
 		</Keycap>
-	</svelte:fragment>
+	{/snippet}
 </Dialog>
 
 <ConfirmDeleteDialog

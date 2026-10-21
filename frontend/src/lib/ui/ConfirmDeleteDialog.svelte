@@ -3,22 +3,38 @@
 	 * Destructive confirmation modal built on the Ark UI Dialog: requires typing
 	 * back the target's exact name/slug before the danger keycap unlocks.
 	 */
+	import type { Snippet } from 'svelte';
+
 	import Dialog from '#lib/ui/Dialog.svelte';
 	import Icon from '#lib/ui/Icon.svelte';
 	import Keycap from '#lib/ui/Keycap.svelte';
 
-	export let open = false;
-	export let title = 'Confirm deletion';
-	/** The exact string the user must type back to unlock the confirm button. */
-	export let expected = '';
-	export let confirmLabel = 'Delete';
-	export let cancelLabel = 'Cancel';
-	export let onConfirm: () => void = () => {};
-	export let onClose: (() => void) | undefined = undefined;
+	interface Props {
+		open?: boolean;
+		title?: string;
+		/** The exact string the user must type back to unlock the confirm button. */
+		expected?: string;
+		confirmLabel?: string;
+		cancelLabel?: string;
+		onConfirm?: () => void;
+		onClose?: () => void;
+		children?: Snippet;
+	}
 
-	let typed = '';
+	let {
+		open = $bindable(false),
+		title = 'Confirm deletion',
+		expected = '',
+		confirmLabel = 'Delete',
+		cancelLabel = 'Cancel',
+		onConfirm = () => {},
+		onClose = undefined,
+		children
+	}: Props = $props();
 
-	$: matches = expected !== '' && typed.trim() === expected;
+	let typed = $state('');
+
+	const matches = $derived(expected !== '' && typed.trim() === expected);
 
 	/** Closes the dialog and clears the confirmation field for the next open. */
 	function close() {
@@ -37,15 +53,29 @@
 </script>
 
 <Dialog bind:open {title} width={460} onClose={close}>
+	{#snippet footer()}
+		<Keycap type="button" variant="key" onclick={close}>{cancelLabel}</Keycap>
+		<Keycap type="button" variant="danger" disabled={!matches} onclick={submit}>
+			<Icon name="trash" size={14} />
+			{confirmLabel}
+		</Keycap>
+	{/snippet}
+
 	<div class="confirm-delete">
 		<div class="confirm-delete__alert">
 			<Icon name="alert" size={18} />
 			<div class="confirm-delete__copy">
-				<slot />
+				{@render children?.()}
 			</div>
 		</div>
 
-		<form class="stack" on:submit|preventDefault={submit}>
+		<form
+			class="stack"
+			onsubmit={(event) => {
+				event.preventDefault();
+				submit();
+			}}
+		>
 			<label for="confirm-delete-input" class="confirm-delete__prompt">
 				Type <code class="mono confirm-delete__expected">{expected}</code> to confirm:
 			</label>
@@ -60,14 +90,6 @@
 			/>
 		</form>
 	</div>
-
-	<svelte:fragment slot="footer">
-		<Keycap type="button" variant="key" onclick={close}>{cancelLabel}</Keycap>
-		<Keycap type="button" variant="danger" disabled={!matches} onclick={submit}>
-			<Icon name="trash" size={14} />
-			{confirmLabel}
-		</Keycap>
-	</svelte:fragment>
 </Dialog>
 
 <style lang="scss">

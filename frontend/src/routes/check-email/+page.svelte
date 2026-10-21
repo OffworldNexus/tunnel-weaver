@@ -91,8 +91,7 @@
 		{#if error}<p class="notice-error spaced" role="alert">{error}</p>{/if}
 
 		<p class="switch spaced">
-			<button type="button" class="linklike" on:click={useAnotherEmail}
-				>Use a different email</button
+			<button type="button" class="linklike" onclick={useAnotherEmail}>Use a different email</button
 			>
 		</p>
 	{:else}

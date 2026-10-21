@@ -74,7 +74,7 @@
 							class:active={isCurrent}
 							href={item.href}
 							aria-current={isCurrent ? 'page' : undefined}
-							on:click={() => (mobileOpen = false)}
+							onclick={() => (mobileOpen = false)}
 						>
 							<Icon name={item.icon} size={18} />
 							<span class="nav__label">{item.label}</span>
@@ -95,7 +95,7 @@
 					</div>
 				</div>
 			{/if}
-			<button class="signout" type="button" disabled={signingOut} on:click={doSignOut}>
+			<button class="signout" type="button" disabled={signingOut} onclick={doSignOut}>
 				<Icon name="power" size={16} /> Sign out
 			</button>
 			<div class="sidebar__theme">
@@ -108,7 +108,7 @@
 		class="scrim"
 		type="button"
 		aria-label="Close navigation"
-		on:click={() => (mobileOpen = false)}
+		onclick={() => (mobileOpen = false)}
 	></button>
 
 	<div class="main">
@@ -117,7 +117,7 @@
 				class="topbar__burger"
 				type="button"
 				aria-label="Open navigation"
-				on:click={() => (mobileOpen = true)}
+				onclick={() => (mobileOpen = true)}
 			>
 				<Icon name="list" size={20} />
 			</button>

@@ -62,7 +62,7 @@
 				type="button"
 				class="toggle"
 				aria-pressed={showPassword}
-				on:click={() => (showPassword = !showPassword)}
+				onclick={() => (showPassword = !showPassword)}
 			>
 				{showPassword ? 'Hide password' : 'Show password'}
 			</button>

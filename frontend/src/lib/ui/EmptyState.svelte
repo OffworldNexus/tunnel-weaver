@@ -1,18 +1,25 @@
 <script lang="ts">
 	/** A friendly empty state. */
+	import type { Snippet } from 'svelte';
+
 	import Icon from '#lib/ui/Icon.svelte';
 	import type { IconName } from '#lib/ui/icons';
 
-	export let icon: IconName = 'inbox';
-	export let title = 'Nothing here';
-	export let text = '';
+	interface Props {
+		icon?: IconName;
+		title?: string;
+		text?: string;
+		children?: Snippet;
+	}
+
+	let { icon = 'inbox', title = 'Nothing here', text = '', children }: Props = $props();
 </script>
 
 <div class="empty">
 	<span class="empty__icon"><Icon name={icon} size={26} /></span>
 	<p class="empty__title">{title}</p>
 	{#if text}<p class="empty__text">{text}</p>{/if}
-	<slot />
+	{@render children?.()}
 </div>
 
 <style lang="scss">

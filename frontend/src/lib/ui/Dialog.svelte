@@ -5,15 +5,30 @@
 	 */
 	import { Dialog } from '@ark-ui/svelte/dialog';
 	import { Portal } from '@ark-ui/svelte/portal';
+	import type { Snippet } from 'svelte';
 
 	import Icon from '#lib/ui/Icon.svelte';
 
-	export let open = false;
-	export let title = '';
-	export let width = 520;
-	/** Hide the default footer actions. */
-	export let bare = false;
-	export let onClose: (() => void) | undefined = undefined;
+	interface Props {
+		open?: boolean;
+		title?: string;
+		width?: number;
+		/** Hide the default footer actions. */
+		bare?: boolean;
+		onClose?: () => void;
+		footer?: Snippet;
+		children?: Snippet;
+	}
+
+	let {
+		open = $bindable(false),
+		title = '',
+		width = 520,
+		bare = false,
+		onClose = undefined,
+		footer,
+		children
+	}: Props = $props();
 
 	function handleOpenChange(details: { open: boolean }) {
 		open = details.open;
@@ -35,11 +50,11 @@
 					</Dialog.CloseTrigger>
 				</header>
 				<div class="dialog__body">
-					<slot />
+					{@render children?.()}
 				</div>
 				{#if !bare}
 					<footer class="dialog__foot">
-						<slot name="footer" />
+						{@render footer?.()}
 					</footer>
 				{/if}
 			</Dialog.Content>

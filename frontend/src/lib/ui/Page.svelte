@@ -1,18 +1,25 @@
 <script lang="ts">
+	import type { Snippet } from 'svelte';
+
 	import Brand from '#lib/brand/Brand.svelte';
 	import SiteFooter from '#lib/ui/SiteFooter.svelte';
 
-	/** Centre the brand; account pages do, and the holding page does too. */
-	export let center = true;
-	/** id of the page's `<h1>`, wired to `<main aria-labelledby>`. */
-	export let labelledby: string | undefined = undefined;
+	interface Props {
+		/** Centre the brand; account pages do, and the holding page does too. */
+		center?: boolean;
+		/** id of the page's `<h1>`, wired to `<main aria-labelledby>`. */
+		labelledby?: string;
+		children?: Snippet;
+	}
+
+	let { center = true, labelledby = undefined, children }: Props = $props();
 </script>
 
 <!-- The account-plane page shell: brand header, a centred column, footer. -->
 <div class="page">
 	<Brand {center} />
 	<main id="main" class="column" aria-labelledby={labelledby}>
-		<slot />
+		{@render children?.()}
 	</main>
 	<SiteFooter />
 </div>

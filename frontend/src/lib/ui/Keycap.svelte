@@ -1,22 +1,45 @@
 <script lang="ts">
-	export let type: 'button' | 'submit' = 'submit';
-	export let disabled = false;
-	export let loading = false;
-	export let variant: 'primary' | 'key' | 'danger' | 'ghost' = 'primary';
-	export let size: 'md' | 'sm' = 'md';
-	export let wide = false;
-	/** When set, the keycap renders as a link instead of a button. */
-	export let href: string | undefined = undefined;
-	/** Link attributes, applied only when `href` renders an anchor (e.g. external links). */
-	export let target: '_self' | '_blank' | '_parent' | '_top' | undefined = undefined;
-	export let rel: string | undefined = undefined;
-	export let title: string | undefined = undefined;
-	export let ariaLabel: string | undefined = undefined;
-	export let onclick: ((event: MouseEvent) => void) | undefined = undefined;
+	import type { Snippet } from 'svelte';
 
-	$: isLink = Boolean(href);
-	$: classes = `keycap keycap--${variant} keycap--${size}${wide ? ' keycap--wide' : ''}`;
-	$: deactivated = disabled || loading;
+	interface Props {
+		type?: 'button' | 'submit';
+		disabled?: boolean;
+		loading?: boolean;
+		variant?: 'primary' | 'key' | 'danger' | 'ghost';
+		size?: 'md' | 'sm';
+		wide?: boolean;
+		/** When set, the keycap renders as a link instead of a button. */
+		href?: string;
+		/** Link attributes, applied only when `href` renders an anchor (e.g. external links). */
+		target?: '_self' | '_blank' | '_parent' | '_top';
+		rel?: string;
+		title?: string;
+		ariaLabel?: string;
+		onclick?: (event: MouseEvent) => void;
+		children?: Snippet;
+	}
+
+	let {
+		type = 'submit',
+		disabled = false,
+		loading = false,
+		variant = 'primary',
+		size = 'md',
+		wide = false,
+		href = undefined,
+		target = undefined,
+		rel = undefined,
+		title = undefined,
+		ariaLabel = undefined,
+		onclick = undefined,
+		children
+	}: Props = $props();
+
+	const isLink = $derived(Boolean(href));
+	const classes = $derived(
+		`keycap keycap--${variant} keycap--${size}${wide ? ' keycap--wide' : ''}`
+	);
+	const deactivated = $derived(disabled || loading);
 </script>
 
 <!-- The shape is built from layered, identically-clipped spans (pedestal, focus
@@ -41,7 +64,7 @@
 		<span class="keycap__ring"><span class="keycap__ring-hole"></span></span>
 		<span class="keycap__cap"><span class="keycap__face"></span></span>
 	</span>
-	<span class="keycap__label"><slot /></span>
+	<span class="keycap__label">{@render children?.()}</span>
 </svelte:element>
 
 <style lang="scss">

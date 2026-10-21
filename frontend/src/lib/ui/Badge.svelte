@@ -1,14 +1,20 @@
 <script lang="ts">
+	import type { Snippet } from 'svelte';
+
 	/** A small status pill. The dot form is used in dense tables. */
-	export let variant: 'neutral' | 'ok' | 'warn' | 'danger' | 'info' | 'accent' | 'muted' =
-		'neutral';
-	export let dot = false;
-	export let title = '';
+	interface Props {
+		variant?: 'neutral' | 'ok' | 'warn' | 'danger' | 'info' | 'accent' | 'muted';
+		dot?: boolean;
+		title?: string;
+		children?: Snippet;
+	}
+
+	let { variant = 'neutral', dot = false, title = '', children }: Props = $props();
 </script>
 
 <span class="badge badge--{variant}" {title}>
 	{#if dot}<span class="badge__dot" aria-hidden="true"></span>{/if}
-	<slot />
+	{@render children?.()}
 </span>
 
 <style lang="scss">

@@ -104,7 +104,7 @@
 
 <div class="stack-page">
 	<Panel title="Machine">
-		<svelte:fragment slot="actions">
+		{#snippet actions()}
 			{#if machine.online}
 				<Keycap
 					type="button"
@@ -134,7 +134,7 @@
 			>
 				<Icon name="ban" size={14} /> Revoke
 			</Keycap>
-		</svelte:fragment>
+		{/snippet}
 
 		<dl class="identity">
 			<div>
@@ -230,7 +230,7 @@
 			name immediately.
 		</p>
 	</div>
-	<svelte:fragment slot="footer">
+	{#snippet footer()}
 		<Keycap type="button" variant="key" onclick={() => (renaming = false)}>Cancel</Keycap>
 		<Keycap
 			type="button"
@@ -240,7 +240,7 @@
 		>
 			Rename
 		</Keycap>
-	</svelte:fragment>
+	{/snippet}
 </Dialog>
 
 <Dialog
@@ -254,14 +254,14 @@
 		reconnect on its own — run <code class="mono">weave start</code> on the machine to bring it back.
 		Its hostnames keep their names.
 	</p>
-	<svelte:fragment slot="footer">
+	{#snippet footer()}
 		<Keycap type="button" variant="key" onclick={() => (disconnecting = false)}>
 			No, keep it connected
 		</Keycap>
 		<Keycap type="button" variant="danger" disabled={busy} onclick={confirmDisconnect}>
 			<Icon name="power" size={14} /> Kick machine
 		</Keycap>
-	</svelte:fragment>
+	{/snippet}
 </Dialog>
 
 <ConfirmDeleteDialog
