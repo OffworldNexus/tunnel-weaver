@@ -78,8 +78,12 @@
 	 * truthful thing to show.
 	 */
 	function span(seconds: number): string {
-		if (seconds < 3600) {return `${Math.max(1, Math.round(seconds / 60))} min`;}
-		if (seconds < 86_400) {return `${Math.round(seconds / 3600)} h`;}
+		if (seconds < 3600) {
+			return `${Math.max(1, Math.round(seconds / 60))} min`;
+		}
+		if (seconds < 86_400) {
+			return `${Math.round(seconds / 3600)} h`;
+		}
 		return `${Math.round(seconds / 86_400)} days`;
 	}
 
