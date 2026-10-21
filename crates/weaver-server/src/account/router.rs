@@ -1304,6 +1304,7 @@ fn empty_overview() -> Value {
         "tunnels": { "active": 0, "total": 0 },
         "usage_30d": Usage::default().json(),
         "window_days": USAGE_WINDOW_SECS / 86_400,
+        "covered_seconds": 0,
     })
 }
 
@@ -1333,11 +1334,26 @@ async fn overview_stats(
 
     let usage = usage_index(&rt.store, person).await?.total();
 
+    // The figures above are sums, which are true of the whole window; a *rate*
+    // is not, so the relay reports how much of the window the traffic actually
+    // covers and lets the console divide by that instead of by 30 days.
+    let service_ids: Vec<i32> = services.iter().map(|(service, _)| service.id).collect();
+    let now = unix_secs();
+    let covered_seconds = match rt
+        .store
+        .covered_span(&service_ids, now - USAGE_WINDOW_SECS, now)
+        .await?
+    {
+        Some((first, last)) => (last - first + 1) * 60,
+        None => 0,
+    };
+
     Ok(json!({
         "machines": { "online": machines_online, "total": machines.len() },
         "tunnels": { "active": tunnels_active, "total": tunnels_total },
         "usage_30d": usage.json(),
         "window_days": USAGE_WINDOW_SECS / 86_400,
+        "covered_seconds": covered_seconds,
     }))
 }
 

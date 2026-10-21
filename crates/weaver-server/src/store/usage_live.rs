@@ -338,6 +338,87 @@ impl Store {
         decode_slot_rows(&self.db, Some(services), day, slots).await
     }
 
+    /// The span the window's data actually covers: its first and last minute
+    /// carrying any metered traffic, as minute numbers.
+    ///
+    /// A rate needs a duration, and the duration is a fact about the traffic —
+    /// not about the window somebody asked for. A relay that came up two minutes
+    /// ago has two minutes of data; dividing that by a thirty-day window invents
+    /// a figure out of nothing, which is worse than showing none. The live day is
+    /// measured to the minute; a day already folded is measured from its first
+    /// minute, so the error there is at most a day, on a span already counted in
+    /// days. `None` when nothing in the window carried traffic.
+    pub async fn covered_span(
+        &self,
+        services: &[i32],
+        from: i64,
+        to: i64,
+    ) -> Result<Option<(i64, i64)>, StoreError> {
+        if services.is_empty() {
+            return Ok(None);
+        }
+        let per_day = MINUTES_PER_DAY as i64;
+        let mut minutes: Vec<i64> = Vec::new();
+
+        // Folded days, at day resolution.
+        let placeholders = vec!["?"; services.len()].join(", ");
+        let mut values: Vec<Value> = vec![
+            Value::from(from.div_euclid(per_day * 60)),
+            Value::from(to.div_euclid(per_day * 60)),
+        ];
+        values.extend(services.iter().map(|service| Value::from(*service)));
+        let sql = format!(
+            "SELECT MIN(day), MAX(day) FROM usage_daily WHERE day BETWEEN ? AND ? \
+             AND service_id IN ({placeholders}) \
+             AND (bytes_in + bytes_out + tunnel_in + tunnel_out + requests) > 0"
+        );
+        let backend = self.db.get_database_backend();
+        if let Some(row) = self
+            .db
+            .query_one_raw(Statement::from_sql_and_values(backend, sql, values))
+            .await?
+        {
+            let earliest: Option<i64> = row.try_get_by_index(0)?;
+            let latest: Option<i64> = row.try_get_by_index(1)?;
+            if let (Some(earliest), Some(latest)) = (earliest, latest) {
+                minutes.push(earliest * per_day);
+                minutes.push((latest + 1) * per_day - 1);
+            }
+        }
+
+        // The live day, to the minute: this is the end that matters when the
+        // relay has only just come up.
+        let mut days: Vec<i64> = self
+            .live_days(services)
+            .await?
+            .into_iter()
+            .map(|(_, day)| day)
+            .filter(|day| day * per_day * 60 <= to && (day + 1) * per_day * 60 > from)
+            .collect();
+        days.sort_unstable();
+        days.dedup();
+        for day in days {
+            for values in self
+                .read_day_slots_of(services, day, &[Slots::BytesIn])
+                .await?
+                .into_values()
+            {
+                if let Some(index) = values.iter().position(|value| *value > 0) {
+                    minutes.push(day * per_day + index as i64);
+                }
+                if let Some(index) = values.iter().rposition(|value| *value > 0) {
+                    minutes.push(day * per_day + index as i64);
+                }
+            }
+        }
+
+        Ok(minutes
+            .iter()
+            .min()
+            .copied()
+            .zip(minutes.iter().max().copied()))
+    }
+
     /// Every `(service_id, day)` that currently has a live row, for `services`,
     /// in `(service, day)` order.
     ///

@@ -22,8 +22,15 @@ export interface OverviewStats {
 	machines: MachineCounts;
 	tunnels: TunnelCounts;
 	usage_30d: Usage30d;
-	/** The window the usage figures cover, in days. */
+	/** The window the usage figures sum over, in days. */
 	window_days: number;
+	/**
+	 * How many seconds of that window actually carried traffic. A rate divides by
+	 * this and never by the nominal window: a relay that came up two minutes ago
+	 * has two minutes of data, not thirty days, and a "rate" computed from the
+	 * window alone is an invention.
+	 */
+	covered_seconds: number;
 }
 
 /** `GET /api/account/overview` — the signed-in account's rollup. */

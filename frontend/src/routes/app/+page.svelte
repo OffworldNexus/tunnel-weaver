@@ -65,10 +65,23 @@
 				] satisfies BarGroup[])
 	);
 
-	/** The reporting window and its totals travel together, or not at all. */
+	/** The reporting window, its totals, and the span they actually cover. */
 	const traffic = $derived(
-		stats === null ? null : { days: stats.window_days, usage: stats.usage_30d }
+		stats === null
+			? null
+			: { days: stats.window_days, usage: stats.usage_30d, covered: stats.covered_seconds }
 	);
+
+	/**
+	 * The span the figures cover, said plainly. A daily average is only honest
+	 * once there is a day of traffic behind it; below that the span itself is the
+	 * truthful thing to show.
+	 */
+	function span(seconds: number): string {
+		if (seconds < 3600) {return `${Math.max(1, Math.round(seconds / 60))} min`;}
+		if (seconds < 86_400) {return `${Math.round(seconds / 3600)} h`;}
+		return `${Math.round(seconds / 86_400)} days`;
+	}
 
 	onMount(async () => {
 		const [overview, page] = await Promise.all([getOverview(), listMachines({ perPage: ROWS })]);
@@ -115,7 +128,11 @@
 					<dt>Requests</dt>
 					<dd class="mono">{count(traffic.usage.requests)}</dd>
 					<span class="counters__sub">
-						{count(Math.round(traffic.usage.requests / traffic.days))} per day
+						{#if traffic.covered >= 86_400}
+							{count(Math.round(traffic.usage.requests / (traffic.covered / 86_400)))} per day
+						{:else}
+							over {span(traffic.covered)}
+						{/if}
 					</span>
 				</div>
 			</dl>
