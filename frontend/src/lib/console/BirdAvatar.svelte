@@ -15,7 +15,9 @@
 		display: block;
 		flex: none;
 		border-radius: 999px;
-		border: 1.5px solid var(--tw-border);
+		// Heavier than the 1.5px the flat initials chip used: the bird artwork is
+		// saturated and busy, so the same hairline reads thinner against it.
+		border: 2px solid var(--tw-border);
 		background: var(--tw-well);
 	}
 </style>
