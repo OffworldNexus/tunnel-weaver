@@ -11,6 +11,18 @@ import { pairingOutcome, pairingUrl, seedPairing } from '../support/harness.js';
 
 const SLUG = /^[a-z0-9]{1,15}$/;
 
+/**
+ * The relay's canonical `p256:<hex>` key, rendered the way the console shows it:
+ * hex grouped in fours for reading aloud. Mirrors `#lib/app/fingerprint`.
+ */
+function groupedFingerprint(key) {
+  const colon = key.indexOf(':');
+  if (colon < 0) return key;
+  const algorithm = key.slice(0, colon);
+  const hex = key.slice(colon + 1).toLowerCase();
+  return `${algorithm}:${hex.match(/.{1,4}/g)?.join(' ') ?? hex}`;
+}
+
 async function openPairingLink(world) {
   await world.page.goto(await pairingUrl(world.pairing.handle));
 }
@@ -35,7 +47,7 @@ Given('the machine {string} is paired', async function (machine) {
   this.paired[machine] = await expectApproved(this);
   // Leave the pair page, so the next link is a real load.
   await this.page.getByRole('link', { name: 'Go to your account', exact: true }).click();
-  await assert.seeHeading(this.page, 'Your account');
+  await assert.seeHeading(this.page, 'Overview');
 });
 
 Given('{string} lost its key and asks to pair again', async function (machine) {
@@ -79,7 +91,7 @@ Then('the confirmation names {string} with nothing to edit', async function (mac
 });
 
 Then('the pairing key fingerprint is shown', async function () {
-  await assert.seeText(this.page, this.pairing.fingerprint, { exact: true });
+  await assert.seeText(this.page, groupedFingerprint(this.pairing.fingerprint), { exact: true });
 });
 
 Then('the address bar carries no pairing handle', async function () {

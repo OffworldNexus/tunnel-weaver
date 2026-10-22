@@ -651,6 +651,7 @@ mod tests {
             acme_root_ca_pem: None,
             acme_fallback_providers: Vec::new(),
             usage_flush_interval_secs: 60,
+            usage_retention_secs: 31_536_000,
             relay_ips,
             setup_complete: false,
             email: None,

@@ -1,9 +1,40 @@
 // Design tokens — the canonical brand palette and font stacks.
 //
-// Light is the base; dark overrides it wholesale under the OS preference. Every
-// component reads these custom properties, so no colour or font is duplicated
-// downstream. Native stacks only (no downloads), so a broken tunnel still
-// renders.
+// Light is the base. Dark is a mixin applied either when the OS prefers it (and
+// the person has not forced light) or when the console's theme toggle has set
+// `data-theme="dark"`; a forced `data-theme="light"` suppresses the OS
+// preference. Every component reads these custom properties, so no colour or
+// font is duplicated downstream. Native stacks only (no downloads), so a broken
+// tunnel still renders.
+
+@mixin tw-dark {
+	color-scheme: dark;
+
+	--tw-deck: #201a16;
+	--tw-well: #0b0604;
+	--tw-text: #fefaf3;
+	--tw-muted: #cdc6bf;
+	--tw-accent: #ffcf2e;
+	--tw-success: #cfd9a0;
+	--tw-danger: #ffb8af;
+	// confirm colours stay the same in both themes
+	--tw-key-pedestal: #0b0604;
+	--tw-raised: #171310;
+	--tw-line-soft: #3a332d;
+	--tw-line-hair: #2a241f;
+	--tw-shadow: 0 10px 30px rgb(0 0 0 / 0.45);
+	--tw-online: #cfd9a0;
+	--tw-idle: #f0b862;
+	--tw-offline: #9a928b;
+	--tw-info: #8fc7e0;
+	--tw-warn: #f0b862;
+	--tw-c1: #ffb066;
+	--tw-c2: #cfd9a0;
+	--tw-c3: #8fc7e0;
+	--tw-c4: #e8a3c4;
+	--tw-c5: #f0b862;
+	--tw-c6: #b9b3ad;
+}
 
 :root {
 	color-scheme: light dark;
@@ -31,6 +62,25 @@
 	--tw-focus: #ba480d;
 	--tw-radius: 3px;
 
+	// Console surfaces and presence states (the machines list reads these).
+	--tw-raised: #f4efe6;
+	--tw-line-soft: #cdc4ba;
+	--tw-line-hair: #ded6cc;
+	--tw-shadow: 0 10px 30px rgb(11 6 4 / 0.1);
+	--tw-online: #4d5818;
+	--tw-idle: #8a5a12;
+	--tw-offline: #7a716a;
+	--tw-info: #2a5c74;
+	--tw-warn: #8a5a12;
+
+	// Chart ramp (the machines/tunnels bars).
+	--tw-c1: #b0611f;
+	--tw-c2: #5f7326;
+	--tw-c3: #2a5c74;
+	--tw-c4: #8a3a63;
+	--tw-c5: #8a5a12;
+	--tw-c6: #55606b;
+
 	// Exact stacks from https://modernfontstacks.com/: Neo-Grotesque for
 	// interface text, Geometric Humanist for headings, Monospace Code for
 	// technical values.
@@ -41,15 +91,11 @@
 }
 
 @media (prefers-color-scheme: dark) {
-	:root {
-		--tw-deck: #201a16;
-		--tw-well: #0b0604;
-		--tw-text: #fefaf3;
-		--tw-muted: #cdc6bf;
-		--tw-accent: #ffcf2e;
-		--tw-success: #cfd9a0;
-		--tw-danger: #ffb8af;
-		// confirm colours stay the same in both themes
-		--tw-key-pedestal: #0b0604;
+	:root:not([data-theme='light']) {
+		@include tw-dark;
 	}
+}
+
+:root[data-theme='dark'] {
+	@include tw-dark;
 }

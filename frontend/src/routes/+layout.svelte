@@ -1,8 +1,16 @@
 <script lang="ts">
 	import '../styles/global.scss';
 
-	import { ensureConfig } from '#lib/account/config';
+	import type { Snippet } from 'svelte';
+
+	import { ensureConfig } from '#lib/account/config.svelte';
 	import Toaster from '#lib/ui/Toaster.svelte';
+
+	interface Props {
+		children: Snippet;
+	}
+
+	let { children }: Props = $props();
 
 	// Warm the constants; the pages that need them report a failure themselves.
 	ensureConfig().catch(() => {});
@@ -11,7 +19,7 @@
 <a class="skip-link" href="#main">Skip to content</a>
 <Toaster />
 
-<slot />
+{@render children()}
 
 <style lang="scss">
 	.skip-link {

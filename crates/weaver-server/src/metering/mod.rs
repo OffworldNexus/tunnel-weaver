@@ -6,15 +6,14 @@
 //! * the **first layer**, an in-memory `(service_id, minute)` aggregation of
 //!   traffic counters and registered open time;
 //! * the **flush job**, a 1 s ticker that accrues open time and periodically
-//!   writes *complete* minutes to the [`Store`]; the in-flight minute is never
-//!   written, so a persisted row is always a full nominal minute and its
-//!   `unused_ms` is zero unless the service was genuinely absent mid-minute
-//!   (storage stays "mostly zeroes"). On shutdown the in-flight minute is
-//!   simply dropped;
-//! * the **persistence surface**, the only caller of the store's usage
-//!   upsert/query (so the store's inversion of `unused_ms` never leaks).
+//!   writes *complete* minutes to the [`Store`] as in-place slot arrays (one
+//!   [`SlotWrite`] per service and metric, covering consecutive minutes); the
+//!   in-flight minute is never written, so a persisted slot is always a full
+//!   nominal minute. On shutdown the in-flight minute is simply dropped;
+//! * the **persistence surface**, the only caller of the store's slot writes
+//!   and of its usage query.
 //!
-//! [`query`](MeteringManager::query) blends the persisted rows with the
+//! [`query`](MeteringManager::query) blends the persisted arrays with the
 //! unflushed in-memory buckets, so the current minute is still visible to
 //! callers even though it is never written.
 //!
@@ -44,7 +43,7 @@
 //!   elapsed for each registered service, splitting at minute boundaries and
 //!   clamping each bucket's `open_ms` to `0..=60_000`.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 #[cfg(test)]
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -55,14 +54,19 @@ use tokio_util::sync::CancellationToken;
 use tracing::warn;
 use weaver_mux::{StreamBytesSink, StreamId};
 
+use crate::metrics::MetricsStore;
 use crate::store::Store;
 use crate::store::StoreError;
-use crate::store::usage::UsageRow;
+use crate::store::usage_live::{SlotWrite, Slots};
 
 pub use crate::store::usage::UsageTotal;
 
 /// Length of a metering minute, in milliseconds.
 const MINUTE_MS: i64 = 60_000;
+
+/// Minutes in a metering day. A slot run never crosses one, because a day is a
+/// separate row of the array.
+const MINUTES_PER_DAY: i64 = 24 * 60;
 
 /// How often the manager accrues open time and checks for a flush.
 const TICK: Duration = Duration::from_secs(1);
@@ -136,28 +140,46 @@ impl Clock {
     }
 }
 
+/// How long the day rollup is kept. The default is one year.
+const DEFAULT_RETENTION: Duration = Duration::from_secs(31_536_000);
+
 /// Owns traffic metering and its periodic persistence.
 ///
 /// Cheap to share behind an `Arc`: every observation method takes `&self`.
 pub struct MeteringManager {
     store: Store,
     flush_interval: Duration,
+    /// How long `usage_daily` rows are kept, swept from the flush tick.
+    retention: Duration,
     /// The wall clock. Injected so a test can hold the minute still.
     clock: Clock,
     inner: Mutex<Inner>,
 }
 
 impl MeteringManager {
-    /// Creates a manager that flushes every `flush_interval`.
+    /// Creates a manager that flushes every `flush_interval`, keeping a year of
+    /// folded days.
     pub fn new(store: Store, flush_interval: Duration) -> Self {
-        Self::with_clock(store, flush_interval, Clock::System)
+        Self::with_retention(store, flush_interval, DEFAULT_RETENTION)
+    }
+
+    /// Creates a manager that flushes every `flush_interval` and keeps folded
+    /// days for `retention`.
+    pub fn with_retention(store: Store, flush_interval: Duration, retention: Duration) -> Self {
+        Self::with_clock(store, flush_interval, Clock::System, retention)
     }
 
     /// Creates a manager reading time from `clock`.
-    fn with_clock(store: Store, flush_interval: Duration, clock: Clock) -> Self {
+    fn with_clock(
+        store: Store,
+        flush_interval: Duration,
+        clock: Clock,
+        retention: Duration,
+    ) -> Self {
         Self {
             store,
             flush_interval,
+            retention,
             clock,
             inner: Mutex::new(Inner::default()),
         }
@@ -331,15 +353,43 @@ impl MeteringManager {
         out
     }
 
-    /// Flushes every **complete** in-memory bucket to the store.
+    /// Flushes every **complete** in-memory bucket to the store, as in-place
+    /// slot writes.
     ///
-    /// The in-flight minute is deliberately never written: a persisted row
-    /// must be a full nominal minute, so `unused_ms` is zero in the common
-    /// case and the storage stays "mostly zeroes". The current minute remains
-    /// visible to [`query`](Self::query) from memory. Used by the periodic
-    /// ticker and at shutdown.
+    /// The in-flight minute is deliberately never written: a persisted slot is
+    /// always a full nominal minute, so the live day's arrays stay "mostly
+    /// zeroes". The current minute remains visible to [`query`](Self::query)
+    /// from memory.
+    ///
+    /// This is minutes only — it never folds or sweeps. Those are the metering
+    /// ticker's job ([`maintain`](Self::maintain), called from [`run`](Self::run)):
+    /// a caller that just wants the live arrays current (every unit test, the
+    /// shutdown path in a test) must not pay for a day of zstd compression.
     pub async fn flush(&self) -> Result<(), StoreError> {
         self.flush_at(self.clock.now_ms()).await
+    }
+
+    /// Folds finished days into the wide rollup and sweeps rows past retention.
+    ///
+    /// This is the flush's second half, run **only from the ticker loop**
+    /// ([`run`](Self::run)) right after the minute flush, so the day that just
+    /// ended is folded with its last minute already written. It is deliberately
+    /// not called from [`flush`](Self::flush) or
+    /// [`flush_at`](Self::flush_at): compression and the retention sweep belong
+    /// to the daemon's cadence, not to a test's explicit flush. A failure is
+    /// logged and retried on the next tick, because neither the relay's traffic
+    /// nor its console should go down over a metrics hiccup.
+    async fn maintain(&self) {
+        let metrics = MetricsStore::new(self.store.clone());
+        match metrics.fold_finished_days().await {
+            Ok(0) => {}
+            Ok(days) => tracing::debug!(days, "folded finished usage days"),
+            Err(e) => warn!(error = %e, "Usage day fold failed"),
+        }
+        let retention = self.retention.as_secs().min(i64::MAX as u64) as i64;
+        if let Err(e) = metrics.sweep(retention).await {
+            warn!(error = %e, "Usage rollup sweep failed");
+        }
     }
 
     /// Spawns the flush job, returning its handle.
@@ -436,20 +486,8 @@ impl MeteringManager {
         if drained.is_empty() {
             return Ok(());
         }
-        let rows: Vec<UsageRow> = drained
-            .iter()
-            .map(|((service_id, minute), b)| UsageRow {
-                service_id: *service_id,
-                minute: *minute,
-                bytes_in: b.bytes_in as i64,
-                bytes_out: b.bytes_out as i64,
-                tunnel_in: b.tunnel_in as i64,
-                tunnel_out: b.tunnel_out as i64,
-                requests: b.requests as i64,
-                open_ms: b.open_ms as i64,
-            })
-            .collect();
-        if let Err(e) = self.store.upsert_usage_batch(&rows).await {
+        let writes = slot_writes(&drained);
+        if let Err(e) = self.store.write_day_slots(&writes).await {
             // The transaction rolled back; put the buckets back so a later
             // flush retries them instead of losing the data.
             let mut inner = self.lock();
@@ -486,6 +524,7 @@ impl MeteringManager {
                         if let Err(e) = self.flush_at(now_ms).await {
                             warn!(error = %e, "Usage flush failed");
                         }
+                        self.maintain().await;
                     }
                 }
             }
@@ -495,6 +534,7 @@ impl MeteringManager {
         if let Err(e) = self.flush_at(now_ms).await {
             warn!(error = %e, "Final usage flush failed");
         }
+        self.maintain().await;
     }
 }
 
@@ -515,6 +555,73 @@ impl StreamBytesSink for ManagerSink {
 /// The minute number (since the Unix epoch) containing `now_ms`.
 fn minute_of(now_ms: i64) -> i64 {
     now_ms.div_euclid(MINUTE_MS)
+}
+
+/// Turns drained buckets into absolute in-place slot writes.
+///
+/// One write per (service, metric) and per **run of consecutive minutes inside
+/// one day**. A slot write covers a contiguous range of slots, so a gap would
+/// overwrite slots this flush knows nothing about; splitting at a gap (and at
+/// midnight, so a run never crosses a day) confines every write to minutes just
+/// drained. In steady state a flush drains the one minute since the last tick,
+/// so this is one single-slot write per metric per service.
+fn slot_writes(drained: &[((i32, i64), Bucket)]) -> Vec<SlotWrite> {
+    let mut by_service: BTreeMap<i32, Vec<i64>> = BTreeMap::new();
+    let mut buckets: HashMap<(i32, i64), Bucket> = HashMap::with_capacity(drained.len());
+    for (key, bucket) in drained {
+        by_service.entry(key.0).or_default().push(key.1);
+        buckets.insert(*key, *bucket);
+    }
+
+    let mut writes = Vec::new();
+    for (service_id, mut minutes) in by_service {
+        minutes.sort_unstable();
+        minutes.dedup();
+        let mut start = 0;
+        while start < minutes.len() {
+            let day = minutes[start].div_euclid(MINUTES_PER_DAY);
+            let mut end = start + 1;
+            while end < minutes.len()
+                && minutes[end] == minutes[end - 1] + 1
+                && minutes[end].div_euclid(MINUTES_PER_DAY) == day
+            {
+                end += 1;
+            }
+            let run = &minutes[start..end];
+            let first_slot = (run[0] - day * MINUTES_PER_DAY) as u16;
+            for slots in Slots::ALL {
+                let values = run
+                    .iter()
+                    .map(|minute| slot_value(&buckets[&(service_id, *minute)], slots))
+                    .collect();
+                writes.push(SlotWrite {
+                    service_id,
+                    day,
+                    slots,
+                    first_slot,
+                    values,
+                });
+            }
+            start = end;
+        }
+    }
+    writes
+}
+
+/// One metric of one bucket as a slot stores it.
+///
+/// `open_ms` stores open time directly — the old `60_000 - open_ms` inversion
+/// existed only to make a full minute the zero value of a per-minute table, and
+/// there is no such table any more.
+fn slot_value(bucket: &Bucket, slot: Slots) -> i64 {
+    match slot {
+        Slots::BytesIn => bucket.bytes_in as i64,
+        Slots::BytesOut => bucket.bytes_out as i64,
+        Slots::TunnelIn => bucket.tunnel_in as i64,
+        Slots::TunnelOut => bucket.tunnel_out as i64,
+        Slots::Requests => bucket.requests as i64,
+        Slots::OpenMs => bucket.open_ms as i64,
+    }
 }
 
 /// Adds `[accounted_ms, now_ms)` to `service_id`'s buckets, splitting at minute
@@ -570,7 +677,14 @@ mod tests {
             .await
             .expect("service");
         (
-            MeteringManager::with_clock(store.clone(), Duration::from_secs(60), clock),
+            MeteringManager::with_clock(
+                store.clone(),
+                Duration::from_secs(60),
+                clock,
+                // Long enough that day 0 (1970) survives the sweep, so a test
+                // can fold and inspect it.
+                Duration::from_secs(200 * 365 * 86_400),
+            ),
             svc.id,
             store,
         )
@@ -586,6 +700,70 @@ mod tests {
             .query(None, None, from_minute * 60, until_minute * 60)
             .await
             .expect("query")
+    }
+
+    /// The console reads the day rollup, so the ticker's second half folds
+    /// finished days into one wide row per service and deletes the minutes it
+    /// folded. That second half is not [`MeteringManager::flush`]: the fold runs
+    /// from the ticker loop, so an explicit flush never compresses.
+    #[tokio::test]
+    async fn the_tick_folds_finished_days_into_the_wide_rollup() {
+        use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+
+        let (meter, svc, store) = manager_with_store().await;
+        let base = 100 * MINUTE_MS;
+
+        // Minute 100 has bytes and is half open; minute 101 has a request.
+        meter.register_service_at(svc, base);
+        meter.visitor_service_bytes_at(svc, base + 1_000, 11, 22);
+        meter.unregister_service_at(svc, base + 30_000);
+        meter.record_request_at(svc, base + MINUTE_MS + 1_000);
+        meter.flush_at(base + 2 * MINUTE_MS).await.expect("flush");
+        let before = store
+            .query_usage(None, None, 100, 102)
+            .await
+            .expect("minutes before the fold");
+        assert_eq!(before.len(), 1, "one row per service");
+        assert_eq!(
+            before[0].covered_minutes, 2,
+            "both minutes are still stored"
+        );
+
+        // The ticker's second half folds the finished day, then deletes its
+        // minutes — all in one transaction per day.
+        crate::metrics::MetricsStore::new(store.clone())
+            .fold_finished_days()
+            .await
+            .expect("fold");
+        assert!(
+            store
+                .query_usage(None, None, 100, 102)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a folded day's minutes are deleted"
+        );
+
+        let row = crate::store::entity::usage_daily::Entity::find()
+            .filter(crate::store::entity::usage_daily::Column::ServiceId.eq(svc))
+            .filter(crate::store::entity::usage_daily::Column::Day.eq(0))
+            .one(store.db())
+            .await
+            .unwrap()
+            .expect("one wide row for the service-day");
+        assert_eq!(row.bytes_in, 11, "the day total");
+        assert_eq!(row.bytes_out, 22);
+        assert_eq!(row.requests, 1);
+        assert_eq!(row.open_ms, 30_000, "half-open minute 100");
+
+        let minutes = crate::metrics::decode_blob(&row.bytes_in_minutes).unwrap();
+        assert_eq!(minutes.len(), 1440, "1440 little-endian i64 per day");
+        assert_eq!(minutes[100], 11, "minute 100's bytes_in");
+        let hours = crate::metrics::decode_blob(&row.bytes_in_hours).unwrap();
+        assert_eq!(hours.len(), 24, "24 hourly values per day");
+        assert_eq!(hours[1], 11, "minute 100 folds into hour 1");
+        let open = crate::metrics::decode_blob(&row.open_ms_minutes).unwrap();
+        assert_eq!(open[100], 30_000, "minute 100's open time");
     }
 
     #[tokio::test]

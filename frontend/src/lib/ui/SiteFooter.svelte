@@ -1,5 +1,7 @@
 <script lang="ts">
-	import { config } from '#lib/account/config';
+	import { config } from '#lib/account/config.svelte';
+
+	const support = $derived(config.value?.support_email);
 </script>
 
 <footer class="site-footer">
@@ -7,8 +9,8 @@
 		<span class="site-footer__word">Tunnel Weaver</span>
 		<span class="site-footer__tagline">Small bird. Strong connections.</span>
 	</p>
-	{#if $config?.support_email}
-		<a class="site-footer__contact" href={`mailto:${$config.support_email}`}>Contact</a>
+	{#if support}
+		<a class="site-footer__contact" href={`mailto:${support}`}>Contact</a>
 	{/if}
 </footer>
 

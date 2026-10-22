@@ -29,6 +29,7 @@ fn create_valid_test_config(
         acme_root_ca_pem: None,
         acme_fallback_providers: Vec::new(),
         usage_flush_interval_secs: 60,
+        usage_retention_secs: 31_536_000,
         relay_ips: Vec::new(),
         setup_complete: false,
         email: None,
@@ -304,7 +305,8 @@ async fn test_control_socket_daemon_suite() {
         assert_eq!(val["ok"], true);
         assert_eq!(val["tunnel_domain"], "weaver.test");
         assert_eq!(val["admin_domain"], "relay-admin.test");
-        assert_eq!(val["schema_version"], 1);
+        // Two migrations: `m0001_init` and `m0002_usage_daily`.
+        assert_eq!(val["schema_version"], 2);
         // The seeded tunnel wildcard reports issued; the admin certificate has
         // no stored row and is still pending, so it counts as ordering.
         assert_eq!(val["cert_counts"]["issued"], 1);
@@ -627,6 +629,7 @@ async fn test_cert_wait_streaming_failed_exit_4_and_renew_rate_limit() {
         acme_root_ca_pem: None,
         acme_fallback_providers: Vec::new(),
         usage_flush_interval_secs: 60,
+        usage_retention_secs: 31_536_000,
         relay_ips: Vec::new(),
         setup_complete: false,
         email: None,

@@ -1,19 +1,26 @@
 <script lang="ts">
+	import type { Snippet } from 'svelte';
+
 	/** A landing section shell: heading, lede and the card list that follows. */
-	export let id: string;
-	export let title: string;
-	export let lede: string;
-	/** `<ol>` for an ordered walkthrough, `<ul>` for a set. */
-	export let listTag: 'ol' | 'ul' = 'ul';
-	/** Minimum card width before the grid wraps. */
-	export let cardsMin = '240px';
+	interface Props {
+		id: string;
+		title: string;
+		lede: string;
+		/** `<ol>` for an ordered walkthrough, `<ul>` for a set. */
+		listTag?: 'ol' | 'ul';
+		/** Minimum card width before the grid wraps. */
+		cardsMin?: string;
+		children?: Snippet;
+	}
+
+	let { id, title, lede, listTag = 'ul', cardsMin = '240px', children }: Props = $props();
 </script>
 
 <section class="section" aria-labelledby={id}>
 	<h2 {id} class="section-title">{title}</h2>
 	<p class="section-lede">{lede}</p>
 	<svelte:element this={listTag} class="cards" style={`--cards-min:${cardsMin}`}>
-		<slot />
+		{@render children?.()}
 	</svelte:element>
 </section>
 

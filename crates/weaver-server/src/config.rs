@@ -70,6 +70,14 @@ pub struct Config {
     /// Defaults to 60.
     #[serde(default = "default_usage_flush_interval")]
     pub usage_flush_interval_secs: u64,
+    /// How long the day rollup (`usage_daily`) is kept, in seconds. Defaults to
+    /// one year.
+    ///
+    /// The minute table is not swept by age — the metering tick folds a
+    /// finished day's minutes into `usage_daily` and deletes them in the same
+    /// transaction — so this is the retention of the console's whole history.
+    #[serde(default = "default_usage_retention")]
+    pub usage_retention_secs: u64,
     /// The relay's own public IPv4/IPv6 addresses.
     ///
     /// Auto-filled at `setup` from the apex `A`/`AAAA` records it resolves,
@@ -629,6 +637,13 @@ fn validate_abuse_config(abuse: &AbuseConfig) -> Vec<String> {
 /// Default usage flush interval, in seconds.
 fn default_usage_flush_interval() -> u64 {
     60
+}
+
+/// The usage rollup's default retention: one year, the console's whole history.
+/// What an existing config predating the key, or a caller with nothing to
+/// preserve, should use.
+pub fn default_usage_retention() -> u64 {
+    31_536_000
 }
 
 /// Checks the admin/tunnel domain split and returns a reason when it is unsafe.

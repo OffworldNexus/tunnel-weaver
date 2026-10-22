@@ -1,2 +1,2 @@
 /** The public source repository. */
-export const REPO_URL = 'https://github.com/OffworldNexus/tunnel-weaver';
+export { REPO_URL } from '#lib/app/links';

@@ -7,22 +7,25 @@
 
 /// A rectangle with the brand's 45° cut on the top-right corner.
 @mixin cut-corner($cut: 10px) {
-	clip-path: polygon(0 0, calc(100% - #{$cut}) 0, 100% #{$cut}, 100% 100%, 0 100%);
+	clip-path: polygon(0 0, calc(100% - (#{$cut})) 0, 100% calc(#{$cut}), 100% 100%, 0 100%);
 }
 
 /// The tightened cut of an inset fill: the diagonal is pulled in from the outer
 /// edge by `$inset`, so its edge sits the same distance from the outline as the
 /// straight sides (for the 1.5px border the surfaces use, ≈ border × (2 − √2)).
 @mixin cut-inset($cut: 10px, $inset: 0.88px) {
-	@include cut-corner($cut - $inset);
+	@include cut-corner(calc(#{$cut} - #{$inset}));
 }
 
 /// A reusable cut-corner surface: an edge layer (`::before`) plus an inset fill
 /// layer (`::after`). Both follow the diagonal, so the border is visible along
-/// the cut as well as the straight edges.
+/// the cut as well as the straight edges. The surface itself is clipped to the
+/// outer cut so flush children (table headers, toolbars, banners) cannot bleed
+/// into the missing corner.
 @mixin cut-panel($cut: 16px, $fill: var(--tw-well), $edge: var(--tw-border), $border: 1.5px) {
 	position: relative;
 	isolation: isolate;
+	@include cut-corner($cut);
 
 	&::before,
 	&::after {

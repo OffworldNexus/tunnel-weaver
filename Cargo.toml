@@ -41,6 +41,11 @@ proptest = { version = "1.11", default-features = false, features = ["std"] }
 sea-orm = { version = "2.0", default-features = false, features = ["sqlx-sqlite", "runtime-tokio-rustls", "macros", "with-json"] }
 sea-orm-migration = { version = "2.0", default-features = false, features = ["sqlx-sqlite", "runtime-tokio-rustls"] }
 sqlx = { version = "0.9", default-features = false, features = ["sqlite-bundled"] }
+# The raw FFI handle `SqliteConnection::lock_handle()` exposes is the
+# `sqlite3` type of `libsqlite3-sys`, and sqlx does not re-export it. The pin
+# must stay inside sqlx-sqlite's own `>=0.30.1, <0.38.0` range so both crates
+# resolve to one `libsqlite3-sys` and one `sqlite3` type.
+libsqlite3-sys = "0.37"
 tokio = { version = "1.43", features = ["sync", "rt", "fs", "macros", "net", "time", "signal", "rt-multi-thread", "io-util"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 sha2 = { version = "0.11", default-features = false }

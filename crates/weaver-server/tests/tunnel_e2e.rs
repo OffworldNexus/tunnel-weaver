@@ -326,6 +326,7 @@ async fn spawn_test_relay(tunnel_domain: &str) -> TestRelay {
         acme_root_ca_pem: None,
         acme_fallback_providers: Vec::new(),
         usage_flush_interval_secs: 60,
+        usage_retention_secs: 31_536_000,
         relay_ips: Vec::new(),
         setup_complete: false,
         email: None,
@@ -775,6 +776,45 @@ async fn test_duplicate_registration_refusal() {
         weaver_proto::ControlHead::register("-invalid-"),
         Err(RefusalCode::InvalidName)
     );
+
+    relay.shutdown_token.cancel();
+}
+
+/// A web-side close signals the live connection with the given code; a
+/// superseding registration signals the old one with `Superseded`.
+#[tokio::test]
+async fn test_close_connection_signals_the_live_connection() {
+    let relay = spawn_test_relay("weaver.test").await;
+    let key = client_key();
+
+    let (close_tx, close_rx) = tokio::sync::oneshot::channel();
+    let conn_id = relay.registry.register_connection(key, close_tx);
+    assert!(relay.registry.is_connected(&key));
+
+    // A web-side disconnect names the code; the connection sees it.
+    assert!(
+        relay
+            .registry
+            .close_connection(&key, weaver_mux::CloseCode::Rejected)
+    );
+    assert_eq!(
+        close_rx.await.expect("the connection is signalled"),
+        weaver_mux::CloseCode::Rejected
+    );
+    // The channel is spent: a second close has nothing left to signal.
+    assert!(
+        !relay
+            .registry
+            .close_connection(&key, weaver_mux::CloseCode::Rejected)
+    );
+    assert!(
+        !relay
+            .registry
+            .close_connection(&client_key(), weaver_mux::CloseCode::KeyRevoked)
+    );
+
+    relay.registry.unregister_connection(key, conn_id);
+    assert!(!relay.registry.is_connected(&key));
 
     relay.shutdown_token.cancel();
 }
@@ -2166,6 +2206,7 @@ async fn test_client_leaving_during_cert_issuance_does_not_leave_hostname_active
         acme_root_ca_pem: None,
         acme_fallback_providers: Vec::new(),
         usage_flush_interval_secs: 60,
+        usage_retention_secs: 31_536_000,
         relay_ips: Vec::new(),
         setup_complete: false,
         email: None,

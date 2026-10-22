@@ -1,66 +1,46 @@
 <script lang="ts">
-	import { me } from '#lib/app/me';
+	/** Security overview: what the account signs in with. */
+	import { me } from '#lib/app/me.svelte';
+	import { setMeta } from '#lib/console/meta.svelte';
+	import Icon from '#lib/ui/Icon.svelte';
 	import Keycap from '#lib/ui/Keycap.svelte';
+	import Panel from '#lib/ui/Panel.svelte';
 	import { resolve } from '$app/paths';
+
+	setMeta({
+		title: 'Security',
+		subtitle: 'Choose how you sign in. Protect your account.',
+		crumbs: [{ label: 'Security' }]
+	});
 </script>
 
-<svelte:head>
-	<title>Security · Tunnel Weaver</title>
-</svelte:head>
+<Panel
+	title="Password"
+	subtitle="Your password signs you in and authorises changes to the account."
+>
+	{#snippet actions()}
+		<Keycap href={resolve('/app/security/password')} variant="key" size="sm">
+			<Icon name="lock" size={14} /> Change password
+		</Keycap>
+	{/snippet}
 
-<h1 id="app-title">Security</h1>
-<p class="lede">Choose how you sign in. Protect your account.</p>
-
-<section class="panel" aria-labelledby="password-title">
-	<h2 id="password-title">Password</h2>
-	{#if $me?.has_password}
-		<p class="state"><span class="check" aria-hidden="true">✓</span> Password is set</p>
+	{#if me.value?.has_password}
+		<p class="state"><Icon name="check" size={16} /> Password is set</p>
 	{:else}
 		<p class="state">No password is set</p>
 	{/if}
-	<Keycap href={resolve('/app/security/password')} variant="ghost">Change password</Keycap>
-</section>
+</Panel>
 
 <style lang="scss">
-	.lede {
-		margin-top: 16px;
-	}
-
-	.panel {
-		margin-top: 16px;
-		padding: 25px;
-		border: 1.5px solid var(--tw-border);
-		border-radius: var(--tw-radius);
-		background: var(--tw-well);
-	}
-
-	.panel h2 {
-		font-size: 24px;
-		line-height: 32px;
-	}
-
 	.state {
-		margin: 16px 0 0;
+		display: flex;
+		align-items: center;
+		gap: 8px;
+		margin: 0;
 		color: var(--tw-muted);
 	}
 
-	.check {
-		color: var(--tw-success);
-		font-weight: 700;
-	}
-
-	/* A full-width dark "key" keycap rather than the page-surface ghost. */
-	.panel :global(.keycap) {
-		width: 100%;
-		margin-top: 16px;
-		color: var(--tw-on-key);
-	}
-
-	.panel :global(.keycap .keycap__face) {
-		background: var(--tw-key);
-	}
-
-	.panel :global(a.keycap:hover .keycap__face) {
-		background: color-mix(in srgb, var(--tw-on-key) 12%, var(--tw-key));
+	.state :global(svg) {
+		color: var(--tw-online);
 	}
 </style>

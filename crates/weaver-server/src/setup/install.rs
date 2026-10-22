@@ -296,6 +296,9 @@ pub async fn execute_install(
         acme_root_ca_pem: root_ca_pem,
         acme_fallback_providers: Vec::new(),
         usage_flush_interval_secs: 60,
+        // The day rollup's retention: the default the daemon falls back to when
+        // the key is absent from an existing config.
+        usage_retention_secs: 31_536_000,
         // The relay's own public IPs, resolved from the apex during planning.
         // They drive the authoritative DNS answers and the explicit DNS socket
         // bindings; never a wildcard.

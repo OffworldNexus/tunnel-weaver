@@ -108,14 +108,16 @@ async fn setup_with(adjust: impl FnOnce(&mut AccountConfig)) -> Fixture {
     let account = AccountRuntime::with_breach(
         &account_config,
         "admin.test",
-        store,
+        store.clone(),
         altcha,
         Some(mailer),
         Arc::new(NoBreach),
     )
     .unwrap();
+    // The console reads its traffic figures from the metrics store over the
+    // same store the tests seed usage rows into.
     Fixture {
-        router: router(account.clone()),
+        router: router(account.clone(), None),
         account,
         sent,
         guard,
@@ -137,6 +139,7 @@ fn base_config() -> Config {
         acme_root_ca_pem: None,
         acme_fallback_providers: Vec::new(),
         usage_flush_interval_secs: 60,
+        usage_retention_secs: 31_536_000,
         relay_ips: Vec::new(),
         setup_complete: false,
         email: None,
@@ -181,6 +184,11 @@ impl Reply {
                 (key == name).then(|| rest.split(';').next().unwrap_or("").to_string())
             })
     }
+}
+
+/// Lowercase hex of a byte slice, for a SQL `X'…'` blob literal.
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 async fn call(
@@ -1556,6 +1564,23 @@ impl Browser {
         .await
     }
 
+    async fn get(&self, fixture: &Fixture, path: &str) -> Reply {
+        call(
+            &fixture.router,
+            "GET",
+            path,
+            &[(
+                "cookie",
+                format!(
+                    "__Host-weaver_session={}; __Host-weaver_csrf={}",
+                    self.session, self.csrf
+                ),
+            )],
+            None,
+        )
+        .await
+    }
+
     async fn lookup(&self, fixture: &Fixture, handle: &str) -> LookupResponse {
         let reply = self
             .post(
@@ -1972,5 +1997,433 @@ async fn pairing_rejected_in_the_browser_tells_the_cli() {
             .await
             .unwrap()
             .is_none()
+    );
+}
+
+// ----- machines -------------------------------------------------------------
+
+/// Signs in a fresh account and seeds it a person with one machine serving one
+/// hostname, so the machines endpoints have something to answer with. Returns
+/// the signed-in browser, the person id and the machine id.
+async fn machines_fixture(fixture: &Fixture) -> (Browser, i32, i32) {
+    let browser = Browser::new(fixture, "Rémy", "remy@example.com").await;
+    let me = browser.get(fixture, "/api/account/me").await;
+    assert_eq!(me.status, StatusCode::OK, "{:?}", me.body);
+    let account_id = me.body["id"].as_i64().expect("account id") as i32;
+
+    let store = &fixture.account.store;
+    let person = store
+        .create_person(account_id, "remy")
+        .await
+        .expect("person");
+    let machine = store
+        .create_machine(person.id, "laptop", &KeyId::P256([7; 33]))
+        .await
+        .expect("machine");
+    store
+        .register_declared_service(machine.id, "remy-laptop-web.weaver.test", "web")
+        .await
+        .expect("service");
+    (browser, person.id, machine.id)
+}
+
+#[tokio::test]
+async fn machines_list_and_detail_describe_the_persons_machines() {
+    let fixture = setup().await;
+    let (browser, _person, machine_id) = machines_fixture(&fixture).await;
+
+    let list = browser.get(&fixture, "/api/account/machines").await;
+    assert_eq!(list.status, StatusCode::OK, "{:?}", list.body);
+    let machines = list.body["machines"].as_array().expect("machines array");
+    assert_eq!(machines.len(), 1);
+    let machine = &machines[0];
+    assert_eq!(machine["id"].as_i64().unwrap(), machine_id as i64);
+    assert_eq!(machine["name"], "laptop");
+    assert_eq!(machine["online"], false, "no registry means offline");
+    assert_eq!(machine["last_seen_at"], serde_json::Value::Null);
+    assert_eq!(machine["fingerprint"], KeyId::P256([7; 33]).to_string());
+    let services = machine["services"].as_array().expect("services");
+    assert_eq!(services.len(), 1);
+    assert_eq!(services[0]["name"], "web");
+    assert_eq!(
+        services[0]["hostnames"][0], "remy-laptop-web.weaver.test",
+        "the list shows the hostname the relay actually serves"
+    );
+
+    let detail = browser
+        .get(&fixture, &format!("/api/account/machines/{machine_id}"))
+        .await;
+    assert_eq!(detail.status, StatusCode::OK, "{:?}", detail.body);
+    assert_eq!(detail.body["name"], "laptop");
+    assert_eq!(detail.body["fingerprint"], KeyId::P256([7; 33]).to_string());
+}
+
+#[tokio::test]
+async fn machines_are_private_to_their_person() {
+    let fixture = setup().await;
+    let (_owner, _person, machine_id) = machines_fixture(&fixture).await;
+
+    let other = Browser::new(&fixture, "Bob", "bob@example.com").await;
+    // Another account has no person yet, so it sees an empty list.
+    let list = other.get(&fixture, "/api/account/machines").await;
+    assert_eq!(list.status, StatusCode::OK, "{:?}", list.body);
+    assert!(list.body["machines"].as_array().unwrap().is_empty());
+
+    // Asking for someone else's machine is a 404, not a leak.
+    let detail = other
+        .get(&fixture, &format!("/api/account/machines/{machine_id}"))
+        .await;
+    assert_eq!(detail.status, StatusCode::NOT_FOUND, "{:?}", detail.body);
+}
+
+#[tokio::test]
+async fn machines_require_a_session_and_csrf() {
+    let fixture = setup().await;
+    let (browser, _person, machine_id) = machines_fixture(&fixture).await;
+
+    let anonymous = call(&fixture.router, "GET", "/api/account/machines", &[], None).await;
+    assert_eq!(anonymous.status, StatusCode::UNAUTHORIZED);
+
+    // A state change without the CSRF token is refused.
+    let no_csrf = call(
+        &fixture.router,
+        "POST",
+        &format!("/api/account/machines/{machine_id}/rename"),
+        &[(
+            "cookie",
+            format!("__Host-weaver_session={}", browser.session),
+        )],
+        Some(serde_json::json!({ "name": "rig" })),
+    )
+    .await;
+    assert_eq!(no_csrf.status, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn renaming_a_machine_is_validated_and_refused_on_collision() {
+    let fixture = setup().await;
+    let (browser, person, machine_id) = machines_fixture(&fixture).await;
+    fixture
+        .account
+        .store
+        .create_machine(person, "desktop", &KeyId::P256([8; 33]))
+        .await
+        .unwrap();
+
+    // A name this person already uses is a conflict.
+    let collision = browser
+        .post(
+            &fixture,
+            &format!("/api/account/machines/{machine_id}/rename"),
+            serde_json::json!({ "name": "desktop" }),
+        )
+        .await;
+    assert_eq!(
+        collision.status,
+        StatusCode::CONFLICT,
+        "{:?}",
+        collision.body
+    );
+
+    // A name that breaks the label rules is a bad request.
+    let invalid = browser
+        .post(
+            &fixture,
+            &format!("/api/account/machines/{machine_id}/rename"),
+            serde_json::json!({ "name": "Not A Name" }),
+        )
+        .await;
+    assert_eq!(
+        invalid.status,
+        StatusCode::BAD_REQUEST,
+        "{:?}",
+        invalid.body
+    );
+
+    // Neither attempt changed anything.
+    let detail = browser
+        .get(&fixture, &format!("/api/account/machines/{machine_id}"))
+        .await;
+    assert_eq!(detail.body["name"], "laptop");
+}
+
+#[tokio::test]
+async fn renaming_a_machine_moves_its_hostname_at_once() {
+    let fixture = setup().await;
+    let (browser, _person, machine_id) = machines_fixture(&fixture).await;
+
+    let renamed = browser
+        .post(
+            &fixture,
+            &format!("/api/account/machines/{machine_id}/rename"),
+            serde_json::json!({ "name": "Rig" }),
+        )
+        .await;
+    assert_eq!(renamed.status, StatusCode::OK, "{:?}", renamed.body);
+    assert_eq!(renamed.body["ok"], true);
+    assert_eq!(renamed.body["name"], "rig", "names are lowercased");
+
+    // The machine's hostname is re-derived, and the old one stops serving.
+    let detail = browser
+        .get(&fixture, &format!("/api/account/machines/{machine_id}"))
+        .await;
+    assert_eq!(
+        detail.body["services"][0]["hostnames"][0],
+        "remy-rig-web.weaver.test"
+    );
+    assert!(
+        fixture
+            .account
+            .store
+            .get_domain("remy-laptop-web.weaver.test")
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn revoking_a_machine_removes_it_and_frees_its_hostname() {
+    let fixture = setup().await;
+    let (browser, _person, machine_id) = machines_fixture(&fixture).await;
+
+    let revoked = browser
+        .post(
+            &fixture,
+            &format!("/api/account/machines/{machine_id}/revoke"),
+            serde_json::json!({}),
+        )
+        .await;
+    assert_eq!(revoked.status, StatusCode::OK, "{:?}", revoked.body);
+    assert_eq!(revoked.body["ok"], true);
+
+    let list = browser.get(&fixture, "/api/account/machines").await;
+    assert!(list.body["machines"].as_array().unwrap().is_empty());
+    // The domain row survives with no service, so the hostname stops resolving.
+    assert!(
+        fixture
+            .account
+            .store
+            .get_domain("remy-laptop-web.weaver.test")
+            .await
+            .unwrap()
+            .unwrap()
+            .service_id
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn machines_report_their_metered_usage() {
+    use sea_orm::ConnectionTrait as _;
+    use weaver_server::metrics::encode_blob;
+
+    let fixture = setup().await;
+    let (browser, _person, machine_id) = machines_fixture(&fixture).await;
+    let store = &fixture.account.store;
+    let service = store
+        .get_or_create_service(machine_id, "web")
+        .await
+        .unwrap();
+    // One day inside the window, with real bytes and requests. The console reads
+    // the wide day rollup, which the flush maintains; the total columns are all
+    // the traffic figures need. The detail view also reads `open_ms_minutes`
+    // back to report when the machine was last seen, so the presence blobs must
+    // be real frames, not the empty stand-ins the totals alone would tolerate:
+    // an empty `open_ms_minutes` is corrupt and fails the read. One open minute
+    // carrying the day's 60 000 ms keeps the total column and the array in step.
+    let day = (std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        / 86_400) as i64;
+    let mut open_minutes = vec![0_i64; 1440];
+    open_minutes[0] = 60_000;
+    let open_minutes_blob = hex(&encode_blob(&open_minutes));
+    let mut open_hours = vec![0_i64; 24];
+    open_hours[0] = 60_000;
+    let open_hours_blob = hex(&encode_blob(&open_hours));
+    store
+        .db()
+        .execute_unprepared(&format!(
+            "INSERT INTO usage_daily (service_id, day, bytes_in, bytes_in_hours, bytes_in_minutes, \
+                bytes_out, bytes_out_hours, bytes_out_minutes, tunnel_in, tunnel_in_hours, tunnel_in_minutes, \
+                tunnel_out, tunnel_out_hours, tunnel_out_minutes, requests, requests_hours, requests_minutes, \
+                open_ms, open_ms_hours, open_ms_minutes) VALUES \
+             ({}, {}, 500, X'', X'', 1000, X'', X'', 20, X'', X'', 30, X'', X'', 7, X'', X'', 60000, X'{open_hours_blob}', X'{open_minutes_blob}')",
+            service.id, day
+        ))
+        .await
+        .unwrap();
+
+    let detail = browser
+        .get(&fixture, &format!("/api/account/machines/{machine_id}"))
+        .await;
+    assert_eq!(detail.status, StatusCode::OK, "{:?}", detail.body);
+    assert_eq!(detail.body["usage_30d"]["bytes_in"], 500);
+    assert_eq!(detail.body["usage_30d"]["bytes_out"], 1000);
+    assert_eq!(detail.body["usage_30d"]["requests"], 7);
+
+    // The list carries the same figures.
+    let list = browser.get(&fixture, "/api/account/machines").await;
+    assert_eq!(list.body["machines"][0]["usage_30d"]["bytes_out"], 1000);
+}
+
+#[tokio::test]
+async fn metrics_endpoint_returns_a_self_scoped_series() {
+    use sea_orm::ConnectionTrait as _;
+    use weaver_server::metrics::encode_blob;
+
+    let fixture = setup().await;
+    let (browser, _person_id, machine_id) = machines_fixture(&fixture).await;
+    let store = &fixture.account.store;
+    let mine = store
+        .get_or_create_service(machine_id, "web")
+        .await
+        .unwrap();
+
+    // Another person's machine and service, which must never be returned.
+    let other_account = store.create_test_person("mallory").await.unwrap();
+    let other_machine = store
+        .create_machine(
+            other_account.id,
+            "desktop",
+            &weaver_mux::KeyId::P256([9; 33]),
+        )
+        .await
+        .unwrap();
+    let theirs = store
+        .get_or_create_service(other_machine.id, "web")
+        .await
+        .unwrap();
+
+    // A folded day for each service: 500 bytes for mine, 999 for theirs. The
+    // hour grain reads the hourly blob, so put the bytes in hour 0 of it.
+    let day = (std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        / 86_400) as i64;
+    for (service_id, bytes) in [(mine.id, 500_i64), (theirs.id, 999_i64)] {
+        let mut hours = vec![0_i64; 24];
+        hours[0] = bytes;
+        let hours_blob = hex(&encode_blob(&hours));
+        store
+            .db()
+            .execute_unprepared(&format!(
+                "INSERT INTO usage_daily (service_id, day, bytes_in, bytes_in_hours, bytes_in_minutes, \
+                    bytes_out, bytes_out_hours, bytes_out_minutes, tunnel_in, tunnel_in_hours, tunnel_in_minutes, \
+                    tunnel_out, tunnel_out_hours, tunnel_out_minutes, requests, requests_hours, requests_minutes, \
+                    open_ms, open_ms_hours, open_ms_minutes) VALUES \
+                 ({service_id}, {day}, {bytes}, X'{hours_blob}', X'', 0, X'', X'', 0, X'', X'', 0, X'', X'', \
+                  0, X'', X'', 0, X'', X'')"
+            ))
+            .await
+            .unwrap();
+    }
+
+    // Ask for both services: the other person's is dropped, not returned.
+    let from = day * 86_400;
+    let to = (day + 1) * 86_400;
+    let reply = browser
+        .get(
+            &fixture,
+            &format!(
+                "/api/account/metrics?services={},{}&metrics=bytes_in&from={from}&to={to}",
+                mine.id, theirs.id
+            ),
+        )
+        .await;
+    assert_eq!(reply.status, StatusCode::OK, "{:?}", reply.body);
+    assert_eq!(reply.body["function"], "sum");
+    assert_eq!(reply.body["granularity"], 3600, "a day window is hour-wide");
+    assert_eq!(reply.body["from"], from);
+    assert_eq!(reply.body["to"], to);
+    let series = reply.body["series"].as_array().expect("series");
+    assert_eq!(
+        series.len(),
+        1,
+        "only the signed-in person's service is returned"
+    );
+    assert_eq!(series[0]["service_id"], mine.id);
+    assert_eq!(series[0]["metric"], "bytes_in");
+    assert_eq!(
+        series[0]["total"], 500,
+        "the other person's 999 is never read"
+    );
+    assert_eq!(
+        series[0]["slots"].as_array().unwrap().len(),
+        24,
+        "the hour slot the bytes fall in"
+    );
+
+    // An unknown metric is a 400, not an empty series.
+    let bad = browser
+        .get(
+            &fixture,
+            &format!(
+                "/api/account/metrics?services={}&metrics=nonsense&from={from}&to={to}",
+                mine.id
+            ),
+        )
+        .await;
+    assert_eq!(bad.status, StatusCode::BAD_REQUEST, "{:?}", bad.body);
+    assert!(
+        bad.body["error"]
+            .as_str()
+            .is_some_and(|message| message.contains("nonsense")),
+        "the refusal names the bad metric"
+    );
+
+    // `from`/`to` also accept `YYYY-MM-DD` (midnight UTC).
+    let dated = browser
+        .get(
+            &fixture,
+            &format!(
+                "/api/account/metrics?services={}&metrics=bytes_in&from=2020-01-01&to=2020-01-02",
+                mine.id
+            ),
+        )
+        .await;
+    assert_eq!(dated.status, StatusCode::OK, "{:?}", dated.body);
+    assert_eq!(dated.body["from"], 1_577_836_800);
+    assert_eq!(dated.body["to"], 1_577_923_200);
+    assert_eq!(
+        dated.body["series"][0]["total"], 0,
+        "nothing was metered in 2020"
+    );
+
+    // A date that does not parse is a 400.
+    let bad_date = browser
+        .get(
+            &fixture,
+            &format!("/api/account/metrics?services={}&from=not-a-date", mine.id),
+        )
+        .await;
+    assert_eq!(
+        bad_date.status,
+        StatusCode::BAD_REQUEST,
+        "{:?}",
+        bad_date.body
+    );
+}
+
+#[tokio::test]
+async fn disconnecting_an_offline_machine_is_a_no_op() {
+    let fixture = setup().await;
+    let (browser, _person, machine_id) = machines_fixture(&fixture).await;
+
+    let reply = browser
+        .post(
+            &fixture,
+            &format!("/api/account/machines/{machine_id}/disconnect"),
+            serde_json::json!({}),
+        )
+        .await;
+    assert_eq!(reply.status, StatusCode::OK, "{:?}", reply.body);
+    assert_eq!(reply.body["ok"], true);
+    assert_eq!(
+        reply.body["disconnected"], false,
+        "there is no live connection to drop"
     );
 }

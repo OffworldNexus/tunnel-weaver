@@ -5,8 +5,13 @@
 	 * The token rides in the URL fragment (`/reset#token=…`), which never reaches
 	 * the server or its logs. On mount it is read, stripped from the address bar,
 	 * and checked (without being spent) for the account's address.
+	 *
+	 * This is a one-shot mutation, not a load: the reset token is single-use, so
+	 * it stays an explicit one-shot effect rather than a route loader — a loader
+	 * could re-run and would have to answer again about a token that is already
+	 * spent. `untrack` keeps it from ever re-running.
 	 */
-	import { onMount } from 'svelte';
+	import { untrack } from 'svelte';
 
 	import { api } from '#lib/account/api';
 	import { jsonForm } from '#lib/account/form';
@@ -19,11 +24,11 @@
 	import { goto } from '$app/navigation';
 	import { resolve } from '$app/paths';
 
-	let phase: 'checking' | 'form' | 'invalid' = 'checking';
-	let token = '';
-	let email = '';
+	let phase = $state<'checking' | 'form' | 'invalid'>('checking');
+	let token = $state('');
+	let email = $state('');
 
-	onMount(async () => {
+	async function run() {
 		token = new URLSearchParams(location.hash.slice(1)).get('token') ?? '';
 		if (!token) {
 			phase = 'invalid';
@@ -39,6 +44,12 @@
 		} else {
 			phase = 'invalid';
 		}
+	}
+
+	$effect(() => {
+		untrack(() => {
+			void run();
+		});
 	});
 
 	const sf = jsonForm(setPasswordSchema, { password: '' }, async ({ password }) => {

@@ -87,7 +87,7 @@
 		gap: 10px 12px;
 	}
 
-	/* Icon + label inside the GitHub keycap; the slot contents are compiled here. */
+	/* Icon + label inside the GitHub keycap; the snippet contents are compiled here. */
 	.landing__github {
 		display: inline-flex;
 		align-items: center;

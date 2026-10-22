@@ -1,7 +1,11 @@
 <script lang="ts">
-	export let value: string;
-	export let error: string | undefined = undefined;
-	export let disabled = false;
+	interface Props {
+		value: string;
+		error?: string;
+		disabled?: boolean;
+	}
+
+	let { value = $bindable(), error = undefined, disabled = false }: Props = $props();
 </script>
 
 <div class="field">

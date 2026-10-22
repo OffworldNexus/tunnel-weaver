@@ -8,7 +8,7 @@
 	import { onDestroy } from 'svelte';
 
 	import { api } from '#lib/account/api';
-	import { ensureConfig } from '#lib/account/config';
+	import { ensureConfig } from '#lib/account/config.svelte';
 	import { flow } from '#lib/account/state';
 	import Keycap from '#lib/ui/Keycap.svelte';
 	import Page from '#lib/ui/Page.svelte';
@@ -17,10 +17,10 @@
 
 	const carried = flow.load();
 
-	let remaining = 0;
-	let busy = false;
-	let info = '';
-	let error = '';
+	let remaining = $state(0);
+	let busy = $state(false);
+	let info = $state('');
+	let error = $state('');
 	let timer: ReturnType<typeof setInterval> | undefined;
 
 	async function startCooldown() {
@@ -91,8 +91,7 @@
 		{#if error}<p class="notice-error spaced" role="alert">{error}</p>{/if}
 
 		<p class="switch spaced">
-			<button type="button" class="linklike" on:click={useAnotherEmail}
-				>Use a different email</button
+			<button type="button" class="linklike" onclick={useAnotherEmail}>Use a different email</button
 			>
 		</p>
 	{:else}

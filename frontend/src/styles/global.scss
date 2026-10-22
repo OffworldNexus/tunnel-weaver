@@ -194,3 +194,139 @@ input:focus-visible,
 	gap: 12px;
 	margin-top: 24px;
 }
+
+// ---- console primitives ---------------------------------------------------
+//
+// The machines list is data-dense, so the table, toolbar and small layout
+// helpers it shares with any future console surface live here rather than being
+// re-declared per page.
+
+.mono {
+	font-family: var(--tw-mono);
+	font-variant-numeric: tabular-nums;
+}
+
+.muted {
+	color: var(--tw-muted);
+}
+
+.nowrap {
+	white-space: nowrap;
+}
+
+// A dense, scannable data table. `table-layout: fixed` keeps the columns where
+// they are as content changes, so a table never reflows under the reader.
+.table {
+	width: 100%;
+	table-layout: fixed;
+	border-collapse: collapse;
+	font-size: 14px;
+}
+
+.table thead th {
+	position: sticky;
+	top: 0;
+	z-index: 1;
+	padding: 10px 11px;
+	text-align: left;
+	font-size: 12px;
+	font-weight: 700;
+	letter-spacing: 0.06em;
+	text-transform: uppercase;
+	color: var(--tw-muted);
+	background: var(--tw-well);
+	border-bottom: 1.5px solid var(--tw-border);
+	white-space: nowrap;
+}
+
+.table tbody td {
+	padding: 11px;
+	border-bottom: 1px solid var(--tw-line-hair);
+	vertical-align: middle;
+	overflow-wrap: anywhere;
+}
+
+.table tbody tr:hover {
+	background: color-mix(in srgb, var(--tw-text) 5%, transparent);
+}
+
+.table td.right,
+.table th.right {
+	text-align: right;
+	overflow-wrap: normal;
+}
+
+// A responsive two-up grid for panels that sit side by side when there is room.
+.grid {
+	display: grid;
+	gap: 18px;
+}
+
+.grid--wide {
+	grid-template-columns: repeat(auto-fit, minmax(360px, 1fr));
+}
+
+// A toolbar: a wrapping row of filters/controls above a table.
+.toolbar {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: center;
+	gap: 10px;
+	padding: 12px 14px;
+	border-bottom: 1.5px solid var(--tw-border);
+}
+
+.toolbar__spacer {
+	flex: 1 1 auto;
+}
+
+// A compact, brand-consistent control used by toolbars and forms.
+.control {
+	height: 38px;
+	padding: 0 10px;
+	border: 1.5px solid var(--tw-border);
+	border-radius: var(--tw-radius);
+	background: var(--tw-well);
+	color: var(--tw-text);
+	font: 400 14px/1 var(--tw-sans);
+	min-width: 0;
+}
+
+.control:focus {
+	outline: 2px solid var(--tw-focus);
+	outline-offset: 1px;
+	border-color: var(--tw-focus);
+}
+
+.control[disabled] {
+	opacity: 0.55;
+}
+
+select.control {
+	cursor: pointer;
+	padding-right: 26px;
+}
+
+.control--sm {
+	height: 32px;
+	font-size: 13px;
+}
+
+// A label + control stacked for forms.
+.stack {
+	display: flex;
+	flex-direction: column;
+	gap: 8px;
+}
+
+.stack > label {
+	font-size: 14px;
+	font-weight: 700;
+}
+
+// A right-aligned action cluster inside a table row.
+.row-actions {
+	display: inline-flex;
+	gap: 6px;
+	justify-content: flex-end;
+}

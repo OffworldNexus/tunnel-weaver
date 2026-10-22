@@ -4,7 +4,11 @@
 	 * `autocomplete="username"` control, so password managers associate the new
 	 * password with the account.
 	 */
-	export let email: string;
+	interface Props {
+		email: string;
+	}
+
+	let { email }: Props = $props();
 </script>
 
 <div class="field">

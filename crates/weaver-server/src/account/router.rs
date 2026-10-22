@@ -13,13 +13,14 @@
 //!   login always performs a password verification so its timing does not
 //!   reveal whether the address exists.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
-use axum::extract::{Query, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
-use axum::{Json, Router};
+use axum::{Extension, Json, Router};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -29,15 +30,19 @@ use crate::account::AccountRuntime;
 use crate::account::pairing;
 use crate::account::session::{self, CSRF_COOKIE, CSRF_HEADER, SESSION_COOKIE};
 use crate::email::{Mailbox, PasswordChanged, Reset, Verification, Welcome};
+use crate::metrics::{Function, Metric, MetricsQuery, MetricsStore};
+use crate::store::Store;
 use crate::store::StoreError;
 use crate::store::account::{
     ActivationOutcome, ActivationRequest, NewPasswordResetToken, NewPendingRegistration,
     NewVerificationToken, ResetRequest,
 };
 use crate::store::entity::pending_registration;
-use crate::store::entity::{account, machine, person};
+use crate::store::entity::{account, machine, person, service};
 use crate::store::names;
+use crate::tunnel::TunnelRegistry;
 use crate::wall_clock::unix_secs;
+use weaver_mux::{CloseCode, KeyId};
 use weaver_proto::pair;
 
 /// Purpose bound into an email-ownership verification token.
@@ -52,7 +57,15 @@ const ALTCHA_LOGIN: &str = "login";
 const ALTCHA_RESET: &str = "reset";
 
 /// Builds the account router with its shared state applied.
-pub fn router(runtime: Arc<AccountRuntime>) -> Router {
+///
+/// `tunnel` is the live tunnel registry, when the process has one. It is what
+/// makes a machine's "online" state, a web-side disconnect and an immediate
+/// revoke possible; without it (tests, the e2e harness) machines simply read as
+/// offline and the close-based actions are no-ops.
+///
+/// `metering` was the usage meter; the console's figures now come from
+/// [`MetricsStore`] over the same store, so the router no longer needs it.
+pub fn router(runtime: Arc<AccountRuntime>, tunnel: Option<Arc<TunnelRegistry>>) -> Router {
     Router::new()
         .route("/api/account/altcha/challenge", get(altcha_challenge))
         .route("/api/account/config", get(config))
@@ -65,12 +78,24 @@ pub fn router(runtime: Arc<AccountRuntime>) -> Router {
         .route("/api/account/reset/complete", post(reset_complete))
         .route("/api/account/login", post(login))
         .route("/api/account/me", get(me))
+        .route("/api/account/avatar", get(avatar))
         .route("/api/account/logout", post(logout))
         .route("/api/account/password", post(change_password))
+        .route("/api/account/machines", get(machines_list))
+        .route("/api/account/overview", get(overview))
+        .route("/api/account/metrics", get(metrics))
+        .route("/api/account/machines/{id}", get(machine_detail))
+        .route("/api/account/machines/{id}/rename", post(machine_rename))
+        .route(
+            "/api/account/machines/{id}/disconnect",
+            post(machine_disconnect),
+        )
+        .route("/api/account/machines/{id}/revoke", post(machine_revoke))
         .route(pair::PAIR_LOOKUP_PATH, post(pair_lookup))
         .route(pair::PAIR_ACCEPT_PATH, post(pair_accept))
         .route(pair::PAIR_REJECT_PATH, post(pair_reject))
         .fallback(spa)
+        .layer(Extension(tunnel))
         .with_state(runtime)
 }
 
@@ -176,6 +201,7 @@ async fn config(State(rt): State<Arc<AccountRuntime>>) -> Response {
         "verification_ttl_secs": rt.config.verification_ttl_secs,
         "resend_cooldown_secs": rt.config.resend_cooldown_secs,
         "support_email": rt.support_email,
+        "relay_host": rt.relay_host(),
     }))
 }
 
@@ -761,6 +787,61 @@ async fn me(State(rt): State<Arc<AccountRuntime>>, headers: HeaderMap) -> Respon
     }
 }
 
+/// How large an avatar may be asked to be, and the size used when unprompted.
+///
+/// The console draws it at 36 px and asks for twice that so it survives a
+/// high-density screen; the clamp keeps a hand-written URL from asking for a
+/// megabyte of SVG.
+const AVATAR_DEFAULT_SIZE: u32 = 96;
+const AVATAR_MIN_SIZE: u32 = 16;
+const AVATAR_MAX_SIZE: u32 = 512;
+
+/// Query for [`avatar`].
+#[derive(Deserialize)]
+struct AvatarQuery {
+    /// Pixel size to render, clamped to [`AVATAR_MIN_SIZE`]..=[`AVATAR_MAX_SIZE`].
+    size: Option<u32>,
+}
+
+/// `GET /api/account/avatar` — the signed-in account's bird, as an SVG.
+///
+/// `bird-id` derives the species and its mid-century silkscreen palette from the
+/// address itself, so the same account always gets the same bird and the relay
+/// stores nothing to serve it. Every model is drawn inside the inscribed circle,
+/// so the console's round frame never clips a beak or a crest.
+async fn avatar(
+    State(rt): State<Arc<AccountRuntime>>,
+    headers: HeaderMap,
+    Query(query): Query<AvatarQuery>,
+) -> Response {
+    let Some(raw) = session::cookie(&headers, SESSION_COOKIE) else {
+        return err(StatusCode::UNAUTHORIZED, "not signed in");
+    };
+    let Ok(Some(account)) = rt.sessions.account(&raw, unix_secs()).await else {
+        return err(StatusCode::UNAUTHORIZED, "not signed in");
+    };
+    let Some(identity) = rt
+        .store
+        .email_identity_for_account(account.id)
+        .await
+        .ok()
+        .flatten()
+    else {
+        return err(StatusCode::NOT_FOUND, "this account has no email address");
+    };
+    let size = query
+        .size
+        .unwrap_or(AVATAR_DEFAULT_SIZE)
+        .clamp(AVATAR_MIN_SIZE, AVATAR_MAX_SIZE);
+    let svg = bird_id::Avatar::from_email(&identity.email).svg_circle_sized(size);
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "image/svg+xml; charset=utf-8")],
+        svg,
+    )
+        .into_response()
+}
+
 /// `POST /api/account/logout` — invalidate the current session (CSRF-protected).
 async fn logout(State(rt): State<Arc<AccountRuntime>>, headers: HeaderMap) -> Response {
     if !origin_ok(&headers, &rt.base_url) || !csrf_ok(&headers) {
@@ -805,6 +886,807 @@ async fn owned_machine(
         .machine_by_id(machine_id)
         .await?
         .filter(|machine| machine.person_id == person.id))
+}
+
+// ----- machines -------------------------------------------------------------
+
+/// Body of a rename request.
+#[derive(Deserialize)]
+struct RenameRequest {
+    name: String,
+}
+
+/// A machine's key in canonical text form, or `None` if the stored key does not
+/// parse. A corrupt row must not turn the whole list into a 500.
+fn key_of(machine: &machine::Model) -> Option<KeyId> {
+    machine.key_id.parse().ok()
+}
+
+/// A slice of usage over the console's reporting window.
+#[derive(Clone, Copy, Default)]
+struct Usage {
+    bytes_in: i64,
+    bytes_out: i64,
+    requests: i64,
+}
+
+impl Usage {
+    fn json(self) -> Value {
+        json!({ "bytes_in": self.bytes_in, "bytes_out": self.bytes_out, "requests": self.requests })
+    }
+
+    fn add(self, other: Usage) -> Usage {
+        Usage {
+            bytes_in: self.bytes_in + other.bytes_in,
+            bytes_out: self.bytes_out + other.bytes_out,
+            requests: self.requests + other.requests,
+        }
+    }
+}
+
+/// A service a machine declares: the hostnames it serves, whether any of them is
+/// currently routed (its tunnel is up), and its own traffic.
+struct ServiceView {
+    name: String,
+    hostnames: Vec<String>,
+    active: bool,
+    usage: Usage,
+}
+
+impl ServiceView {
+    fn json(self) -> Value {
+        json!({
+            "name": self.name,
+            "hostnames": self.hostnames,
+            "active": self.active,
+            "usage_30d": self.usage.json(),
+        })
+    }
+}
+
+/// How far back the console's traffic figures reach.
+const USAGE_WINDOW_SECS: i64 = 30 * 24 * 60 * 60;
+
+/// The account's traffic over the reporting window, indexed the two ways the
+/// console asks for it: per machine (the list column, the machine total) and per
+/// `(machine, service)` (the detail's service rows).
+///
+/// [`MetricsStore::totals`] sums the day rollup (and the day in progress from
+/// the minute table), so a machine that only just started moving bytes is
+/// already counted. A failing query yields no figures — which read as zero
+/// rather than blocking the page.
+#[derive(Default)]
+struct UsageIndex {
+    machines: HashMap<String, Usage>,
+    services: HashMap<(String, String), Usage>,
+}
+
+impl UsageIndex {
+    /// Everything the account moved: the sum of its machines.
+    fn total(&self) -> Usage {
+        self.machines
+            .values()
+            .copied()
+            .fold(Usage::default(), Usage::add)
+    }
+
+    /// A machine's traffic, or zero.
+    fn of_machine(&self, machine: &str) -> Usage {
+        self.machines.get(machine).copied().unwrap_or_default()
+    }
+
+    /// A service's traffic, or zero.
+    fn of_service(&self, machine: &str, service: &str) -> Usage {
+        self.services
+            .get(&(machine.to_string(), service.to_string()))
+            .copied()
+            .unwrap_or_default()
+    }
+}
+
+/// The signed-in person's services, each with the name of the machine it runs
+/// on, in `machine → service` order.
+async fn person_services(
+    store: &Store,
+    person: &person::Model,
+) -> Result<Vec<(machine::Model, service::Model)>, StoreError> {
+    let machines = store.list_machines(person.id).await?;
+    let mut by_id: HashMap<i32, machine::Model> = HashMap::new();
+    for machine in machines {
+        by_id.insert(machine.id, machine);
+    }
+    let ids: Vec<i32> = by_id.keys().copied().collect();
+    let mut services = Vec::new();
+    for (svc, _) in store.services_with_hostnames(&ids).await? {
+        if let Some(machine) = by_id.get(&svc.machine_id) {
+            services.push((machine.clone(), svc));
+        }
+    }
+    Ok(services)
+}
+
+/// The account's traffic over the reporting window, read from the metrics store.
+async fn usage_index(store: &Store, person: &person::Model) -> Result<UsageIndex, StoreError> {
+    let until = unix_secs();
+    let services = person_services(store, person).await?;
+    let ids: Vec<i32> = services.iter().map(|(_, svc)| svc.id).collect();
+    let totals = MetricsStore::new(store.clone())
+        .totals(
+            &ids,
+            &[Metric::BytesIn, Metric::BytesOut, Metric::Requests],
+            until - USAGE_WINDOW_SECS,
+            until,
+        )
+        .await?;
+    let mut index = UsageIndex::default();
+    for (machine, svc) in services {
+        let usage = Usage {
+            bytes_in: totals.get(&(svc.id, Metric::BytesIn)).copied().unwrap_or(0),
+            bytes_out: totals
+                .get(&(svc.id, Metric::BytesOut))
+                .copied()
+                .unwrap_or(0),
+            requests: totals
+                .get(&(svc.id, Metric::Requests))
+                .copied()
+                .unwrap_or(0),
+        };
+        let machine_usage = index.machines.entry(machine.name.clone()).or_default();
+        *machine_usage = machine_usage.add(usage);
+        index.services.insert((machine.name, svc.name), usage);
+    }
+    Ok(index)
+}
+
+/// Each machine's most recent open minute (Unix seconds), from the metrics
+/// store. Machines with no metered minute are absent.
+async fn last_seen_by_machine(
+    store: &Store,
+    person: &person::Model,
+) -> Result<HashMap<i32, i64>, StoreError> {
+    let services = person_services(store, person).await?;
+    let ids: Vec<i32> = services.iter().map(|(_, svc)| svc.id).collect();
+    let minutes = MetricsStore::new(store.clone())
+        .last_open_minutes(&ids)
+        .await?;
+    let mut last_seen: HashMap<i32, i64> = HashMap::new();
+    for (machine, svc) in services {
+        if let Some(minute) = minutes.get(&svc.id) {
+            let seconds = minute * 60;
+            last_seen
+                .entry(machine.id)
+                .and_modify(|seen| *seen = (*seen).max(seconds))
+                .or_insert(seconds);
+        }
+    }
+    Ok(last_seen)
+}
+
+/// One machine's most recent open minute (Unix seconds), or `None` when it has
+/// never been metered.
+async fn machine_last_seen(store: &Store, machine_id: i32) -> Result<Option<i64>, StoreError> {
+    let svc_ids: Vec<i32> = store
+        .services_with_hostnames(&[machine_id])
+        .await?
+        .into_iter()
+        .map(|(svc, _)| svc.id)
+        .collect();
+    let minutes = MetricsStore::new(store.clone())
+        .last_open_minutes(&svc_ids)
+        .await?;
+    Ok(minutes.values().copied().max().map(|minute| minute * 60))
+}
+
+/// The machine-list view the SPA renders, for one machine.
+///
+/// `online` comes from the live registry and is never stored; `last_seen_at` is
+/// the most recent metered minute (`None` when the machine was never metered);
+/// `usage_30d` is its traffic over the reporting window; `fingerprint` is the
+/// raw `p256:<hex>` the SPA groups for display.
+fn machine_view(
+    machine: &machine::Model,
+    online: bool,
+    metered_last_seen: Option<i64>,
+    services: Vec<ServiceView>,
+    usage: Usage,
+) -> Value {
+    json!({
+        "id": machine.id,
+        "name": machine.name,
+        "online": online,
+        "last_seen_at": last_seen(online, metered_last_seen),
+        "paired_at": machine.created_at,
+        "fingerprint": machine.key_id,
+        "usage_30d": usage.json(),
+        "services": services.into_iter().map(ServiceView::json).collect::<Vec<Value>>(),
+    })
+}
+
+/// When a machine was last seen.
+///
+/// A machine holding a live connection has been seen *this instant* — the
+/// relay is talking to it right now — so a connected machine reports "now"
+/// rather than its last flushed metered minute (which can lag by up to two
+/// minutes, because only complete minutes are persisted). A disconnected
+/// machine reports the most recent minute it was up, or `None` if it never was.
+fn last_seen(online: bool, metered_last_seen: Option<i64>) -> Option<i64> {
+    if online {
+        Some(unix_secs())
+    } else {
+        metered_last_seen
+    }
+}
+
+/// A failed machine read: logged, generic to the client.
+fn machine_load_error(e: StoreError) -> Response {
+    tracing::warn!(error = %e, "failed to load machines");
+    err(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "could not load your machines",
+    )
+}
+
+/// A service as the view sees it: its hostname's liveness comes from the live
+/// registry, so a service with no registry (or no route) is simply inactive.
+fn service_view(
+    svc: service::Model,
+    hostnames: Vec<String>,
+    tunnel: Option<&TunnelRegistry>,
+    usage: Usage,
+) -> ServiceView {
+    let active = tunnel.is_some_and(|t| hostnames.iter().any(|host| t.is_active(host)));
+    ServiceView {
+        name: svc.name,
+        hostnames,
+        active,
+        usage,
+    }
+}
+
+/// The signed-in person, or `None` when the account has no person yet.
+async fn person_of(rt: &AccountRuntime, account_id: i32) -> Option<person::Model> {
+    rt.store.person_by_account(account_id).await.ok().flatten()
+}
+
+/// Query for the machines collection: which page to return, and the two filters
+/// the console offers.
+#[derive(Deserialize)]
+struct MachinesQuery {
+    page: Option<u32>,
+    per_page: Option<u32>,
+    /// A case-insensitive substring of the machine name.
+    q: Option<String>,
+    /// `all` (the default), `online` or `offline`.
+    health: Option<String>,
+}
+
+/// The machines collection's default page size, and its ceiling.
+const MACHINES_PER_PAGE: u32 = 60;
+const MACHINES_PER_PAGE_MAX: u32 = 200;
+
+/// `GET /api/account/machines` — a page of the signed-in person's machines.
+///
+/// Paging, the name search and the health filter are all resolved here, so the
+/// console never holds the whole collection to render one page.
+async fn machines_list(
+    State(rt): State<Arc<AccountRuntime>>,
+    Extension(tunnel): Extension<Option<Arc<TunnelRegistry>>>,
+    Query(query): Query<MachinesQuery>,
+    headers: HeaderMap,
+) -> Response {
+    let Some(account) = signed_in(&rt, &headers).await else {
+        return err(StatusCode::UNAUTHORIZED, "not signed in");
+    };
+    let Some(person) = person_of(&rt, account.id).await else {
+        return json_ok(empty_machine_page());
+    };
+    match machine_page(&rt, tunnel.as_deref(), &person, &query).await {
+        Ok(page) => json_ok(page),
+        Err(e) => machine_load_error(e),
+    }
+}
+
+/// An empty first page, for an account with no person yet.
+fn empty_machine_page() -> Value {
+    json!({ "machines": [], "page": 1, "per_page": MACHINES_PER_PAGE, "total": 0, "page_count": 1 })
+}
+
+/// One page of `person`'s machines, with the metadata the pager needs.
+///
+/// The person's machines are small in number, so the name and health filters are
+/// applied in memory (health is derived from the live registry, which the store
+/// cannot filter on), and only the requested page's services and usage are then
+/// read — the expensive per-machine lookups never touch the rows being skipped.
+async fn machine_page(
+    rt: &AccountRuntime,
+    tunnel: Option<&TunnelRegistry>,
+    person: &person::Model,
+    query: &MachinesQuery,
+) -> Result<Value, StoreError> {
+    let per_page = query
+        .per_page
+        .unwrap_or(MACHINES_PER_PAGE)
+        .clamp(1, MACHINES_PER_PAGE_MAX) as usize;
+    let needle = query.q.as_deref().unwrap_or("").trim().to_ascii_lowercase();
+    let health = query.health.as_deref().unwrap_or("all");
+
+    let online = |machine: &machine::Model| {
+        tunnel.is_some_and(|t| key_of(machine).is_some_and(|key| t.is_connected(&key)))
+    };
+
+    let matched: Vec<machine::Model> = rt
+        .store
+        .list_machines(person.id)
+        .await?
+        .into_iter()
+        .filter(|machine| needle.is_empty() || machine.name.contains(&needle))
+        .filter(|machine| match health {
+            "online" => online(machine),
+            "offline" => !online(machine),
+            _ => true,
+        })
+        .collect();
+
+    let total = matched.len();
+    let page_count = total.div_ceil(per_page).max(1);
+    let page = query.page.unwrap_or(1).clamp(1, page_count as u32);
+    let start = (page as usize - 1) * per_page;
+    let slice: Vec<machine::Model> = matched.into_iter().skip(start).take(per_page).collect();
+
+    let ids: Vec<i32> = slice.iter().map(|machine| machine.id).collect();
+    let names: HashMap<i32, String> = slice
+        .iter()
+        .map(|machine| (machine.id, machine.name.clone()))
+        .collect();
+    let usage = usage_index(&rt.store, person).await?;
+    let mut services: HashMap<i32, Vec<ServiceView>> = HashMap::new();
+    for (svc, hostnames) in rt.store.services_with_hostnames(&ids).await? {
+        let machine_id = svc.machine_id;
+        let machine_name = names.get(&machine_id).cloned().unwrap_or_default();
+        let service_usage = usage.of_service(&machine_name, &svc.name);
+        services.entry(machine_id).or_default().push(service_view(
+            svc,
+            hostnames,
+            tunnel,
+            service_usage,
+        ));
+    }
+    let last_seen = last_seen_by_machine(&rt.store, person).await?;
+
+    let machines: Vec<Value> = slice
+        .into_iter()
+        .map(|machine| {
+            machine_view(
+                &machine,
+                online(&machine),
+                last_seen.get(&machine.id).copied(),
+                services.remove(&machine.id).unwrap_or_default(),
+                usage.of_machine(&machine.name),
+            )
+        })
+        .collect();
+
+    Ok(json!({
+        "machines": machines,
+        "page": page,
+        "per_page": per_page,
+        "total": total,
+        "page_count": page_count,
+    }))
+}
+
+/// `GET /api/account/overview` — the account-level rollup.
+///
+/// This is what the console's stat blocks render: how many machines and tunnels
+/// are live, and the traffic carried over the reporting window. Computed here,
+/// once, rather than by the browser re-summing the machine list.
+async fn overview(
+    State(rt): State<Arc<AccountRuntime>>,
+    Extension(tunnel): Extension<Option<Arc<TunnelRegistry>>>,
+    headers: HeaderMap,
+) -> Response {
+    let Some(account) = signed_in(&rt, &headers).await else {
+        return err(StatusCode::UNAUTHORIZED, "not signed in");
+    };
+    let Some(person) = person_of(&rt, account.id).await else {
+        return json_ok(empty_overview());
+    };
+    match overview_stats(&rt, tunnel.as_deref(), &person).await {
+        Ok(stats) => json_ok(stats),
+        Err(e) => machine_load_error(e),
+    }
+}
+
+/// The all-zero rollup for an account with no person yet.
+fn empty_overview() -> Value {
+    json!({
+        "machines": { "online": 0, "total": 0 },
+        "tunnels": { "active": 0, "total": 0 },
+        "usage_30d": Usage::default().json(),
+        "window_days": USAGE_WINDOW_SECS / 86_400,
+        "covered_seconds": 0,
+    })
+}
+
+/// Presence counts and traffic totals for `person`.
+async fn overview_stats(
+    rt: &AccountRuntime,
+    tunnel: Option<&TunnelRegistry>,
+    person: &person::Model,
+) -> Result<Value, StoreError> {
+    let machines = rt.store.list_machines(person.id).await?;
+    let ids: Vec<i32> = machines.iter().map(|machine| machine.id).collect();
+    let machines_online = machines
+        .iter()
+        .filter(|machine| {
+            tunnel.is_some_and(|t| key_of(machine).is_some_and(|key| t.is_connected(&key)))
+        })
+        .count();
+
+    let services = rt.store.services_with_hostnames(&ids).await?;
+    let tunnels_total = services.len();
+    let tunnels_active = services
+        .iter()
+        .filter(|(_, hostnames)| {
+            tunnel.is_some_and(|t| hostnames.iter().any(|hostname| t.is_active(hostname)))
+        })
+        .count();
+
+    let usage = usage_index(&rt.store, person).await?.total();
+
+    // The figures above are sums, which are true of the whole window; a *rate*
+    // is not, so the relay reports how much of the window the traffic actually
+    // covers and lets the console divide by that instead of by 30 days.
+    let service_ids: Vec<i32> = services.iter().map(|(service, _)| service.id).collect();
+    let now = unix_secs();
+    let covered_seconds = match rt
+        .store
+        .covered_span(&service_ids, now - USAGE_WINDOW_SECS, now)
+        .await?
+    {
+        Some((first, last)) => (last - first + 1) * 60,
+        None => 0,
+    };
+
+    Ok(json!({
+        "machines": { "online": machines_online, "total": machines.len() },
+        "tunnels": { "active": tunnels_active, "total": tunnels_total },
+        "usage_30d": usage.json(),
+        "window_days": USAGE_WINDOW_SECS / 86_400,
+        "covered_seconds": covered_seconds,
+    }))
+}
+
+/// Query parameters of `GET /api/account/metrics`.
+#[derive(Deserialize)]
+struct MetricsParams {
+    /// Comma-separated service ids; absent means every service of the person.
+    services: Option<String>,
+    /// Comma-separated person names. Self-scoped: only the signed-in person's
+    /// own name is honoured, so this can never widen the query.
+    people: Option<String>,
+    /// Comma-separated metric names; absent means every metric.
+    metrics: Option<String>,
+    /// Window start, Unix seconds or `YYYY-MM-DD`; defaults to 30 days ago.
+    from: Option<String>,
+    /// Window end, Unix seconds or `YYYY-MM-DD`; defaults to now.
+    to: Option<String>,
+    /// Reduction; absent means `sum`.
+    function: Option<String>,
+}
+
+/// `GET /api/account/metrics` — the signed-in person's usage series, as the
+/// metrics store's JSON verbatim (`Content-Type: application/json`).
+///
+/// Self-scoped: any requested service id that is not one of the person's is
+/// dropped, and only the person's own name survives `people`, so another
+/// person's data can never be read. An unknown metric, function or date is a
+/// 400 rather than a silent default.
+async fn metrics(
+    State(rt): State<Arc<AccountRuntime>>,
+    Query(params): Query<MetricsParams>,
+    headers: HeaderMap,
+) -> Response {
+    let Some(account) = signed_in(&rt, &headers).await else {
+        return err(StatusCode::UNAUTHORIZED, "not signed in");
+    };
+    let Some(person) = person_of(&rt, account.id).await else {
+        return err(StatusCode::BAD_REQUEST, "this account has no person yet");
+    };
+    let metrics = match parse_metrics(params.metrics.as_deref()) {
+        Ok(metrics) => metrics,
+        Err(message) => return err(StatusCode::BAD_REQUEST, &message),
+    };
+    let function = match parse_function(params.function.as_deref()) {
+        Ok(function) => function,
+        Err(message) => return err(StatusCode::BAD_REQUEST, &message),
+    };
+    let now = unix_secs();
+    let from = match parse_time(params.from.as_deref(), now - USAGE_WINDOW_SECS) {
+        Ok(from) => from,
+        Err(message) => return err(StatusCode::BAD_REQUEST, &message),
+    };
+    let to = match parse_time(params.to.as_deref(), now) {
+        Ok(to) => to,
+        Err(message) => return err(StatusCode::BAD_REQUEST, &message),
+    };
+
+    let owned = match person_services(&rt.store, &person).await {
+        Ok(services) => services,
+        Err(e) => return machine_load_error(e),
+    };
+    let owned_ids: Vec<i32> = owned.iter().map(|(_, svc)| svc.id).collect();
+    let requested = parse_service_ids(params.services.as_deref());
+    let services: Vec<i32> = if requested.is_empty() {
+        owned_ids.clone()
+    } else {
+        requested
+            .into_iter()
+            .filter(|id| owned_ids.contains(id))
+            .collect()
+    };
+    let people: Vec<String> = parse_csv(params.people.as_deref())
+        .into_iter()
+        .filter(|name| name.eq_ignore_ascii_case(&person.name))
+        .collect();
+
+    let query = MetricsQuery {
+        services,
+        people,
+        metrics,
+        from,
+        to,
+        function,
+    };
+    match MetricsStore::new(rt.store.clone()).query(&query).await {
+        Ok(body) => (
+            StatusCode::OK,
+            [(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/json"),
+            )],
+            body,
+        )
+            .into_response(),
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to read account metrics");
+            err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "could not read usage metrics",
+            )
+        }
+    }
+}
+
+/// Splits a comma-separated parameter into trimmed, non-empty items.
+fn parse_csv(value: Option<&str>) -> Vec<String> {
+    value
+        .unwrap_or("")
+        .split(',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Parses the `metrics` parameter; absent means every metric. An unknown name is
+/// an error, so a typo is a 400 rather than a silently empty series.
+fn parse_metrics(value: Option<&str>) -> Result<Vec<Metric>, String> {
+    let names = parse_csv(value);
+    if names.is_empty() {
+        return Ok(Metric::ALL.to_vec());
+    }
+    names
+        .iter()
+        .map(|name| Metric::parse(name).ok_or_else(|| format!("unknown metric '{name}'")))
+        .collect()
+}
+
+/// Parses the `function` parameter; absent means `sum`.
+fn parse_function(value: Option<&str>) -> Result<Function, String> {
+    match value.map(str::trim).filter(|value| !value.is_empty()) {
+        None => Ok(Function::Sum),
+        Some(name) => Function::parse(name).ok_or_else(|| format!("unknown function '{name}'")),
+    }
+}
+
+/// Parses a time parameter as Unix seconds or a `YYYY-MM-DD` date (midnight
+/// UTC), falling back to `default`; an unparsable value is an error.
+fn parse_time(value: Option<&str>, default: i64) -> Result<i64, String> {
+    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(default);
+    };
+    if let Ok(seconds) = value.parse::<i64>() {
+        return Ok(seconds);
+    }
+    match value.parse::<jiff::civil::Date>() {
+        Ok(date) => date
+            .at(0, 0, 0, 0)
+            .to_zoned(jiff::tz::TimeZone::UTC)
+            .map(|zoned| zoned.timestamp().as_second())
+            .map_err(|e| format!("invalid date '{value}': {e}")),
+        Err(_) => Err(format!("invalid time '{value}'")),
+    }
+}
+
+/// Parses comma-separated service ids, ignoring entries that are not integers.
+fn parse_service_ids(value: Option<&str>) -> Vec<i32> {
+    parse_csv(value)
+        .iter()
+        .filter_map(|id| id.parse::<i32>().ok())
+        .collect()
+}
+
+/// `GET /api/account/machines/{id}` — one machine of the signed-in person.
+async fn machine_detail(
+    State(rt): State<Arc<AccountRuntime>>,
+    Extension(tunnel): Extension<Option<Arc<TunnelRegistry>>>,
+    Path(machine_id): Path<i32>,
+    headers: HeaderMap,
+) -> Response {
+    let Some(account) = signed_in(&rt, &headers).await else {
+        return err(StatusCode::UNAUTHORIZED, "not signed in");
+    };
+    let Some(person) = person_of(&rt, account.id).await else {
+        return err(StatusCode::NOT_FOUND, "machine not found");
+    };
+    let machine = match owned_machine(&rt, &person, machine_id).await {
+        Ok(Some(machine)) => machine,
+        Ok(None) => return err(StatusCode::NOT_FOUND, "machine not found"),
+        Err(e) => return machine_load_error(e),
+    };
+    let usage = match usage_index(&rt.store, &person).await {
+        Ok(usage) => usage,
+        Err(e) => return machine_load_error(e),
+    };
+    let services = match rt.store.services_with_hostnames(&[machine.id]).await {
+        Ok(services) => services
+            .into_iter()
+            .map(|(svc, hostnames)| {
+                let service_usage = usage.of_service(&machine.name, &svc.name);
+                service_view(svc, hostnames, tunnel.as_deref(), service_usage)
+            })
+            .collect::<Vec<_>>(),
+        Err(e) => return machine_load_error(e),
+    };
+    let last_seen_at = match machine_last_seen(&rt.store, machine.id).await {
+        Ok(last_seen) => last_seen,
+        Err(e) => return machine_load_error(e),
+    };
+    let online = tunnel
+        .as_deref()
+        .is_some_and(|t| key_of(&machine).is_some_and(|key| t.is_connected(&key)));
+    json_ok(machine_view(
+        &machine,
+        online,
+        last_seen_at,
+        services,
+        usage.of_machine(&machine.name),
+    ))
+}
+
+/// `POST /api/account/machines/{id}/rename` — rename a machine (CSRF-protected).
+///
+/// The store renames the machine and re-derives its hostnames first; the live
+/// registry is remapped second, so what routes follows what is stored. A
+/// machine that is offline is simply renamed — its hostnames are already the
+/// new ones for whenever it reconnects.
+async fn machine_rename(
+    State(rt): State<Arc<AccountRuntime>>,
+    Extension(tunnel): Extension<Option<Arc<TunnelRegistry>>>,
+    Path(machine_id): Path<i32>,
+    headers: HeaderMap,
+    Json(req): Json<RenameRequest>,
+) -> Response {
+    if !origin_ok(&headers, &rt.base_url) || !csrf_ok(&headers) {
+        return err(StatusCode::FORBIDDEN, "request refused");
+    }
+    let Some(account) = signed_in(&rt, &headers).await else {
+        return err(StatusCode::UNAUTHORIZED, "not signed in");
+    };
+    let Some(person) = person_of(&rt, account.id).await else {
+        return err(StatusCode::NOT_FOUND, "machine not found");
+    };
+    let machine = match owned_machine(&rt, &person, machine_id).await {
+        Ok(Some(machine)) => machine,
+        Ok(None) => return err(StatusCode::NOT_FOUND, "machine not found"),
+        Err(e) => return machine_load_error(e),
+    };
+    let renamed = match rt.store.rename_machine(machine.id, req.name.trim()).await {
+        Ok(renamed) => renamed,
+        Err(StoreError::InvalidName(_)) => {
+            return err(
+                StatusCode::BAD_REQUEST,
+                "a machine name is 1–15 lowercase letters or digits",
+            );
+        }
+        // The per-person unique index refuses a name this person already uses.
+        Err(StoreError::Db(_)) => {
+            return err(
+                StatusCode::CONFLICT,
+                "you already have a machine with this name",
+            );
+        }
+        Err(e) => return machine_load_error(e),
+    };
+    if let (Some(registry), Some(key)) = (tunnel.as_deref(), key_of(&renamed)) {
+        registry.rename_machine(&key).await;
+    }
+    json_ok(json!({ "ok": true, "name": renamed.name }))
+}
+
+/// `POST /api/account/machines/{id}/disconnect` — drop a live tunnel.
+///
+/// The key is kept: the relay closes with `Rejected` so the client exits and
+/// does not reconnect, and the machine comes back on the next `weave start`.
+/// Idempotent — a machine that is already offline answers `disconnected: false`.
+async fn machine_disconnect(
+    State(rt): State<Arc<AccountRuntime>>,
+    Extension(tunnel): Extension<Option<Arc<TunnelRegistry>>>,
+    Path(machine_id): Path<i32>,
+    headers: HeaderMap,
+) -> Response {
+    if !origin_ok(&headers, &rt.base_url) || !csrf_ok(&headers) {
+        return err(StatusCode::FORBIDDEN, "request refused");
+    }
+    let Some(account) = signed_in(&rt, &headers).await else {
+        return err(StatusCode::UNAUTHORIZED, "not signed in");
+    };
+    let Some(person) = person_of(&rt, account.id).await else {
+        return err(StatusCode::NOT_FOUND, "machine not found");
+    };
+    let machine = match owned_machine(&rt, &person, machine_id).await {
+        Ok(Some(machine)) => machine,
+        Ok(None) => return err(StatusCode::NOT_FOUND, "machine not found"),
+        Err(e) => return machine_load_error(e),
+    };
+    let disconnected = match (tunnel.as_deref(), key_of(&machine)) {
+        (Some(registry), Some(key)) => registry.close_connection(&key, CloseCode::Rejected),
+        _ => false,
+    };
+    json_ok(json!({ "ok": true, "disconnected": disconnected }))
+}
+
+/// `POST /api/account/machines/{id}/revoke` — revoke a machine (CSRF-protected).
+///
+/// The live tunnel is closed with `KeyRevoked` first, so it drops at once
+/// rather than waiting for the reverify poll; the machine is then deleted in the
+/// store, cascading its services, so its hostnames stop resolving. Both sides
+/// read the same `machine.key_id` row, so the registry and the store cannot
+/// disagree. Revoking an already-gone key is the goal state, not an error.
+async fn machine_revoke(
+    State(rt): State<Arc<AccountRuntime>>,
+    Extension(tunnel): Extension<Option<Arc<TunnelRegistry>>>,
+    Path(machine_id): Path<i32>,
+    headers: HeaderMap,
+) -> Response {
+    if !origin_ok(&headers, &rt.base_url) || !csrf_ok(&headers) {
+        return err(StatusCode::FORBIDDEN, "request refused");
+    }
+    let Some(account) = signed_in(&rt, &headers).await else {
+        return err(StatusCode::UNAUTHORIZED, "not signed in");
+    };
+    let Some(person) = person_of(&rt, account.id).await else {
+        return err(StatusCode::NOT_FOUND, "machine not found");
+    };
+    let machine = match owned_machine(&rt, &person, machine_id).await {
+        Ok(Some(machine)) => machine,
+        Ok(None) => return err(StatusCode::NOT_FOUND, "machine not found"),
+        Err(e) => return machine_load_error(e),
+    };
+    let Some(key) = key_of(&machine) else {
+        return err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "this machine has no usable key",
+        );
+    };
+    if let Some(registry) = tunnel.as_deref() {
+        registry.close_connection(&key, CloseCode::KeyRevoked);
+    }
+    match rt.store.revoke_machine(&key).await {
+        Ok(_) => json_ok(json!({ "ok": true })),
+        Err(e) => machine_load_error(e),
+    }
 }
 
 /// `POST /api/account/pair/lookup` — resolve a handle without consuming it.

@@ -1,106 +1,39 @@
-//! Persistent usage storage: one row per `(service_id, minute)` bucket.
+//! Usage reads for the metering control verb: the live day's arrays aggregated.
 //!
-//! The storage logic for [`Store`] lives here rather than in `store/mod.rs` so
-//! that module stays about general store concerns. The business-logic caller
-//! is [`crate::metering::MeteringManager`]; nothing else reads or writes usage
-//! rows, and the `unused_ms` inversion never leaks past this module.
+//! The slot *storage* lives in [`super::usage_live`] and the rollup reads live
+//! in [`crate::metrics`]; what is here is the one query the metering manager
+//! serves — a per-service aggregate over a window, with the display identity
+//! (`service`, `machine`, `person`) resolved from the store.
+//!
+//! The window is read from the **live day's arrays** only. A folded day's
+//! minutes are compressed into `usage_daily` and are no longer readable minute
+//! by minute — exactly as the old per-minute `usage` rows were deleted as they
+//! were folded — so a folded day contributes nothing here. The console's own
+//! figures come from [`crate::metrics::MetricsStore::totals`], which does see
+//! the rolled-up day.
 
-use sea_orm::sea_query::{Alias, Expr, ExprTrait, OnConflict};
+use std::collections::{BTreeMap, HashMap};
+
 use sea_orm::{
-    ColumnTrait, EntityTrait, JoinType, QueryFilter, QueryOrder, QuerySelect, RelationTrait, Set,
-    TransactionTrait,
+    ColumnTrait, EntityTrait, JoinType, QueryFilter, QueryOrder, QuerySelect, RelationTrait,
 };
 
-use super::entity::{machine, person, service, usage};
+use super::entity::{machine, person, service};
+use super::usage_live::{MINUTES_PER_DAY, Slots};
 use super::{Store, StoreError};
 
 impl Store {
-    /// Persists a batch of metered minute buckets in one transaction.
-    ///
-    /// The bucket key is `(service_id, minute)`. Every counter is
-    /// *incremented* on conflict — the manager flushes each bucket once, so
-    /// the increment path is a safety net for a partial minute landing on an
-    /// already-written one — and the stored `unused_ms` is produced by
-    /// [`unused_ms_from_open_ms`], the single place the inversion happens.
-    /// `open_ms` outside `0..=60_000` is rejected, never silently clamped.
-    ///
-    /// Rows of a service deleted meanwhile (its machine was revoked) are
-    /// dropped: there is nothing left to bill, and one dangling `service_id`
-    /// must not fail the whole batch on its foreign key, forever.
-    pub(crate) async fn upsert_usage_batch(&self, rows: &[UsageRow]) -> Result<(), StoreError> {
-        if rows.is_empty() {
-            return Ok(());
-        }
-        let txn = self.db.begin().await?;
-        let live: Vec<i32> = service::Entity::find()
-            .select_only()
-            .column(service::Column::Id)
-            .filter(service::Column::Id.is_in(rows.iter().map(|row| row.service_id)))
-            .into_tuple()
-            .all(&txn)
-            .await?;
-        let mut models = Vec::with_capacity(rows.len());
-        for row in rows.iter().filter(|row| live.contains(&row.service_id)) {
-            models.push(usage::ActiveModel {
-                service_id: Set(row.service_id),
-                minute: Set(row.minute),
-                bytes_in: Set(row.bytes_in),
-                bytes_out: Set(row.bytes_out),
-                tunnel_in: Set(row.tunnel_in),
-                tunnel_out: Set(row.tunnel_out),
-                requests: Set(row.requests),
-                unused_ms: Set(unused_ms_from_open_ms(row.open_ms)?),
-            });
-        }
-        // SQLite/Postgres expose the proposed row as `excluded`; referencing
-        // it explicitly lets us add the incoming counters to the stored ones
-        // rather than overwrite them.
-        let excluded = |col: usage::Column| Expr::col((Alias::new("excluded"), col));
-        let mut conflict = OnConflict::columns([usage::Column::ServiceId, usage::Column::Minute]);
-        conflict
-            .value(
-                usage::Column::BytesIn,
-                Expr::col(usage::Column::BytesIn).add(excluded(usage::Column::BytesIn)),
-            )
-            .value(
-                usage::Column::BytesOut,
-                Expr::col(usage::Column::BytesOut).add(excluded(usage::Column::BytesOut)),
-            )
-            .value(
-                usage::Column::TunnelIn,
-                Expr::col(usage::Column::TunnelIn).add(excluded(usage::Column::TunnelIn)),
-            )
-            .value(
-                usage::Column::TunnelOut,
-                Expr::col(usage::Column::TunnelOut).add(excluded(usage::Column::TunnelOut)),
-            )
-            .value(
-                usage::Column::Requests,
-                Expr::col(usage::Column::Requests).add(excluded(usage::Column::Requests)),
-            )
-            .value(
-                usage::Column::UnusedMs,
-                Expr::col(usage::Column::UnusedMs).add(excluded(usage::Column::UnusedMs)),
-            );
-
-        if models.is_empty() {
-            return Ok(());
-        }
-        usage::Entity::insert_many(models)
-            .on_conflict(conflict)
-            .exec_without_returning(&txn)
-            .await?;
-        txn.commit().await?;
-        Ok(())
-    }
-
     /// Aggregated per-service usage over `[since_min, until_min)`, optionally
     /// filtered by person and/or service name.
     ///
-    /// `since_min`/`until_min` are minute numbers. `open_ms` is derived here
-    /// and only here (`covered_minutes * 60_000 - SUM(unused_ms)`), so the
-    /// stored inversion never leaks past the store. An unknown person or
-    /// service name matches nothing and yields an empty result, not an error.
+    /// `since_min`/`until_min` are minute numbers. `open_ms` is the sum of the
+    /// `open_ms` slots, which store open time directly — there is no stored
+    /// inversion to undo any more. An unknown person or service name matches
+    /// nothing and yields an empty result, not an error.
+    ///
+    /// A minute counts as *covered* when any of its six slots is non-zero, i.e.
+    /// when a bucket was recorded for it; a service with no covered minute in
+    /// the window is left out of the result.
     pub(crate) async fn query_usage(
         &self,
         person: Option<&str>,
@@ -108,28 +41,96 @@ impl Store {
         since_min: i64,
         until_min: i64,
     ) -> Result<Vec<UsageTotal>, StoreError> {
-        let mut query = usage::Entity::find()
+        if until_min <= since_min {
+            return Ok(Vec::new());
+        }
+        let identities = self.usage_identities(person, service).await?;
+        if identities.is_empty() {
+            return Ok(Vec::new());
+        }
+        let ids: Vec<i32> = identities.iter().map(|i| i.service_id).collect();
+        let mut totals: HashMap<i32, UsageTotal> = identities
+            .into_iter()
+            .map(|identity| (identity.service_id, UsageTotal::from_identity(&identity)))
+            .collect();
+
+        let first_day = since_min.div_euclid(MINUTES_PER_DAY as i64);
+        let last_day = (until_min - 1).div_euclid(MINUTES_PER_DAY as i64);
+        let mut by_day: BTreeMap<i64, Vec<i32>> = BTreeMap::new();
+        for (service_id, day) in self.live_days(&ids).await? {
+            if (first_day..=last_day).contains(&day) {
+                by_day.entry(day).or_default().push(service_id);
+            }
+        }
+
+        for (day, day_services) in by_day {
+            let arrays = self
+                .read_day_slots_of(&day_services, day, &Slots::ALL)
+                .await?;
+            let base = day * MINUTES_PER_DAY as i64;
+            // Only the window's minutes can be covered; skip the rest.
+            let first = (since_min - base).clamp(0, MINUTES_PER_DAY as i64) as usize;
+            let last = (until_min - base).clamp(0, MINUTES_PER_DAY as i64) as usize;
+            for service_id in day_services {
+                let Some(total) = totals.get_mut(&service_id) else {
+                    continue;
+                };
+                for index in first..last {
+                    let mut covered = false;
+                    for slot in Slots::ALL {
+                        let Some(value) = arrays
+                            .get(&(service_id, slot))
+                            .and_then(|values| values.get(index))
+                            .copied()
+                        else {
+                            continue;
+                        };
+                        covered |= value != 0;
+                        match slot {
+                            Slots::BytesIn => total.bytes_in += value,
+                            Slots::BytesOut => total.bytes_out += value,
+                            Slots::TunnelIn => total.tunnel_in += value,
+                            Slots::TunnelOut => total.tunnel_out += value,
+                            Slots::Requests => total.requests += value,
+                            Slots::OpenMs => total.open_ms += value,
+                        }
+                    }
+                    if covered {
+                        total.covered_minutes += 1;
+                    }
+                }
+            }
+        }
+
+        let mut totals: Vec<UsageTotal> = totals
+            .into_values()
+            .filter(|total| total.covered_minutes > 0)
+            .collect();
+        totals.sort_by(|a, b| {
+            (&a.person, &a.machine, &a.service).cmp(&(&b.person, &b.machine, &b.service))
+        });
+        Ok(totals)
+    }
+
+    /// The services matching the meter's optional person/service-name filters,
+    /// with their display identity, in `person → machine → service` order.
+    ///
+    /// An unknown name matches nothing, so the filter is applied to the
+    /// identity rather than to usage, and a service with no usage in the window
+    /// is simply absent from [`Store::query_usage`]'s result.
+    async fn usage_identities(
+        &self,
+        person: Option<&str>,
+        service: Option<&str>,
+    ) -> Result<Vec<ServiceIdentity>, StoreError> {
+        let mut query = service::Entity::find()
             .select_only()
-            .column(usage::Column::ServiceId)
+            .column_as(service::Column::Id, "service_id")
             .column_as(service::Column::Name, "service")
             .column_as(machine::Column::Name, "machine")
             .column_as(person::Column::Name, "person")
-            .column_as(Expr::col(usage::Column::BytesIn).sum(), "bytes_in")
-            .column_as(Expr::col(usage::Column::BytesOut).sum(), "bytes_out")
-            .column_as(Expr::col(usage::Column::TunnelIn).sum(), "tunnel_in")
-            .column_as(Expr::col(usage::Column::TunnelOut).sum(), "tunnel_out")
-            .column_as(Expr::col(usage::Column::Requests).sum(), "requests")
-            .column_as(Expr::col(usage::Column::UnusedMs).sum(), "unused_ms")
-            .column_as(Expr::col(usage::Column::Minute).count(), "covered_minutes")
-            .join(JoinType::InnerJoin, usage::Relation::Service.def())
             .join(JoinType::InnerJoin, service::Relation::Machine.def())
             .join(JoinType::InnerJoin, machine::Relation::Person.def())
-            .filter(usage::Column::Minute.gte(since_min))
-            .filter(usage::Column::Minute.lt(until_min))
-            .group_by(usage::Column::ServiceId)
-            .group_by(service::Column::Name)
-            .group_by(machine::Column::Name)
-            .group_by(person::Column::Name)
             .order_by_asc(person::Column::Name)
             .order_by_asc(machine::Column::Name)
             .order_by_asc(service::Column::Name);
@@ -139,21 +140,16 @@ impl Store {
         if let Some(service) = service {
             query = query.filter(service::Column::Name.eq(service.to_ascii_lowercase()));
         }
-        let rows = query.into_model::<UsageAggRow>().all(&self.db).await?;
-        Ok(rows
+        Ok(query
+            .into_model::<ServiceIdentityRow>()
+            .all(&self.db)
+            .await?
             .into_iter()
-            .map(|r| UsageTotal {
-                service_id: r.service_id,
-                service: r.service,
-                machine: r.machine,
-                person: r.person,
-                bytes_in: r.bytes_in,
-                bytes_out: r.bytes_out,
-                tunnel_in: r.tunnel_in,
-                tunnel_out: r.tunnel_out,
-                requests: r.requests,
-                covered_minutes: r.covered_minutes,
-                open_ms: r.covered_minutes * 60_000 - r.unused_ms,
+            .map(|row| ServiceIdentity {
+                service_id: row.service_id,
+                service: row.service,
+                machine: row.machine,
+                person: row.person,
             })
             .collect())
     }
@@ -161,8 +157,8 @@ impl Store {
     /// Resolves `(service, machine, person)` names for a set of service ids.
     ///
     /// Used by the metering manager to name services that only exist in the
-    /// unflushed in-memory buckets and therefore have no persisted usage row
-    /// to join against. Unknown ids are simply absent from the result.
+    /// unflushed in-memory buckets and therefore have no persisted slot array
+    /// to read. Unknown ids are simply absent from the result.
     pub(crate) async fn service_identities(
         &self,
         ids: &[i32],
@@ -212,23 +208,6 @@ struct ServiceIdentityRow {
     person: String,
 }
 
-/// One metered minute for one service, ready to be persisted.
-///
-/// Produced by [`crate::metering::MeteringManager`]; `open_ms` is the
-/// milliseconds the service was registered during this nominal minute
-/// (`0..=60_000`). Crate-internal: metering is the only writer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct UsageRow {
-    pub(crate) service_id: i32,
-    pub(crate) minute: i64,
-    pub(crate) bytes_in: i64,
-    pub(crate) bytes_out: i64,
-    pub(crate) tunnel_in: i64,
-    pub(crate) tunnel_out: i64,
-    pub(crate) requests: i64,
-    pub(crate) open_ms: i64,
-}
-
 /// Aggregated usage for one service over a queried window.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UsageTotal {
@@ -245,163 +224,53 @@ pub struct UsageTotal {
     /// Tunnel leg: relay -> client compressed bytes.
     pub tunnel_out: i64,
     pub requests: i64,
-    /// Distinct minutes with a persisted bucket in the window.
+    /// Distinct minutes with a recorded bucket in the window.
     pub covered_minutes: i64,
     /// Milliseconds the service was registered across the window.
     pub open_ms: i64,
 }
 
-/// Raw aggregate row before the `open_ms` inversion, matched to the query's
-/// column aliases.
-#[derive(Debug, sea_orm::FromQueryResult)]
-struct UsageAggRow {
-    service_id: i32,
-    service: String,
-    machine: String,
-    person: String,
-    bytes_in: i64,
-    bytes_out: i64,
-    tunnel_in: i64,
-    tunnel_out: i64,
-    requests: i64,
-    unused_ms: i64,
-    covered_minutes: i64,
-}
-
-/// Inverts `open_ms` into the stored `unused_ms`, rejecting out-of-range input.
-///
-/// Storage keeps the *unused* milliseconds so the common full-minute bucket is
-/// the zero value and an alternate view could be added without a schema
-/// change. This is the single place the inversion is applied;
-/// [`Store::query_usage`] is the single place it is undone.
-fn unused_ms_from_open_ms(open_ms: i64) -> Result<i32, StoreError> {
-    if !(0..=60_000).contains(&open_ms) {
-        return Err(StoreError::InvalidUsage(format!(
-            "open_ms {open_ms} is outside 0..=60000"
-        )));
+impl UsageTotal {
+    /// A zeroed total carrying an identity, ready to be summed into.
+    fn from_identity(identity: &ServiceIdentity) -> Self {
+        Self {
+            service_id: identity.service_id,
+            service: identity.service.clone(),
+            machine: identity.machine.clone(),
+            person: identity.person.clone(),
+            bytes_in: 0,
+            bytes_out: 0,
+            tunnel_in: 0,
+            tunnel_out: 0,
+            requests: 0,
+            covered_minutes: 0,
+            open_ms: 0,
+        }
     }
-    Ok((60_000 - open_ms) as i32)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::usage_live::SlotWrite;
 
-    #[tokio::test]
-    async fn upsert_increments_and_rejects_out_of_range() {
-        let store = Store::connect("sqlite::memory:").await.expect("connect");
-        let alice = store.create_test_person("Alice").await.expect("person");
-        let laptop = store
-            .create_machine(alice.id, "Laptop", &weaver_mux::KeyId::Ed25519([1; 32]))
-            .await
-            .expect("machine");
-        let svc = store
-            .get_or_create_service(laptop.id, "web")
-            .await
-            .expect("service");
-
-        let row = UsageRow {
-            service_id: svc.id,
-            minute: 100,
-            bytes_in: 10,
-            bytes_out: 20,
-            tunnel_in: 1,
-            tunnel_out: 2,
-            requests: 1,
-            open_ms: 60_000,
-        };
-        store.upsert_usage_batch(&[row]).await.expect("first flush");
-
-        // Flushing the same bucket again accumulates every counter.
+    /// Writes one minute's worth of one metric at its slot in `day`.
+    async fn slot(store: &Store, service_id: i32, minute: i64, slots: Slots, value: i64) {
+        let day = minute.div_euclid(MINUTES_PER_DAY as i64);
         store
-            .upsert_usage_batch(&[UsageRow {
-                bytes_in: 5,
-                bytes_out: 7,
-                requests: 2,
-                ..row
+            .write_day_slots(&[SlotWrite {
+                service_id,
+                day,
+                slots,
+                first_slot: (minute - day * MINUTES_PER_DAY as i64) as u16,
+                values: vec![value],
             }])
             .await
-            .expect("second flush");
-
-        let totals = store
-            .query_usage(None, None, 0, 1_000)
-            .await
-            .expect("query");
-        assert_eq!(totals.len(), 1);
-        let t = &totals[0];
-        assert_eq!(t.bytes_in, 15);
-        assert_eq!(t.bytes_out, 27);
-        assert_eq!(t.tunnel_in, 2);
-        assert_eq!(t.tunnel_out, 4);
-        assert_eq!(t.requests, 3);
-        assert_eq!(t.covered_minutes, 1);
-        assert_eq!(t.open_ms, 60_000, "a full minute stays a full minute");
-        assert_eq!(t.service, "web");
-        assert_eq!(t.machine, "laptop");
-        assert_eq!(t.person, "alice");
-
-        // An out-of-range open_ms is rejected and stores nothing at all.
-        let err = store
-            .upsert_usage_batch(&[UsageRow {
-                service_id: svc.id,
-                minute: 101,
-                open_ms: 60_001,
-                ..row
-            }])
-            .await;
-        assert!(
-            matches!(err, Err(StoreError::InvalidUsage(_))),
-            "got {err:?}"
-        );
-        assert_eq!(
-            store.query_usage(None, None, 0, 1_000).await.unwrap().len(),
-            1,
-            "the rejected batch must not have written a row"
-        );
+            .expect("write slot");
     }
 
     #[tokio::test]
-    async fn rows_of_a_revoked_machine_do_not_sink_the_batch() {
-        let store = Store::connect("sqlite::memory:").await.expect("connect");
-        let alice = store.create_test_person("alice").await.expect("person");
-        let keep_key = weaver_mux::KeyId::Ed25519([1; 32]);
-        let gone_key = weaver_mux::KeyId::Ed25519([2; 32]);
-        let laptop = store
-            .create_machine(alice.id, "laptop", &keep_key)
-            .await
-            .expect("machine");
-        let desktop = store
-            .create_machine(alice.id, "desktop", &gone_key)
-            .await
-            .expect("machine");
-        let kept = store.get_or_create_service(laptop.id, "web").await.unwrap();
-        let gone = store
-            .get_or_create_service(desktop.id, "web")
-            .await
-            .unwrap();
-        store.revoke_machine(&gone_key).await.unwrap();
-
-        let row = |service_id| UsageRow {
-            service_id,
-            minute: 100,
-            bytes_in: 1,
-            bytes_out: 1,
-            tunnel_in: 1,
-            tunnel_out: 1,
-            requests: 1,
-            open_ms: 60_000,
-        };
-        store
-            .upsert_usage_batch(&[row(kept.id), row(gone.id)])
-            .await
-            .expect("the live service's row is still written");
-        let totals = store.query_usage(None, None, 0, 1_000).await.unwrap();
-        assert_eq!(totals.len(), 1);
-        assert_eq!(totals[0].machine, "laptop");
-    }
-
-    #[tokio::test]
-    async fn query_filters_and_open_ms_inversion() {
+    async fn query_sums_the_live_arrays_and_inverts_nothing() {
         let store = Store::connect("sqlite::memory:").await.expect("connect");
         let alice = store.create_test_person("Alice").await.expect("person");
         let laptop = store
@@ -414,46 +283,30 @@ mod tests {
             .expect("service");
 
         // Minute 100: half open. Minute 101: fully open.
-        store
-            .upsert_usage_batch(&[
-                UsageRow {
-                    service_id: web.id,
-                    minute: 100,
-                    bytes_in: 1,
-                    bytes_out: 2,
-                    tunnel_in: 10,
-                    tunnel_out: 20,
-                    requests: 1,
-                    open_ms: 30_000,
-                },
-                UsageRow {
-                    service_id: web.id,
-                    minute: 101,
-                    bytes_in: 3,
-                    bytes_out: 4,
-                    tunnel_in: 30,
-                    tunnel_out: 40,
-                    requests: 2,
-                    open_ms: 60_000,
-                },
-            ])
-            .await
-            .expect("flush");
+        for (minute, bytes, open_ms) in [(100, 3, 30_000), (101, 9, 60_000)] {
+            slot(&store, web.id, minute, Slots::BytesIn, bytes).await;
+            slot(&store, web.id, minute, Slots::BytesOut, bytes * 2).await;
+            slot(&store, web.id, minute, Slots::Requests, 1).await;
+            slot(&store, web.id, minute, Slots::OpenMs, open_ms).await;
+        }
 
         let totals = store
             .query_usage(None, None, 100, 102)
             .await
             .expect("query");
         assert_eq!(totals.len(), 1);
-        assert_eq!(totals[0].covered_minutes, 2);
-        assert_eq!(totals[0].bytes_in, 4);
-        assert_eq!(totals[0].open_ms, 90_000, "30000 + 60000");
+        let t = &totals[0];
+        assert_eq!(t.covered_minutes, 2);
+        assert_eq!(t.bytes_in, 12);
+        assert_eq!(t.bytes_out, 24);
+        assert_eq!(t.requests, 2);
+        assert_eq!(t.open_ms, 90_000, "30000 + 60000, no inversion left");
+        assert_eq!(t.service, "web");
+        assert_eq!(t.machine, "laptop");
+        assert_eq!(t.person, "alice");
 
         // The window is half-open: [100, 101) covers only minute 100.
-        let only_100 = store
-            .query_usage(None, None, 100, 101)
-            .await
-            .expect("query");
+        let only_100 = store.query_usage(None, None, 100, 101).await.unwrap();
         assert_eq!(only_100[0].covered_minutes, 1);
         assert_eq!(only_100[0].open_ms, 30_000);
 
@@ -487,6 +340,36 @@ mod tests {
                 .await
                 .unwrap()
                 .is_empty()
+        );
+    }
+
+    /// A service with no recorded minute is absent, and so is a window with no
+    /// live row at all.
+    #[tokio::test]
+    async fn a_window_with_no_slots_yields_nothing() {
+        let store = Store::connect("sqlite::memory:").await.expect("connect");
+        let alice = store.create_test_person("alice").await.expect("person");
+        let laptop = store
+            .create_machine(alice.id, "laptop", &weaver_mux::KeyId::Ed25519([1; 32]))
+            .await
+            .expect("machine");
+        store.get_or_create_service(laptop.id, "web").await.unwrap();
+
+        assert!(
+            store
+                .query_usage(None, None, 0, 1_000)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        slot(&store, 1, 100, Slots::Requests, 0).await;
+        assert!(
+            store
+                .query_usage(None, None, 0, 1_000)
+                .await
+                .unwrap()
+                .is_empty(),
+            "an all-zero bucket is not a covered minute"
         );
     }
 }

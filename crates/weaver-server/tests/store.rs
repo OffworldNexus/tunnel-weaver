@@ -23,6 +23,11 @@ where
     row.try_get_by_index::<T>(0).expect("column decode failed")
 }
 
+/// Lowercase hex of a byte slice, for a SQL `X'…'` blob literal.
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
 fn sample_config() -> Config {
     Config {
         tunnel_domain: "example.com".into(),
@@ -38,6 +43,7 @@ fn sample_config() -> Config {
         acme_root_ca_pem: None,
         acme_fallback_providers: vec!["letsencrypt-staging".into()],
         usage_flush_interval_secs: 60,
+        usage_retention_secs: 31_536_000,
         relay_ips: Vec::new(),
         setup_complete: false,
         email: None,
@@ -109,19 +115,19 @@ async fn test_store_open_runs_migrations_and_is_idempotent() {
         let store = Store::open(&db_path).await.expect("open failed");
         let count: i64 = scalar(
             &store,
-            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN ('config', 'acme_account', 'domains', 'certificates', 'cert_events', 'seaql_migrations', 'person', 'machine', 'machine_key_log', 'service', 'usage', 'challenge', 'abuse_bucket')",
+            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN ('config', 'acme_account', 'domains', 'certificates', 'cert_events', 'seaql_migrations', 'person', 'machine', 'machine_key_log', 'service', 'usage_daily', 'usage_live', 'challenge', 'abuse_bucket')",
         )
         .await;
-        assert_eq!(count, 13);
-        assert_eq!(store.schema_version().await.expect("schema_version"), 1);
+        assert_eq!(count, 14);
+        assert_eq!(store.schema_version().await.expect("schema_version"), 2);
     }
 
     // Re-open existing database: should succeed and not re-apply migrations
     {
         let store = Store::open(&db_path).await.expect("re-open failed");
         let migration_count: i64 = scalar(&store, "SELECT count(*) FROM seaql_migrations").await;
-        assert_eq!(migration_count, 1);
-        assert_eq!(store.schema_version().await.expect("schema_version"), 1);
+        assert_eq!(migration_count, 2);
+        assert_eq!(store.schema_version().await.expect("schema_version"), 2);
     }
 }
 
@@ -889,22 +895,38 @@ async fn test_migration_usage_round_trips() {
     weaver_server::Migrator::down(store.db(), None)
         .await
         .expect("down");
-    let usage_tables: i64 = scalar(
-        &store,
-        "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='usage'",
-    )
-    .await;
-    assert_eq!(usage_tables, 0, "down must drop the usage table");
+    assert_eq!(
+        scalar::<i64>(
+            &store,
+            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='usage_live'"
+        )
+        .await,
+        0,
+        "down must drop the live-slot table"
+    );
 
     weaver_server::Migrator::up(store.db(), None)
         .await
         .expect("up");
-    let usage_tables: i64 = scalar(
-        &store,
-        "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='usage'",
-    )
-    .await;
-    assert_eq!(usage_tables, 1, "up must recreate the usage table");
+    assert_eq!(
+        scalar::<i64>(
+            &store,
+            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='usage_live'"
+        )
+        .await,
+        1,
+        "up must recreate the live-slot table"
+    );
+    // The old per-minute table is gone for good, on a fresh database too.
+    assert_eq!(
+        scalar::<i64>(
+            &store,
+            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='usage'"
+        )
+        .await,
+        0,
+        "the per-minute table must not come back"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1970,6 +1992,414 @@ async fn test_revoking_deletes_the_machine_but_keeps_its_log() {
 
     // Revoking again is the goal state, not an error.
     assert!(store.revoke_machine(&key).await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn test_renaming_a_machine_rederives_its_hostnames() {
+    use weaver_mux::KeyId;
+
+    let store = Store::connect("sqlite::memory:").await.unwrap();
+    let alice = store.create_test_person("alice").await.unwrap();
+    let bob = store.create_test_person("bob").await.unwrap();
+    let laptop = store
+        .create_machine(alice.id, "laptop", &KeyId::P256([2; 33]))
+        .await
+        .unwrap();
+    store
+        .register_declared_service(laptop.id, "alice-laptop-web.example.com", "web")
+        .await
+        .unwrap();
+    store
+        .register_declared_service(laptop.id, "alice-laptop-db.example.com", "db")
+        .await
+        .unwrap();
+    let desktop = store
+        .create_machine(alice.id, "desktop", &KeyId::P256([3; 33]))
+        .await
+        .unwrap();
+    // Another person's hostname must never be touched by alice's rename.
+    let bobs = store
+        .create_machine(bob.id, "laptop", &KeyId::P256([4; 33]))
+        .await
+        .unwrap();
+    store
+        .register_declared_service(bobs.id, "bob-laptop-web.example.com", "web")
+        .await
+        .unwrap();
+
+    let renamed = store.rename_machine(laptop.id, "Rig").await.unwrap();
+    assert_eq!(renamed.name, "rig", "names are lowercased");
+
+    // Every service moved to the new prefix, old rows are gone.
+    let hosts: Vec<String> = store
+        .services_with_hostnames(&[laptop.id])
+        .await
+        .unwrap()
+        .into_iter()
+        .flat_map(|(_, hosts)| hosts)
+        .collect();
+    assert_eq!(
+        hosts,
+        vec!["alice-rig-db.example.com", "alice-rig-web.example.com"]
+    );
+    assert!(
+        store
+            .get_domain("alice-laptop-web.example.com")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .get_domain("alice-laptop-db.example.com")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    // Bob's identical-looking name is untouched.
+    assert!(
+        store
+            .get_domain("bob-laptop-web.example.com")
+            .await
+            .unwrap()
+            .is_some()
+    );
+
+    // The per-person unique index still holds.
+    assert!(matches!(
+        store.rename_machine(laptop.id, "desktop").await,
+        Err(StoreError::Db(_))
+    ));
+    // A rename to the current name is a harmless no-op.
+    assert_eq!(
+        store.rename_machine(laptop.id, "rig").await.unwrap().name,
+        "rig"
+    );
+    // Names are validated before anything is written.
+    assert!(matches!(
+        store.rename_machine(laptop.id, "Not A Name").await,
+        Err(StoreError::InvalidName(_))
+    ));
+    assert!(matches!(
+        store
+            .rename_machine(laptop.id, "this-name-is-far-too-long")
+            .await,
+        Err(StoreError::InvalidName(_))
+    ));
+    // An unknown machine is a conflict, not a silent success.
+    assert!(matches!(
+        store.rename_machine(desktop.id + 9_999, "rig").await,
+        Err(StoreError::Conflict(_))
+    ));
+}
+
+#[tokio::test]
+async fn test_renaming_adopts_a_leftover_unowned_hostname() {
+    use weaver_mux::KeyId;
+
+    let store = Store::connect("sqlite::memory:").await.unwrap();
+    let alice = store.create_test_person("alice").await.unwrap();
+    // A machine that once served `alice-old-web`, then was revoked: its
+    // hostname row survives with its `service_id` cleared.
+    let old = store
+        .create_machine(alice.id, "old", &KeyId::P256([2; 33]))
+        .await
+        .unwrap();
+    store
+        .register_declared_service(old.id, "alice-old-web.example.com", "web")
+        .await
+        .unwrap();
+    store
+        .revoke_machine(&old.key_id.parse().unwrap())
+        .await
+        .unwrap();
+    assert!(
+        store
+            .get_domain("alice-old-web.example.com")
+            .await
+            .unwrap()
+            .unwrap()
+            .service_id
+            .is_none()
+    );
+
+    // A new machine serves `alice-fresh-web`; renaming it to `old` derives a
+    // hostname that already exists, so the leftover row must be adopted rather
+    // than colliding with the unique index.
+    let fresh = store
+        .create_machine(alice.id, "fresh", &KeyId::P256([3; 33]))
+        .await
+        .unwrap();
+    store
+        .register_declared_service(fresh.id, "alice-fresh-web.example.com", "web")
+        .await
+        .unwrap();
+    let web = store.get_or_create_service(fresh.id, "web").await.unwrap();
+
+    store.rename_machine(fresh.id, "old").await.unwrap();
+    assert_eq!(
+        store
+            .get_domain("alice-old-web.example.com")
+            .await
+            .unwrap()
+            .unwrap()
+            .service_id,
+        Some(web.id)
+    );
+    assert!(
+        store
+            .get_domain("alice-fresh-web.example.com")
+            .await
+            .unwrap()
+            .is_none(),
+        "the machine's own old hostname is gone"
+    );
+}
+
+#[tokio::test]
+async fn test_machine_last_seen_comes_from_the_day_rollup() {
+    use sea_orm::ConnectionTrait;
+    use weaver_mux::KeyId;
+    use weaver_server::metrics::{MetricsStore, encode_blob};
+
+    let store = Store::connect("sqlite::memory:").await.unwrap();
+    let alice = store.create_test_person("alice").await.unwrap();
+    let laptop = store
+        .create_machine(alice.id, "laptop", &KeyId::P256([2; 33]))
+        .await
+        .unwrap();
+    let web = store
+        .register_declared_service(laptop.id, "alice-laptop-web.example.com", "web")
+        .await
+        .unwrap();
+    let desktop = store
+        .create_machine(alice.id, "desktop", &KeyId::P256([3; 33]))
+        .await
+        .unwrap();
+    let desk_web = store
+        .register_declared_service(desktop.id, "alice-desktop-web.example.com", "web")
+        .await
+        .unwrap();
+    let metrics = MetricsStore::new(store.clone());
+
+    // Nothing metered yet: never seen.
+    assert!(
+        metrics
+            .last_open_minutes(&[web.id, desk_web.id])
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    // A folded day carries open time in its per-minute blob; the last non-zero
+    // index is the last minute the service was up.
+    let mut open = vec![0_i64; 1440];
+    open[6] = 60_000;
+    let open_blob = encode_blob(&open);
+    let zero_blob = encode_blob(&[0_i64; 1440]);
+    let z = hex(&zero_blob);
+    let blob = hex(&open_blob);
+    store
+        .db()
+        .execute_unprepared(&format!(
+            "INSERT INTO usage_daily (service_id, day, bytes_in, bytes_in_hours, bytes_in_minutes, \
+                bytes_out, bytes_out_hours, bytes_out_minutes, tunnel_in, tunnel_in_hours, tunnel_in_minutes, \
+                tunnel_out, tunnel_out_hours, tunnel_out_minutes, requests, requests_hours, requests_minutes, \
+                open_ms, open_ms_hours, open_ms_minutes) VALUES \
+             ({}, 100, 0, X'{z}', X'{z}', 0, X'{z}', X'{z}', 0, X'{z}', X'{z}', 0, X'{z}', X'{z}', \
+              0, X'{z}', X'{z}', 60000, X'{z}', X'{blob}')",
+            web.id
+        ))
+        .await
+        .unwrap();
+
+    let seen = metrics
+        .last_open_minutes(&[web.id, desk_web.id])
+        .await
+        .unwrap();
+    assert_eq!(
+        seen.get(&web.id),
+        Some(&(100 * 1440 + 6)),
+        "the folded day's last open minute"
+    );
+    // A machine with no open time has no presence, even with services.
+    assert!(!seen.contains_key(&desk_web.id));
+
+    // A later live day is read from its slot array and wins.
+    use weaver_server::store::usage_live::{SlotWrite, Slots};
+    let today_minute = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+        / 60;
+    let day = today_minute.div_euclid(1440);
+    store
+        .write_day_slots(&[SlotWrite {
+            service_id: web.id,
+            day,
+            slots: Slots::OpenMs,
+            first_slot: (today_minute - day * 1440) as u16,
+            values: vec![60_000],
+        }])
+        .await
+        .unwrap();
+    let seen = metrics.last_open_minutes(&[web.id]).await.unwrap();
+    assert_eq!(seen.get(&web.id), Some(&today_minute));
+}
+
+/// Upgrading a relay leaves recorded slots and no rollup; the metering tick's
+/// fold compresses each finished day into one wide row per service and deletes
+/// the live rows it folded.
+#[tokio::test]
+async fn test_fold_finished_days_compresses_recorded_minutes() {
+    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+    use weaver_mux::KeyId;
+    use weaver_server::metrics::{MetricsStore, decode_blob};
+    use weaver_server::store::entity::usage_daily;
+    use weaver_server::store::usage_live::{SlotWrite, Slots};
+
+    let store = Store::connect("sqlite::memory:").await.unwrap();
+    let alice = store.create_test_person("alice").await.unwrap();
+    let laptop = store
+        .create_machine(alice.id, "laptop", &KeyId::P256([2; 33]))
+        .await
+        .unwrap();
+    let web = store
+        .register_declared_service(laptop.id, "alice-laptop-web.example.com", "web")
+        .await
+        .unwrap();
+
+    // Day 0: minute 100 wholly open, minute 101 never open. Day 1: minute 1441
+    // half open. Slot arrays store open time directly.
+    let slot = |day: i64, first_slot: u16, slots: Slots, values: Vec<i64>| SlotWrite {
+        service_id: web.id,
+        day,
+        slots,
+        first_slot,
+        values,
+    };
+    store
+        .write_day_slots(&[
+            slot(0, 100, Slots::BytesIn, vec![10, 30]),
+            slot(0, 100, Slots::BytesOut, vec![20, 40]),
+            slot(0, 100, Slots::TunnelIn, vec![1, 3]),
+            slot(0, 100, Slots::TunnelOut, vec![2, 4]),
+            slot(0, 100, Slots::Requests, vec![1, 2]),
+            slot(0, 100, Slots::OpenMs, vec![60_000, 0]),
+            slot(1, 1, Slots::BytesIn, vec![5]),
+            slot(1, 1, Slots::BytesOut, vec![6]),
+            slot(1, 1, Slots::Requests, vec![1]),
+            slot(1, 1, Slots::OpenMs, vec![30_000]),
+        ])
+        .await
+        .unwrap();
+
+    let metrics = MetricsStore::new(store.clone());
+    assert_eq!(
+        metrics.fold_finished_days().await.unwrap(),
+        2,
+        "one row folded for each finished day"
+    );
+    assert_eq!(
+        scalar::<i64>(&store, "SELECT COUNT(*) FROM usage_live").await,
+        0,
+        "the folded days' live rows are deleted"
+    );
+
+    assert_eq!(
+        scalar::<i64>(&store, "SELECT bytes_in FROM usage_daily WHERE day = 0").await,
+        40
+    );
+    assert_eq!(
+        scalar::<i64>(&store, "SELECT open_ms FROM usage_daily WHERE day = 0").await,
+        60_000,
+        "minute 100 fully open plus a never-open minute 101"
+    );
+    assert_eq!(
+        scalar::<i64>(&store, "SELECT requests FROM usage_daily WHERE day = 0").await,
+        3
+    );
+
+    // The blobs are the day's 1440 little-endian i64 values, zstd-compressed;
+    // decoding them recovers the per-minute detail the fold started from.
+    let row = usage_daily::Entity::find()
+        .filter(usage_daily::Column::ServiceId.eq(web.id))
+        .filter(usage_daily::Column::Day.eq(0))
+        .one(store.db())
+        .await
+        .unwrap()
+        .expect("one wide row for the service-day");
+    let bytes_in = decode_blob(&row.bytes_in_minutes).unwrap();
+    assert_eq!(bytes_in.len(), 1440);
+    assert_eq!(bytes_in[100], 10);
+    assert_eq!(bytes_in[101], 30);
+    let hours = decode_blob(&row.bytes_in_hours).unwrap();
+    assert_eq!(hours.len(), 24);
+    assert_eq!(hours[1], 40, "both minutes are in hour 1");
+    let open = decode_blob(&row.open_ms_minutes).unwrap();
+    assert_eq!(open[100], 60_000);
+    assert_eq!(open[101], 0, "a never-open minute stays zero");
+
+    // Day 1 is a separate row with its own half-open minute.
+    assert_eq!(
+        scalar::<i64>(&store, "SELECT open_ms FROM usage_daily WHERE day = 1").await,
+        30_000
+    );
+}
+
+/// The rollup is the one table with a retention: `sweep` drops whole rows older
+/// than the retention and leaves the rest.
+#[tokio::test]
+async fn test_sweep_removes_rollup_rows_past_retention() {
+    use sea_orm::ConnectionTrait;
+    use weaver_mux::KeyId;
+    use weaver_server::metrics::MetricsStore;
+
+    let store = Store::connect("sqlite::memory:").await.unwrap();
+    let alice = store.create_test_person("alice").await.unwrap();
+    let laptop = store
+        .create_machine(alice.id, "laptop", &KeyId::P256([2; 33]))
+        .await
+        .unwrap();
+    let web = store
+        .register_declared_service(laptop.id, "alice-laptop-web.example.com", "web")
+        .await
+        .unwrap();
+
+    let now_day = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+        / 86_400;
+    // An empty blob is a valid non-NULL value, and the sweep never decodes it.
+    for day in [now_day - 400, now_day - 2, now_day] {
+        store
+            .db()
+            .execute_unprepared(&format!(
+                "INSERT INTO usage_daily (service_id, day, bytes_in, bytes_in_hours, bytes_in_minutes, \
+                    bytes_out, bytes_out_hours, bytes_out_minutes, tunnel_in, tunnel_in_hours, tunnel_in_minutes, \
+                    tunnel_out, tunnel_out_hours, tunnel_out_minutes, requests, requests_hours, requests_minutes, \
+                    open_ms, open_ms_hours, open_ms_minutes) VALUES \
+                 ({}, {day}, 0, X'', X'', 0, X'', X'', 0, X'', X'', 0, X'', X'', 0, X'', X'', 0, X'', X'')",
+                web.id
+            ))
+            .await
+            .unwrap();
+    }
+
+    let metrics = MetricsStore::new(store);
+    // A year drops the 400-day-old row but keeps the last two days.
+    assert_eq!(metrics.sweep(365 * 86_400).await.unwrap(), 1);
+    assert_eq!(
+        scalar::<i64>(metrics.store(), "SELECT COUNT(*) FROM usage_daily").await,
+        2
+    );
+    // A zero retention keeps only the current day.
+    assert_eq!(metrics.sweep(0).await.unwrap(), 1);
+    assert_eq!(
+        scalar::<i64>(metrics.store(), "SELECT day FROM usage_daily").await,
+        now_day
+    );
 }
 
 #[tokio::test]

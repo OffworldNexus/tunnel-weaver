@@ -147,6 +147,24 @@ impl AccountRuntime {
         format!("{}/app", self.base_url.trim_end_matches('/'))
     }
 
+    /// The admin host a client dials to pair, for the `weave pair <host>`
+    /// instruction shown in the console.
+    ///
+    /// Derived from `base_url` (the SPA's own origin) so a custom
+    /// `account.base_url` stays correct; the scheme and any path are dropped,
+    /// leaving just the host (and port) the CLI needs.
+    pub fn relay_host(&self) -> String {
+        let after_scheme = self
+            .base_url
+            .split_once("://")
+            .map_or(self.base_url.as_str(), |(_, rest)| rest);
+        after_scheme
+            .split('/')
+            .next()
+            .unwrap_or(after_scheme)
+            .to_string()
+    }
+
     /// The absolute HTTPS URL of the normal password-recovery page.
     ///
     /// Linked from the "your password was changed" notification so a recipient

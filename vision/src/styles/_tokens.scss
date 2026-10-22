@@ -1,0 +1,112 @@
+// Design tokens — the canonical brand palette and font stacks.
+//
+// Light is the base; dark overrides it wholesale under the OS preference or an
+// explicit `data-theme` on the root (the console ships a theme toggle). Every
+// component reads these custom properties, so no colour or font is duplicated
+// downstream. Native stacks only (no downloads), so a broken tunnel still
+// renders.
+
+:root {
+	color-scheme: light dark;
+
+	--tw-deck: #e5e0d8;
+	--tw-well: #fefaf3;
+	--tw-text: #0b0604;
+	--tw-muted: #524943;
+	// Mode-invariant, like the keycap colours.
+	--tw-border: #897e76;
+	--tw-accent: #772a0a;
+	--tw-success: #4d5818;
+	--tw-danger: #a44039;
+	--tw-info: #2a5c74;
+	--tw-warn: #8a5a12;
+
+	// Keycap · confirm tier. The cap keeps its fill in both themes; only the
+	// pedestal below it changes.
+	--tw-confirm: #aebd68;
+	--tw-confirm-hover: #becb84;
+	--tw-on-confirm: #1e2500;
+	// Keycap · key tier (Figma `key`/`onKey`): a mode-invariant dark neutral
+	// cap with light text, used by the panel secondary actions.
+	--tw-key: #38312b;
+	--tw-on-key: #fefaf3;
+	--tw-key-pedestal: #524943;
+	--tw-focus: #ba480d;
+	--tw-radius: 3px;
+
+	// ---- console surfaces ----
+	// The signed-in shell stacks three surfaces: the deck (page), the well
+	// (panels) and a raised layer for controls sitting on a panel.
+	--tw-raised: #f4efe6;
+	--tw-line-soft: #cdc4ba;
+	--tw-line-hair: #ded6cc;
+	--tw-shadow: 0 10px 30px rgb(11 6 4 / 0.1);
+
+	// ---- data viz ----
+	// A fixed categorical ramp: colour carries meaning in the charts, so the
+	// order matters (A is always the primary series). Chosen to stay legible
+	// against both the deck and the well.
+	--tw-c1: #b0611f; // rust / outbound
+	--tw-c2: #5f7326; // olive / inbound
+	--tw-c3: #2a5c74; // petrol / requests
+	--tw-c4: #8a3a63; // plum
+	--tw-c5: #8a5a12; // amber
+	--tw-c6: #55606b; // slate
+
+	// ---- status ----
+	--tw-online: #4d5818;
+	--tw-idle: #8a5a12;
+	--tw-offline: #7a716a;
+
+	// Exact stacks from https://modernfontstacks.com/: Neo-Grotesque for
+	// interface text, Geometric Humanist for headings, Monospace Code for
+	// technical values.
+	--tw-sans: Inter, Roboto, 'Helvetica Neue', 'Arial Nova', 'Nimbus Sans', Arial, sans-serif;
+	--tw-heading: Avenir, Montserrat, Corbel, 'URW Gothic', source-sans-pro, sans-serif;
+	--tw-mono:
+		ui-monospace, 'Cascadia Code', 'Source Code Pro', Menlo, Consolas, 'DejaVu Sans Mono', monospace;
+}
+
+// The dark palette, applied both by OS preference and by an explicit toggle.
+// Kept as a mixin so the two entry points can never drift.
+@mixin tw-dark-palette {
+	--tw-deck: #201a16;
+	--tw-well: #0b0604;
+	--tw-text: #fefaf3;
+	--tw-muted: #cdc6bf;
+	--tw-accent: #ffcf2e;
+	--tw-success: #cfd9a0;
+	--tw-danger: #ffb8af;
+	--tw-info: #8fc7e0;
+	--tw-warn: #f0b862;
+	--tw-raised: #171310;
+	--tw-line-soft: #3a332d;
+	--tw-line-hair: #2a241f;
+	--tw-shadow: 0 10px 30px rgb(0 0 0 / 0.45);
+	--tw-c1: #ffb066;
+	--tw-c2: #cfd9a0;
+	--tw-c3: #8fc7e0;
+	--tw-c4: #e8a3c4;
+	--tw-c5: #f0b862;
+	--tw-c6: #b9b3ad;
+	--tw-online: #cfd9a0;
+	--tw-idle: #f0b862;
+	--tw-offline: #9a928b;
+	// confirm colours stay the same in both themes
+	--tw-key-pedestal: #0b0604;
+}
+
+@media (prefers-color-scheme: dark) {
+	:root:not([data-theme='light']) {
+		@include tw-dark-palette;
+	}
+}
+
+:root[data-theme='dark'] {
+	color-scheme: dark;
+	@include tw-dark-palette;
+}
+
+:root[data-theme='light'] {
+	color-scheme: light;
+}

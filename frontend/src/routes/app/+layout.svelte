@@ -1,24 +1,29 @@
 <script lang="ts">
 	/**
-	 * The signed-in shell for every `/app` route: confirms the session once on
-	 * entry and owns the page chrome and the account nav. A signed-out visitor
-	 * is sent to sign-in.
+	 * The signed-in console layout: it confirms the session once on entry and
+	 * mounts the shell for every `/app` route. A signed-out visitor is sent to
+	 * sign-in; until the session is known a bare holding page is shown.
 	 */
-	import { onMount } from 'svelte';
+	import type { Snippet } from 'svelte';
+	import { untrack } from 'svelte';
 
 	import { notify } from '#lib/account/notices';
-	import { ensureMe, me } from '#lib/app/me';
+	import { ensureMe, me } from '#lib/app/me.svelte';
+	import { meta } from '#lib/console/meta.svelte';
+	import Shell from '#lib/console/Shell.svelte';
 	import Keycap from '#lib/ui/Keycap.svelte';
 	import Page from '#lib/ui/Page.svelte';
 	import { goto } from '$app/navigation';
 	import { resolve } from '$app/paths';
-	import { page } from '$app/state';
 
-	const accountPath = resolve('/app');
-	const securityPath = resolve('/app/security');
+	interface Props {
+		children: Snippet;
+	}
 
-	let checking = true;
-	let error = '';
+	let { children }: Props = $props();
+
+	let checking = $state(true);
+	let error = $state('');
 
 	async function check() {
 		checking = true;
@@ -33,29 +38,25 @@
 		checking = false;
 	}
 
-	onMount(check);
+	// One-shot: the session is confirmed once on entry, so the effect reads
+	// nothing reactively (`untrack`) and never re-runs.
+	$effect(() => {
+		untrack(() => {
+			void check();
+		});
+	});
 </script>
 
 <svelte:head>
-	<title>Your account · Tunnel Weaver</title>
+	<title>Console · Tunnel Weaver</title>
 </svelte:head>
 
-<Page center={false} labelledby="app-title">
-	{#if $me}
-		<nav class="nav" aria-label="Account">
-			<a href={accountPath} aria-current={page.url.pathname === accountPath ? 'page' : undefined}>
-				Your account
-			</a>
-			<a
-				href={securityPath}
-				aria-current={page.url.pathname.startsWith(securityPath) ? 'page' : undefined}
-			>
-				Security
-			</a>
-		</nav>
-
-		<slot />
-	{:else}
+{#if me.value}
+	<Shell title={meta.title} subtitle={meta.subtitle} crumbs={meta.crumbs}>
+		{@render children()}
+	</Shell>
+{:else}
+	<Page labelledby="app-title">
 		<h1 id="app-title">Your account</h1>
 		{#if checking}
 			<p class="lede" aria-live="polite">Checking your session…</p>
@@ -66,33 +67,5 @@
 				<Keycap wide variant="ghost" href={resolve('/sign-in')}>Back to sign in</Keycap>
 			</div>
 		{/if}
-	{/if}
-</Page>
-
-<style lang="scss">
-	.nav {
-		display: flex;
-		flex-wrap: wrap;
-		gap: 8px 20px;
-		margin-bottom: 24px;
-		padding-bottom: 12px;
-		border-bottom: 1.5px solid var(--tw-border);
-	}
-
-	.nav a {
-		display: inline-flex;
-		align-items: center;
-		min-height: 44px;
-		color: var(--tw-muted);
-		font-weight: 700;
-		text-decoration: none;
-	}
-
-	.nav a:hover {
-		text-decoration: underline;
-	}
-
-	.nav a[aria-current='page'] {
-		color: var(--tw-text);
-	}
-</style>
+	</Page>
+{/if}

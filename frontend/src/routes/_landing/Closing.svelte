@@ -64,7 +64,7 @@
 		min-width: 180px;
 	}
 
-	/* Icon + label inside the GitHub keycap; the slot contents are compiled here,
+	/* Icon + label inside the GitHub keycap; the snippet contents are compiled here,
 	   so this wrapper is in this component's scope. */
 	.closing__cta {
 		display: inline-flex;

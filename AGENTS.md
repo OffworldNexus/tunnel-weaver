@@ -67,6 +67,23 @@
   `account-spa` is on, so build the SPA before compiling `weaver-server` (see
   Testing).
 
+- `vision/` is a stand-alone, fully mocked SvelteKit reference application for
+  the signed-in console (`cd vision && pnpm run dev`, type-check with
+  `pnpm -C vision run check`). It is not embedded into `weaver-server`; it
+  exists as the living UX and visual design specification for the console:
+  - Role hierarchy and scoped sidebar drill-down (`super_admin → org_admin → user → machine`,
+    where admin accounts own no machines or tunnels of their own).
+  - Minitel hardware control language: 4-layer cut-corner `Keycap` action
+    buttons, videotex inverse-video `.chips` radio/mode rails, SVG bat-handle
+    `Toggle` switches, `@ark-ui/svelte` `Dialog` / `DatePicker` (with
+    type-to-confirm deletion and ban-annotation modals), `layerchart`
+    per-second speed graphs with 30-day `P50`/`P95` reference lines, and
+    `@harshmandan/svaul` request inspection drawer with the Flux-Capacitor
+    Y-junction byte diagram.
+  - **Whenever new frontend or console features are developed in `frontend/`,
+    use `vision/` as the reference example** for information architecture,
+    interaction flows, component choices, and visual styling.
+
 - The relay serves authoritative DNS (`src/dns/`, `hickory-proto`) for the
   tunnel domain `<root>` and one flat label beneath it. Hostnames are
   `<person>-<machine>-<service>.<root>` (`store::names`); person/machine are
