@@ -81,6 +81,7 @@ pub fn router(runtime: Arc<AccountRuntime>, tunnel: Option<Arc<TunnelRegistry>>)
         .route("/api/account/me", get(me))
         .route("/api/account/avatar", get(avatar))
         .route("/api/account/logout", post(logout))
+        .route("/api/account/delete", post(delete_account))
         .route("/api/account/password", post(change_password))
         .route("/api/account/machines", get(machines_list))
         .route("/api/account/overview", get(overview))
@@ -855,6 +856,81 @@ async fn logout(State(rt): State<Arc<AccountRuntime>>, headers: HeaderMap) -> Re
         json_ok(json!({ "ok": true })),
         rt.sessions.clear_session_cookie(),
     )
+}
+
+/// Body of a delete-account request.
+#[derive(Deserialize)]
+struct DeleteAccountRequest {
+    /// The string the user typed back; re-checked server-side below. Defaulted
+    /// so an omitted field is an empty (never-matching) address — a `403`, not
+    /// a deserializer `422` — keeping every refusal one shape.
+    #[serde(default)]
+    address: String,
+}
+
+/// `POST /api/account/delete` — irreversibly delete the signed-in account.
+///
+/// Strictly authenticated: same-origin and CSRF checked, then a live session is
+/// required (there is deliberately no password re-authentication yet — a
+/// stronger step is a later story). The typed address is re-checked **here**
+/// against the account's real address, or its display name when it has no email
+/// identity: the client-side gate is convenience, this is the control. Both
+/// comparisons trim and case-fold, so casing or stray whitespace still matches.
+///
+/// Every live tunnel is closed with `KeyRevoked` before the rows go, so no
+/// machine outruns the delete; the store then removes the account and all it
+/// owns in one transaction. The response clears both cookies, and the removed
+/// session rows mean a repeat request is answered `401`. The store call is
+/// idempotent, so a concurrent double-submit that still holds a valid session
+/// succeeds rather than failing on an already-gone account.
+async fn delete_account(
+    State(rt): State<Arc<AccountRuntime>>,
+    Extension(tunnel): Extension<Option<Arc<TunnelRegistry>>>,
+    headers: HeaderMap,
+    Json(req): Json<DeleteAccountRequest>,
+) -> Response {
+    if !origin_ok(&headers, &rt.base_url) || !csrf_ok(&headers) {
+        return err(StatusCode::FORBIDDEN, "request refused");
+    }
+    let Some(account) = signed_in(&rt, &headers).await else {
+        return err(StatusCode::UNAUTHORIZED, "not signed in");
+    };
+    // The address when the account has one, else the display name — the same
+    // value the SPA asks the user to type back.
+    let expected = rt
+        .store
+        .email_identity_for_account(account.id)
+        .await
+        .ok()
+        .flatten()
+        .map(|identity| identity.email)
+        .unwrap_or_else(|| account.name.clone());
+    if req.address.trim().to_lowercase() != expected.trim().to_lowercase() {
+        return err(StatusCode::FORBIDDEN, "request refused");
+    }
+
+    // Close every live tunnel first, so none survives the rows to reconnect.
+    if let Some(registry) = tunnel.as_deref()
+        && let Some(person) = person_of(&rt, account.id).await
+        && let Ok(machines) = rt.store.list_machines(person.id).await
+    {
+        for machine in machines {
+            if let Some(key) = key_of(&machine) {
+                registry.close_connection(&key, CloseCode::KeyRevoked);
+            }
+        }
+    }
+
+    match rt.store.delete_account(account.id).await {
+        Ok(()) => with_cookie(
+            with_cookie(
+                json_ok(json!({ "ok": true })),
+                rt.sessions.clear_session_cookie(),
+            ),
+            rt.sessions.clear_csrf_cookie(),
+        ),
+        Err(e) => load_error(e),
+    }
 }
 
 /// A pairing action's answer.

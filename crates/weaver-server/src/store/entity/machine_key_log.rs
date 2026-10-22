@@ -6,6 +6,10 @@
 //! describes. It is write-only from the relay's point of view: nothing that
 //! authenticates a key ever reads it — `machine.key_id` is the only source of
 //! truth for who a key is.
+//!
+//! The one exception to that survival is account deletion: `Store::delete_account`
+//! purges a person's log rows outright, because "delete my account and remove my
+//! data" outranks the audit trail for that single, explicit act.
 
 use sea_orm::entity::prelude::*;
 
