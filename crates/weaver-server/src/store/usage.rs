@@ -128,6 +128,7 @@ impl Store {
             .column_as(service::Column::Id, "service_id")
             .column_as(service::Column::Name, "service")
             .column_as(machine::Column::Name, "machine")
+            .column_as(person::Column::Id, "person_id")
             .column_as(person::Column::Name, "person")
             .join(JoinType::InnerJoin, service::Relation::Machine.def())
             .join(JoinType::InnerJoin, machine::Relation::Person.def())
@@ -149,6 +150,7 @@ impl Store {
                 service_id: row.service_id,
                 service: row.service,
                 machine: row.machine,
+                person_id: row.person_id,
                 person: row.person,
             })
             .collect())
@@ -171,6 +173,7 @@ impl Store {
             .column_as(service::Column::Id, "service_id")
             .column_as(service::Column::Name, "service")
             .column_as(machine::Column::Name, "machine")
+            .column_as(person::Column::Id, "person_id")
             .column_as(person::Column::Name, "person")
             .join(JoinType::InnerJoin, service::Relation::Machine.def())
             .join(JoinType::InnerJoin, machine::Relation::Person.def())
@@ -184,6 +187,7 @@ impl Store {
                 service_id: r.service_id,
                 service: r.service,
                 machine: r.machine,
+                person_id: r.person_id,
                 person: r.person,
             })
             .collect())
@@ -196,6 +200,7 @@ pub(crate) struct ServiceIdentity {
     pub(crate) service_id: i32,
     pub(crate) service: String,
     pub(crate) machine: String,
+    pub(crate) person_id: i32,
     pub(crate) person: String,
 }
 
@@ -205,6 +210,7 @@ struct ServiceIdentityRow {
     service_id: i32,
     service: String,
     machine: String,
+    person_id: i32,
     person: String,
 }
 

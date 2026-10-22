@@ -161,17 +161,26 @@ pub async fn run_server(
     cert_manager.start_renewal_loop(shutdown_token.clone());
 
     let identity_resolver = Arc::new(crate::tunnel::StoreIdentityResolver::new(store.clone()));
-    let metering = Arc::new(crate::metering::MeteringManager::with_retention(
-        store.clone(),
-        Duration::from_secs(config.usage_flush_interval_secs),
-        Duration::from_secs(config.usage_retention_secs),
-    ));
+    // The console's real-time change bus, created here so the registry and the
+    // account plane share one instance: the registry announces presence and
+    // route transitions, the account plane announces membership writes, and
+    // every open stream of the affected person recomputes (WVR-25).
+    let live = crate::live::LiveHub::new();
+    let metering = Arc::new(
+        crate::metering::MeteringManager::with_retention(
+            store.clone(),
+            Duration::from_secs(config.usage_flush_interval_secs),
+            Duration::from_secs(config.usage_retention_secs),
+        )
+        .with_live(live.clone()),
+    );
     let tunnel_registry = Arc::new(crate::tunnel::TunnelRegistry::new(
         config.tunnel_domain.clone(),
         Arc::clone(&cert_manager),
         identity_resolver,
         store.clone(),
         Arc::clone(&metering),
+        live.clone(),
     ));
 
     // The manager ticks once a second and flushes on the configured cadence;
@@ -262,6 +271,7 @@ pub async fn run_server(
         store.clone(),
         altcha.clone(),
         mailer,
+        live,
     )
     .map_err(|e| ServerError::Activation(format!("Failed to initialize the account plane: {e}")))?;
     let account_sweep = {

@@ -283,19 +283,39 @@ jobs:
           EOF
           )
 
-          RESP=$(curl -s -X POST "https://api.digitalocean.com/v2/droplets" \
-            -H "Authorization: Bearer $DO_TOKEN" \
-            -H "Content-Type: application/json" \
-            -d "{
-              \"name\": \"$DROPLET_NAME\",
-              \"region\": \"fra1\",
-              \"size\": \"s-1vcpu-1gb\",
-              \"image\": \"ubuntu-24-04-x64\",
-              \"user_data\": $(printf '%s' "$USER_DATA" | jq -R -s '.')
-            }")
-          DROPLET_ID=$(echo "$RESP" | jq -r '.droplet.id // empty')
+          # Provisioning must survive transient capacity, not just the happy
+          # path: a region can turn away a create request with "Size is not
+          # available in this region" for a few minutes even when the account may
+          # use that size there, and the legacy basic slug and its intel/amd
+          # variants draw on separate pools. So stay in the workflow's region and
+          # try each slug over a few rounds before giving up.
+          REGION="ams3"
+          DROPLET_ID=""
+          RESP=""
+          for round in 1 2 3 4 5; do
+            for SIZE in s-1vcpu-1gb s-1vcpu-1gb-intel s-1vcpu-1gb-amd s-1vcpu-1gb-35gb-intel; do
+              echo "Attempt $round: droplet $REGION/$SIZE …"
+              RESP=$(curl -s -X POST "https://api.digitalocean.com/v2/droplets" \
+                -H "Authorization: Bearer $DO_TOKEN" \
+                -H "Content-Type: application/json" \
+                -d "{
+                  \"name\": \"$DROPLET_NAME\",
+                  \"region\": \"$REGION\",
+                  \"size\": \"$SIZE\",
+                  \"image\": \"ubuntu-24-04-x64\",
+                  \"user_data\": $(printf '%s' "$USER_DATA" | jq -R -s '.')
+                }")
+              DROPLET_ID=$(echo "$RESP" | jq -r '.droplet.id // empty')
+              if [ -n "$DROPLET_ID" ]; then
+                echo "Created droplet $DROPLET_ID ($REGION/$SIZE)"
+                break 2
+              fi
+              echo "  refused: $(echo "$RESP" | jq -r '.message // .id // "unknown error"')"
+            done
+            sleep 15
+          done
           if [ -z "$DROPLET_ID" ]; then
-            echo "Failed to create droplet: $RESP"
+            echo "Failed to create droplet in $REGION after every slug and retry: $RESP"
             exit 1
           fi
           echo "droplet_id=$DROPLET_ID" >> "$GITHUB_OUTPUT"

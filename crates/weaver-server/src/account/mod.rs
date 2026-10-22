@@ -12,12 +12,14 @@ pub mod pairing;
 pub mod password;
 pub mod router;
 pub mod session;
+pub mod views;
 
 use std::sync::Arc;
 
 use crate::altcha::AltchaRuntime;
 use crate::config::AccountConfig;
 use crate::email::Mailer;
+use crate::live::LiveHub;
 use crate::store::Store;
 use password::Passwords;
 use session::Sessions;
@@ -34,6 +36,10 @@ pub struct AccountRuntime {
     /// The in-memory registry of pending pairings. Not persisted: a
     /// pending pairing lives only as long as the CLI's channel.
     pub pairings: pairing::Pairings,
+    /// The console's real-time change bus: presence transitions, membership
+    /// writes and metered minutes announce the affected person here, and every
+    /// open SSE stream of that person recomputes (WVR-25).
+    pub live: LiveHub,
     /// Absolute HTTPS base URL of the account plane (e.g. `https://admin.host`).
     pub base_url: String,
     /// A precomputed hash verified against when no account matches, so login
@@ -54,6 +60,7 @@ impl AccountRuntime {
         store: Store,
         altcha: Arc<AltchaRuntime>,
         mailer: Option<Arc<dyn Mailer>>,
+        live: LiveHub,
     ) -> Result<Arc<Self>, String> {
         let breach = password::HibpBreachCheck::new(config.hibp_url.clone())?;
         Self::with_breach(
@@ -62,6 +69,7 @@ impl AccountRuntime {
             store,
             altcha,
             mailer,
+            live,
             Arc::new(breach),
         )
     }
@@ -76,6 +84,7 @@ impl AccountRuntime {
         store: Store,
         altcha: Arc<AltchaRuntime>,
         mailer: Option<Arc<dyn Mailer>>,
+        live: LiveHub,
         breach: Arc<dyn password::BreachCheck>,
     ) -> Result<Arc<Self>, String> {
         let base_url = config
@@ -116,6 +125,7 @@ impl AccountRuntime {
             sessions,
             config: config.clone(),
             pairings: pairing::Pairings::default(),
+            live,
             base_url,
             dummy_hash,
             support_email,

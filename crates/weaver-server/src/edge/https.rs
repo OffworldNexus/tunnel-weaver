@@ -129,8 +129,37 @@ async fn serve_account(
         Err(never) => match never {},
     };
     let (parts, body) = response.into_parts();
-    // Account responses are small (JSON, HTML, modest assets); buffer them so the
-    // boxed body stays `Send + Sync`, which the edge's unified body type requires.
+    // Account responses are ordinarily small (JSON, HTML, modest assets) and are
+    // buffered so the boxed body stays `Send + Sync`, which the edge's unified
+    // body type requires. An SSE stream is the exception: it never ends, so it
+    // is bridged frame by frame instead.
+    let is_stream = parts
+        .headers
+        .get(http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.starts_with("text/event-stream"));
+    if is_stream {
+        let (tx, rx) = tokio::sync::mpsc::channel::<crate::tunnel::proxy::BodyFrameItem>(8);
+        tokio::spawn(async move {
+            let mut body = body;
+            while let Some(frame) = body.frame().await {
+                let frame = match frame {
+                    Ok(frame) => frame,
+                    Err(e) => {
+                        let _ = tx.send(Err(Box::new(e))).await;
+                        break;
+                    }
+                };
+                if tx.send(Ok(frame)).await.is_err() {
+                    break;
+                }
+            }
+        });
+        let mut response =
+            Response::from_parts(parts, crate::tunnel::proxy::TunnelResponseBody::boxed(rx));
+        weaver_assets::apply_common_security_headers(&mut response, include_hsts);
+        return response;
+    }
     let bytes = match body.collect().await {
         Ok(collected) => collected.to_bytes(),
         Err(_) => {

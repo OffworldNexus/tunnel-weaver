@@ -111,6 +111,7 @@ async fn setup_with(adjust: impl FnOnce(&mut AccountConfig)) -> Fixture {
         store.clone(),
         altcha,
         Some(mailer),
+        weaver_server::live::LiveHub::new(),
         Arc::new(NoBreach),
     )
     .unwrap();

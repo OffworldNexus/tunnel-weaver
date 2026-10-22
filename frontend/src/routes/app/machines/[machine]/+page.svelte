@@ -12,7 +12,14 @@
 	import { notify } from '#lib/account/notices';
 	import { fingerprint } from '#lib/app/fingerprint';
 	import { bytes } from '#lib/app/format';
-	import { disconnectMachine, renameMachine, revokeMachine } from '#lib/app/machines';
+	import { streamJson } from '#lib/app/live';
+	import {
+		disconnectMachine,
+		type Machine,
+		machineUrl,
+		renameMachine,
+		revokeMachine
+	} from '#lib/app/machines';
 	import { date, timeAgo } from '#lib/app/time';
 	import { setMeta } from '#lib/console/meta.svelte';
 	import Badge from '#lib/ui/Badge.svelte';
@@ -30,7 +37,23 @@
 
 	let { data }: PageProps = $props();
 
-	const machine = $derived(data.machine);
+	/**
+	 * The latest pushed machine, or `null` until the first frame. The loader's
+	 * copy renders first; every later change — online/offline, a service coming
+	 * up or down, a rename from another tab — arrives on the same stream without
+	 * a reload.
+	 */
+	let pushed = $state<Machine | null>(null);
+
+	const machine = $derived(pushed ?? data.machine);
+
+	// One stream for this machine, keyed on the loaded id (never on the pushed
+	// body, which would resubscribe on every frame).
+	$effect(() => {
+		return streamJson<Machine>(machineUrl(data.machine.id), (next) => {
+			pushed = next;
+		});
+	});
 
 	let renaming = $state(false);
 	let renameValue = $state('');

@@ -77,8 +77,9 @@ export function readPage(raw: string | null): number {
 	return Math.max(1, Number(raw) || 1);
 }
 
-/** `GET /api/account/machines` — one page of the signed-in person's machines. */
-export function listMachines({ page, perPage, q, health }: MachineQuery = {}) {
+/** The account-API URL for a machines query — the JSON call and its SSE variant
+ * share it, so a stream is literally the same resource. */
+export function machinesUrl({ page, perPage, q, health }: MachineQuery = {}): string {
 	const params = new URLSearchParams();
 	if (page !== undefined) {
 		params.set('page', String(page));
@@ -94,12 +95,22 @@ export function listMachines({ page, perPage, q, health }: MachineQuery = {}) {
 	}
 	const query = params.toString();
 	const suffix = query ? `?${query}` : '';
-	return api<MachinePage>(`/api/account/machines${suffix}`);
+	return `/api/account/machines${suffix}`;
+}
+
+/** `GET /api/account/machines` — one page of the signed-in person's machines. */
+export function listMachines(query: MachineQuery = {}) {
+	return api<MachinePage>(machinesUrl(query));
+}
+
+/** The account-API URL for one machine. */
+export function machineUrl(id: number): string {
+	return `/api/account/machines/${id}`;
 }
 
 /** `GET /api/account/machines/{id}` — one machine. */
 export function getMachine(id: number) {
-	return api<Machine>(`/api/account/machines/${id}`);
+	return api<Machine>(machineUrl(id));
 }
 
 /** `POST /api/account/machines/{id}/rename` — rename, re-deriving its hostnames. */

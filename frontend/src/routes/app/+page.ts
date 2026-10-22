@@ -8,17 +8,17 @@
  */
 import { unwrap } from '#lib/app/load';
 import { listMachines } from '#lib/app/machines';
-import { getOverview } from '#lib/app/overview';
+import { getOverview, OVERVIEW_ROWS } from '#lib/app/overview';
 
 import type { PageLoad } from './$types';
-
-/** How many machines the overview lists before pointing at the full list. */
-const ROWS = 10;
 
 export const load: PageLoad = async ({ depends }) => {
 	depends('app:machines');
 
-	const [overview, page] = await Promise.all([getOverview(), listMachines({ perPage: ROWS })]);
+	const [overview, page] = await Promise.all([
+		getOverview(),
+		listMachines({ perPage: OVERVIEW_ROWS })
+	]);
 	const stats = unwrap(overview, 'We could not load your account. Please try again.');
 	const listed = unwrap(page, 'We could not load your machines. Please try again.');
 
