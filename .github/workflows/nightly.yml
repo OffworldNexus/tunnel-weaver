@@ -289,7 +289,7 @@ jobs:
           # use that size there, and the legacy basic slug and its intel/amd
           # variants draw on separate pools. So stay in the workflow's region and
           # try each slug over a few rounds before giving up.
-          REGION="fra1"
+          REGION="ams3"
           DROPLET_ID=""
           RESP=""
           for round in 1 2 3 4 5; do
