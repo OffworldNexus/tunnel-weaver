@@ -365,6 +365,7 @@ async fn main() {
         store.clone(),
         Arc::clone(&altcha),
         Some(mailer),
+        weaver_server::live::LiveHub::new(),
         Arc::new(NoBreach),
     )
     .expect("account runtime");

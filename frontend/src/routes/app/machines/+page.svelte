@@ -15,10 +15,13 @@
 
 	import { notify } from '#lib/account/notices';
 	import { bytes } from '#lib/app/format';
+	import { streamJson } from '#lib/app/live';
 	import {
 		disconnectMachine,
 		type Machine,
 		type MachineHealth,
+		type MachinePage,
+		machinesUrl,
 		readHealth,
 		readPage,
 		renameMachine,
@@ -57,6 +60,54 @@
 	let disconnecting = $state<Machine | null>(null);
 	let revoking = $state<Machine | null>(null);
 	let busy = $state(false);
+
+	/**
+	 * The latest pushed page, or `null` until the first frame. The loader's copy
+	 * renders first; a pushed snapshot replaces it and every later change arrives
+	 * on the same stream, without a reload.
+	 */
+	let pushed = $state<MachinePage | null>(null);
+
+	/**
+	 * The rows the template renders. The pushed snapshot wins once it has arrived;
+	 * until then the loader's first paint is shown, so there is never an empty
+	 * frame. `null` also resets on every new query below, so a page change never
+	 * keeps a previous page's rows on screen.
+	 */
+	const view = $derived(
+		pushed
+			? {
+					machines: pushed.machines,
+					total: pushed.total,
+					page: pushed.page,
+					pageCount: pushed.page_count,
+					perPage: pushed.per_page
+				}
+			: {
+					machines: data.machines,
+					total: data.total,
+					page: data.page,
+					pageCount: data.pageCount,
+					perPage: data.perPage
+				}
+	);
+
+	// One stream per query: a page, search or filter change resubscribes, and the
+	// old stream is closed by the effect's cleanup. The relay re-sends the whole
+	// page on every relevant change, so the UI follows machines coming online,
+	// going offline, pairing and being revoked.
+	$effect(() => {
+		const url = machinesUrl({
+			page: data.page,
+			perPage: data.perPage,
+			q: data.q,
+			health: data.health
+		});
+		pushed = null;
+		return streamJson<MachinePage>(url, (page) => {
+			pushed = page;
+		});
+	});
 
 	setMeta({
 		title: 'Machines',
@@ -131,8 +182,8 @@
 		untrack(() => write({ ...address(), q }));
 	});
 
-	const from = $derived(data.total === 0 ? 0 : (data.page - 1) * data.perPage + 1);
-	const to = $derived(Math.min(data.page * data.perPage, data.total));
+	const from = $derived(view.total === 0 ? 0 : (view.page - 1) * view.perPage + 1);
+	const to = $derived(Math.min(view.page * view.perPage, view.total));
 
 	function startRename(machine: Machine) {
 		renaming = machine;
@@ -196,7 +247,7 @@
 	}
 </script>
 
-<Panel flush title="Machines" subtitle="{data.total} paired · click a row to open a machine">
+<Panel flush title="Machines" subtitle="{view.total} paired · click a row to open a machine">
 	{#snippet actions()}
 		<Keycap type="button" size="sm" variant="primary" onclick={() => (pairing = true)}>
 			<Icon name="plus" size={15} /> Pair a machine
@@ -224,7 +275,7 @@
 		<span class="toolbar__spacer"></span>
 	</div>
 
-	{#if data.machines.length}
+	{#if view.machines.length}
 		<div class="table-wrap">
 			<table class="table">
 				<colgroup>
@@ -244,7 +295,7 @@
 					</tr>
 				</thead>
 				<tbody>
-					{#each data.machines as machine (machine.id)}
+					{#each view.machines as machine (machine.id)}
 						<tr
 							class="row-link"
 							role="link"
@@ -318,9 +369,9 @@
 	{#snippet footer()}
 		<Pagination
 			bare
-			page={data.page}
-			pageCount={data.pageCount}
-			total={data.total}
+			page={view.page}
+			pageCount={view.pageCount}
+			total={view.total}
 			{from}
 			{to}
 			unit="machines"

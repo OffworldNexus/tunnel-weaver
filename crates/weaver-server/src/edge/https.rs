@@ -500,6 +500,18 @@ pub async fn handle_https_request(
         // plane — the landing page at `/`, the auth routes, the account API and
         // the vendored ALTCHA widget.
         if let Some(account) = &config.account {
+            // A streamable account GET asking for `text/event-stream` is served
+            // here rather than through the router, whose buffered body cannot
+            // carry an endless response (WVR-25).
+            if crate::account::stream::wants_stream(&req) {
+                return Ok(crate::account::stream::serve(
+                    account,
+                    config.tunnel_registry.clone(),
+                    req,
+                    include_hsts,
+                )
+                .await);
+            }
             return Ok(
                 serve_account(account, config.tunnel_registry.clone(), req, include_hsts).await,
             );

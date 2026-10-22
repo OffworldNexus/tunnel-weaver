@@ -7,6 +7,7 @@ pub mod control;
 pub mod dns;
 pub mod edge;
 pub mod email;
+pub mod live;
 pub mod metering;
 pub mod metrics;
 pub mod notify;

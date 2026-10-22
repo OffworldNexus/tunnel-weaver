@@ -13,6 +13,11 @@ use crate::store::Store;
 pub struct Identity {
     /// The machine's row id.
     pub machine_id: i32,
+    /// The owning person's row id.
+    ///
+    /// Carried alongside the names so a live transition can address the person's
+    /// console streams ([`crate::live::LiveHub`]) without a second lookup.
+    pub person_id: i32,
     /// Namespace owner (a person or account).
     pub person: String,
     /// Machine within that namespace.
@@ -47,6 +52,7 @@ impl StoreIdentityResolver {
         let (person, machine) = self.store.machine_by_key(key_id).await.ok()??;
         Some(Identity {
             machine_id: machine.id,
+            person_id: person.id,
             person: person.name,
             machine: machine.name,
         })

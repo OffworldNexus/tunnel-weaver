@@ -12,6 +12,9 @@
 	 */
 	import type { BarGroup } from '#lib/app/chart';
 	import { bytes, count } from '#lib/app/format';
+	import { streamJson } from '#lib/app/live';
+	import { type MachinePage, machinesUrl } from '#lib/app/machines';
+	import { OVERVIEW_ROWS, OVERVIEW_URL, type OverviewStats } from '#lib/app/overview';
 	import { timeAgo } from '#lib/app/time';
 	import MachineActions from '#lib/console/MachineActions.svelte';
 	import { setMeta } from '#lib/console/meta.svelte';
@@ -31,6 +34,35 @@
 
 	let pairing = $state(false);
 
+	/**
+	 * The latest pushed rollup and first machines page, or `null` until the first
+	 * frame. The loader's copies render first; every later change — a machine
+	 * coming online, a tunnel opening, traffic moving — arrives on these two
+	 * streams without a reload.
+	 */
+	let pushedStats = $state<OverviewStats | null>(null);
+	let pushedMachines = $state<MachinePage | null>(null);
+
+	/** The rollup the stat panels render. */
+	const stats = $derived(pushedStats ?? data.stats);
+
+	/** The machines the table renders, and how many are paired in total. */
+	const machines = $derived(pushedMachines?.machines ?? data.machines);
+	const total = $derived(pushedMachines?.total ?? data.total);
+
+	// Two streams for the two resources the page shows. The machines page is the
+	// overview's own fixed first page; both re-send in full on every change.
+	$effect(() => {
+		return streamJson<OverviewStats>(OVERVIEW_URL, (next) => {
+			pushedStats = next;
+		});
+	});
+	$effect(() => {
+		return streamJson<MachinePage>(machinesUrl({ perPage: OVERVIEW_ROWS }), (next) => {
+			pushedMachines = next;
+		});
+	});
+
 	setMeta({
 		title: 'Overview',
 		subtitle: 'Your account and the machines paired to it.',
@@ -41,21 +73,21 @@
 	const composition = $derived([
 		{
 			label: 'Machines',
-			active: data.stats.machines.online,
-			total: data.stats.machines.total
+			active: stats.machines.online,
+			total: stats.machines.total
 		},
 		{
 			label: 'Tunnels',
-			active: data.stats.tunnels.active,
-			total: data.stats.tunnels.total
+			active: stats.tunnels.active,
+			total: stats.tunnels.total
 		}
 	] satisfies BarGroup[]);
 
 	/** The reporting window, its totals, and the span they actually cover. */
 	const traffic = $derived({
-		days: data.stats.window_days,
-		usage: data.stats.usage_30d,
-		covered: data.stats.covered_seconds
+		days: stats.window_days,
+		usage: stats.usage_30d,
+		covered: stats.covered_seconds
 	});
 
 	/**
@@ -103,14 +135,14 @@
 	</Panel>
 </div>
 
-<Panel flush title="Machines" subtitle="{data.total} paired · click a row to open a machine">
+<Panel flush title="Machines" subtitle="{total} paired · click a row to open a machine">
 	{#snippet actions()}
 		<Keycap type="button" size="sm" variant="primary" onclick={() => (pairing = true)}>
 			<Icon name="plus" size={15} /> Pair a machine
 		</Keycap>
 	{/snippet}
 
-	{#if data.machines.length}
+	{#if machines.length}
 		<div class="table-wrap">
 			<table class="table">
 				<!-- Fixed widths, so no column moves as the list reloads. The last
@@ -139,7 +171,7 @@
 					</tr>
 				</thead>
 				<tbody>
-					{#each data.machines as machine (machine.id)}
+					{#each machines as machine (machine.id)}
 						<tr
 							class="row-link"
 							role="link"
@@ -183,11 +215,11 @@
 	{/if}
 
 	{#snippet footer()}
-		{#if data.total > data.machines.length}
+		{#if total > machines.length}
 			<div class="more">
 				<span>
-					Showing <span class="mono">{data.machines.length}</span> of
-					<span class="mono">{data.total}</span> machines.
+					Showing <span class="mono">{machines.length}</span> of
+					<span class="mono">{total}</span> machines.
 				</span>
 				<Keycap href={resolve('/app/machines')} variant="key" size="sm">
 					See all machines <Icon name="chevron-right" size={14} />

@@ -428,6 +428,7 @@ async fn test_pebble_e2e_tunnel_registration_and_proxying() {
             store.as_ref().clone(),
             std::time::Duration::from_secs(60),
         )),
+        weaver_server::live::LiveHub::new(),
     ));
 
     let shutdown_token = CancellationToken::new();

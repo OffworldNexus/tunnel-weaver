@@ -33,7 +33,15 @@ export interface OverviewStats {
 	covered_seconds: number;
 }
 
+/** The account-API URL of the rollup — shared by the JSON call and its SSE
+ * variant. */
+export const OVERVIEW_URL = '/api/account/overview';
+
+/** How many machines the overview lists before pointing at the full list. The
+ * route loader and the page's live stream must agree, so it lives here. */
+export const OVERVIEW_ROWS = 10;
+
 /** `GET /api/account/overview` — the signed-in account's rollup. */
 export function getOverview() {
-	return api<OverviewStats>('/api/account/overview');
+	return api<OverviewStats>(OVERVIEW_URL);
 }

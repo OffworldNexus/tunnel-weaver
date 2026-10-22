@@ -387,6 +387,7 @@ async fn spawn_test_relay(tunnel_domain: &str) -> TestRelay {
         resolver,
         store.as_ref().clone(),
         Arc::clone(&metering),
+        weaver_server::live::LiveHub::new(),
     ));
 
     let shutdown_token = CancellationToken::new();
@@ -2230,6 +2231,7 @@ async fn test_client_leaving_during_cert_issuance_does_not_leave_hostname_active
             store.as_ref().clone(),
             std::time::Duration::from_secs(60),
         )),
+        weaver_server::live::LiveHub::new(),
     ));
 
     let key = client_key();

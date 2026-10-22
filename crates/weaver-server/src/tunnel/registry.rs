@@ -10,6 +10,7 @@ use weaver_mux::{CloseCode, KeyId};
 use weaver_proto::control::RefusalCode;
 
 use crate::cert::CertManager;
+use crate::live::LiveHub;
 use crate::metering::MeteringManager;
 use crate::store::Store;
 use crate::tunnel::identity::StoreIdentityResolver;
@@ -47,6 +48,10 @@ pub struct TunnelRegistry {
     identities: Arc<StoreIdentityResolver>,
     store: Store,
     metering: Arc<MeteringManager>,
+    /// The console's change bus. Every presence or route transition here is a
+    /// change to the owning person's view, so each announces the person; a relay
+    /// whose console is closed has no subscriber and pays nothing.
+    live: LiveHub,
     routes: RwLock<HashMap<String, TunnelRoute>>,
     connections: Mutex<HashMap<KeyId, ActiveConnection>>,
     /// Hostnames with a live route (and the admin host once visited). Owned by
@@ -64,6 +69,7 @@ impl TunnelRegistry {
         identities: Arc<StoreIdentityResolver>,
         store: Store,
         metering: Arc<MeteringManager>,
+        live: LiveHub,
     ) -> Self {
         Self {
             tunnel_domain,
@@ -71,11 +77,29 @@ impl TunnelRegistry {
             identities,
             store,
             metering,
+            live,
             routes: RwLock::new(HashMap::new()),
             connections: Mutex::new(HashMap::new()),
             active_hosts: RwLock::new(HashSet::new()),
             next_conn_id: AtomicU64::new(1),
         }
+    }
+
+    /// Tells the person behind `key_id` that their live state may have changed.
+    ///
+    /// Best-effort and detached: a transition never waits on a console, and a
+    /// key with no resolvable machine (a revoke that already deleted the row)
+    /// simply has nobody to tell. The stream recomputes its whole resource, so
+    /// this only has to name the person, never what changed.
+    fn notify_person_of(&self, key_id: &KeyId) {
+        let identities = Arc::clone(&self.identities);
+        let live = self.live.clone();
+        let key = *key_id;
+        tokio::spawn(async move {
+            if let Some(identity) = identities.identity(&key).await {
+                live.notify(identity.person_id);
+            }
+        });
     }
 
     /// Access to the underlying state store.
@@ -152,6 +176,8 @@ impl TunnelRegistry {
             }
         }
 
+        drop(conns);
+        self.notify_person_of(&key_id);
         conn_id
     }
 
@@ -232,6 +258,7 @@ impl TunnelRegistry {
         if let Some(conn) = self.connections.lock().unwrap().get_mut(key_id) {
             conn.services = live;
         }
+        self.live.notify(identity.person_id);
         remapped
     }
 
@@ -251,6 +278,7 @@ impl TunnelRegistry {
                 info!(%hostname, "Unregistered service on connection close");
             }
         }
+        self.notify_person_of(&key_id);
     }
 
     /// The certificate manager this registry activates hostnames on.
@@ -350,6 +378,7 @@ impl TunnelRegistry {
         } else {
             info!(hostname = %host_lower, "Tunnel service left during certificate issuance");
         }
+        self.live.notify(identity.person_id);
 
         Ok(host_lower)
     }
@@ -372,6 +401,7 @@ impl TunnelRegistry {
                 conn.services.remove(&lower);
             }
         }
+        self.notify_person_of(&key_id);
     }
 
     /// The identity resolver, shared with the mux `Verifier`.

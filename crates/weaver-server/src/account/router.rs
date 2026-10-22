@@ -1612,6 +1612,7 @@ async fn machine_rename(
     if let (Some(registry), Some(key)) = (tunnel.as_deref(), key_of(&renamed)) {
         registry.rename_machine(&key).await;
     }
+    rt.live.notify(person.id);
     json_ok(json!({ "ok": true, "name": renamed.name }))
 }
 
@@ -1644,6 +1645,12 @@ async fn machine_disconnect(
         (Some(registry), Some(key)) => registry.close_connection(&key, CloseCode::Rejected),
         _ => false,
     };
+    // The connection's driver deregisters it (and announces the person) a moment
+    // later; announce here too so an open console flips the row at once rather
+    // than on the next event.
+    if disconnected {
+        rt.live.notify(person.id);
+    }
     json_ok(json!({ "ok": true, "disconnected": disconnected }))
 }
 
@@ -1684,7 +1691,10 @@ async fn machine_revoke(
         registry.close_connection(&key, CloseCode::KeyRevoked);
     }
     match rt.store.revoke_machine(&key).await {
-        Ok(_) => json_ok(json!({ "ok": true })),
+        Ok(_) => {
+            rt.live.notify(person.id);
+            json_ok(json!({ "ok": true }))
+        }
         Err(e) => machine_load_error(e),
     }
 }
@@ -1925,6 +1935,7 @@ async fn approve(
             (person, machine)
         }
     };
+    rt.live.notify(person.id);
     Ok(pair::ServerMessage::Approved {
         machine_id: machine.id,
         person: person.name,
