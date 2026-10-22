@@ -283,19 +283,41 @@ jobs:
           EOF
           )
 
-          RESP=$(curl -s -X POST "https://api.digitalocean.com/v2/droplets" \
-            -H "Authorization: Bearer $DO_TOKEN" \
-            -H "Content-Type: application/json" \
-            -d "{
-              \"name\": \"$DROPLET_NAME\",
-              \"region\": \"fra1\",
-              \"size\": \"s-1vcpu-1gb\",
-              \"image\": \"ubuntu-24-04-x64\",
-              \"user_data\": $(printf '%s' "$USER_DATA" | jq -R -s '.')
-            }")
-          DROPLET_ID=$(echo "$RESP" | jq -r '.droplet.id // empty')
+          # Try a list of (region, size) candidates until one is available. A
+          # single hardcoded pair is fragile: a DigitalOcean region runs out of a
+          # basic size without warning ("Size is not available in this region"),
+          # which fails the whole job before it can build or test anything.
+          DROPLET_ID=""
+          RESP=""
+          for CANDIDATE in \
+            "ams3 s-1vcpu-1gb" \
+            "fra1 s-1vcpu-1gb" \
+            "ams3 s-1vcpu-1gb-intel" \
+            "nyc3 s-1vcpu-1gb" \
+            "lon1 s-1vcpu-1gb" \
+            "sgp1 s-1vcpu-1gb"; do
+            REGION="${CANDIDATE%% *}"
+            SIZE="${CANDIDATE##* }"
+            echo "Trying droplet region=$REGION size=$SIZE …"
+            RESP=$(curl -s -X POST "https://api.digitalocean.com/v2/droplets" \
+              -H "Authorization: Bearer $DO_TOKEN" \
+              -H "Content-Type: application/json" \
+              -d "{
+                \"name\": \"$DROPLET_NAME\",
+                \"region\": \"$REGION\",
+                \"size\": \"$SIZE\",
+                \"image\": \"ubuntu-24-04-x64\",
+                \"user_data\": $(printf '%s' "$USER_DATA" | jq -R -s '.')
+              }")
+            DROPLET_ID=$(echo "$RESP" | jq -r '.droplet.id // empty')
+            if [ -n "$DROPLET_ID" ]; then
+              echo "Created droplet $DROPLET_ID in $REGION ($SIZE)"
+              break
+            fi
+            echo "  refused: $(echo "$RESP" | jq -r '.message // .id // "unknown error"')"
+          done
           if [ -z "$DROPLET_ID" ]; then
-            echo "Failed to create droplet: $RESP"
+            echo "Failed to create droplet in any candidate region/size: $RESP"
             exit 1
           fi
           echo "droplet_id=$DROPLET_ID" >> "$GITHUB_OUTPUT"
