@@ -16,7 +16,14 @@
 		expected?: string;
 		confirmLabel?: string;
 		cancelLabel?: string;
-		onConfirm?: () => void;
+		/**
+		 * Compare the typed value to `expected` ignoring case. Both sides are
+		 * trimmed either way; this only relaxes casing, which addresses (unlike
+		 * slugs) need. Off by default so the machine dialogs stay exact.
+		 */
+		caseInsensitive?: boolean;
+		/** Receives the typed value, for callers that re-check it server-side. */
+		onConfirm?: (typed: string) => void;
 		onClose?: () => void;
 		children?: Snippet;
 	}
@@ -27,6 +34,7 @@
 		expected = '',
 		confirmLabel = 'Delete',
 		cancelLabel = 'Cancel',
+		caseInsensitive = false,
 		onConfirm = () => {},
 		onClose = undefined,
 		children
@@ -34,7 +42,13 @@
 
 	let typed = $state('');
 
-	const matches = $derived(expected !== '' && typed.trim() === expected);
+	const wanted = $derived(expected.trim());
+	const matches = $derived(
+		wanted !== '' &&
+			(caseInsensitive
+				? typed.trim().toLocaleLowerCase() === wanted.toLocaleLowerCase()
+				: typed.trim() === wanted)
+	);
 
 	/** Closes the dialog and clears the confirmation field for the next open. */
 	function close() {
@@ -47,8 +61,11 @@
 		if (!matches) {
 			return;
 		}
+		// Capture before clearing: the caller may re-check the typed value
+		// against the server's own record.
+		const value = typed;
 		typed = '';
-		onConfirm();
+		onConfirm(value);
 	}
 </script>
 

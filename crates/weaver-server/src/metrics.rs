@@ -523,6 +523,21 @@ impl MetricsStore {
             let length = values.len().min(MINUTES_PER_DAY);
             target[..length].copy_from_slice(&values[..length]);
         }
+        // A service can be deleted between the live-day read above and this
+        // write: deleting an account removes its services. Skip the ones already
+        // gone rather than tripping the `usage_daily` foreign key — an in-flight
+        // bucket for a deleted service must not resurrect a row.
+        let present: HashSet<i32> = service::Entity::find()
+            .select_only()
+            .column(service::Column::Id)
+            .filter(service::Column::Id.is_in(by_service.keys().copied()))
+            .into_tuple::<i32>()
+            .all(&txn)
+            .await?
+            .into_iter()
+            .collect();
+        by_service.retain(|service_id, _| present.contains(service_id));
+
         for (service_id, minutes) in by_service {
             self.write_day(&txn, service_id, day, minutes).await?;
         }

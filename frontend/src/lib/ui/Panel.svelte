@@ -14,6 +14,11 @@
 		cut?: number;
 		/** Keep the body at a fixed height and scroll (for feeds). */
 		scroll?: boolean;
+		/**
+		 * Tint the edge and title red, for an irreversible action's panel (the
+		 * Danger zone). Purely presentational; it changes nothing about the body.
+		 */
+		danger?: boolean;
 		actions?: Snippet;
 		footer?: Snippet;
 		children?: Snippet;
@@ -25,13 +30,19 @@
 		flush = false,
 		cut = 16,
 		scroll = false,
+		danger = false,
 		actions,
 		footer,
 		children
 	}: Props = $props();
 </script>
 
-<section class="panel" style="--cut: {cut}px" aria-label={title || undefined}>
+<section
+	class="panel"
+	class:panel--danger={danger}
+	style="--cut: {cut}px"
+	aria-label={title || undefined}
+>
 	{#if title || actions !== undefined}
 		<header class="panel__head">
 			<div class="panel__titles">
@@ -71,6 +82,21 @@
 		gap: 12px;
 		padding: 14px 16px;
 		border-bottom: 1.5px solid var(--tw-border);
+	}
+
+	/* Danger zone: the same surface with a red edge and title. The doubled
+	   selector raises specificity over the mixin's own `.panel::before` edge
+	   layer without exporting a `--tw-border` override to arbitrary children. */
+	.panel.panel--danger::before {
+		background: var(--tw-danger);
+	}
+
+	.panel--danger .panel__head {
+		border-bottom-color: var(--tw-danger);
+	}
+
+	.panel--danger .panel__title {
+		color: var(--tw-danger);
 	}
 
 	.panel__titles {

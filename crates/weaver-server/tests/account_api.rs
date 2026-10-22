@@ -1419,6 +1419,191 @@ async fn change_password_requires_a_session_and_a_same_origin_csrf_request() {
     assert!(signs_in(&fixture, email, "correct horse battery").await);
 }
 
+// ----- delete account ------------------------------------------------------
+
+/// Posts a delete-account request with the double-submit CSRF pair attached.
+async fn delete_account(fixture: &Fixture, session: &str, csrf: &str, address: &str) -> Reply {
+    call(
+        &fixture.router,
+        "POST",
+        "/api/account/delete",
+        &[
+            (
+                "cookie",
+                format!("__Host-weaver_session={session}; __Host-weaver_csrf={csrf}"),
+            ),
+            ("x-csrf-token", csrf.to_string()),
+        ],
+        Some(serde_json::json!({ "address": address })),
+    )
+    .await
+}
+
+/// The endpoint is authenticated and CSRF-protected exactly like `logout`: the
+/// same-origin/CSRF guard runs first, and a well-formed request without a live
+/// session is refused as unauthenticated.
+#[tokio::test]
+async fn delete_account_requires_a_session_and_a_same_origin_csrf_request() {
+    let fixture = setup().await;
+    let email = "delete-guard@example.com";
+    register(&fixture, "Rémy", email, "correct horse battery").await;
+    let (session, csrf) = sign_in(&fixture, email, "correct horse battery").await;
+    let body = Some(serde_json::json!({ "address": email }));
+
+    // No cookies at all: the CSRF guard refuses before the session is examined.
+    let bare = call(
+        &fixture.router,
+        "POST",
+        "/api/account/delete",
+        &[],
+        body.clone(),
+    )
+    .await;
+    assert_eq!(bare.status, StatusCode::FORBIDDEN, "{:?}", bare.body);
+
+    // A browser-declared cross-site fetch → 403.
+    let cross_site = call(
+        &fixture.router,
+        "POST",
+        "/api/account/delete",
+        &[
+            ("sec-fetch-site", "cross-site".to_string()),
+            (
+                "cookie",
+                format!("__Host-weaver_session={session}; __Host-weaver_csrf={csrf}"),
+            ),
+            ("x-csrf-token", csrf.clone()),
+        ],
+        body.clone(),
+    )
+    .await;
+    assert_eq!(
+        cross_site.status,
+        StatusCode::FORBIDDEN,
+        "{:?}",
+        cross_site.body
+    );
+
+    // Same-origin but without the CSRF header → 403.
+    let no_csrf = call(
+        &fixture.router,
+        "POST",
+        "/api/account/delete",
+        &[(
+            "cookie",
+            format!("__Host-weaver_session={session}; __Host-weaver_csrf={csrf}"),
+        )],
+        body.clone(),
+    )
+    .await;
+    assert_eq!(no_csrf.status, StatusCode::FORBIDDEN, "{:?}", no_csrf.body);
+
+    // A well-formed CSRF pair with no session cookie → 401 (not signed in).
+    let signed_out = call(
+        &fixture.router,
+        "POST",
+        "/api/account/delete",
+        &[
+            ("cookie", format!("__Host-weaver_csrf={csrf}")),
+            ("x-csrf-token", csrf.clone()),
+        ],
+        body,
+    )
+    .await;
+    assert_eq!(
+        signed_out.status,
+        StatusCode::UNAUTHORIZED,
+        "{:?}",
+        signed_out.body
+    );
+
+    // None of the refusals touched the account.
+    let me = call(
+        &fixture.router,
+        "GET",
+        "/api/account/me",
+        &[("cookie", format!("__Host-weaver_session={session}"))],
+        None,
+    )
+    .await;
+    assert_eq!(
+        me.status,
+        StatusCode::OK,
+        "the account survives a refused delete: {:?}",
+        me.body
+    );
+}
+
+/// The typed address is the control, not the client-side convenience: a wrong
+/// one is refused server-side, and casing/whitespace around the real address
+/// still match. A successful delete clears both cookies and ends every session.
+#[tokio::test]
+async fn delete_account_re_checks_the_address_and_lands_the_owner_signed_out() {
+    let fixture = setup().await;
+    let email = "delete@example.com";
+    register(&fixture, "Rémy", email, "correct horse battery").await;
+    let (session, csrf) = sign_in(&fixture, email, "correct horse battery").await;
+
+    // A wrong address is refused even though the request is otherwise valid.
+    let wrong = delete_account(&fixture, &session, &csrf, "someone-else@example.com").await;
+    assert_eq!(wrong.status, StatusCode::FORBIDDEN, "{:?}", wrong.body);
+
+    // An omitted address field is a refusal of the same shape, not a 422.
+    let missing = call(
+        &fixture.router,
+        "POST",
+        "/api/account/delete",
+        &[
+            (
+                "cookie",
+                format!("__Host-weaver_session={session}; __Host-weaver_csrf={csrf}"),
+            ),
+            ("x-csrf-token", csrf.clone()),
+        ],
+        Some(serde_json::json!({})),
+    )
+    .await;
+    assert_eq!(missing.status, StatusCode::FORBIDDEN, "{:?}", missing.body);
+
+    // Surrounding whitespace and different casing are the same address.
+    let reply = delete_account(&fixture, &session, &csrf, "  DELETE@Example.com  ").await;
+    assert_eq!(reply.status, StatusCode::OK, "{:?}", reply.body);
+    assert_eq!(
+        reply.cookie("__Host-weaver_session"),
+        Some(String::new()),
+        "the session cookie is cleared"
+    );
+    assert_eq!(
+        reply.cookie("__Host-weaver_csrf"),
+        Some(String::new()),
+        "the CSRF cookie is cleared too"
+    );
+
+    // The session no longer authenticates, and the account is really gone.
+    let me = call(
+        &fixture.router,
+        "GET",
+        "/api/account/me",
+        &[("cookie", format!("__Host-weaver_session={session}"))],
+        None,
+    )
+    .await;
+    assert_eq!(
+        me.status,
+        StatusCode::UNAUTHORIZED,
+        "a delete ends every session"
+    );
+    assert!(
+        !signs_in(&fixture, email, "correct horse battery").await,
+        "the account is gone"
+    );
+
+    // A repeat with the same (now dead) session is refused as unauthenticated;
+    // the store test covers the idempotency of the underlying delete.
+    let again = delete_account(&fixture, &session, &csrf, email).await;
+    assert_eq!(again.status, StatusCode::UNAUTHORIZED, "{:?}", again.body);
+}
+
 // ----- pairing --------------------------------------------------------------
 //
 // The CLI side is a real WebSocket over an in-memory duplex pipe, served by the

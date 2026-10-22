@@ -1853,6 +1853,151 @@ async fn test_an_account_has_one_person_and_takes_it_along() {
 }
 
 #[tokio::test]
+async fn test_delete_account_removes_every_trace_and_is_idempotent() {
+    use weaver_mux::KeyId;
+
+    let store = Store::connect("sqlite::memory:").await.unwrap();
+    let email = "delete@example.com";
+    let account = activated(&store, "Delete Me", email).await;
+
+    // A person, a machine, a service with a materialized hostname, a live usage
+    // bucket and a browser session: everything the delete must take along.
+    let slug = store.propose_person_name(&account.name).await.unwrap();
+    let person = store.create_person(account.id, &slug).await.unwrap();
+    let machine = store
+        .create_machine(person.id, "laptop", &KeyId::Ed25519([3; 32]))
+        .await
+        .unwrap();
+    let service = store
+        .get_or_create_service(machine.id, "web")
+        .await
+        .unwrap();
+    store
+        .set_domain_service(&format!("{slug}-laptop-web.weaver.test"), service.id)
+        .await
+        .unwrap();
+    store
+        .ensure_day_slots(&[(service.id, 20_000)])
+        .await
+        .unwrap();
+    let now = 1_800_000_000;
+    store
+        .session_create(account.id, "deadbeef", now, now + 100)
+        .await
+        .unwrap();
+
+    // The activation left the address's pending registration and its two tokens
+    // behind (only `completed_at` was set); the delete must purge those too.
+    assert_eq!(
+        scalar::<i64>(&store, "SELECT count(*) FROM pending_registration").await,
+        1
+    );
+    assert_eq!(
+        scalar::<i64>(&store, "SELECT count(*) FROM verification_token").await,
+        2
+    );
+
+    store.delete_account(account.id).await.unwrap();
+
+    for table in [
+        "account",
+        "person",
+        "machine",
+        "machine_key_log",
+        "service",
+        "domains",
+        "usage_live",
+        "usage_daily",
+        "browser_session",
+        "password_credential",
+        "email_identity",
+        "email_verification",
+        "password_reset_token",
+        "pending_registration",
+        "verification_token",
+    ] {
+        assert_eq!(
+            scalar::<i64>(&store, &format!("SELECT count(*) FROM {table}")).await,
+            0,
+            "table {table} still holds a row after account deletion"
+        );
+    }
+
+    // No reference survives anywhere: the whole database passes an FK audit.
+    let broken = store
+        .db()
+        .query_all_raw(Statement::from_string(
+            DbBackend::Sqlite,
+            "PRAGMA foreign_key_check",
+        ))
+        .await
+        .unwrap();
+    assert!(broken.is_empty(), "foreign_key_check found {broken:?}");
+
+    // The freed person name is reusable, and a repeat delete is the goal state.
+    assert_eq!(
+        store.propose_person_name(&account.name).await.unwrap(),
+        slug
+    );
+    store.delete_account(account.id).await.unwrap();
+}
+
+#[tokio::test]
+async fn test_delete_account_without_email_purges_pending_rows_by_name() {
+    let store = Store::connect("sqlite::memory:").await.unwrap();
+    // `create_test_person` makes an account with no email identity, the SSO
+    // shape the display-name fallback exists for.
+    let alice = store.create_test_person("alice").await.unwrap();
+
+    let keep = store
+        .pending_registration_create(NewPendingRegistration {
+            flow_id: "keep".into(),
+            name: "Bob".into(),
+            email: "bob@example.com".into(),
+            lookup_key: "bob@example.com".into(),
+            created_at: 1,
+            expires_at: 100,
+        })
+        .await
+        .unwrap();
+    let mine = store
+        .pending_registration_create(NewPendingRegistration {
+            // A different casing of the same display name; the match folds.
+            name: "Alice".into(),
+            flow_id: "mine".into(),
+            email: "alice@example.com".into(),
+            lookup_key: "alice@example.com".into(),
+            created_at: 1,
+            expires_at: 100,
+        })
+        .await
+        .unwrap();
+    store
+        .verification_token_issue(
+            mine.id,
+            NewVerificationToken {
+                email_lookup_key: "alice@example.com".into(),
+                token_digest: "token-digest".into(),
+                purpose: "email-verification".into(),
+                issued_at: 1,
+                expires_at: 100,
+            },
+        )
+        .await
+        .unwrap();
+
+    store.delete_account(alice.account_id).await.unwrap();
+
+    // Alice's pending row (and its token) are gone; Bob's is untouched.
+    let remaining: String = scalar(&store, "SELECT flow_id FROM pending_registration").await;
+    assert_eq!(remaining, keep.flow_id);
+    assert_eq!(
+        scalar::<i64>(&store, "SELECT count(*) FROM verification_token").await,
+        0
+    );
+}
+
+#[tokio::test]
 async fn test_a_key_identifies_exactly_one_machine() {
     use weaver_mux::KeyId;
 

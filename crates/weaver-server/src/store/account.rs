@@ -16,8 +16,8 @@ use sea_orm::{
 };
 
 use super::entity::{
-    account, browser_session, email_identity, email_verification, password_credential,
-    password_reset_token, pending_registration, verification_token,
+    account, browser_session, domain, email_identity, email_verification, machine_key_log,
+    password_credential, password_reset_token, pending_registration, person, verification_token,
 };
 use super::{Store, StoreError};
 
@@ -359,6 +359,94 @@ impl Store {
     /// Fetches an account by its stable id.
     pub async fn account_by_id(&self, id: i32) -> Result<Option<account::Model>, StoreError> {
         Ok(account::Entity::find_by_id(id).one(&self.db).await?)
+    }
+
+    /// Hard-deletes an account and everything it owns, atomically.
+    ///
+    /// This is the "delete my account" path and it is deliberately terminal:
+    /// nothing is anonymized, nothing is kept for accounting, and there is no
+    /// soft-delete state or recovery window. One transaction removes, in order:
+    ///
+    /// * the person's materialized hostname rows, by name prefix — the account
+    ///   cascade only `SET NULL`s `domains.service_id`, which would leave every
+    ///   name behind and keep it reserved;
+    /// * the person's `machine_key_log` rows — the one path that overrides the
+    ///   "the log outlives the machine and person" rule, because no row may
+    ///   still name the person;
+    /// * the account itself, cascading person → machine → service →
+    ///   `usage_live`/`usage_daily` and the account-scoped rows (browser
+    ///   sessions, password credentials, email identity, verification history,
+    ///   reset tokens);
+    /// * the pre-account `pending_registration` rows that still hold this
+    ///   person's address (and, through the foreign key, their
+    ///   `verification_token`s) — rows no account cascade reaches.
+    ///
+    /// The pending-row purge **must** follow the account delete: `email_verification`
+    /// references `verification_token` with `RESTRICT`, and only the account
+    /// cascade removes those referencing rows first.
+    ///
+    /// Idempotent: an account that is already gone is the goal state, so a
+    /// repeat call commits and returns `Ok(())`.
+    pub async fn delete_account(&self, account_id: i32) -> Result<(), StoreError> {
+        let txn = self.db.begin().await?;
+        let Some(account) = account::Entity::find_by_id(account_id).one(&txn).await? else {
+            txn.commit().await?;
+            return Ok(());
+        };
+
+        // Read the person and the verified address before the cascade removes
+        // them; both drive the explicit purges below.
+        let person = person::Entity::find()
+            .filter(person::Column::AccountId.eq(account_id))
+            .one(&txn)
+            .await?;
+        let identity = email_identity::Entity::find()
+            .filter(email_identity::Column::AccountId.eq(account_id))
+            .one(&txn)
+            .await?;
+
+        if let Some(person) = &person {
+            // Person names are `[a-z0-9]{1,15}` with no dash and no `LIKE`
+            // metacharacter, so a `name-%` prefix match is exact.
+            domain::Entity::delete_many()
+                .filter(domain::Column::Name.like(format!("{}-%", person.name)))
+                .exec(&txn)
+                .await?;
+            machine_key_log::Entity::delete_many()
+                .filter(machine_key_log::Column::PersonId.eq(person.id))
+                .exec(&txn)
+                .await?;
+        }
+
+        account::Entity::delete_by_id(account_id).exec(&txn).await?;
+
+        // Pre-account rows: match on the verified address when there is one,
+        // otherwise on the display name. Name matching is case-folded in Rust
+        // because SQLite's `LOWER` is ASCII-only and the name preserves Unicode.
+        if let Some(identity) = identity {
+            pending_registration::Entity::delete_many()
+                .filter(pending_registration::Column::LookupKey.eq(identity.lookup_key))
+                .exec(&txn)
+                .await?;
+        } else {
+            let wanted = account.name.trim().to_lowercase();
+            let matching: Vec<i32> = pending_registration::Entity::find()
+                .all(&txn)
+                .await?
+                .into_iter()
+                .filter(|pending| pending.name.trim().to_lowercase() == wanted)
+                .map(|pending| pending.id)
+                .collect();
+            if !matching.is_empty() {
+                pending_registration::Entity::delete_many()
+                    .filter(pending_registration::Column::Id.is_in(matching))
+                    .exec(&txn)
+                    .await?;
+            }
+        }
+
+        txn.commit().await?;
+        Ok(())
     }
 
     /// Atomically activates a verified signup.

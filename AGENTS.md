@@ -16,7 +16,7 @@
   `cd frontend && pnpm run build` (~3s, timeout 180000ms). Must exit 0 and
   externalize the bootstrap (no inline `<script>` in `build/index.html`).
 - Browser BDD (Cucumber + Playwright against the real server):
-  `cd e2e && pnpm test` (~23s, timeout 300000ms); one-time
+  `cd e2e && pnpm test` (~53s, timeout 300000ms); one-time
   `pnpm exec playwright install chromium`. It rebuilds
   `weaver-server --example e2e_server` first, so stop any running copy of that
   binary (a live one blocks the relink with `ETXTBSY`).
@@ -28,9 +28,10 @@
 - Conformance (nightly / PR to develop only, needs the DO droplet): h2spec
   and Autobahn run in `.github/workflows/nightly.yml`; allow-lists live in
   `ci/conformance/*-allowlist.txt`, one case per line with a justification.
-- Last measured: 2026-10-19, full suite 577 passed/0 failed/4 ignored, e2e 18
-  scenarios/193 steps passed (43s), SPA lint and svelte-check clean.
-  (Prior: 2026-10-12, 559 passed (100s) after WVR-50; 550 passed (72s).)
+- Last measured: 2026-10-23, full suite 619 passed/0 failed/4 ignored (107s),
+  e2e 21 scenarios/227 steps passed (53s), SPA lint and svelte-check clean.
+  (Prior: 2026-10-19, 577 passed (100s), e2e 18 scenarios/193 steps (43s);
+  2026-10-12, 559 passed (100s) after WVR-50; 550 passed (72s).)
 
 ## Conventions
 

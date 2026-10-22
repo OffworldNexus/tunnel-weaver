@@ -2,7 +2,7 @@
 
 import { Then, When } from '@cucumber/cucumber';
 import * as assert from '../support/assertions.js';
-import { latestMailBySubject, latestMailLink, mailLinks } from '../support/harness.js';
+import { latestMailBySubject, latestMailLink, mailLinks, poll } from '../support/harness.js';
 import { createAccount, openVerificationLink, press, setPassword } from '../support/flow.js';
 
 const RESET_LINK = /https:\/\/localhost:\d+\/reset#token=[0-9a-f]+/g;
@@ -91,4 +91,70 @@ Then('I am signed out everywhere, this device included', async function () {
 
 Then('the password change notification email is sent', async function () {
   await latestMailBySubject('Your password was changed');
+});
+
+// ----- account deletion (WVR-29) ---------------------------------------------
+
+/** The confirm keycap inside the open dialog, never the Danger-zone opener. */
+function confirmButton(page) {
+  return page
+    .getByRole('dialog', { name: 'Delete your account?' })
+    .getByRole('button', { name: 'Delete account' });
+}
+
+When('I open the delete confirmation', async function () {
+  const danger = this.page.getByRole('region', { name: 'Danger zone' });
+  await danger.getByRole('button', { name: 'Delete account' }).click();
+  await this.page
+    .getByRole('dialog', { name: 'Delete your account?' })
+    .waitFor({ state: 'visible' });
+});
+
+// The gate is convenience only — the relay re-checks the address — but a locked
+// keycap is what stops a stray click, so both halves are asserted here.
+Then('the delete confirmation is locked', async function () {
+  const button = confirmButton(this.page);
+  await button.waitFor({ state: 'visible' });
+  if (!(await button.isDisabled())) {
+    throw new Error('The delete confirmation was unlocked before the address was typed.');
+  }
+});
+
+When('I type my email into the confirmation', async function () {
+  await this.page.getByLabel(/to confirm/).fill(this.email);
+});
+
+Then('the delete confirmation is unlocked', async function () {
+  const button = confirmButton(this.page);
+  await poll(
+    async () => (!(await button.isDisabled()) ? true : undefined),
+    () => 'The delete confirmation never unlocked after the account address was typed in.'
+  );
+});
+
+When('I confirm the deletion', async function () {
+  await confirmButton(this.page).click();
+});
+
+Then('the deletion lands me signed out on the sign-in page', async function () {
+  await this.page.waitForURL(/\/sign-in$/);
+  await assert.seeHeading(this.page, 'Sign in');
+});
+
+Then('the old session no longer authenticates', async function () {
+  const status = await this.page.evaluate(async () => (await fetch('/api/account/me')).status);
+  if (status !== 401) {
+    throw new Error(`Expected "/api/account/me" to answer 401 for the deleted session, got ${status}.`);
+  }
+});
+
+Then('the browser holds no account cookie', async function () {
+  const stale = (await this.context.cookies()).filter((cookie) =>
+    ['__Host-weaver_session', '__Host-weaver_csrf'].includes(cookie.name)
+  );
+  if (stale.length > 0) {
+    throw new Error(
+      `Expected both account cookies to be cleared, but found: ${stale.map((c) => c.name).join(', ')}.`
+    );
+  }
 });

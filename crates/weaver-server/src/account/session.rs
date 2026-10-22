@@ -136,6 +136,15 @@ impl Sessions {
         set_cookie(SESSION_COOKIE, "", Some(0), true, self.secure)
     }
 
+    /// The `Set-Cookie` value that clears the CSRF double-submit cookie.
+    ///
+    /// Needed wherever the session is destroyed for good (account deletion):
+    /// unlike logout, which leaves a dead session row behind, there is nothing
+    /// to double-submit against once the account is gone.
+    pub fn clear_csrf_cookie(&self) -> String {
+        set_cookie(CSRF_COOKIE, "", Some(0), false, self.secure)
+    }
+
     /// The `Set-Cookie` value for a fresh CSRF double-submit cookie.
     pub fn csrf_cookie(&self, token: &str) -> String {
         set_cookie(CSRF_COOKIE, token, Some(self.ttl_secs), false, self.secure)

@@ -88,3 +88,25 @@ Feature: Account lifecycle
     Then the current password field reports "that is not your current password"
     When I open the "account" page
     Then I see the signed-in identity for "Ada Lovelace"
+
+  # WVR-29: deletion really destroys its account, so this scenario registers one
+  # of its own instead of borrowing the one the read-only journeys leave behind.
+  # It walks the whole destructive journey: the Danger zone gate, the signed-out
+  # landing with its notice, and the proof that nothing of the account survives.
+  Scenario: Deleting my account from the Danger zone leaves nothing behind
+    Given an account exists for "Ada Lovelace" with the password "correct-horse-battery-staple"
+    When I sign in with the password "correct-horse-battery-staple"
+    Then I see the signed-in identity for "Ada Lovelace"
+    When I follow the "Security" link
+    Then I see the "Security" heading
+    When I open the delete confirmation
+    Then the delete confirmation is locked
+    When I type my email into the confirmation
+    Then the delete confirmation is unlocked
+    When I confirm the deletion
+    Then the deletion lands me signed out on the sign-in page
+    And I see "Your account and all its data have been deleted."
+    And the old session no longer authenticates
+    And the browser holds no account cookie
+    When I sign in with the wrong password "correct-horse-battery-staple"
+    Then I see the error "invalid email or password"
