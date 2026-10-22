@@ -43,7 +43,7 @@
 //!   elapsed for each registered service, splitting at minute boundaries and
 //!   clamping each bucket's `open_ms` to `0..=60_000`.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 #[cfg(test)]
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -54,6 +54,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::warn;
 use weaver_mux::{StreamBytesSink, StreamId};
 
+use crate::live::{Change, Entity, LiveHub, Viewer};
 use crate::metrics::MetricsStore;
 use crate::store::Store;
 use crate::store::StoreError;
@@ -153,6 +154,10 @@ pub struct MeteringManager {
     retention: Duration,
     /// The wall clock. Injected so a test can hold the minute still.
     clock: Clock,
+    /// The console's change bus, when the process has one: each flush announces
+    /// the metered statistics to the person whose traffic landed, so their open
+    /// views re-read. `None` in tests, where nothing is watching.
+    live: Option<LiveHub>,
     inner: Mutex<Inner>,
 }
 
@@ -169,6 +174,13 @@ impl MeteringManager {
         Self::with_clock(store, flush_interval, Clock::System, retention)
     }
 
+    /// Attaches the console's change bus, so a flush wakes the traffic views.
+    /// A builder, used once at startup.
+    pub fn with_live(mut self, live: LiveHub) -> Self {
+        self.live = Some(live);
+        self
+    }
+
     /// Creates a manager reading time from `clock`.
     fn with_clock(
         store: Store,
@@ -181,6 +193,7 @@ impl MeteringManager {
             flush_interval,
             retention,
             clock,
+            live: None,
             inner: Mutex::new(Inner::default()),
         }
     }
@@ -502,7 +515,37 @@ impl MeteringManager {
             }
             return Err(e);
         }
+        self.announce_flushed(&drained).await;
         Ok(())
+    }
+
+    /// Announces the metered statistics to each person whose traffic just
+    /// flushed — one change per person per flush, never one per service.
+    ///
+    /// Best-effort: a console's freshness must never fail a flush, so a lookup
+    /// failure is logged and swallowed.
+    async fn announce_flushed(&self, drained: &[((i32, i64), Bucket)]) {
+        let Some(live) = &self.live else {
+            return;
+        };
+        let ids: Vec<i32> = drained
+            .iter()
+            .map(|((service_id, _), _)| *service_id)
+            .collect();
+        let identities = match self.store.service_identities(&ids).await {
+            Ok(identities) => identities,
+            Err(e) => {
+                warn!(error = %e, "could not resolve flushed services for the console");
+                return;
+            }
+        };
+        let mut people: BTreeSet<i32> = BTreeSet::new();
+        for identity in identities {
+            people.insert(identity.person_id);
+        }
+        for person in people {
+            live.publish(Change::visible_to(Viewer::Person(person)).entity(Entity::Statistics));
+        }
     }
 
     async fn run(self: Arc<Self>, shutdown: CancellationToken) {

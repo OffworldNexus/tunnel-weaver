@@ -10,10 +10,10 @@ use weaver_mux::{CloseCode, KeyId};
 use weaver_proto::control::RefusalCode;
 
 use crate::cert::CertManager;
-use crate::live::LiveHub;
+use crate::live::{Change, Entity, LiveHub, Viewer};
 use crate::metering::MeteringManager;
 use crate::store::Store;
-use crate::tunnel::identity::StoreIdentityResolver;
+use crate::tunnel::identity::{Identity, StoreIdentityResolver};
 use crate::tunnel::proxy::ProxyRequest;
 
 /// Route information for a registered tunnel service.
@@ -85,19 +85,62 @@ impl TunnelRegistry {
         }
     }
 
-    /// Tells the person behind `key_id` that their live state may have changed.
+    /// Tells the person behind `key_id` that their machine's live state may have
+    /// changed.
     ///
     /// Best-effort and detached: a transition never waits on a console, and a
     /// key with no resolvable machine (a revoke that already deleted the row)
-    /// simply has nobody to tell. The stream recomputes its whole resource, so
-    /// this only has to name the person, never what changed.
-    fn notify_person_of(&self, key_id: &KeyId) {
+    /// simply has nobody to tell. The change names the machine by id, so only a
+    /// view that showed it (or every machine, for a set change) re-reads.
+    fn announce_machine(&self, key_id: KeyId) {
         let identities = Arc::clone(&self.identities);
         let live = self.live.clone();
-        let key = *key_id;
         tokio::spawn(async move {
-            if let Some(identity) = identities.identity(&key).await {
-                live.notify(identity.person_id);
+            if let Some(identity) = identities.identity(&key_id).await {
+                live.publish(
+                    Change::visible_to(Viewer::Person(identity.person_id))
+                        .entity(Entity::Machine)
+                        .id(identity.machine_id),
+                );
+            }
+        });
+    }
+
+    /// Announces that a service's state changed on `identity`'s machine: the
+    /// machine itself (its service set and its own row) and the tunnel, each by
+    /// id.
+    fn announce_service(&self, identity: &Identity, service_id: i32) {
+        let viewer = Viewer::Person(identity.person_id);
+        self.live.publish(
+            Change::visible_to(viewer)
+                .entity(Entity::Machine)
+                .id(identity.machine_id),
+        );
+        self.live.publish(
+            Change::visible_to(viewer)
+                .entity(Entity::Tunnel)
+                .id(service_id),
+        );
+    }
+
+    /// The same, when only the key is at hand: resolves the identity off the
+    /// hot path.
+    fn announce_service_by_key(&self, key_id: KeyId, service_id: i32) {
+        let identities = Arc::clone(&self.identities);
+        let live = self.live.clone();
+        tokio::spawn(async move {
+            if let Some(identity) = identities.identity(&key_id).await {
+                let viewer = Viewer::Person(identity.person_id);
+                live.publish(
+                    Change::visible_to(viewer)
+                        .entity(Entity::Machine)
+                        .id(identity.machine_id),
+                );
+                live.publish(
+                    Change::visible_to(viewer)
+                        .entity(Entity::Tunnel)
+                        .id(service_id),
+                );
             }
         });
     }
@@ -177,7 +220,7 @@ impl TunnelRegistry {
         }
 
         drop(conns);
-        self.notify_person_of(&key_id);
+        self.announce_machine(key_id);
         conn_id
     }
 
@@ -258,7 +301,7 @@ impl TunnelRegistry {
         if let Some(conn) = self.connections.lock().unwrap().get_mut(key_id) {
             conn.services = live;
         }
-        self.live.notify(identity.person_id);
+        // The caller (the account plane's rename handler) announces the change.
         remapped
     }
 
@@ -278,7 +321,7 @@ impl TunnelRegistry {
                 info!(%hostname, "Unregistered service on connection close");
             }
         }
-        self.notify_person_of(&key_id);
+        self.announce_machine(key_id);
     }
 
     /// The certificate manager this registry activates hostnames on.
@@ -378,7 +421,7 @@ impl TunnelRegistry {
         } else {
             info!(hostname = %host_lower, "Tunnel service left during certificate issuance");
         }
-        self.live.notify(identity.person_id);
+        self.announce_service(&identity, persisted.id);
 
         Ok(host_lower)
     }
@@ -400,8 +443,8 @@ impl TunnelRegistry {
             if let Some(conn) = conns.get_mut(&key_id) {
                 conn.services.remove(&lower);
             }
+            self.announce_service_by_key(key_id, service_id);
         }
-        self.notify_person_of(&key_id);
     }
 
     /// The identity resolver, shared with the mux `Verifier`.

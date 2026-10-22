@@ -166,11 +166,14 @@ pub async fn run_server(
     // route transitions, the account plane announces membership writes, and
     // every open stream of the affected person recomputes (WVR-25).
     let live = crate::live::LiveHub::new();
-    let metering = Arc::new(crate::metering::MeteringManager::with_retention(
-        store.clone(),
-        Duration::from_secs(config.usage_flush_interval_secs),
-        Duration::from_secs(config.usage_retention_secs),
-    ));
+    let metering = Arc::new(
+        crate::metering::MeteringManager::with_retention(
+            store.clone(),
+            Duration::from_secs(config.usage_flush_interval_secs),
+            Duration::from_secs(config.usage_retention_secs),
+        )
+        .with_live(live.clone()),
+    );
     let tunnel_registry = Arc::new(crate::tunnel::TunnelRegistry::new(
         config.tunnel_domain.clone(),
         Arc::clone(&cert_manager),

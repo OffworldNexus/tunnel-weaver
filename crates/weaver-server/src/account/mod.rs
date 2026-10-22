@@ -12,7 +12,7 @@ pub mod pairing;
 pub mod password;
 pub mod router;
 pub mod session;
-pub mod stream;
+pub mod views;
 
 use std::sync::Arc;
 
