@@ -101,7 +101,7 @@ certificate is independent: its failure only affects the relay's own endpoint.
 - Alerting is systemd `sd_notify` status plus `WARN`/`ERROR` logs. Watch for
   `Wildcard certificate issuance failed` / `renewal failed` and the reported
   `retry_at`.
-- The background renewal loop runs every 12 h and renews when less than a third
+- The background renewal job runs every 12 h and renews when less than a third
   of the lifetime remains. DNS-01 reuse of the local responder means renewal
   does not re-run `setup`.
 - On unrecoverable expiry, check `journalctl -u weaver-server` for the ACME
@@ -198,6 +198,29 @@ rows retired longer ago than `account.key_log_retention_days` (default **365**,
 minimum 1) are deleted, while the row of a machine's current key is never
 deleted however old it is. Set the retention to `0` and `Config::load` rejects
 the config.
+
+## Periodic jobs
+
+Every periodic background job is a `Task` (`name`, `next_tick`, `run`, and an
+optional `shutdown`) driven by one process-wide `Scheduler` built in
+`server::run` (ADR 0012). The scheduler wakes at the earliest deadline and runs
+whatever is due; the drain awaits it, and its `shutdown` pass performs the
+metering task's final flush before the store closes. The startup log line
+`periodic scheduler running` lists the tasks by name.
+
+| Task | Cadence | Config |
+|---|---|---|
+| `usage-metering` | 1 s tick, flush every `usage_flush_interval_secs` | `usage_flush_interval_secs`, `usage_retention_secs` |
+| `abuse-bucket-sweep` | 600 s (only when abuse is enabled) | `abuse.bucket_ttl_secs` |
+| `altcha-proof-sweep` | `abuse.altcha.sweep_interval_secs` | `abuse.altcha.sweep_interval_secs` |
+| `account-sweep` | `account.sweep_interval_secs` | `account.sweep_interval_secs`, `account.key_log_retention_days` |
+| `inactivity-sweep` | `account.sweep_interval_secs` | `account.inactive_after_secs`, `account.inactivity_warning_before_secs` |
+| `cert-renewal` | 12 h | — |
+
+Each task's first tick is immediate. Connections have their own scheduler for
+connection-local timers (`visitor-byte-report` every 5 s, `sse-heartbeat` every
+15 s); those share the `Task` seam but are driven from the connection's own
+`select!` rather than sleeping.
 
 ## Abandoned accounts
 

@@ -405,15 +405,16 @@ impl MeteringManager {
         }
     }
 
-    /// Spawns the flush job, returning its handle.
+    /// Spawns the flush job as a scheduler task, returning its handle.
     ///
-    /// The job ticks once a second, accruing open time and flushing on the
-    /// configured cadence. On `shutdown` it ticks once more and flushes; the
-    /// in-flight minute is still never written, because only complete minutes
-    /// are. Await the returned handle before closing the store.
+    /// The task ticks once a second, accruing open time and flushing on the
+    /// configured cadence. On `shutdown` it ticks once more, flushes, and folds
+    /// the day; the in-flight minute is still never written, because only
+    /// complete minutes are. Await the returned handle before closing the store.
     pub fn start(self: &Arc<Self>, shutdown: CancellationToken) -> JoinHandle<()> {
-        let manager = Arc::clone(self);
-        tokio::spawn(async move { manager.run(shutdown).await })
+        let task: Arc<dyn crate::scheduler::Task> = Arc::new(MeteringTask::new(Arc::clone(self)));
+        let scheduler = crate::scheduler::Scheduler::new(vec![task]);
+        tokio::spawn(async move { scheduler.run(shutdown).await })
     }
 
     // ------------------------------------------------------------------
@@ -547,37 +548,78 @@ impl MeteringManager {
             live.publish(Change::visible_to(Viewer::Person(person)).entity(Entity::Statistics));
         }
     }
+}
 
-    async fn run(self: Arc<Self>, shutdown: CancellationToken) {
-        let mut ticker = tokio::time::interval(TICK);
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        let mut last = Instant::now();
-        let mut since_flush = Duration::ZERO;
-        loop {
-            tokio::select! {
-                _ = shutdown.cancelled() => break,
-                _ = ticker.tick() => {
-                    let now = Instant::now();
-                    since_flush += now.saturating_duration_since(last);
-                    last = now;
-                    let now_ms = self.clock.now_ms();
-                    self.tick_at(now_ms);
-                    if since_flush >= self.flush_interval {
-                        since_flush = Duration::ZERO;
-                        if let Err(e) = self.flush_at(now_ms).await {
-                            warn!(error = %e, "Usage flush failed");
-                        }
-                        self.maintain().await;
-                    }
-                }
-            }
+/// The metering flush job, as a scheduler [`Task`](crate::scheduler::Task).
+///
+/// Ticks once a second, accruing open time; every `flush_interval` it writes the
+/// complete minutes, folds the day that just ended and sweeps past retention.
+/// [`Task::shutdown`](crate::scheduler::Task::shutdown) performs the same final
+/// pass, so the drain can await it before the store closes.
+pub struct MeteringTask {
+    manager: Arc<MeteringManager>,
+    state: Mutex<MeterState>,
+}
+
+/// The task's cadence bookkeeping: wall-clock-independent, so a slow or missed
+/// tick never loses or double-counts elapsed time.
+struct MeterState {
+    last: Instant,
+    since_flush: Duration,
+}
+
+impl MeteringTask {
+    /// Wraps a manager.
+    pub fn new(manager: Arc<MeteringManager>) -> Self {
+        Self {
+            manager,
+            state: Mutex::new(MeterState {
+                last: Instant::now(),
+                since_flush: Duration::ZERO,
+            }),
         }
-        let now_ms = self.clock.now_ms();
-        self.tick_at(now_ms);
-        if let Err(e) = self.flush_at(now_ms).await {
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::scheduler::Task for MeteringTask {
+    fn name(&self) -> &'static str {
+        "usage-metering"
+    }
+
+    fn next_tick(&self, _now: i64) -> Duration {
+        TICK
+    }
+
+    async fn run(&self, _now: i64) {
+        let (now_ms, flush) = {
+            let mut state = self.state.lock().unwrap();
+            let now = Instant::now();
+            let elapsed = now.saturating_duration_since(state.last);
+            state.last = now;
+            state.since_flush += elapsed;
+            let flush = state.since_flush >= self.manager.flush_interval;
+            if flush {
+                state.since_flush = Duration::ZERO;
+            }
+            (self.manager.clock.now_ms(), flush)
+        };
+        self.manager.tick_at(now_ms);
+        if flush {
+            if let Err(e) = self.manager.flush_at(now_ms).await {
+                warn!(error = %e, "Usage flush failed");
+            }
+            self.manager.maintain().await;
+        }
+    }
+
+    async fn shutdown(&self, _now: i64) {
+        let now_ms = self.manager.clock.now_ms();
+        self.manager.tick_at(now_ms);
+        if let Err(e) = self.manager.flush_at(now_ms).await {
             warn!(error = %e, "Final usage flush failed");
         }
-        self.maintain().await;
+        self.manager.maintain().await;
     }
 }
 

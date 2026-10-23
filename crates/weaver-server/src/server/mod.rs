@@ -157,9 +157,6 @@ pub async fn run_server(
     // 8. Spawn HTTP, HTTPS, and control server tasks and eager issuance
     let shutdown_token = external_shutdown.unwrap_or_default();
 
-    // Start background renewal loop
-    cert_manager.start_renewal_loop(shutdown_token.clone());
-
     let identity_resolver = Arc::new(crate::tunnel::StoreIdentityResolver::new(store.clone()));
     // The console's real-time change bus, created here so the registry and the
     // account plane share one instance: the registry announces presence and
@@ -183,13 +180,7 @@ pub async fn run_server(
         live.clone(),
     ));
 
-    // The manager ticks once a second and flushes on the configured cadence;
-    // on shutdown it performs a final flush that includes the partial current
-    // minute, which the drain below awaits before the store is closed.
-    let usage_task = Arc::clone(&metering).start(shutdown_token.clone());
-
-    // The relay-web budget gate (None when abuse is unconfigured) plus
-    // a background sweep that drops idle buckets so the table stays bounded.
+    // The relay-web budget gate (None when abuse is unconfigured).
     let guard = crate::abuse::build(&config, store.clone());
     // The ALTCHA runtime (None when `abuse.altcha` is not enabled).
     let altcha =
@@ -199,58 +190,6 @@ pub async fn run_server(
     altcha.ensure_demo_client().await.map_err(|e| {
         ServerError::Activation(format!("Failed to provision the ALTCHA demo client: {e}"))
     })?;
-    let abuse_task = config
-        .abuse
-        .as_ref()
-        .filter(|abuse| abuse.enabled)
-        .map(|cfg| {
-            let store = store.clone();
-            let ttl_ms = (cfg.bucket_ttl_secs as i64).saturating_mul(1000).max(1);
-            let token = shutdown_token.clone();
-            info!(ttl_secs = cfg.bucket_ttl_secs, "abuse bucket sweep running");
-            tokio::spawn(async move {
-                let mut ticker = tokio::time::interval(Duration::from_secs(600));
-                loop {
-                    tokio::select! {
-                        _ = token.cancelled() => break,
-                        _ = ticker.tick() => {
-                            let cutoff = crate::wall_clock::unix_ms() - ttl_ms;
-                            if let Err(err) = store.abuse_sweep(cutoff).await {
-                                warn!(error = %err, "abuse bucket sweep failed");
-                            }
-                        }
-                    }
-                }
-            })
-        });
-
-    // Sweep expired spent-proof markers so the table stays bounded. The
-    // ALTCHA API is always served, so this always runs.
-    let altcha_sweep = config
-        .abuse
-        .as_ref()
-        .and_then(|abuse| abuse.altcha.clone())
-        .unwrap_or_else(crate::config::AltchaConfig::builtin);
-    let altcha_task = {
-        let store = store.clone();
-        let interval = altcha_sweep.sweep_interval_secs.max(1);
-        let token = shutdown_token.clone();
-        info!(interval_secs = interval, "ALTCHA proof sweep running");
-        tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(Duration::from_secs(interval));
-            loop {
-                tokio::select! {
-                    _ = token.cancelled() => break,
-                    _ = ticker.tick() => {
-                        let cutoff = crate::wall_clock::unix_ms();
-                        if let Err(err) = store.altcha_sweep_proofs(cutoff).await {
-                            warn!(error = %err, "ALTCHA proof sweep failed");
-                        }
-                    }
-                }
-            }
-        })
-    };
 
     // The account plane. It is always served on the admin host. The
     // mailer is optional: when email is not configured, signup still records the
@@ -274,70 +213,46 @@ pub async fn run_server(
         live,
     )
     .map_err(|e| ServerError::Activation(format!("Failed to initialize the account plane: {e}")))?;
-    let account_sweep = {
-        let store = store.clone();
-        let account_config = config.account.clone();
-        let interval = config.account.sweep_interval_secs.max(1);
-        let token = shutdown_token.clone();
-        info!(
-            interval_secs = interval,
-            "account token/session/key-log sweep running"
-        );
-        tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(Duration::from_secs(interval));
-            loop {
-                tokio::select! {
-                    _ = token.cancelled() => break,
-                    _ = ticker.tick() => {
-                        let cutoff = crate::wall_clock::unix_ms() / 1000;
-                        if let Err(err) = store.verification_token_sweep(cutoff).await {
-                            warn!(error = %err, "verification token sweep failed");
-                        }
-                        if let Err(err) = store.password_reset_token_sweep(cutoff).await {
-                            warn!(error = %err, "password reset token sweep failed");
-                        }
-                        if let Err(err) = store.session_sweep(cutoff).await {
-                            warn!(error = %err, "session sweep failed");
-                        }
-                        let key_log_cutoff = account_config.key_log_cutoff(cutoff);
-                        if let Err(err) = store.sweep_machine_key_log(key_log_cutoff).await {
-                            warn!(error = %err, "machine key log sweep failed");
-                        }
-                    }
-                }
-            }
-        })
-    };
 
-    // The inactivity sweep: warn accounts that have gone unused for almost the
-    // configured threshold, then delete them through the very same store
-    // operation as "delete my account". Bounded per tick.
-    let inactivity_sweep = {
-        let account = account.clone();
-        let registry = Arc::clone(&tunnel_registry);
-        let interval = config.account.sweep_interval_secs.max(1);
-        let token = shutdown_token.clone();
-        info!(interval_secs = interval, "inactivity sweep running");
-        tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(Duration::from_secs(interval));
-            loop {
-                tokio::select! {
-                    _ = token.cancelled() => break,
-                    _ = ticker.tick() => {
-                        let now = crate::wall_clock::unix_secs();
-                        match crate::account::inactivity::run(&account, Some(&registry), now).await {
-                            Ok(report) => info!(
-                                warned = report.warned,
-                                deleted = report.deleted,
-                                "inactivity sweep complete"
-                            ),
-                            Err(err) => warn!(error = %err, "inactivity sweep failed"),
-                        }
-                    }
-                }
-            }
-        })
-    };
+    // The periodic jobs, driven by one scheduler: usage metering, the ALTCHA and
+    // account/inactivity sweeps, certificate renewal, and (when abuse is on) the
+    // abuse bucket sweep. Assembling them here is what keeps the relay's
+    // periodic work described in one place.
+    let altcha_sweep = config
+        .abuse
+        .as_ref()
+        .and_then(|abuse| abuse.altcha.clone())
+        .unwrap_or_else(crate::config::AltchaConfig::builtin);
+    let mut scheduler_tasks: Vec<Arc<dyn crate::scheduler::Task>> = vec![
+        Arc::new(crate::metering::MeteringTask::new(Arc::clone(&metering))),
+        Arc::new(crate::housekeeping::AltchaSweepTask::new(
+            store.clone(),
+            Duration::from_secs(altcha_sweep.sweep_interval_secs.max(1)),
+        )),
+        Arc::new(crate::housekeeping::AccountSweepTask::new(
+            store.clone(),
+            config.account.clone(),
+            Duration::from_secs(config.account.sweep_interval_secs.max(1)),
+        )),
+        Arc::new(crate::housekeeping::InactivitySweepTask::new(
+            account.clone(),
+            Arc::clone(&tunnel_registry),
+            Duration::from_secs(config.account.sweep_interval_secs.max(1)),
+        )),
+        cert_manager.renewal_task(),
+    ];
+    if let Some(abuse) = config.abuse.as_ref().filter(|abuse| abuse.enabled) {
+        let ttl_ms = (abuse.bucket_ttl_secs as i64).saturating_mul(1000).max(1);
+        scheduler_tasks.push(Arc::new(crate::housekeeping::AbuseSweepTask::new(
+            store.clone(),
+            ttl_ms,
+        )));
+    }
+    let scheduler = crate::scheduler::Scheduler::new(scheduler_tasks);
+    info!(tasks = ?scheduler.names(), "periodic scheduler running");
+    // Awaiting this runs every task's shutdown hook, including the final usage
+    // flush, so the drain awaits it before the store closes.
+    let scheduler_task = tokio::spawn(scheduler.run(shutdown_token.clone()));
 
     let http_token = shutdown_token.clone();
     let challenge_responders: Vec<Arc<dyn ChallengeResponder>> =
@@ -475,13 +390,10 @@ pub async fn run_server(
     info!(drain_timeout_secs = 10, "Draining active connections");
 
     let drain = async {
-        let _ = tokio::join!(http_task, https_task, control_task, usage_task);
-        if let Some(task) = abuse_task {
-            let _ = task.await;
-        }
-        let _ = altcha_task.await;
-        let _ = account_sweep.await;
-        let _ = inactivity_sweep.await;
+        let _ = tokio::join!(http_task, https_task, control_task);
+        // The scheduler's shutdown hooks run the final usage flush, so it must
+        // finish before the store closes.
+        let _ = scheduler_task.await;
         let _ = futures_util::future::join_all(dns_tasks).await;
     };
 

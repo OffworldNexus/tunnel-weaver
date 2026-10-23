@@ -14,7 +14,6 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use tokio::sync::{Mutex, Semaphore, broadcast};
-use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 pub use acme::{
@@ -664,30 +663,40 @@ impl CertManager {
         results
     }
 
-    /// Spawns the background renewal loop task running every 12 hours (+ jitter).
-    pub fn start_renewal_loop(self: &Arc<Self>, shutdown_token: CancellationToken) {
-        let manager = Arc::clone(self);
-        tokio::spawn(async move {
-            info!("Certificate renewal background loop started");
-            let mut interval = tokio::time::interval(Duration::from_secs(12 * 3600));
-
-            loop {
-                tokio::select! {
-                    _ = shutdown_token.cancelled() => {
-                        info!("Certificate renewal loop received cancellation, shutting down");
-                        break;
-                    }
-                    _ = interval.tick() => {
-                        debug!("Executing scheduled certificate renewal tick");
-                        let _ = manager.renew_eligible().await;
-                    }
-                }
-            }
-        });
+    /// The periodic renewal job, as a scheduler
+    /// [`Task`](crate::scheduler::Task).
+    ///
+    /// Runs every 12 hours: [`renew_eligible`](Self::renew_eligible) re-orders
+    /// the certificates that are close enough to expiry.
+    pub fn renewal_task(self: &Arc<Self>) -> Arc<dyn crate::scheduler::Task> {
+        Arc::new(CertRenewalTask {
+            manager: Arc::clone(self),
+        })
     }
 
     /// Returns a reference to the dynamic certificate resolver.
     pub fn resolver(&self) -> Arc<CertResolver> {
         Arc::clone(&self.resolver)
+    }
+}
+
+/// The certificate renewal job, as a scheduler [`Task`](crate::scheduler::Task).
+pub struct CertRenewalTask {
+    manager: Arc<CertManager>,
+}
+
+#[async_trait::async_trait]
+impl crate::scheduler::Task for CertRenewalTask {
+    fn name(&self) -> &'static str {
+        "cert-renewal"
+    }
+
+    fn next_tick(&self, _now: i64) -> Duration {
+        Duration::from_secs(12 * 3600)
+    }
+
+    async fn run(&self, _now: i64) {
+        debug!("Executing scheduled certificate renewal tick");
+        let _ = self.manager.renew_eligible().await;
     }
 }

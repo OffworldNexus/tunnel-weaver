@@ -38,7 +38,6 @@ use bytes::Bytes;
 use futures_util::stream;
 use serde_json::{Value, json};
 use tokio::sync::{broadcast, mpsc};
-use tokio::time::MissedTickBehavior;
 use weaver_mux::KeyId;
 
 use crate::account::AccountRuntime;
@@ -173,11 +172,12 @@ async fn run<V: View>(
     tx: mpsc::Sender<Bytes>,
 ) {
     let mut changes = runtime.live.subscribe();
-    // An offset, not a plain interval: `interval`'s first tick is immediate, and
-    // an immediate heartbeat would only add noise to the first frame.
-    let mut heartbeat =
-        tokio::time::interval_at(tokio::time::Instant::now() + HEARTBEAT, HEARTBEAT);
-    heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    // Staggered, so the first heartbeat is a full period away: an immediate
+    // heartbeat would only add noise to the first frame.
+    let mut timers =
+        crate::scheduler::Scheduler::staggered(vec![
+            Arc::new(HeartbeatTask { tx: tx.clone() }) as Arc<dyn crate::scheduler::Task>
+        ]);
 
     let mut last: Option<Vec<u8>> = None;
     let mut viewer = Viewer::Anyone;
@@ -218,6 +218,9 @@ async fn run<V: View>(
 
         // Wait for a change this view cares about, or a keep-alive tick.
         loop {
+            let deadline = timers
+                .next_deadline()
+                .unwrap_or_else(|| tokio::time::Instant::now() + HEARTBEAT);
             tokio::select! {
                 change = changes.recv() => match change {
                     Ok(change) if change.invalidates(viewer, &interests) => break,
@@ -225,14 +228,37 @@ async fn run<V: View>(
                     Err(broadcast::error::RecvError::Lagged(_)) => break,
                     Err(broadcast::error::RecvError::Closed) => return,
                 },
-                _ = heartbeat.tick() => {
-                    if tx.send(Bytes::from_static(b": ping\n\n")).await.is_err() {
+                _ = tokio::time::sleep_until(deadline) => {
+                    timers.run_due().await;
+                    // A failed heartbeat means the client is gone.
+                    if tx.is_closed() {
                         return;
                     }
                 }
             }
         }
         coalesce(&mut changes).await;
+    }
+}
+
+/// The SSE keep-alive timer, as a scheduler [`Task`](crate::scheduler::Task).
+///
+/// One per open stream; its tick sends an SSE comment so a proxy or a browser
+/// does not time an idle stream out.
+struct HeartbeatTask {
+    tx: mpsc::Sender<Bytes>,
+}
+
+#[async_trait::async_trait]
+impl crate::scheduler::Task for HeartbeatTask {
+    fn name(&self) -> &'static str {
+        "sse-heartbeat"
+    }
+    fn next_tick(&self, _now: i64) -> Duration {
+        HEARTBEAT
+    }
+    async fn run(&self, _now: i64) {
+        let _ = self.tx.send(Bytes::from_static(b": ping\n\n")).await;
     }
 }
 
