@@ -19,25 +19,36 @@ every new job copied the boilerplate. Connections separately grew their own
 timers (the 5 s visitor byte report, the 15 s SSE heartbeat) that had to
 interleave with I/O in a `select!`.
 
-A blind interval is also the wrong shape for a job whose cadence depends on
-state: the inactivity sweep wants to wake when the next account actually falls
-due, not to poll every hour.
+A blind interval is also the wrong shape for most of this work. The inactivity
+sweep has nothing to do until the second an account falls due; certificate
+renewal nothing until a certificate enters its renewal window; the garbage
+sweeps reclaim rows that are already inert and can wait for a quiet hour.
+Polling every hour (or every minute) only rereads the same data, and per-job
+interval knobs are tuning nobody needs.
 
 ## Decision
 
-### A `Task` says *when*, not *how often*
+### A `Task` picks its own instants
 
-A task is `name()`, `async next_tick(now) -> i64`, `async run(now)`, and an
-optional `async shutdown(now)`. `now` and the returned deadline are **absolute
-Unix seconds** — the relay's clock everywhere — so a task compares directly
-against a stored timestamp; no task here needs sub-second resolution.
+A task is `name()`, `async next_tick(last_tick, now) -> i64`, `async run(tick)`,
+and an optional `async shutdown(now)`. All times are absolute Unix seconds.
 
-`next_tick` is asked once before the first run and again after every run, and it
-is `async` on purpose: the answer may be based on state the task just read. The
-inactivity sweep, for example, returns
-`min(now + poll_ceiling, the instant the next account falls due)` instead of
-polling on a fixed interval. Returning a value at or before `now` means "due
-now".
+- `next_tick` returns the exact second the task next has work. `last_tick` is
+  the scheduled time of the run that just finished, or `None` when the process
+  has just started, so a job catches up at boot and then follows its data. It
+  is `async` because the answer usually lives in the store: the inactivity
+  sweep returns the earliest warning or deletion instant after `last_tick`;
+  certificate renewal the opening of the first renewal window (or a failed
+  order's backoff retry); metering the next flush boundary; the garbage sweeps
+  the next UTC midnight. There are no per-task interval fields or knobs.
+- `run(tick)` receives the **scheduled** instant, not a clock reading. Every
+  cutoff, SQL predicate and timestamp the run writes derives from that one
+  value, so a tick is internally consistent and a late wake-up does not change
+  what it means. A task never reads the clock inside `run`.
+
+A task that falls behind (it slept through several of its instants) is asked
+again with the real `now` and decides itself whether to replay or skip; every
+task here skips, since one run settles everything due.
 
 ### One `Scheduler` type, two driving modes
 
@@ -45,7 +56,7 @@ now".
   the earliest deadline and exits on a `CancellationToken`, then calls
   `shutdown()` on each task. Metering uses `shutdown` to flush before the store
   closes.
-- `next_deadline()` + `run_due()` never sleep, so a connection drives its own
+- `next_wait()` + `run_due()` never sleep, so a connection drives its own
   timers from a `select!` arm without the scheduler taking the I/O loop from it.
 
 Due tasks in one pass run **concurrently** (`join_all`), so a slow sweep does not
@@ -65,8 +76,11 @@ in `housekeeping`.
 
 - The relay's periodic work is described in one place — the task list in
   `server::run` — and adding a job is one `Task` impl.
-- A job's cadence can follow its data instead of a fixed interval, because
-  `next_tick` is absolute and may consult the store.
+- A job wakes when its data says so, not on a fixed interval: the relay is
+  idle between events, and there are no interval knobs to tune.
+- A job that runs early or late by its own choice must never spin: a
+  `next_tick` that could return a past instant for work it cannot do (a failed
+  send, an overdue renewal already in flight) bounds it with a retry delay.
 - Independent jobs no longer serialize: they run concurrently across the pool.
   They must stay independent (they are: `&self`, `Arc`-shared).
 - Connection-local and process-wide timers share the seam, so both are written

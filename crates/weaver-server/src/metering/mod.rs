@@ -47,7 +47,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 #[cfg(test)]
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -68,9 +68,6 @@ const MINUTE_MS: i64 = 60_000;
 /// Minutes in a metering day. A slot run never crosses one, because a day is a
 /// separate row of the array.
 const MINUTES_PER_DAY: i64 = 24 * 60;
-
-/// How often the manager accrues open time and checks for a flush.
-const TICK: Duration = Duration::from_secs(1);
 
 /// Counters accumulated for one `(service_id, minute)` bucket.
 #[derive(Debug, Clone, Copy, Default)]
@@ -413,8 +410,12 @@ impl MeteringManager {
     /// complete minutes are. Await the returned handle before closing the store.
     pub fn start(self: &Arc<Self>, shutdown: CancellationToken) -> JoinHandle<()> {
         let task: Arc<dyn crate::scheduler::Task> = Arc::new(MeteringTask::new(Arc::clone(self)));
+        // The job's ticks come from the manager's own clock, the same one the
+        // observations are stamped with.
+        let manager = Arc::clone(self);
+        let clock: crate::scheduler::Clock = Arc::new(move || manager.clock.now_ms());
         tokio::spawn(async move {
-            crate::scheduler::Scheduler::new(vec![task])
+            crate::scheduler::Scheduler::with_clock(vec![task], clock)
                 .await
                 .run(shutdown)
                 .await
@@ -556,32 +557,26 @@ impl MeteringManager {
 
 /// The metering flush job, as a scheduler [`Task`](crate::scheduler::Task).
 ///
-/// Ticks once a second, accruing open time; every `flush_interval` it writes the
-/// complete minutes, folds the day that just ended and sweeps past retention.
-/// [`Task::shutdown`](crate::scheduler::Task::shutdown) performs the same final
-/// pass, so the drain can await it before the store closes.
+/// Wakes on the epoch-aligned multiples of `flush_interval` (with the default
+/// 60 s, the instant each minute closes): only complete minutes are ever
+/// written, so that is the first moment there is something to write. Open time
+/// is accrued up to the tick right before the flush, split per minute, so no
+/// per-second tick is needed. Each flush also folds the day that just ended and
+/// sweeps past retention.
 pub struct MeteringTask {
     manager: Arc<MeteringManager>,
-    state: Mutex<MeterState>,
-}
-
-/// The task's cadence bookkeeping: wall-clock-independent, so a slow or missed
-/// tick never loses or double-counts elapsed time.
-struct MeterState {
-    last: Instant,
-    since_flush: Duration,
 }
 
 impl MeteringTask {
     /// Wraps a manager.
     pub fn new(manager: Arc<MeteringManager>) -> Self {
-        Self {
-            manager,
-            state: Mutex::new(MeterState {
-                last: Instant::now(),
-                since_flush: Duration::ZERO,
-            }),
-        }
+        Self { manager }
+    }
+
+    fn period(&self) -> i64 {
+        i64::try_from(self.manager.flush_interval.as_secs())
+            .unwrap_or(i64::MAX)
+            .max(1)
     }
 }
 
@@ -591,34 +586,26 @@ impl crate::scheduler::Task for MeteringTask {
         "usage-metering"
     }
 
-    async fn next_tick(&self, now: i64) -> i64 {
-        now + TICK.as_secs() as i64
+    async fn next_tick(&self, last_tick: Option<i64>, now: i64) -> i64 {
+        // The next boundary after both the last flush and the clock: a late
+        // wake-up skips the boundaries it slept through instead of replaying
+        // them, since one flush drains every closed minute.
+        let period = self.period();
+        let base = last_tick.map_or(now, |last| last.max(now));
+        (base.div_euclid(period) + 1).saturating_mul(period)
     }
 
-    async fn run(&self, _now: i64) {
-        let (now_ms, flush) = {
-            let mut state = self.state.lock().unwrap();
-            let now = Instant::now();
-            let elapsed = now.saturating_duration_since(state.last);
-            state.last = now;
-            state.since_flush += elapsed;
-            let flush = state.since_flush >= self.manager.flush_interval;
-            if flush {
-                state.since_flush = Duration::ZERO;
-            }
-            (self.manager.clock.now_ms(), flush)
-        };
-        self.manager.tick_at(now_ms);
-        if flush {
-            if let Err(e) = self.manager.flush_at(now_ms).await {
-                warn!(error = %e, "Usage flush failed");
-            }
-            self.manager.maintain().await;
+    async fn run(&self, tick: i64) {
+        let tick_ms = tick.saturating_mul(1000);
+        self.manager.tick_at(tick_ms);
+        if let Err(e) = self.manager.flush_at(tick_ms).await {
+            warn!(error = %e, "Usage flush failed");
         }
+        self.manager.maintain().await;
     }
 
-    async fn shutdown(&self, _now: i64) {
-        let now_ms = self.manager.clock.now_ms();
+    async fn shutdown(&self, now: i64) {
+        let now_ms = now.saturating_mul(1000);
         self.manager.tick_at(now_ms);
         if let Err(e) = self.manager.flush_at(now_ms).await {
             warn!(error = %e, "Final usage flush failed");
@@ -1059,9 +1046,9 @@ mod tests {
 
         let token = CancellationToken::new();
         let task = meter.start(token.clone());
-        // 50 ms of open time, produced by moving the pinned clock rather than by
-        // waiting for the wall clock to move.
-        clock.store(base + 50, Ordering::Relaxed);
+        // Open time, produced by moving the pinned clock rather than by waiting
+        // for the wall clock to move.
+        clock.store(base + 1_050, Ordering::Relaxed);
         token.cancel();
         let _ = task.await;
 
@@ -1083,7 +1070,7 @@ mod tests {
         assert_eq!(totals[0].bytes_out, 22);
         assert_eq!(totals[0].tunnel_in, 33);
         assert_eq!(totals[0].tunnel_out, 44);
-        assert_eq!(totals[0].open_ms, 50);
+        assert_eq!(totals[0].open_ms, 1_050);
     }
 
     #[tokio::test]

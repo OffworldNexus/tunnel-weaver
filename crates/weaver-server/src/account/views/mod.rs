@@ -219,10 +219,7 @@ async fn run<V: View>(
 
         // Wait for a change this view cares about, or a keep-alive tick.
         loop {
-            let now = crate::wall_clock::unix_secs();
-            let wait = timers.next_deadline().map_or(HEARTBEAT, |at| {
-                Duration::from_secs(at.saturating_sub(now).max(0) as u64)
-            });
+            let wait = timers.next_wait().unwrap_or(HEARTBEAT);
             tokio::select! {
                 change = changes.recv() => match change {
                     Ok(change) if change.invalidates(viewer, &interests) => break,
@@ -256,10 +253,12 @@ impl crate::scheduler::Task for HeartbeatTask {
     fn name(&self) -> &'static str {
         "sse-heartbeat"
     }
-    async fn next_tick(&self, now: i64) -> i64 {
-        now + HEARTBEAT.as_secs() as i64
+    async fn next_tick(&self, last_tick: Option<i64>, now: i64) -> i64 {
+        // A keep-alive is the one genuinely periodic job: a full period after
+        // the stream opened or the last ping, never in the past.
+        (last_tick.unwrap_or(now) + HEARTBEAT.as_secs() as i64).max(now)
     }
-    async fn run(&self, _now: i64) {
+    async fn run(&self, _tick: i64) {
         let _ = self.tx.send(Bytes::from_static(b": ping\n\n")).await;
     }
 }

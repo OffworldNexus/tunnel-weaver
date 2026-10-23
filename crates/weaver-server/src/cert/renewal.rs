@@ -15,6 +15,12 @@ pub fn should_renew(not_before: i64, not_after: i64, now: i64) -> bool {
     remaining <= total_lifetime / 3
 }
 
+/// The first Unix second at which [`should_renew`] holds for this validity
+/// window: one third of the lifetime before `not_after`.
+pub fn renewal_at(not_before: i64, not_after: i64) -> i64 {
+    not_after.saturating_sub(not_after.saturating_sub(not_before) / 3)
+}
+
 /// Computes exponential backoff for issuance or renewal failure.
 ///
 /// Starts at 1 hour (3600s), doubles per consecutive failure, and caps at 24 hours (86400s).
@@ -35,6 +41,14 @@ pub fn compute_backoff(consecutive_failures: u32, retry_after: Option<u64>) -> D
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_renewal_at_is_the_first_eligible_second() {
+        let (nb, na) = (1_000_000, 1_090_000);
+        let at = renewal_at(nb, na);
+        assert!(should_renew(nb, na, at));
+        assert!(!should_renew(nb, na, at - 1));
+    }
 
     #[test]
     fn test_should_renew_at_one_third() {

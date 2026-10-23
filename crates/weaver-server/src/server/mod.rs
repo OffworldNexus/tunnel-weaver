@@ -218,26 +218,16 @@ pub async fn run_server(
     // account/inactivity sweeps, certificate renewal, and (when abuse is on) the
     // abuse bucket sweep. Assembling them here is what keeps the relay's
     // periodic work described in one place.
-    let altcha_sweep = config
-        .abuse
-        .as_ref()
-        .and_then(|abuse| abuse.altcha.clone())
-        .unwrap_or_else(crate::config::AltchaConfig::builtin);
     let mut scheduler_tasks: Vec<Arc<dyn crate::scheduler::Task>> = vec![
         Arc::new(crate::metering::MeteringTask::new(Arc::clone(&metering))),
-        Arc::new(crate::housekeeping::AltchaSweepTask::new(
-            store.clone(),
-            Duration::from_secs(altcha_sweep.sweep_interval_secs.max(1)),
-        )),
+        Arc::new(crate::housekeeping::AltchaSweepTask::new(store.clone())),
         Arc::new(crate::housekeeping::AccountSweepTask::new(
             store.clone(),
             config.account.clone(),
-            Duration::from_secs(config.account.sweep_interval_secs.max(1)),
         )),
         Arc::new(crate::housekeeping::InactivitySweepTask::new(
             account.clone(),
             Arc::clone(&tunnel_registry),
-            Duration::from_secs(config.account.sweep_interval_secs.max(1)),
         )),
         cert_manager.renewal_task(),
     ];

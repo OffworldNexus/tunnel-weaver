@@ -159,8 +159,10 @@ impl Store {
 
     /// Atomically consume a proof, or report it already spent.
     ///
-    /// Fails closed (a store error) when the live-proof count has reached `cap`,
-    /// so the table cannot grow without bound. `INSERT … ON CONFLICT DO NOTHING`
+    /// Fails closed (a store error) when the live-proof count at `now_ms` has
+    /// reached `cap`, so the table cannot grow without bound. Expired markers
+    /// do not count: they no longer guard anything, and how soon the sweep
+    /// reclaims them must not decide whether a fresh proof is accepted. `INSERT … ON CONFLICT DO NOTHING`
     /// is the single-use point: the first insert affects one row, a replay zero.
     pub async fn altcha_consume_proof(
         &self,
@@ -170,7 +172,7 @@ impl Store {
         now_ms: i64,
         cap: u64,
     ) -> Result<ConsumeOutcome, StoreError> {
-        if cap > 0 && self.altcha_proof_count().await? >= cap {
+        if cap > 0 && self.altcha_live_proof_count(now_ms).await? >= cap {
             return Err(StoreError::Capacity("altcha_proof"));
         }
         let result = altcha_proof::Entity::insert(altcha_proof::ActiveModel {
@@ -194,9 +196,12 @@ impl Store {
         })
     }
 
-    /// Count every spent-proof row (live or expired).
-    pub async fn altcha_proof_count(&self) -> Result<u64, StoreError> {
-        Ok(altcha_proof::Entity::find().count(&self.db).await?)
+    /// Count the spent-proof rows still live at `now_ms`.
+    pub async fn altcha_live_proof_count(&self, now_ms: i64) -> Result<u64, StoreError> {
+        Ok(altcha_proof::Entity::find()
+            .filter(altcha_proof::Column::ExpiresAtMs.gte(now_ms))
+            .count(&self.db)
+            .await?)
     }
 
     /// Delete spent-proof rows that expired before `cutoff_ms`; returns the
@@ -375,6 +380,23 @@ mod tests {
             .altcha_consume_proof("ak", "nonce-2", 10_000, 1_000, 1)
             .await;
         assert!(matches!(capped, Err(StoreError::Capacity(_))));
+    }
+
+    #[tokio::test]
+    async fn expired_markers_do_not_count_against_the_cap() {
+        let store = store().await;
+        store
+            .altcha_consume_proof("ak", "nonce-1", 1_000, 0, 1)
+            .await
+            .unwrap();
+        // The first marker expired at 1 000 ms; it is unswept but inert.
+        assert_eq!(
+            store
+                .altcha_consume_proof("ak", "nonce-2", 10_000, 2_000, 1)
+                .await
+                .unwrap(),
+            ConsumeOutcome::Consumed
+        );
     }
 
     #[tokio::test]

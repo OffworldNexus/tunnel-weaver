@@ -234,9 +234,6 @@ pub struct AltchaConfig {
     /// Upper bound on live spent-proof rows before verification fails closed.
     #[serde(default = "default_altcha_proof_cap")]
     pub proof_cap: u64,
-    /// How often the spent-proof sweep runs, in seconds.
-    #[serde(default = "default_altcha_sweep_secs")]
-    pub sweep_interval_secs: u64,
     /// Override for the public base URL of the ALTCHA API.
     ///
     /// Defaults to `https://<tunnel domain>`. Set for non-standard deployments,
@@ -259,7 +256,6 @@ impl AltchaConfig {
             default_key_prefix: default_altcha_key_prefix(),
             default_ttl_secs: default_altcha_ttl_secs(),
             proof_cap: default_altcha_proof_cap(),
-            sweep_interval_secs: default_altcha_sweep_secs(),
             api_base_url: None,
         }
     }
@@ -308,9 +304,6 @@ pub struct AccountConfig {
     /// Base URL of the Have I Been Pwned k-anonymity range API.
     #[serde(default = "default_account_hibp_url")]
     pub hibp_url: String,
-    /// How often expired tokens and sessions are swept, in seconds.
-    #[serde(default = "default_account_sweep_interval_secs")]
-    pub sweep_interval_secs: u64,
     /// Per-network budget for starting a signup.
     #[serde(default = "default_account_signup_budget")]
     pub signup: BudgetConfig,
@@ -328,9 +321,9 @@ pub struct AccountConfig {
     pub pair: BudgetConfig,
     /// How long a retired machine key stays in the key log, in days.
     ///
-    /// The log is an audit trail only; the periodic sweep (on
-    /// `sweep_interval_secs`) drops rows retired longer ago than this. Rows of
-    /// keys still in use are never dropped.
+    /// The log is an audit trail only; the nightly account sweep drops rows
+    /// retired longer ago than this. Rows of keys still in use are never
+    /// dropped.
     #[serde(default = "default_account_key_log_retention_days")]
     pub key_log_retention_days: u64,
     /// Public support address shown in the app footer as a `mailto:` link.
@@ -374,7 +367,6 @@ impl Default for AccountConfig {
             session_ttl_secs: default_account_session_ttl_secs(),
             cookie_secure: true,
             hibp_url: default_account_hibp_url(),
-            sweep_interval_secs: default_account_sweep_interval_secs(),
             signup: default_account_signup_budget(),
             login: default_account_login_budget(),
             resend: default_account_resend_budget(),
@@ -447,11 +439,6 @@ fn default_account_session_ttl_secs() -> u64 {
 /// Default breach-check endpoint.
 fn default_account_hibp_url() -> String {
     "https://api.pwnedpasswords.com/range".to_string()
-}
-
-/// Default account sweep interval: 1 hour.
-fn default_account_sweep_interval_secs() -> u64 {
-    3_600
 }
 
 /// Default signup budget: a 10-request burst refilling at 10 per 10 minutes.
@@ -590,11 +577,6 @@ fn default_altcha_proof_cap() -> u64 {
     100_000
 }
 
-/// Default spent-proof sweep interval, in seconds.
-fn default_altcha_sweep_secs() -> u64 {
-    60
-}
-
 /// Rejects an armed [`AbuseConfig`] whose buckets could never admit anything.
 ///
 /// A disabled block is never rejected; its numbers are not in play.
@@ -651,9 +633,6 @@ fn validate_abuse_config(abuse: &AbuseConfig) -> Vec<String> {
         }
         if altcha.proof_cap < 1 {
             issues.push("abuse.altcha.proof_cap must be >= 1".into());
-        }
-        if altcha.sweep_interval_secs < 1 {
-            issues.push("abuse.altcha.sweep_interval_secs must be >= 1".into());
         }
     }
     issues
@@ -721,7 +700,6 @@ fn validate_account_config(account: &AccountConfig) -> Vec<String> {
         ("completion_ttl_secs", account.completion_ttl_secs),
         ("reset_ttl_secs", account.reset_ttl_secs),
         ("session_ttl_secs", account.session_ttl_secs),
-        ("sweep_interval_secs", account.sweep_interval_secs),
         ("key_log_retention_days", account.key_log_retention_days),
         ("inactive_after_secs", account.inactive_after_secs),
         (

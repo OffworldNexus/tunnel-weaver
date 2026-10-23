@@ -2602,7 +2602,7 @@ const MONTH: i64 = 30 * 86_400;
 const YEAR: i64 = 365 * 86_400;
 
 #[tokio::test]
-async fn test_inactivity_candidates_use_sign_in_or_activation_oldest_first() {
+async fn test_inactivity_candidates_use_sign_in_or_activation_and_page_by_id() {
     let store = Store::connect("sqlite::memory:").await.unwrap();
     let t0 = 1_800_000_000;
     let never = activated(&store, "Never Signed In", "never@example.com").await;
@@ -2620,7 +2620,7 @@ async fn test_inactivity_candidates_use_sign_in_or_activation_oldest_first() {
 
     let now = t0 + YEAR;
     let candidates = store
-        .inactivity_candidates(now, 11 * MONTH, 10)
+        .inactivity_candidates(now, 11 * MONTH, 0, 10)
         .await
         .unwrap();
     let ids: Vec<i32> = candidates.iter().map(|c| c.account_id).collect();
@@ -2629,7 +2629,7 @@ async fn test_inactivity_candidates_use_sign_in_or_activation_oldest_first() {
         !ids.contains(&fresh.id),
         "a recently active account is not a candidate"
     );
-    // Oldest activity first: the never-signed-in account, then the stale one.
+    // In id order, so the sweep can page through them with a cursor.
     assert_eq!(ids, vec![never.id, stale.id]);
     // An account that never signed in falls back to its activation instant.
     assert_eq!(candidates[0].last_activity, t0);
@@ -2638,13 +2638,82 @@ async fn test_inactivity_candidates_use_sign_in_or_activation_oldest_first() {
     assert!(!candidates[0].has_live_session);
     assert_eq!(candidates[1].last_activity, t0 + 5 * 86_400);
 
-    // The batch is bounded, oldest first.
-    let bounded = store
-        .inactivity_candidates(now, 11 * MONTH, 1)
+    // A page is bounded, and the cursor resumes after the last id seen.
+    let first = store
+        .inactivity_candidates(now, 11 * MONTH, 0, 1)
         .await
         .unwrap();
-    assert_eq!(bounded.len(), 1);
-    assert_eq!(bounded[0].account_id, never.id);
+    assert_eq!(first.len(), 1);
+    assert_eq!(first[0].account_id, never.id);
+    let second = store
+        .inactivity_candidates(now, 11 * MONTH, never.id, 1)
+        .await
+        .unwrap();
+    assert_eq!(second[0].account_id, stale.id);
+    assert!(
+        store
+            .inactivity_candidates(now, 11 * MONTH, stale.id, 1)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn test_inactivity_next_event_is_the_earliest_warning_or_deletion() {
+    let store = Store::connect("sqlite::memory:").await.unwrap();
+    let (warn_after, delete_after) = (11 * MONTH, YEAR);
+    assert_eq!(
+        store
+            .inactivity_next_event(0, warn_after, delete_after)
+            .await
+            .unwrap(),
+        None,
+        "no account, no event"
+    );
+
+    let t0 = 1_800_000_000;
+    let early = activated(&store, "Early", "early@example.com").await;
+    let late = activated(&store, "Late", "late@example.com").await;
+    store.account_record_login(early.id, t0).await.unwrap();
+    store
+        .account_record_login(late.id, t0 + 86_400)
+        .await
+        .unwrap();
+
+    // The next thing to happen is the early account's warning.
+    let next = |after| store.inactivity_next_event(after, warn_after, delete_after);
+    assert_eq!(next(t0).await.unwrap(), Some(t0 + warn_after));
+    // Once that tick ran, the late account's warning is next.
+    assert_eq!(
+        next(t0 + warn_after).await.unwrap(),
+        Some(t0 + 86_400 + warn_after)
+    );
+
+    // A warning sent for this stretch of idleness drops out: the early
+    // account's deletion is what remains for it.
+    store
+        .account_mark_inactivity_warning(early.id, t0 + warn_after)
+        .await
+        .unwrap();
+    store
+        .account_mark_inactivity_warning(late.id, t0 + 86_400 + warn_after)
+        .await
+        .unwrap();
+    assert_eq!(next(t0).await.unwrap(), Some(t0 + delete_after));
+
+    // Signing in again starts a new stretch: the old warning no longer counts.
+    let back = t0 + YEAR - 10;
+    store.account_record_login(early.id, back).await.unwrap();
+    assert_eq!(
+        next(t0 + delete_after).await.unwrap(),
+        Some(t0 + 86_400 + delete_after),
+        "the late account's deletion comes before the early one's new warning"
+    );
+    assert_eq!(
+        next(t0 + 86_400 + delete_after).await.unwrap(),
+        Some(back + warn_after)
+    );
 }
 
 #[tokio::test]
@@ -2676,7 +2745,7 @@ async fn test_inactivity_candidates_flag_only_live_sessions() {
         .unwrap();
 
     let candidates = store
-        .inactivity_candidates(now, 11 * MONTH, 10)
+        .inactivity_candidates(now, 11 * MONTH, 0, 10)
         .await
         .unwrap();
     let row = |id: i32| candidates.iter().find(|c| c.account_id == id).unwrap();
@@ -2729,7 +2798,7 @@ async fn test_inactivity_candidates_fold_the_newest_metered_day_into_activity() 
         .unwrap();
 
     let candidate = store
-        .inactivity_candidates(now, 11 * MONTH, 10)
+        .inactivity_candidates(now, 11 * MONTH, 0, 10)
         .await
         .unwrap()
         .into_iter()
@@ -2742,7 +2811,7 @@ async fn test_inactivity_candidates_fold_the_newest_metered_day_into_activity() 
     // That same metered day is ancient two years on, so the account is due.
     let later = t0 + 2 * YEAR;
     let candidate = store
-        .inactivity_candidates(later, 11 * MONTH, 10)
+        .inactivity_candidates(later, 11 * MONTH, 0, 10)
         .await
         .unwrap()
         .into_iter()

@@ -2719,6 +2719,56 @@ async fn inactivity_sweep_warns_once_then_deletes() {
     );
 }
 
+/// The sweep's own schedule: `next_event` names the exact second of the
+/// warning (the lead time *before* deletion, not after activity) and then of
+/// the deletion, and a run at each of those ticks does exactly that step.
+#[tokio::test]
+async fn inactivity_sweep_wakes_exactly_at_the_warning_then_the_deletion() {
+    let fixture = setup_with(|cfg| {
+        cfg.inactive_after_secs = 1000;
+        cfg.inactivity_warning_before_secs = 200;
+    })
+    .await;
+    register(
+        &fixture,
+        "Timed",
+        "timed@example.com",
+        "correct horse battery",
+    )
+    .await;
+    let account_id = account_id_for(&fixture, "timed@example.com").await;
+    let now = weaver_server::wall_clock::unix_secs() + 2000;
+    let last_seen = now - 600;
+    fixture
+        .account
+        .store
+        .account_record_login(account_id, last_seen)
+        .await
+        .unwrap();
+
+    // Idle 600 s of a 1000 s life with a 200 s lead: too early to warn.
+    let report = inactivity::run(&fixture.account, None, now).await.unwrap();
+    assert_eq!(report, inactivity::SweepReport::default());
+
+    let warn_at = inactivity::next_event(&fixture.account, now, now)
+        .await
+        .unwrap();
+    assert_eq!(warn_at, last_seen + 800);
+    let report = inactivity::run(&fixture.account, None, warn_at)
+        .await
+        .unwrap();
+    assert_eq!(report.warned, 1);
+
+    let delete_at = inactivity::next_event(&fixture.account, warn_at, warn_at)
+        .await
+        .unwrap();
+    assert_eq!(delete_at, last_seen + 1000);
+    let report = inactivity::run(&fixture.account, None, delete_at)
+        .await
+        .unwrap();
+    assert_eq!(report.deleted, 1);
+}
+
 #[tokio::test]
 async fn inactivity_sweep_signs_in_after_a_warning_and_spares_the_account() {
     let fixture = inactivity_fixture().await;

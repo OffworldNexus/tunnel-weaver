@@ -1,27 +1,32 @@
 //! The relay's housekeeping sweeps, as [`Task`](crate::scheduler::Task)s.
 //!
-//! These are the store- and account-bound periodic jobs that used to be four
-//! hand-written interval loops in [`crate::server`]. Each one is a plain
-//! [`Task`]: a fixed period and a `run` that prunes something. Metering and
-//! certificate renewal are also tasks, but live next to what they drive
-//! ([`crate::metering`], [`crate::cert`]).
+//! The garbage sweeps (abuse buckets, spent ALTCHA proofs, expired account
+//! tokens and sessions) only reclaim rows that are already inert — every reader
+//! filters on expiry — so they run once at boot to catch up and then at each UTC
+//! midnight. The inactivity sweep is different: it acts on people, so it wakes
+//! exactly when the next account falls due. Metering and certificate renewal
+//! are tasks too, but live next to what they drive ([`crate::metering`],
+//! [`crate::cert`]).
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use tracing::{info, warn};
 
 use crate::account::AccountRuntime;
 use crate::account::inactivity;
 use crate::config::AccountConfig;
-use crate::scheduler::Task;
+use crate::scheduler::{Task, next_midnight};
 use crate::store::Store;
 use crate::tunnel::TunnelRegistry;
-use crate::wall_clock::{unix_ms, unix_secs};
 
-/// How often idle abuse buckets are dropped. Fixed, unlike the bucket TTL it
-/// prunes against.
-pub const ABUSE_SWEEP_INTERVAL: Duration = Duration::from_secs(600);
+/// Boot catch-up, then every UTC midnight: the schedule of a pure garbage sweep.
+fn at_boot_then_midnight(last_tick: Option<i64>, now: i64) -> i64 {
+    match last_tick {
+        None => now,
+        Some(_) => next_midnight(now),
+    }
+}
 
 /// Drops abuse rate-limit buckets idle for longer than the configured TTL.
 pub struct AbuseSweepTask {
@@ -41,26 +46,28 @@ impl Task for AbuseSweepTask {
     fn name(&self) -> &'static str {
         "abuse-bucket-sweep"
     }
-    async fn next_tick(&self, now: i64) -> i64 {
-        now + ABUSE_SWEEP_INTERVAL.as_secs() as i64
+    async fn next_tick(&self, last_tick: Option<i64>, now: i64) -> i64 {
+        at_boot_then_midnight(last_tick, now)
     }
-    async fn run(&self, _now: i64) {
-        let cutoff = unix_ms() - self.ttl_ms;
+    async fn run(&self, tick: i64) {
+        let cutoff = tick.saturating_mul(1000).saturating_sub(self.ttl_ms);
         if let Err(err) = self.store.abuse_sweep(cutoff).await {
             warn!(error = %err, "abuse bucket sweep failed");
         }
     }
 }
 
-/// Drops spent ALTCHA proof markers so the table stays bounded.
+/// Drops expired ALTCHA proof markers so the table stays small.
+///
+/// Only live markers count against the proof cap, so how long an expired one
+/// lingers is a disk question, not a correctness one.
 pub struct AltchaSweepTask {
     store: Store,
-    interval: Duration,
 }
 
 impl AltchaSweepTask {
-    pub fn new(store: Store, interval: Duration) -> Self {
-        Self { store, interval }
+    pub fn new(store: Store) -> Self {
+        Self { store }
     }
 }
 
@@ -69,12 +76,15 @@ impl Task for AltchaSweepTask {
     fn name(&self) -> &'static str {
         "altcha-proof-sweep"
     }
-    async fn next_tick(&self, now: i64) -> i64 {
-        now + self.interval.as_secs() as i64
+    async fn next_tick(&self, last_tick: Option<i64>, now: i64) -> i64 {
+        at_boot_then_midnight(last_tick, now)
     }
-    async fn run(&self, _now: i64) {
-        let cutoff = unix_ms();
-        if let Err(err) = self.store.altcha_sweep_proofs(cutoff).await {
+    async fn run(&self, tick: i64) {
+        if let Err(err) = self
+            .store
+            .altcha_sweep_proofs(tick.saturating_mul(1000))
+            .await
+        {
             warn!(error = %err, "ALTCHA proof sweep failed");
         }
     }
@@ -85,16 +95,11 @@ impl Task for AltchaSweepTask {
 pub struct AccountSweepTask {
     store: Store,
     config: AccountConfig,
-    interval: Duration,
 }
 
 impl AccountSweepTask {
-    pub fn new(store: Store, config: AccountConfig, interval: Duration) -> Self {
-        Self {
-            store,
-            config,
-            interval,
-        }
+    pub fn new(store: Store, config: AccountConfig) -> Self {
+        Self { store, config }
     }
 }
 
@@ -103,21 +108,20 @@ impl Task for AccountSweepTask {
     fn name(&self) -> &'static str {
         "account-sweep"
     }
-    async fn next_tick(&self, now: i64) -> i64 {
-        now + self.interval.as_secs() as i64
+    async fn next_tick(&self, last_tick: Option<i64>, now: i64) -> i64 {
+        at_boot_then_midnight(last_tick, now)
     }
-    async fn run(&self, _now: i64) {
-        let cutoff = unix_secs();
-        if let Err(err) = self.store.verification_token_sweep(cutoff).await {
+    async fn run(&self, tick: i64) {
+        if let Err(err) = self.store.verification_token_sweep(tick).await {
             warn!(error = %err, "verification token sweep failed");
         }
-        if let Err(err) = self.store.password_reset_token_sweep(cutoff).await {
+        if let Err(err) = self.store.password_reset_token_sweep(tick).await {
             warn!(error = %err, "password reset token sweep failed");
         }
-        if let Err(err) = self.store.session_sweep(cutoff).await {
+        if let Err(err) = self.store.session_sweep(tick).await {
             warn!(error = %err, "session sweep failed");
         }
-        let key_log_cutoff = self.config.key_log_cutoff(cutoff);
+        let key_log_cutoff = self.config.key_log_cutoff(tick);
         if let Err(err) = self.store.sweep_machine_key_log(key_log_cutoff).await {
             warn!(error = %err, "machine key log sweep failed");
         }
@@ -126,24 +130,22 @@ impl Task for AccountSweepTask {
 
 /// Warns and then deletes accounts nobody has used (WVR-160).
 ///
-/// Bounded per tick inside [`inactivity::run`]; it reuses the same cadence as
-/// the account sweep so the whole account plane is pruned on one clock.
+/// Wakes at the exact second the next account is due for its warning or its
+/// deletion (see [`inactivity::next_event`]).
 pub struct InactivitySweepTask {
     account: Arc<AccountRuntime>,
     registry: Arc<TunnelRegistry>,
-    interval: Duration,
+    /// Set when the last run left work undone (a store error, a failed
+    /// deletion), so the next tick retries it instead of skipping past it.
+    failed: AtomicBool,
 }
 
 impl InactivitySweepTask {
-    pub fn new(
-        account: Arc<AccountRuntime>,
-        registry: Arc<TunnelRegistry>,
-        interval: Duration,
-    ) -> Self {
+    pub fn new(account: Arc<AccountRuntime>, registry: Arc<TunnelRegistry>) -> Self {
         Self {
             account,
             registry,
-            interval,
+            failed: AtomicBool::new(false),
         }
     }
 }
@@ -153,17 +155,42 @@ impl Task for InactivitySweepTask {
     fn name(&self) -> &'static str {
         "inactivity-sweep"
     }
-    async fn next_tick(&self, now: i64) -> i64 {
-        now + self.interval.as_secs() as i64
+    async fn next_tick(&self, last_tick: Option<i64>, now: i64) -> i64 {
+        // At boot, catch up on whatever fell due while the relay was down.
+        let Some(last_tick) = last_tick else {
+            return now;
+        };
+        // Events up to `last_tick` were settled by that run — unless part of it
+        // failed, in which case the backlog is retried later.
+        let retry = self
+            .failed
+            .swap(false, Ordering::SeqCst)
+            .then_some(now + inactivity::RETRY_AFTER_FAILURE);
+        match inactivity::next_event(&self.account, last_tick, now).await {
+            Ok(at) => retry.map_or(at, |retry| retry.min(at)),
+            Err(err) => {
+                warn!(error = %err, "inactivity schedule lookup failed");
+                now + inactivity::RETRY_AFTER_FAILURE
+            }
+        }
     }
-    async fn run(&self, now: i64) {
-        match inactivity::run(&self.account, Some(&self.registry), now).await {
-            Ok(report) => info!(
-                warned = report.warned,
-                deleted = report.deleted,
-                "inactivity sweep complete"
-            ),
-            Err(err) => warn!(error = %err, "inactivity sweep failed"),
+    async fn run(&self, tick: i64) {
+        match inactivity::run(&self.account, Some(&self.registry), tick).await {
+            Ok(report) => {
+                if report.failed > 0 {
+                    self.failed.store(true, Ordering::SeqCst);
+                }
+                info!(
+                    warned = report.warned,
+                    deleted = report.deleted,
+                    failed = report.failed,
+                    "inactivity sweep complete"
+                );
+            }
+            Err(err) => {
+                self.failed.store(true, Ordering::SeqCst);
+                warn!(error = %err, "inactivity sweep failed");
+            }
         }
     }
 }

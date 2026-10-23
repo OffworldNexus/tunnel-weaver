@@ -1,110 +1,121 @@
 //! A tiny cooperative scheduler for the relay's periodic jobs.
 //!
-//! Every periodic background job — the usage flush, the abuse/ALTCHA/account
-//! sweeps, certificate renewal, the inactivity sweep, and each connection's own
-//! timers — is a [`Task`]: a [`next_tick`](Task::next_tick) that says **when**
-//! (an absolute Unix second) it next wants to run, and a [`run`](Task::run) that
-//! does the work. A [`Scheduler`] holds a set of tasks, sleeps until the earliest
-//! deadline and runs whatever is due.
+//! Every background job — the usage meter, the store sweeps, certificate
+//! renewal, the inactivity sweep, and each connection's own timers — is a
+//! [`Task`]. A task is not "something that runs every N seconds": it is
+//! something that **picks the instant it next has work to do**. The inactivity
+//! sweep wakes exactly when the next account falls due, certificate renewal
+//! exactly when the first certificate enters its renewal window, the garbage
+//! sweeps at UTC midnight. A fixed period is just the degenerate case (the SSE
+//! heartbeat).
 //!
-//! `next_tick` is absolute, not a duration, and is asked again after every run:
-//! a task can base its next wake-up on state it just read, e.g. the inactivity
-//! sweep returning `min(now + 1h, the instant the next account falls due)`
-//! instead of polling on a blind interval. It is `async` for exactly that
-//! reason — the state often lives in the store.
+//! The contract:
+//!
+//! * [`Task::next_tick`]`(last_tick, now)` returns the absolute Unix second of
+//!   the next run. `last_tick` is the scheduled time of the run that just
+//!   finished, or `None` when the process has just started, so a task can catch
+//!   up at boot and then follow its data. It is `async` because the answer often
+//!   lives in the store.
+//! * [`Task::run`]`(tick)` receives the **scheduled** time of the tick — the
+//!   instant `next_tick` asked for — never a fresh clock reading. Everything the
+//!   run does (cutoffs, SQL predicates, timestamps it writes) is computed from
+//!   that one value, so a tick is internally consistent and a late wake-up does
+//!   not shift its semantics.
 //!
 //! Two ways to drive a scheduler:
 //!
 //! * [`Scheduler::run`] owns the loop for the process-wide scheduler: it sleeps
-//!   until the next deadline and exits on a [`CancellationToken`], then calls
-//!   [`Task::shutdown`] once per task — metering uses that to flush before the
-//!   store closes.
-//! * [`Scheduler::next_deadline`] + [`Scheduler::run_due`] never sleep, so a
-//!   connection's own event loop drives its timers from a `select!` arm without
-//!   the scheduler stealing the loop from the I/O.
+//!   until the earliest deadline, exits on a [`CancellationToken`], then calls
+//!   [`Task::shutdown`] once per task — metering flushes there.
+//! * [`Scheduler::next_wait`] + [`Scheduler::run_due`] never sleep, so a
+//!   connection's own event loop drives its timers from a `select!` arm.
 //!
-//! Deadlines are whole Unix seconds (the relay's clock everywhere): no task here
-//! needs sub-second resolution, and it lets a task compare against a stored
-//! timestamp directly.
-//!
-//! Due tasks in one pass run **concurrently** (`join_all`), so a slow sweep does
-//! not hold up the metering tick beside it; they run on the runtime's worker
-//! pool. A task is still never re-entered: its next deadline is only computed
-//! once its `run` has returned, and the next pass does not start until every due
-//! task of this one has finished.
+//! Due tasks in one pass run concurrently (`join_all`) on the runtime's worker
+//! pool. A task is never re-entered: its next deadline is asked only once its
+//! `run` has returned.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
 
-/// One unit of periodic work.
+/// Seconds in a UTC day.
+pub const DAY: i64 = 86_400;
+
+/// The first UTC midnight strictly after `now` (Unix seconds).
+pub fn next_midnight(now: i64) -> i64 {
+    (now.div_euclid(DAY) + 1) * DAY
+}
+
+/// One unit of scheduled work.
 #[async_trait::async_trait]
 pub trait Task: Send + Sync {
     /// Stable name, for logs.
     fn name(&self) -> &'static str;
 
-    /// The absolute Unix second at which this task wants to run next.
+    /// The absolute Unix second at which this task next has work to do.
     ///
-    /// Asked once before the first run and again after every run, so the answer
-    /// may be based on state the task just read. Returning a value at or before
-    /// `now` means "due now".
-    async fn next_tick(&self, now: i64) -> i64;
+    /// `last_tick` is the scheduled time of the run that just finished, `None`
+    /// before the first run (the process just started). `now` is the clock.
+    /// A value at or before `now` means "due now".
+    async fn next_tick(&self, last_tick: Option<i64>, now: i64) -> i64;
 
-    /// Runs one tick. Errors are the task's own concern: it logs them.
-    async fn run(&self, now: i64);
+    /// Runs the tick scheduled for `tick` (Unix seconds). Base every cutoff and
+    /// timestamp on `tick`; do not read the clock. Errors are logged here.
+    async fn run(&self, tick: i64);
 
-    /// One last call when the scheduler stops, for a task that must flush.
-    ///
-    /// Default is a no-op; only the metering task overrides it.
+    /// One last call when the scheduler stops, at `now`, for a task that must
+    /// flush. Default is a no-op; only metering overrides it.
     async fn shutdown(&self, _now: i64) {}
 }
 
-/// One task and the Unix second it is next due.
+/// One task and when it is next due.
 struct Entry {
     task: Arc<dyn Task>,
     next_run: i64,
 }
 
+/// A wall clock in Unix milliseconds, injectable so tests are deterministic.
+pub type Clock = Arc<dyn Fn() -> i64 + Send + Sync>;
+
 /// A set of [`Task`]s driven by one loop.
 pub struct Scheduler {
     entries: Vec<Entry>,
-    /// Wall clock, injectable so tests are deterministic.
-    now: Arc<dyn Fn() -> i64 + Send + Sync>,
+    clock_ms: Clock,
 }
 
 impl Scheduler {
-    /// Builds a scheduler from its tasks, asking each one when it first wants
-    /// to run.
+    /// Builds a scheduler on the wall clock, asking each task for its first
+    /// tick.
     pub async fn new(tasks: Vec<Arc<dyn Task>>) -> Self {
-        Self::with_clock(tasks, Arc::new(crate::wall_clock::unix_secs)).await
+        Self::with_clock(tasks, Arc::new(crate::wall_clock::unix_ms)).await
     }
 
-    /// Builds a scheduler with an explicit wall clock (tests).
-    pub async fn with_clock(
-        tasks: Vec<Arc<dyn Task>>,
-        now: Arc<dyn Fn() -> i64 + Send + Sync>,
-    ) -> Self {
-        let at = now();
+    /// Builds a scheduler on an explicit millisecond clock (tests).
+    pub async fn with_clock(tasks: Vec<Arc<dyn Task>>, clock_ms: Clock) -> Self {
+        let now = clock_ms().div_euclid(1000);
         let mut entries = Vec::with_capacity(tasks.len());
         for task in tasks {
-            let next_run = task.next_tick(at).await;
+            let next_run = task.next_tick(None, now).await;
             entries.push(Entry { task, next_run });
         }
-        Self { entries, now }
+        Self { entries, clock_ms }
     }
 
-    /// Adds a task, asking it when it first wants to run.
-    pub async fn add(&mut self, task: Arc<dyn Task>) {
-        let at = (self.now)();
-        let next_run = task.next_tick(at).await;
-        self.entries.push(Entry { task, next_run });
+    fn now(&self) -> i64 {
+        (self.clock_ms)().div_euclid(1000)
     }
 
-    /// The Unix second the earliest task is next due, or `None` when there are
-    /// no tasks.
+    /// The Unix second the earliest task is next due, `None` with no tasks.
     pub fn next_deadline(&self) -> Option<i64> {
         self.entries.iter().map(|entry| entry.next_run).min()
+    }
+
+    /// How long until the earliest deadline, `None` with no tasks.
+    pub fn next_wait(&self) -> Option<Duration> {
+        let deadline_ms = self.next_deadline()?.saturating_mul(1000);
+        let wait_ms = deadline_ms.saturating_sub((self.clock_ms)()).max(0);
+        Some(Duration::from_millis(wait_ms as u64))
     }
 
     /// The tasks' names, in order, for the startup log line.
@@ -112,49 +123,46 @@ impl Scheduler {
         self.entries.iter().map(|entry| entry.task.name()).collect()
     }
 
-    /// Runs every due task once, concurrently. Never sleeps.
+    /// Runs every due task once, concurrently, each at its own scheduled tick.
+    /// Never sleeps.
     pub async fn run_due(&mut self) {
-        let now = (self.now)();
-        let due: Vec<usize> = self
+        let now = self.now();
+        let due: Vec<(usize, i64)> = self
             .entries
             .iter()
             .enumerate()
             .filter(|(_, entry)| entry.next_run <= now)
-            .map(|(index, _)| index)
+            .map(|(index, entry)| (index, entry.next_run))
             .collect();
         if due.is_empty() {
             return;
         }
 
-        let tasks: Vec<Arc<dyn Task>> = due
+        let runs: Vec<(Arc<dyn Task>, i64)> = due
             .iter()
-            .map(|&index| Arc::clone(&self.entries[index].task))
+            .map(|&(index, tick)| (Arc::clone(&self.entries[index].task), tick))
             .collect();
-        futures_util::future::join_all(tasks.iter().map(|task| task.run(now))).await;
+        futures_util::future::join_all(runs.iter().map(|(task, tick)| task.run(*tick))).await;
 
-        // Reschedule from the post-run clock, so a task that overran its period
-        // is asked from the time it actually finished rather than piling up.
-        let after = (self.now)();
-        for &index in &due {
-            self.entries[index].next_run = self.entries[index].task.next_tick(after).await;
+        let now = self.now();
+        for (index, tick) in due {
+            self.entries[index].next_run =
+                self.entries[index].task.next_tick(Some(tick), now).await;
         }
     }
 
     /// Drives the tasks until `shutdown` is cancelled, then shuts them down.
     ///
-    /// This owns the loop: it sleeps until the earliest deadline and calls
-    /// [`run_due`](Self::run_due). Await the task that runs this before closing
-    /// the store, so a task's `shutdown` flush completes.
+    /// Await the task that runs this before closing the store, so a task's
+    /// `shutdown` flush completes.
     pub async fn run(mut self, shutdown: CancellationToken) {
-        while let Some(deadline) = self.next_deadline() {
-            let now = (self.now)();
-            let wait = Duration::from_secs(deadline.saturating_sub(now).max(0) as u64);
+        while let Some(wait) = self.next_wait() {
             tokio::select! {
                 _ = shutdown.cancelled() => break,
                 _ = tokio::time::sleep(wait) => self.run_due().await,
             }
         }
-        let now = (self.now)();
+        let now = self.now();
         for entry in &self.entries {
             entry.task.shutdown(now).await;
         }
@@ -168,7 +176,7 @@ mod tests {
 
     use super::*;
 
-    /// A clock the test can move by hand.
+    /// A clock the test moves by hand, in seconds.
     #[derive(Clone)]
     struct TestClock(Arc<Mutex<i64>>);
 
@@ -179,25 +187,29 @@ mod tests {
         fn set(&self, at: i64) {
             *self.0.lock().unwrap() = at;
         }
-        fn as_fn(&self) -> Arc<dyn Fn() -> i64 + Send + Sync> {
+        fn as_clock(&self) -> Clock {
             let cell = Arc::clone(&self.0);
-            Arc::new(move || *cell.lock().unwrap())
+            Arc::new(move || *cell.lock().unwrap() * 1000)
         }
     }
 
-    /// A task that records every `now` it runs at and reports a fixed period.
-    struct Counter {
+    /// Records every `(last_tick, now)` it is asked and every tick it runs; its
+    /// schedule is a fixed list of instants, the way a data-driven task picks
+    /// "when the next thing falls due".
+    struct Agenda {
+        at: Vec<i64>,
+        asked: Mutex<Vec<(Option<i64>, i64)>>,
         runs: Mutex<Vec<i64>>,
         shutdowns: AtomicU64,
-        period: i64,
     }
 
-    impl Counter {
-        fn new(period: i64) -> Arc<Self> {
+    impl Agenda {
+        fn new(at: Vec<i64>) -> Arc<Self> {
             Arc::new(Self {
+                at,
+                asked: Mutex::new(Vec::new()),
                 runs: Mutex::new(Vec::new()),
                 shutdowns: AtomicU64::new(0),
-                period,
             })
         }
         fn runs(&self) -> Vec<i64> {
@@ -206,15 +218,21 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl Task for Counter {
+    impl Task for Agenda {
         fn name(&self) -> &'static str {
-            "counter"
+            "agenda"
         }
-        async fn next_tick(&self, now: i64) -> i64 {
-            now + self.period
+        async fn next_tick(&self, last_tick: Option<i64>, now: i64) -> i64 {
+            self.asked.lock().unwrap().push((last_tick, now));
+            let after = last_tick.unwrap_or(i64::MIN);
+            self.at
+                .iter()
+                .copied()
+                .find(|&at| at > after)
+                .unwrap_or(i64::MAX)
         }
-        async fn run(&self, now: i64) {
-            self.runs.lock().unwrap().push(now);
+        async fn run(&self, tick: i64) {
+            self.runs.lock().unwrap().push(tick);
         }
         async fn shutdown(&self, _now: i64) {
             self.shutdowns.fetch_add(1, Ordering::SeqCst);
@@ -226,7 +244,7 @@ mod tests {
     struct WaitsForPeer {
         me: Arc<AtomicU64>,
         peer: Arc<AtomicU64>,
-        saw_peer: Arc<AtomicU64>,
+        saw_peer: AtomicU64,
     }
 
     #[async_trait::async_trait]
@@ -234,10 +252,10 @@ mod tests {
         fn name(&self) -> &'static str {
             "waits-for-peer"
         }
-        async fn next_tick(&self, now: i64) -> i64 {
-            now
+        async fn next_tick(&self, last_tick: Option<i64>, now: i64) -> i64 {
+            if last_tick.is_none() { now } else { i64::MAX }
         }
-        async fn run(&self, _now: i64) {
+        async fn run(&self, _tick: i64) {
             self.me.store(1, Ordering::SeqCst);
             for _ in 0..100_000 {
                 if self.peer.load(Ordering::SeqCst) == 1 {
@@ -253,39 +271,39 @@ mod tests {
         task
     }
 
-    #[tokio::test]
-    async fn the_first_run_is_at_the_tasks_next_tick() {
-        let clock = TestClock::new(1000);
-        let task = Counter::new(60);
-        let mut scheduler = Scheduler::with_clock(vec![as_task(task.clone())], clock.as_fn()).await;
-
-        // The first deadline is what the task asked for, not "now".
-        assert_eq!(scheduler.next_deadline(), Some(1060));
-        scheduler.run_due().await;
-        assert!(task.runs().is_empty(), "not due before its date");
-
-        clock.set(1060);
-        scheduler.run_due().await;
-        assert_eq!(task.runs(), vec![1060]);
-        // The next deadline is derived from the state after the run.
-        assert_eq!(scheduler.next_deadline(), Some(1120));
+    #[test]
+    fn next_midnight_is_strictly_after() {
+        assert_eq!(next_midnight(0), DAY);
+        assert_eq!(next_midnight(DAY - 1), DAY);
+        assert_eq!(next_midnight(DAY), 2 * DAY);
     }
 
     #[tokio::test]
-    async fn every_due_task_runs_in_one_pass() {
-        let clock = TestClock::new(0);
-        let first = Counter::new(60);
-        let second = Counter::new(60);
-        let mut scheduler = Scheduler::with_clock(
-            vec![as_task(first.clone()), as_task(second.clone())],
-            clock.as_fn(),
-        )
-        .await;
+    async fn the_first_ask_says_the_process_just_started() {
+        let clock = TestClock::new(1000);
+        let task = Agenda::new(vec![1500]);
+        let scheduler = Scheduler::with_clock(vec![as_task(task.clone())], clock.as_clock()).await;
+        assert_eq!(*task.asked.lock().unwrap(), vec![(None, 1000)]);
+        assert_eq!(scheduler.next_deadline(), Some(1500));
+    }
 
-        clock.set(60);
+    #[tokio::test]
+    async fn run_gets_the_scheduled_tick_not_the_clock() {
+        let clock = TestClock::new(1000);
+        let task = Agenda::new(vec![1500, 4000]);
+        let mut scheduler =
+            Scheduler::with_clock(vec![as_task(task.clone())], clock.as_clock()).await;
+
         scheduler.run_due().await;
-        assert_eq!(first.runs(), vec![60]);
-        assert_eq!(second.runs(), vec![60]);
+        assert!(task.runs().is_empty(), "not due before its instant");
+
+        // The scheduler wakes late; the run still sees the instant it asked for.
+        clock.set(1507);
+        scheduler.run_due().await;
+        assert_eq!(task.runs(), vec![1500]);
+        // And the task is told which tick just ran, plus the real clock.
+        assert_eq!(task.asked.lock().unwrap().last(), Some(&(Some(1500), 1507)));
+        assert_eq!(scheduler.next_deadline(), Some(4000));
     }
 
     #[tokio::test]
@@ -296,16 +314,18 @@ mod tests {
         let a = Arc::new(WaitsForPeer {
             me: Arc::clone(&a_started),
             peer: Arc::clone(&b_started),
-            saw_peer: Arc::new(AtomicU64::new(0)),
+            saw_peer: AtomicU64::new(0),
         });
         let b = Arc::new(WaitsForPeer {
             me: Arc::clone(&b_started),
             peer: Arc::clone(&a_started),
-            saw_peer: Arc::new(AtomicU64::new(0)),
+            saw_peer: AtomicU64::new(0),
         });
-        let mut scheduler =
-            Scheduler::with_clock(vec![as_task(a.clone()), as_task(b.clone())], clock.as_fn())
-                .await;
+        let mut scheduler = Scheduler::with_clock(
+            vec![as_task(a.clone()), as_task(b.clone())],
+            clock.as_clock(),
+        )
+        .await;
 
         scheduler.run_due().await;
         assert_eq!(a.saw_peer.load(Ordering::SeqCst), 1);
@@ -313,17 +333,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_waits_to_its_deadline_and_shuts_down_on_cancel() {
+    async fn run_waits_for_its_deadline_and_shuts_down_on_cancel() {
         let clock = TestClock::new(0);
-        let task = Counter::new(3600);
-        let scheduler = Scheduler::with_clock(vec![as_task(task.clone())], clock.as_fn()).await;
+        let task = Agenda::new(vec![3600]);
+        let scheduler = Scheduler::with_clock(vec![as_task(task.clone())], clock.as_clock()).await;
         let token = CancellationToken::new();
 
         let handle = tokio::spawn(scheduler.run(token.clone()));
-        // The only deadline is an hour out, so nothing runs before we cancel.
         tokio::task::yield_now().await;
-        assert!(task.runs().is_empty());
-
         token.cancel();
         handle.await.unwrap();
         assert!(task.runs().is_empty());

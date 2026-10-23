@@ -678,10 +678,10 @@ impl crate::scheduler::Task for VisitorReportTask {
     fn name(&self) -> &'static str {
         "visitor-byte-report"
     }
-    async fn next_tick(&self, now: i64) -> i64 {
-        now + VISITOR_REPORT_INTERVAL.as_secs() as i64
+    async fn next_tick(&self, last_tick: Option<i64>, now: i64) -> i64 {
+        (last_tick.unwrap_or(now) + VISITOR_REPORT_INTERVAL.as_secs() as i64).max(now)
     }
-    async fn run(&self, _now: i64) {
+    async fn run(&self, _tick: i64) {
         report_conn_bytes(&self.bytes, &self.config);
     }
 }
@@ -854,10 +854,7 @@ pub async fn run_https_server_full(
                     ) as Arc<dyn crate::scheduler::Task>])
                     .await;
                     loop {
-                        let now = crate::wall_clock::unix_secs();
-                        let wait = timers.next_deadline().map_or(VISITOR_REPORT_INTERVAL, |at| {
-                            Duration::from_secs(at.saturating_sub(now).max(0) as u64)
-                        });
+                        let wait = timers.next_wait().unwrap_or(VISITOR_REPORT_INTERVAL);
                         tokio::select! {
                             res = conn.as_mut() => {
                                 if let Err(err) = res {
