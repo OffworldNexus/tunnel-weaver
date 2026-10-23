@@ -2,9 +2,9 @@
 //!
 //! This is WVR-160's trigger. It runs alongside the account token/session sweep
 //! and never invents a second deletion path: it sends one warning email at the
-//! configured lead time, then at the threshold calls the very same
-//! [`Store::delete_account`](crate::store::Store::delete_account) that the
-//! "delete my account" button uses.
+//! configured lead time, then at the threshold calls
+//! [`AccountRuntime::delete_account`](crate::account::AccountRuntime::delete_account)
+//! — the very same function the "delete my account" endpoint uses.
 //!
 //! The two "active right now" signals — a live browser session and a live tunnel
 //! — are honored whatever the timestamps say, because a tunnel can run for
@@ -16,7 +16,6 @@
 
 use tracing::{debug, info, warn};
 
-use crate::account::session;
 use crate::account::views::key_of;
 use crate::account::{AccountRuntime, router::human_timestamp};
 use crate::email::{InactivityWarning, Mailbox};
@@ -24,15 +23,10 @@ use crate::store::StoreError;
 use crate::store::account::InactivityCandidate;
 use crate::store::entity::machine;
 use crate::tunnel::TunnelRegistry;
-use weaver_mux::CloseCode;
 
 /// How many accounts one tick considers. The bound is what keeps a large expiry
 /// set from stalling the relay: the rest are picked up on later ticks.
 pub const SWEEP_BATCH: u64 = 100;
-
-/// A floor on the sign-in link's life, so a warning sent late in the window
-/// still leaves the owner time to act.
-const MIN_LINK_TTL_SECS: i64 = 86_400;
 
 /// What one tick did, for the log line.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -77,7 +71,7 @@ pub async fn run(
 
         let idle = now.saturating_sub(candidate.last_activity);
         if idle >= inactive_after {
-            delete(rt, registry, &candidate, &machines).await;
+            delete(rt, registry, &candidate).await;
             report.deleted += 1;
         } else if idle >= warning_before
             && not_warned_since(&candidate)
@@ -116,34 +110,25 @@ fn not_warned_since(candidate: &InactivityCandidate) -> bool {
         .is_none_or(|warned| warned < candidate.last_activity)
 }
 
-/// Deletes the account through the shared store operation, closing any live
-/// tunnel first so no machine outruns the delete.
+/// Deletes the account through the shared deletion path.
+///
+/// A failure is logged, not fatal: one account must not abandon the rest of the
+/// batch.
 async fn delete(
     rt: &AccountRuntime,
     registry: Option<&TunnelRegistry>,
     candidate: &InactivityCandidate,
-    machines: &[machine::Model],
 ) {
-    if let Some(registry) = registry {
-        for key in machines.iter().filter_map(key_of) {
-            registry.close_connection(&key, CloseCode::KeyRevoked);
-        }
-    }
-    match rt.store.delete_account(candidate.account_id).await {
-        Ok(()) => {
-            info!(
-                account_id = candidate.account_id,
-                "Inactive account deleted"
-            );
-        }
-        Err(err) => {
-            // One account's failure must not abandon the rest of the batch.
-            warn!(
-                account_id = candidate.account_id,
-                error = %err,
-                "Failed to delete an inactive account"
-            );
-        }
+    match rt.delete_account(candidate.account_id, registry).await {
+        Ok(()) => info!(
+            account_id = candidate.account_id,
+            "Inactive account deleted"
+        ),
+        Err(err) => warn!(
+            account_id = candidate.account_id,
+            error = %err,
+            "Failed to delete an inactive account"
+        ),
     }
 }
 
@@ -173,28 +158,12 @@ async fn warn_account(
         return false;
     };
 
+    // The account is deleted at `last_activity + inactive_after`; the warning
+    // tells the owner that date. The link is the ordinary sign-in page, not a
+    // pre-authorised action: signing in there resets the clock.
     let delete_at = candidate.last_activity.saturating_add(inactive_after);
-    let expires_at = delete_at.max(now.saturating_add(MIN_LINK_TTL_SECS));
-
-    // A fresh single-use link. Issuing revokes any earlier one, so only the
-    // latest email works.
-    let raw = session::new_token();
-    if let Err(err) = rt
-        .store
-        .login_token_issue(
-            candidate.account_id,
-            &session::token_hash(&raw),
-            now,
-            expires_at,
-        )
-        .await
-    {
-        warn!(account_id = candidate.account_id, error = %err, "Failed to mint a sign-in link");
-        return false;
-    }
-
     let template = InactivityWarning {
-        signin_url: rt.signin_url(&raw),
+        signin_url: rt.signin_url(),
         delete_on: human_timestamp(delete_at),
     };
     let email = match mailer.compose(to, &template) {

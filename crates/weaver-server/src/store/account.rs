@@ -19,9 +19,9 @@ use sea_orm::{
 use std::collections::{HashMap, HashSet};
 
 use super::entity::{
-    account, browser_session, domain, email_identity, email_verification, login_token, machine,
-    machine_key_log, password_credential, password_reset_token, pending_registration, person,
-    service, usage_daily, usage_live, verification_token,
+    account, browser_session, domain, email_identity, email_verification, machine, machine_key_log,
+    password_credential, password_reset_token, pending_registration, person, service, usage_daily,
+    usage_live, verification_token,
 };
 use super::{Store, StoreError};
 
@@ -413,7 +413,7 @@ impl Store {
     /// * the account itself, cascading person → machine → service →
     ///   `usage_live`/`usage_daily` and the account-scoped rows (browser
     ///   sessions, password credentials, email identity, verification history,
-    ///   reset tokens, sign-in links);
+    ///   reset tokens);
     /// * the pre-account `pending_registration` rows that still hold this
     ///   person's address (and, through the foreign key, their
     ///   `verification_token`s) — rows no account cascade reaches.
@@ -775,73 +775,6 @@ impl Store {
         let result = password_reset_token::Entity::delete_many()
             .filter(password_reset_token::Column::ConsumedAt.is_null())
             .filter(password_reset_token::Column::ExpiresAt.lt(cutoff))
-            .exec(&self.db)
-            .await?;
-        Ok(result.rows_affected)
-    }
-
-    // ----- login tokens (inactivity warning links) -----
-
-    /// Issues a fresh sign-in link for an account, revoking that account's
-    /// outstanding unconsumed links first so only the latest one works.
-    pub async fn login_token_issue(
-        &self,
-        account_id: i32,
-        token_digest: &str,
-        issued_at: i64,
-        expires_at: i64,
-    ) -> Result<login_token::Model, StoreError> {
-        let txn = self.db.begin().await?;
-        login_token::Entity::update_many()
-            .col_expr(login_token::Column::RevokedAt, Expr::value(Some(issued_at)))
-            .filter(login_token::Column::AccountId.eq(account_id))
-            .filter(login_token::Column::ConsumedAt.is_null())
-            .filter(login_token::Column::RevokedAt.is_null())
-            .exec(&txn)
-            .await?;
-        let token = login_token::ActiveModel {
-            account_id: Set(account_id),
-            token_digest: Set(token_digest.to_string()),
-            issued_at: Set(issued_at),
-            expires_at: Set(expires_at),
-            ..Default::default()
-        }
-        .insert(&txn)
-        .await?;
-        txn.commit().await?;
-        Ok(token)
-    }
-
-    /// Resolves a sign-in link by its stored digest.
-    pub async fn login_token_by_digest(
-        &self,
-        token_digest: &str,
-    ) -> Result<Option<login_token::Model>, StoreError> {
-        Ok(login_token::Entity::find()
-            .filter(login_token::Column::TokenDigest.eq(token_digest))
-            .one(&self.db)
-            .await?)
-    }
-
-    /// Consumes a sign-in link at most once. Returns `false` when it was already
-    /// consumed, revoked, or expired.
-    pub async fn login_token_consume(&self, token_id: i32, now: i64) -> Result<bool, StoreError> {
-        let result = login_token::Entity::update_many()
-            .col_expr(login_token::Column::ConsumedAt, Expr::value(Some(now)))
-            .filter(login_token::Column::Id.eq(token_id))
-            .filter(login_token::Column::ConsumedAt.is_null())
-            .filter(login_token::Column::RevokedAt.is_null())
-            .filter(login_token::Column::ExpiresAt.gt(now))
-            .exec(&self.db)
-            .await?;
-        Ok(result.rows_affected == 1)
-    }
-
-    /// Deletes sign-in links that expired unconsumed before `cutoff`.
-    pub async fn login_token_sweep(&self, cutoff: i64) -> Result<u64, StoreError> {
-        let result = login_token::Entity::delete_many()
-            .filter(login_token::Column::ConsumedAt.is_null())
-            .filter(login_token::Column::ExpiresAt.lt(cutoff))
             .exec(&self.db)
             .await?;
         Ok(result.rows_affected)

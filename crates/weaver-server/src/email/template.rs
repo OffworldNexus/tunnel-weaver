@@ -631,13 +631,13 @@ const INACTIVITY_WARNING_HEADING: &str = "Your account is about to be deleted";
 /// The inactivity warning, sent once when an account has gone unused for almost
 /// the whole threshold.
 ///
-/// `delete_on` is a human, timezone-qualified date and `signin_url` is a
-/// single-use link that signs the owner in — which is what resets the clock.
-/// Both are supplied by the caller so the copy always matches the configured
-/// timeline rather than restating it.
+/// `delete_on` is a human, timezone-qualified date and `signin_url` is the
+/// ordinary sign-in page — signing in there is what resets the clock. Both are
+/// supplied by the caller so the copy always matches the configured timeline
+/// rather than restating it.
 #[derive(Debug, Clone)]
 pub struct InactivityWarning {
-    /// Absolute HTTPS link that signs the recipient in and resets the clock.
+    /// Absolute HTTPS link to the sign-in page; signing in resets the clock.
     pub signin_url: String,
     /// Human, timezone-qualified deletion date.
     pub delete_on: String,
@@ -826,23 +826,15 @@ mod tests {
     #[test]
     fn inactivity_warning_carries_the_date_and_link_in_both_parts() {
         let rendered = InactivityWarning {
-            signin_url: "https://relay.example.org/continue#token=abc".into(),
+            signin_url: "https://relay.example.org/sign-in".into(),
             delete_on: "2027-10-23 12:00 UTC".into(),
         }
         .render(&env())
         .unwrap();
         assert!(rendered.html.contains("2027-10-23 12:00 UTC"));
-        assert!(
-            rendered
-                .html
-                .contains("https://relay.example.org/continue#token=abc")
-        );
+        assert!(rendered.html.contains("https://relay.example.org/sign-in"));
         assert!(rendered.text.contains("2027-10-23 12:00 UTC"));
-        assert!(
-            rendered
-                .text
-                .contains("https://relay.example.org/continue#token=abc")
-        );
+        assert!(rendered.text.contains("https://relay.example.org/sign-in"));
         // Shared partials resolved; the footer's support link is present.
         assert!(rendered.html.contains("TUNNEL WEAVER"));
         assert!(rendered.html.contains("https://relay.example.org/support"));
@@ -855,7 +847,7 @@ mod tests {
     #[test]
     fn inactivity_warning_rejects_an_untrusted_link() {
         let err = InactivityWarning {
-            signin_url: "http://relay.example.org/continue#token=abc".into(),
+            signin_url: "http://relay.example.org/sign-in".into(),
             delete_on: "2027-10-23 12:00 UTC".into(),
         }
         .render(&env())

@@ -224,12 +224,11 @@ when the account is deleted. Both must be positive and the warning must come
 first, or `Config::load` rejects the config.
 
 At the warning mark the relay sends **one** email to the account's own address,
-carrying a single-use link that signs the owner in and therefore resets the
-clock; the send is recorded in `account.inactivity_warning_at`, so it is not
-repeated every tick, and a later sign-in or metered minute moves the clock past
-it so the next cycle can warn again. The warning is best-effort: with no mailer
-configured the account is still deleted on schedule, with no warning and no
-retry loop.
+linking to the ordinary sign-in page; signing in there resets the clock. The
+send is recorded in `account.inactivity_warning_at`, so it is not repeated every
+tick, and a later sign-in or metered minute moves the clock past it so the next
+cycle can warn again. The warning is best-effort: with no mailer configured the
+account is still deleted on schedule, with no warning and no retry loop.
 
 At the threshold the account is removed through the very same
 `Store::delete_account` operation as the "delete my account" button — no second
@@ -251,8 +250,7 @@ change lands.
 Later migrations add on top of that baseline rather than squashing again:
 `m0002_usage_daily` introduces the day-grain `usage_daily` rollup and the live
 `usage_live` slot arrays, and `m0003_inactivity` adds `account.last_login_at`
-and `account.inactivity_warning_at` together with the `login_token` sign-in-link
-table.
+and `account.inactivity_warning_at` for the inactivity sweep.
 
 ## The nightly
 

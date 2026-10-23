@@ -21,9 +21,11 @@ use crate::altcha::AltchaRuntime;
 use crate::config::AccountConfig;
 use crate::email::Mailer;
 use crate::live::LiveHub;
-use crate::store::Store;
+use crate::store::{Store, StoreError};
+use crate::tunnel::TunnelRegistry;
 use password::Passwords;
 use session::Sessions;
+use weaver_mux::CloseCode;
 
 /// Shared state for the account plane, built once and mounted into the edge.
 #[derive(Clone)]
@@ -153,16 +155,41 @@ impl AccountRuntime {
         )
     }
 
-    /// Builds the single-use sign-in link carried by the inactivity warning.
+    /// The absolute HTTPS URL of the ordinary sign-in page.
     ///
-    /// Like [`reset_url`](Self::reset_url), the token rides in the URL fragment
-    /// so it never reaches the server or its logs until the SPA posts it. The
-    /// `/continue` page consumes it and signs the owner in.
-    pub fn signin_url(&self, raw_token: &str) -> String {
-        format!(
-            "{}/continue#token={raw_token}",
-            self.base_url.trim_end_matches('/')
-        )
+    /// Linked from the inactivity warning: signing in there is what resets the
+    /// inactivity clock.
+    pub fn signin_url(&self) -> String {
+        format!("{}/sign-in", self.base_url.trim_end_matches('/'))
+    }
+
+    /// Deletes an account and everything it owns, closing every live tunnel
+    /// first so no machine outruns the delete.
+    ///
+    /// This is the **one** deletion path: the self-service `POST
+    /// /api/account/delete` handler and the inactivity sweep both call it, so
+    /// the two cannot drift in what an account deletion guarantees — live
+    /// tunnels closed, then the store's atomic cascade (including session
+    /// invalidation).
+    pub async fn delete_account(
+        &self,
+        account_id: i32,
+        tunnel: Option<&TunnelRegistry>,
+    ) -> Result<(), StoreError> {
+        if let Some(registry) = tunnel
+            && let Some(person) = self
+                .store
+                .person_by_account(account_id)
+                .await
+                .ok()
+                .flatten()
+            && let Ok(machines) = self.store.list_machines(person.id).await
+        {
+            for key in machines.iter().filter_map(views::key_of) {
+                registry.close_connection(&key, CloseCode::KeyRevoked);
+            }
+        }
+        self.store.delete_account(account_id).await
     }
 
     /// The absolute HTTPS URL of the signed-in account shell.

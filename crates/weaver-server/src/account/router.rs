@@ -78,7 +78,6 @@ pub fn router(runtime: Arc<AccountRuntime>, tunnel: Option<Arc<TunnelRegistry>>)
         .route("/api/account/reset/check", post(reset_check))
         .route("/api/account/reset/complete", post(reset_complete))
         .route("/api/account/login", post(login))
-        .route("/api/account/continue", post(continue_session))
         .route("/api/account/me", get(me))
         .route("/api/account/avatar", get(avatar))
         .route("/api/account/logout", post(logout))
@@ -115,12 +114,6 @@ struct SignupRequest {
 #[derive(Deserialize)]
 struct ResendRequest {
     flow: String,
-}
-
-/// Body of an inactivity-warning sign-in link exchange.
-#[derive(Deserialize)]
-struct ContinueRequest {
-    token: String,
 }
 
 #[derive(Deserialize)]
@@ -770,65 +763,6 @@ async fn login(
     with_cookie(response, rt.sessions.csrf_cookie(&csrf))
 }
 
-/// `POST /api/account/continue` — exchange an inactivity-warning sign-in link
-/// for a live session.
-///
-/// The raw token arrives in the body (never the query), so it cannot leak
-/// through a log or a `Referer`. The link is single-use: it is consumed before
-/// the session is minted, so a replay finds it spent. Recording the sign-in
-/// resets the inactivity clock, which is the whole point of the link.
-async fn continue_session(
-    State(rt): State<Arc<AccountRuntime>>,
-    headers: HeaderMap,
-    Json(req): Json<ContinueRequest>,
-) -> Response {
-    if !origin_ok(&headers, &rt.base_url) {
-        return err(StatusCode::FORBIDDEN, "request refused");
-    }
-    let now = unix_secs();
-    let digest = session::token_hash(&req.token);
-    let Some(token) = rt.store.login_token_by_digest(&digest).await.ok().flatten() else {
-        return err(
-            StatusCode::BAD_REQUEST,
-            "this link is invalid or has already been used",
-        );
-    };
-    if token.consumed_at.is_some() || token.revoked_at.is_some() || token.expires_at <= now {
-        return err(
-            StatusCode::BAD_REQUEST,
-            "this link has expired or has already been used",
-        );
-    }
-    // Single-use: spend it before doing anything else, so a replay is refused.
-    if !rt
-        .store
-        .login_token_consume(token.id, now)
-        .await
-        .unwrap_or(false)
-    {
-        return err(
-            StatusCode::BAD_REQUEST,
-            "this link has expired or has already been used",
-        );
-    }
-    if rt
-        .store
-        .account_record_login(token.account_id, now)
-        .await
-        .is_err()
-    {
-        return err(StatusCode::SERVICE_UNAVAILABLE, "temporarily unavailable");
-    }
-    let raw = match rt.sessions.create(token.account_id, now).await {
-        Ok(raw) => raw,
-        Err(_) => return err(StatusCode::SERVICE_UNAVAILABLE, "temporarily unavailable"),
-    };
-    let csrf = session::new_token();
-    let response = json_ok(json!({ "ok": true }));
-    let response = with_cookie(response, rt.sessions.session_cookie(&raw));
-    with_cookie(response, rt.sessions.csrf_cookie(&csrf))
-}
-
 /// `GET /api/account/me` — the signed-in identity.
 async fn me(State(rt): State<Arc<AccountRuntime>>, headers: HeaderMap) -> Response {
     let Some(raw) = session::cookie(&headers, SESSION_COOKIE) else {
@@ -981,19 +915,9 @@ async fn delete_account(
         return err(StatusCode::FORBIDDEN, "request refused");
     }
 
-    // Close every live tunnel first, so none survives the rows to reconnect.
-    if let Some(registry) = tunnel.as_deref()
-        && let Some(person) = person_of(&rt, account.id).await
-        && let Ok(machines) = rt.store.list_machines(person.id).await
-    {
-        for machine in machines {
-            if let Some(key) = key_of(&machine) {
-                registry.close_connection(&key, CloseCode::KeyRevoked);
-            }
-        }
-    }
-
-    match rt.store.delete_account(account.id).await {
+    // The one shared deletion path closes every live tunnel first, so none
+    // survives the rows to reconnect, then removes the account and all it owns.
+    match rt.delete_account(account.id, tunnel.as_deref()).await {
         Ok(()) => with_cookie(
             with_cookie(
                 json_ok(json!({ "ok": true })),

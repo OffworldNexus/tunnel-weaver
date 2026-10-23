@@ -115,10 +115,10 @@ async fn test_store_open_runs_migrations_and_is_idempotent() {
         let store = Store::open(&db_path).await.expect("open failed");
         let count: i64 = scalar(
             &store,
-            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN ('config', 'acme_account', 'domains', 'certificates', 'cert_events', 'seaql_migrations', 'person', 'machine', 'machine_key_log', 'service', 'usage_daily', 'usage_live', 'challenge', 'abuse_bucket', 'login_token')",
+            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN ('config', 'acme_account', 'domains', 'certificates', 'cert_events', 'seaql_migrations', 'person', 'machine', 'machine_key_log', 'service', 'usage_daily', 'usage_live', 'challenge', 'abuse_bucket')",
         )
         .await;
-        assert_eq!(count, 15);
+        assert_eq!(count, 14);
         assert_eq!(store.schema_version().await.expect("schema_version"), 3);
     }
 
@@ -2778,75 +2778,4 @@ async fn test_account_login_and_warning_timestamps_round_trip() {
     let updated = store.account_by_id(account.id).await.unwrap().unwrap();
     assert_eq!(updated.last_login_at, Some(1_800_001_000));
     assert_eq!(updated.inactivity_warning_at, Some(1_800_000_600));
-}
-
-#[tokio::test]
-async fn test_login_token_is_single_use_revocable_and_swept() {
-    let store = Store::connect("sqlite::memory:").await.unwrap();
-    let account = activated(&store, "Link", "link@example.com").await;
-    let t0 = 1_800_000_000;
-
-    // Issue, resolve, and spend exactly once.
-    let issued = store
-        .login_token_issue(account.id, "digest-a", t0, t0 + 3600)
-        .await
-        .unwrap();
-    let found = store
-        .login_token_by_digest("digest-a")
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(found.id, issued.id);
-    assert_eq!(found.consumed_at, None);
-    assert!(store.login_token_consume(issued.id, t0 + 10).await.unwrap());
-    assert!(
-        !store.login_token_consume(issued.id, t0 + 11).await.unwrap(),
-        "a link is single-use"
-    );
-
-    // Issuing again revokes the older outstanding link.
-    let first = store
-        .login_token_issue(account.id, "digest-b", t0, t0 + 3600)
-        .await
-        .unwrap();
-    let _second = store
-        .login_token_issue(account.id, "digest-c", t0, t0 + 3600)
-        .await
-        .unwrap();
-    assert!(
-        store
-            .login_token_by_digest("digest-b")
-            .await
-            .unwrap()
-            .unwrap()
-            .revoked_at
-            .is_some(),
-        "a newer link revokes the older"
-    );
-    assert!(
-        !store.login_token_consume(first.id, t0 + 12).await.unwrap(),
-        "a revoked link is refused"
-    );
-
-    // Expired unconsumed links are swept; consumed/revoked rows are kept.
-    let _expiring = store
-        .login_token_issue(account.id, "digest-d", t0, t0 + 60)
-        .await
-        .unwrap();
-    assert_eq!(store.login_token_sweep(t0 + 120).await.unwrap(), 1);
-    assert!(
-        store
-            .login_token_by_digest("digest-d")
-            .await
-            .unwrap()
-            .is_none()
-    );
-    assert!(
-        store
-            .login_token_by_digest("digest-a")
-            .await
-            .unwrap()
-            .is_some(),
-        "a consumed row survives as provenance"
-    );
 }
