@@ -199,6 +199,44 @@ minimum 1) are deleted, while the row of a machine's current key is never
 deleted however old it is. Set the retention to `0` and `Config::load` rejects
 the config.
 
+## Abandoned accounts
+
+An account nobody uses is eventually deleted, so abandoned data does not
+accumulate forever. The same periodic sweep that owns the token/session/key-log
+retention also runs an **inactivity sweep**, bounded per tick
+(100 accounts), that reads each account's last activity:
+
+- the last successful sign-in, `account.last_login_at` (falling back to
+  `activated_at` for an account that never signed in);
+- the newest day any of its services was metered (`usage_daily`, folded, or the
+  live day);
+- and two "active right now" signals that always win whatever the timestamps
+  say: a live browser session (`browser_session` unexpired and uninvalidated)
+  and a live tunnel for any of its machines.
+
+The last two matter because a tunnel can run for months without a console
+sign-in, so an account that looks stale on paper may in fact be serving traffic.
+
+Two knobs control the timeline. `account.inactivity_warning_before_secs`
+(default **2592000**, one month) is how long before deletion the warning is
+sent; `account.inactive_after_secs` (default **31536000**, twelve months) is
+when the account is deleted. Both must be positive and the warning must come
+first, or `Config::load` rejects the config.
+
+At the warning mark the relay sends **one** email to the account's own address,
+carrying a single-use link that signs the owner in and therefore resets the
+clock; the send is recorded in `account.inactivity_warning_at`, so it is not
+repeated every tick, and a later sign-in or metered minute moves the clock past
+it so the next cycle can warn again. The warning is best-effort: with no mailer
+configured the account is still deleted on schedule, with no warning and no
+retry loop.
+
+At the threshold the account is removed through the very same
+`Store::delete_account` operation as the "delete my account" button — no second
+cascade path — after its live tunnels are closed and its sessions invalidated by
+the cascade. The sweep logs the number of warnings sent and accounts deleted per
+tick.
+
 ## Schema
 
 All migrations were squashed into a single `m0001_init` that creates the final
@@ -209,6 +247,12 @@ database must be rebuilt, and its machines re-paired. (The live relay was
 rebuilt rather than migrated.) Deployment tooling that expected incrementally
 applied migrations should treat the relay database as disposable before this
 change lands.
+
+Later migrations add on top of that baseline rather than squashing again:
+`m0002_usage_daily` introduces the day-grain `usage_daily` rollup and the live
+`usage_live` slot arrays, and `m0003_inactivity` adds `account.last_login_at`
+and `account.inactivity_warning_at` together with the `login_token` sign-in-link
+table.
 
 ## The nightly
 

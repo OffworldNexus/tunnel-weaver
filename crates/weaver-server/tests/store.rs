@@ -115,19 +115,19 @@ async fn test_store_open_runs_migrations_and_is_idempotent() {
         let store = Store::open(&db_path).await.expect("open failed");
         let count: i64 = scalar(
             &store,
-            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN ('config', 'acme_account', 'domains', 'certificates', 'cert_events', 'seaql_migrations', 'person', 'machine', 'machine_key_log', 'service', 'usage_daily', 'usage_live', 'challenge', 'abuse_bucket')",
+            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN ('config', 'acme_account', 'domains', 'certificates', 'cert_events', 'seaql_migrations', 'person', 'machine', 'machine_key_log', 'service', 'usage_daily', 'usage_live', 'challenge', 'abuse_bucket', 'login_token')",
         )
         .await;
-        assert_eq!(count, 14);
-        assert_eq!(store.schema_version().await.expect("schema_version"), 2);
+        assert_eq!(count, 15);
+        assert_eq!(store.schema_version().await.expect("schema_version"), 3);
     }
 
     // Re-open existing database: should succeed and not re-apply migrations
     {
         let store = Store::open(&db_path).await.expect("re-open failed");
         let migration_count: i64 = scalar(&store, "SELECT count(*) FROM seaql_migrations").await;
-        assert_eq!(migration_count, 2);
-        assert_eq!(store.schema_version().await.expect("schema_version"), 2);
+        assert_eq!(migration_count, 3);
+        assert_eq!(store.schema_version().await.expect("schema_version"), 3);
     }
 }
 
@@ -2592,4 +2592,261 @@ async fn test_key_log_sweep_drops_only_retired_rows_past_the_cutoff() {
     // The sweep the relay runs uses the configured retention.
     let account = weaver_server::config::AccountConfig::default();
     assert_eq!(account.key_log_cutoff(365 * 86_400 + 5), 5);
+}
+
+// ---------------------------------------------------------------------------
+// Inactivity sweep inputs (WVR-160).
+// ---------------------------------------------------------------------------
+
+const MONTH: i64 = 30 * 86_400;
+const YEAR: i64 = 365 * 86_400;
+
+#[tokio::test]
+async fn test_inactivity_candidates_use_sign_in_or_activation_oldest_first() {
+    let store = Store::connect("sqlite::memory:").await.unwrap();
+    let t0 = 1_800_000_000;
+    let never = activated(&store, "Never Signed In", "never@example.com").await;
+    let stale = activated(&store, "Stale", "stale@example.com").await;
+    let fresh = activated(&store, "Fresh", "fresh@example.com").await;
+    // `stale` signed in five days after activation; `fresh` signed in recently.
+    store
+        .account_record_login(stale.id, t0 + 5 * 86_400)
+        .await
+        .unwrap();
+    store
+        .account_record_login(fresh.id, t0 + YEAR - 86_400)
+        .await
+        .unwrap();
+
+    let now = t0 + YEAR;
+    let candidates = store
+        .inactivity_candidates(now, 11 * MONTH, 10)
+        .await
+        .unwrap();
+    let ids: Vec<i32> = candidates.iter().map(|c| c.account_id).collect();
+    // `fresh` is inside the warning window and is not even a candidate.
+    assert!(
+        !ids.contains(&fresh.id),
+        "a recently active account is not a candidate"
+    );
+    // Oldest activity first: the never-signed-in account, then the stale one.
+    assert_eq!(ids, vec![never.id, stale.id]);
+    // An account that never signed in falls back to its activation instant.
+    assert_eq!(candidates[0].last_activity, t0);
+    assert_eq!(candidates[0].name, "Never Signed In");
+    assert_eq!(candidates[0].email, "never@example.com");
+    assert!(!candidates[0].has_live_session);
+    assert_eq!(candidates[1].last_activity, t0 + 5 * 86_400);
+
+    // The batch is bounded, oldest first.
+    let bounded = store
+        .inactivity_candidates(now, 11 * MONTH, 1)
+        .await
+        .unwrap();
+    assert_eq!(bounded.len(), 1);
+    assert_eq!(bounded[0].account_id, never.id);
+}
+
+#[tokio::test]
+async fn test_inactivity_candidates_flag_only_live_sessions() {
+    let store = Store::connect("sqlite::memory:").await.unwrap();
+    let t0 = 1_800_000_000;
+    let now = t0 + YEAR;
+    let live = activated(&store, "Live", "live@example.com").await;
+    let expired = activated(&store, "Expired", "expired@example.com").await;
+    let invalidated = activated(&store, "Invalidated", "invalidated@example.com").await;
+    // A live, unexpired session...
+    store
+        .session_create(live.id, "live-hash", now - 60, now + 3600)
+        .await
+        .unwrap();
+    // ...versus one that is already expired...
+    store
+        .session_create(expired.id, "expired-hash", now - 7200, now - 3600)
+        .await
+        .unwrap();
+    // ...versus one that was explicitly retired.
+    store
+        .session_create(invalidated.id, "invalidated-hash", now - 60, now + 3600)
+        .await
+        .unwrap();
+    store
+        .session_invalidate("invalidated-hash", now)
+        .await
+        .unwrap();
+
+    let candidates = store
+        .inactivity_candidates(now, 11 * MONTH, 10)
+        .await
+        .unwrap();
+    let row = |id: i32| candidates.iter().find(|c| c.account_id == id).unwrap();
+    assert!(
+        row(live.id).has_live_session,
+        "an unexpired session marks the account live"
+    );
+    assert!(
+        !row(expired.id).has_live_session,
+        "an expired session does not"
+    );
+    assert!(
+        !row(invalidated.id).has_live_session,
+        "an invalidated session does not"
+    );
+}
+
+#[tokio::test]
+async fn test_inactivity_candidates_fold_the_newest_metered_day_into_activity() {
+    use weaver_mux::KeyId;
+    use weaver_server::store::usage_live::{SlotWrite, Slots};
+
+    let store = Store::connect("sqlite::memory:").await.unwrap();
+    let t0 = 1_800_000_000;
+    let account = activated(&store, "Metered", "metered@example.com").await;
+    let person = store.create_person(account.id, "metered").await.unwrap();
+    let laptop = store
+        .create_machine(person.id, "laptop", &KeyId::P256([9; 33]))
+        .await
+        .unwrap();
+    let web = store
+        .register_declared_service(laptop.id, "metered-laptop-web.example.com", "web")
+        .await
+        .unwrap();
+
+    // The account last signed in a year ago, but its service was metered
+    // yesterday, which is activity in its own right.
+    store.account_record_login(account.id, t0).await.unwrap();
+    let now = t0 + YEAR;
+    let yesterday = (now - 86_400).div_euclid(86_400);
+    store
+        .write_day_slots(&[SlotWrite {
+            service_id: web.id,
+            day: yesterday,
+            slots: Slots::OpenMs,
+            first_slot: 0,
+            values: vec![60_000],
+        }])
+        .await
+        .unwrap();
+
+    let candidate = store
+        .inactivity_candidates(now, 11 * MONTH, 10)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|c| c.account_id == account.id)
+        .expect("a year-old sign-in still shortlists the account");
+    // The metered day, not the stale sign-in, is now the activity clock.
+    assert_eq!(candidate.last_activity, yesterday * 86_400);
+    assert!(now - candidate.last_activity < 11 * MONTH);
+
+    // That same metered day is ancient two years on, so the account is due.
+    let later = t0 + 2 * YEAR;
+    let candidate = store
+        .inactivity_candidates(later, 11 * MONTH, 10)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|c| c.account_id == account.id)
+        .unwrap();
+    assert!(later - candidate.last_activity >= 11 * MONTH);
+}
+
+#[tokio::test]
+async fn test_account_login_and_warning_timestamps_round_trip() {
+    let store = Store::connect("sqlite::memory:").await.unwrap();
+    let account = activated(&store, "Clock", "clock@example.com").await;
+    assert_eq!(account.last_login_at, None);
+    assert_eq!(account.inactivity_warning_at, None);
+
+    store
+        .account_record_login(account.id, 1_800_000_500)
+        .await
+        .unwrap();
+    store
+        .account_mark_inactivity_warning(account.id, 1_800_000_600)
+        .await
+        .unwrap();
+    let updated = store.account_by_id(account.id).await.unwrap().unwrap();
+    assert_eq!(updated.last_login_at, Some(1_800_000_500));
+    assert_eq!(updated.inactivity_warning_at, Some(1_800_000_600));
+
+    // A later sign-in moves the clock without erasing the warning record.
+    store
+        .account_record_login(account.id, 1_800_001_000)
+        .await
+        .unwrap();
+    let updated = store.account_by_id(account.id).await.unwrap().unwrap();
+    assert_eq!(updated.last_login_at, Some(1_800_001_000));
+    assert_eq!(updated.inactivity_warning_at, Some(1_800_000_600));
+}
+
+#[tokio::test]
+async fn test_login_token_is_single_use_revocable_and_swept() {
+    let store = Store::connect("sqlite::memory:").await.unwrap();
+    let account = activated(&store, "Link", "link@example.com").await;
+    let t0 = 1_800_000_000;
+
+    // Issue, resolve, and spend exactly once.
+    let issued = store
+        .login_token_issue(account.id, "digest-a", t0, t0 + 3600)
+        .await
+        .unwrap();
+    let found = store
+        .login_token_by_digest("digest-a")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(found.id, issued.id);
+    assert_eq!(found.consumed_at, None);
+    assert!(store.login_token_consume(issued.id, t0 + 10).await.unwrap());
+    assert!(
+        !store.login_token_consume(issued.id, t0 + 11).await.unwrap(),
+        "a link is single-use"
+    );
+
+    // Issuing again revokes the older outstanding link.
+    let first = store
+        .login_token_issue(account.id, "digest-b", t0, t0 + 3600)
+        .await
+        .unwrap();
+    let _second = store
+        .login_token_issue(account.id, "digest-c", t0, t0 + 3600)
+        .await
+        .unwrap();
+    assert!(
+        store
+            .login_token_by_digest("digest-b")
+            .await
+            .unwrap()
+            .unwrap()
+            .revoked_at
+            .is_some(),
+        "a newer link revokes the older"
+    );
+    assert!(
+        !store.login_token_consume(first.id, t0 + 12).await.unwrap(),
+        "a revoked link is refused"
+    );
+
+    // Expired unconsumed links are swept; consumed/revoked rows are kept.
+    let _expiring = store
+        .login_token_issue(account.id, "digest-d", t0, t0 + 60)
+        .await
+        .unwrap();
+    assert_eq!(store.login_token_sweep(t0 + 120).await.unwrap(), 1);
+    assert!(
+        store
+            .login_token_by_digest("digest-d")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .login_token_by_digest("digest-a")
+            .await
+            .unwrap()
+            .is_some(),
+        "a consumed row survives as provenance"
+    );
 }

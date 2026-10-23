@@ -305,8 +305,9 @@ async fn test_control_socket_daemon_suite() {
         assert_eq!(val["ok"], true);
         assert_eq!(val["tunnel_domain"], "weaver.test");
         assert_eq!(val["admin_domain"], "relay-admin.test");
-        // Two migrations: `m0001_init` and `m0002_usage_daily`.
-        assert_eq!(val["schema_version"], 2);
+        // Three migrations: `m0001_init`, `m0002_usage_daily` and
+        // `m0003_inactivity`.
+        assert_eq!(val["schema_version"], 3);
         // The seeded tunnel wildcard reports issued; the admin certificate has
         // no stored row and is still pending, so it counts as ordering.
         assert_eq!(val["cert_counts"]["issued"], 1);

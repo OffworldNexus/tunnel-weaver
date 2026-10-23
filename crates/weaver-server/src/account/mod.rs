@@ -8,6 +8,7 @@
 //! The plane is always on; [`crate::config::AccountConfig`] only tunes it. The
 //! runtime is built once at startup and shared through the edge config.
 
+pub mod inactivity;
 pub mod pairing;
 pub mod password;
 pub mod router;
@@ -148,6 +149,18 @@ impl AccountRuntime {
     pub fn reset_url(&self, raw_token: &str) -> String {
         format!(
             "{}/reset#token={raw_token}",
+            self.base_url.trim_end_matches('/')
+        )
+    }
+
+    /// Builds the single-use sign-in link carried by the inactivity warning.
+    ///
+    /// Like [`reset_url`](Self::reset_url), the token rides in the URL fragment
+    /// so it never reaches the server or its logs until the SPA posts it. The
+    /// `/continue` page consumes it and signs the owner in.
+    pub fn signin_url(&self, raw_token: &str) -> String {
+        format!(
+            "{}/continue#token={raw_token}",
             self.base_url.trim_end_matches('/')
         )
     }

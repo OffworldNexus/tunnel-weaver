@@ -1,0 +1,9 @@
+{{ heading }}
+
+{{ intro }}
+
+{{ signin_url }}
+
+{{ expiry }}
+
+{{ support_url }}

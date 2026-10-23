@@ -4,6 +4,12 @@
 //! carries a non-unique, Unicode display name (multiple accounts may share one,
 //! accents preserved) and is resolved through its `email_identity`, never by
 //! name.
+//!
+//! `last_login_at` and `inactivity_warning_at` exist for the inactivity sweep
+//! (WVR-160): the first is the clock the sweep reads (falling back to
+//! `activated_at` for an account that never signed in), the second records that
+//! the "will be deleted" warning was sent for the current inactive cycle so it
+//! is not repeated every tick.
 
 use sea_orm::entity::prelude::*;
 
@@ -16,6 +22,10 @@ pub struct Model {
     pub state: String,
     pub created_at: i64,
     pub activated_at: i64,
+    /// Unix seconds of the last successful sign-in; `None` until the first one.
+    pub last_login_at: Option<i64>,
+    /// Unix seconds the inactivity warning was last sent; `None` if never.
+    pub inactivity_warning_at: Option<i64>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

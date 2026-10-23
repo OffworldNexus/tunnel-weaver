@@ -309,6 +309,36 @@ pub async fn run_server(
         })
     };
 
+    // The inactivity sweep: warn accounts that have gone unused for almost the
+    // configured threshold, then delete them through the very same store
+    // operation as "delete my account". Bounded per tick.
+    let inactivity_sweep = {
+        let account = account.clone();
+        let registry = Arc::clone(&tunnel_registry);
+        let interval = config.account.sweep_interval_secs.max(1);
+        let token = shutdown_token.clone();
+        info!(interval_secs = interval, "inactivity sweep running");
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(interval));
+            loop {
+                tokio::select! {
+                    _ = token.cancelled() => break,
+                    _ = ticker.tick() => {
+                        let now = crate::wall_clock::unix_secs();
+                        match crate::account::inactivity::run(&account, Some(&registry), now).await {
+                            Ok(report) => info!(
+                                warned = report.warned,
+                                deleted = report.deleted,
+                                "inactivity sweep complete"
+                            ),
+                            Err(err) => warn!(error = %err, "inactivity sweep failed"),
+                        }
+                    }
+                }
+            }
+        })
+    };
+
     let http_token = shutdown_token.clone();
     let challenge_responders: Vec<Arc<dyn ChallengeResponder>> =
         vec![Arc::new(Http01Solver::new(Arc::new(store.clone())))];
@@ -451,6 +481,7 @@ pub async fn run_server(
         }
         let _ = altcha_task.await;
         let _ = account_sweep.await;
+        let _ = inactivity_sweep.await;
         let _ = futures_util::future::join_all(dns_tasks).await;
     };
 

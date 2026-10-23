@@ -78,6 +78,7 @@ pub fn router(runtime: Arc<AccountRuntime>, tunnel: Option<Arc<TunnelRegistry>>)
         .route("/api/account/reset/check", post(reset_check))
         .route("/api/account/reset/complete", post(reset_complete))
         .route("/api/account/login", post(login))
+        .route("/api/account/continue", post(continue_session))
         .route("/api/account/me", get(me))
         .route("/api/account/avatar", get(avatar))
         .route("/api/account/logout", post(logout))
@@ -114,6 +115,12 @@ struct SignupRequest {
 #[derive(Deserialize)]
 struct ResendRequest {
     flow: String,
+}
+
+/// Body of an inactivity-warning sign-in link exchange.
+#[derive(Deserialize)]
+struct ContinueRequest {
+    token: String,
 }
 
 #[derive(Deserialize)]
@@ -747,12 +754,77 @@ async fn login(
         return err(StatusCode::UNAUTHORIZED, "invalid email or password");
     };
 
+    // Record the sign-in: this is the inactivity clock the sweep reads (WVR-160).
+    // A failure here is logged, not fatal — the user is still signed in.
+    if let Err(err) = rt.store.account_record_login(account.id, now).await {
+        tracing::warn!(error = %err, "failed to record the last login");
+    }
+
     let raw = match rt.sessions.create(account.id, now).await {
         Ok(raw) => raw,
         Err(_) => return err(StatusCode::SERVICE_UNAVAILABLE, "temporarily unavailable"),
     };
     let csrf = session::new_token();
     let response = json_ok(json!({ "ok": true, "name": account.name }));
+    let response = with_cookie(response, rt.sessions.session_cookie(&raw));
+    with_cookie(response, rt.sessions.csrf_cookie(&csrf))
+}
+
+/// `POST /api/account/continue` — exchange an inactivity-warning sign-in link
+/// for a live session.
+///
+/// The raw token arrives in the body (never the query), so it cannot leak
+/// through a log or a `Referer`. The link is single-use: it is consumed before
+/// the session is minted, so a replay finds it spent. Recording the sign-in
+/// resets the inactivity clock, which is the whole point of the link.
+async fn continue_session(
+    State(rt): State<Arc<AccountRuntime>>,
+    headers: HeaderMap,
+    Json(req): Json<ContinueRequest>,
+) -> Response {
+    if !origin_ok(&headers, &rt.base_url) {
+        return err(StatusCode::FORBIDDEN, "request refused");
+    }
+    let now = unix_secs();
+    let digest = session::token_hash(&req.token);
+    let Some(token) = rt.store.login_token_by_digest(&digest).await.ok().flatten() else {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "this link is invalid or has already been used",
+        );
+    };
+    if token.consumed_at.is_some() || token.revoked_at.is_some() || token.expires_at <= now {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "this link has expired or has already been used",
+        );
+    }
+    // Single-use: spend it before doing anything else, so a replay is refused.
+    if !rt
+        .store
+        .login_token_consume(token.id, now)
+        .await
+        .unwrap_or(false)
+    {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "this link has expired or has already been used",
+        );
+    }
+    if rt
+        .store
+        .account_record_login(token.account_id, now)
+        .await
+        .is_err()
+    {
+        return err(StatusCode::SERVICE_UNAVAILABLE, "temporarily unavailable");
+    }
+    let raw = match rt.sessions.create(token.account_id, now).await {
+        Ok(raw) => raw,
+        Err(_) => return err(StatusCode::SERVICE_UNAVAILABLE, "temporarily unavailable"),
+    };
+    let csrf = session::new_token();
+    let response = json_ok(json!({ "ok": true }));
     let response = with_cookie(response, rt.sessions.session_cookie(&raw));
     with_cookie(response, rt.sessions.csrf_cookie(&csrf))
 }
@@ -2030,7 +2102,7 @@ fn human_duration(secs: u64) -> String {
 /// A human, timezone-qualified instant for security copy (e.g.
 /// `2026-10-12 14:01 UTC`). The zone comes from the server, so the exact string
 /// is environment-dependent and must not be asserted literally in tests.
-fn human_timestamp(secs: i64) -> String {
+pub(crate) fn human_timestamp(secs: i64) -> String {
     let zoned = jiff::Timestamp::from_second(secs)
         .map(|ts| ts.to_zoned(jiff::tz::TimeZone::system()))
         .unwrap_or_else(|_| jiff::Zoned::now());

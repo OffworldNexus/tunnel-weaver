@@ -17,6 +17,7 @@ pub mod config;
 pub mod domain;
 pub mod email_identity;
 pub mod email_verification;
+pub mod login_token;
 pub mod machine;
 pub mod machine_key_log;
 pub mod password_credential;
