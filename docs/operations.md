@@ -255,9 +255,10 @@ account is still deleted on schedule, with no warning and no retry loop.
 
 At the threshold the account is removed through the very same
 `Store::delete_account` operation as the "delete my account" button — no second
-cascade path — after its live tunnels are closed and its sessions invalidated by
-the cascade. The sweep logs the number of warnings sent and accounts deleted per
-tick.
+cascade path. Its keys are captured, the store rows are removed (invalidating
+its sessions and, because the store is the routing authority, its hostnames and
+keys), and its live tunnels are then closed with `KeyRevoked`. The sweep logs
+the number of warnings sent and accounts deleted per tick.
 
 ## Schema
 

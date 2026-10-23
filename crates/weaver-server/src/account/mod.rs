@@ -25,7 +25,7 @@ use crate::store::{Store, StoreError};
 use crate::tunnel::TunnelRegistry;
 use password::Passwords;
 use session::Sessions;
-use weaver_mux::CloseCode;
+use weaver_mux::{CloseCode, KeyId};
 
 /// Shared state for the account plane, built once and mounted into the edge.
 #[derive(Clone)]
@@ -163,33 +163,44 @@ impl AccountRuntime {
         format!("{}/sign-in", self.base_url.trim_end_matches('/'))
     }
 
-    /// Deletes an account and everything it owns, closing every live tunnel
-    /// first so no machine outruns the delete.
+    /// Deletes an account and everything it owns, closing every live tunnel so
+    /// no machine outruns the delete.
     ///
     /// This is the **one** deletion path: the self-service `POST
     /// /api/account/delete` handler and the inactivity sweep both call it, so
-    /// the two cannot drift in what an account deletion guarantees — live
-    /// tunnels closed, then the store's atomic cascade (including session
-    /// invalidation).
+    /// the two cannot drift in what an account deletion guarantees.
+    ///
+    /// The keys are captured first, then the store is deleted, then the tunnels
+    /// are closed — in that order, deliberately. The cascade removes the rows
+    /// the lookup walks (`person` → `machine`), so they must be read before it;
+    /// and deleting first means that once it commits the relay can no longer
+    /// authenticate or route the machine, so a client that reconnects in the gap
+    /// cannot serve, while closing first would leave such a reconnected tunnel
+    /// alive. A connection that re-used one of the captured keys is closed
+    /// either way.
     pub async fn delete_account(
         &self,
         account_id: i32,
         tunnel: Option<&TunnelRegistry>,
     ) -> Result<(), StoreError> {
-        if let Some(registry) = tunnel
-            && let Some(person) = self
-                .store
-                .person_by_account(account_id)
-                .await
-                .ok()
-                .flatten()
-            && let Ok(machines) = self.store.list_machines(person.id).await
-        {
-            for key in machines.iter().filter_map(views::key_of) {
+        let keys: Vec<KeyId> = if tunnel.is_some() {
+            let machines = match self.store.person_by_account(account_id).await? {
+                Some(person) => self.store.list_machines(person.id).await?,
+                None => Vec::new(),
+            };
+            machines.iter().filter_map(views::key_of).collect()
+        } else {
+            Vec::new()
+        };
+
+        self.store.delete_account(account_id).await?;
+
+        if let Some(registry) = tunnel {
+            for key in keys {
                 registry.close_connection(&key, CloseCode::KeyRevoked);
             }
         }
-        self.store.delete_account(account_id).await
+        Ok(())
     }
 
     /// The absolute HTTPS URL of the signed-in account shell.

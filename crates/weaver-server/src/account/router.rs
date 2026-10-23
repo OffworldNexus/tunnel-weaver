@@ -748,9 +748,16 @@ async fn login(
     };
 
     // Record the sign-in: this is the inactivity clock the sweep reads (WVR-160).
-    // A failure here is logged, not fatal — the user is still signed in.
-    if let Err(err) = rt.store.account_record_login(account.id, now).await {
-        tracing::warn!(error = %err, "failed to record the last login");
+    // If it cannot be recorded the clock would drift and the account could be
+    // swept while it is in use, so the sign-in fails rather than issuing a
+    // session the sweep does not know about.
+    if rt
+        .store
+        .account_record_login(account.id, now)
+        .await
+        .is_err()
+    {
+        return err(StatusCode::SERVICE_UNAVAILABLE, "temporarily unavailable");
     }
 
     let raw = match rt.sessions.create(account.id, now).await {
