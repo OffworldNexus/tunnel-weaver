@@ -101,8 +101,9 @@ certificate is independent: its failure only affects the relay's own endpoint.
 - Alerting is systemd `sd_notify` status plus `WARN`/`ERROR` logs. Watch for
   `Wildcard certificate issuance failed` / `renewal failed` and the reported
   `retry_at`.
-- The background renewal loop runs every 12 h and renews when less than a third
-  of the lifetime remains. DNS-01 reuse of the local responder means renewal
+- The background renewal job runs at boot, then wakes at the exact second the
+  first certificate has less than a third of its lifetime left (or at the
+  failed order's `retry_at`), and renews it then. DNS-01 reuse of the local responder means renewal
   does not re-run `setup`.
 - On unrecoverable expiry, check `journalctl -u weaver-server` for the ACME
   error, confirm port 53 and delegation still hold, then force a re-order:
@@ -193,11 +194,82 @@ outlives the machine and person it describes. It is **write-only** as far as
 authentication goes: nothing that authorises a key reads it; `machine.key_id`
 is the only source of truth for who a key is.
 
-Retention is swept by the account sweep (every `account.sweep_interval_secs`):
+Retention is swept by the account sweep (at boot, then every UTC midnight):
 rows retired longer ago than `account.key_log_retention_days` (default **365**,
 minimum 1) are deleted, while the row of a machine's current key is never
 deleted however old it is. Set the retention to `0` and `Config::load` rejects
 the config.
+
+## Periodic jobs
+
+Every background job is a `Task` driven by one process-wide `Scheduler` built in
+`server::run` (ADR 0012); the startup log line `periodic scheduler running`
+lists them by name. A task is not "run every N seconds": its
+`next_tick(last_tick, now)` returns the exact Unix second it next has work
+(`last_tick` is `None` at boot, so a job can catch up first), and `run(tick)`
+does that work as of the scheduled `tick`, never a fresh clock reading. The
+drain awaits the scheduler, and its `shutdown` pass performs the metering
+task's final flush before the store closes.
+
+| Task | Wakes at | Config |
+|---|---|---|
+| `usage-metering` | each epoch-aligned multiple of `usage_flush_interval_secs` (by default, the instant a minute closes) | `usage_flush_interval_secs`, `usage_retention_secs` |
+| `abuse-bucket-sweep` | boot, then UTC midnight (only when abuse is enabled) | `abuse.bucket_ttl_secs` |
+| `altcha-proof-sweep` | boot, then UTC midnight | — |
+| `account-sweep` | boot, then UTC midnight | `account.key_log_retention_days` |
+| `inactivity-sweep` | boot, then the exact second the next account is due for its warning or deletion | `account.inactive_after_secs`, `account.inactivity_warning_before_secs` |
+| `cert-renewal` | boot, then the opening of the first renewal window or a failed order's retry | — |
+
+The garbage sweeps can wait for midnight because what they reclaim is already
+inert: every reader filters on expiry, and the ALTCHA proof cap only counts
+unexpired markers. The former `account.sweep_interval_secs` and
+`abuse.altcha.sweep_interval_secs` keys are gone; an existing config that still
+sets them loads and ignores them.
+
+Connections have their own scheduler for connection-local timers
+(`visitor-byte-report` every 5 s, `sse-heartbeat` every 15 s), driven from the
+connection's own `select!` rather than sleeping.
+
+## Abandoned accounts
+
+An account nobody uses is eventually deleted, so abandoned data does not
+accumulate forever. The **inactivity sweep** is not polled: it computes, from
+the store, the exact second the next account is due for its warning or its
+deletion, sleeps until then, and settles every account due at that tick
+(paging through them 100 at a time). It reads each account's last activity:
+
+- the last successful sign-in, `account.last_login_at` (falling back to
+  `activated_at` for an account that never signed in);
+- the newest day any of its services was metered (`usage_daily`, folded, or the
+  live day);
+- and two "active right now" signals that always win whatever the timestamps
+  say: a live browser session (`browser_session` unexpired and uninvalidated)
+  and a live tunnel for any of its machines.
+
+The last two matter because a tunnel can run for months without a console
+sign-in, so an account that looks stale on paper may in fact be serving traffic.
+
+Two knobs control the timeline. `account.inactivity_warning_before_secs`
+(default **2592000**, one month) is how long before deletion the warning is
+sent; `account.inactive_after_secs` (default **31536000**, twelve months) is
+when the account is deleted. Both must be positive and the warning must come
+first, or `Config::load` rejects the config. With the defaults an account is
+warned after eleven months of idleness and deleted at twelve.
+
+At the warning mark the relay sends **one** email to the account's own address,
+linking to the ordinary sign-in page; signing in there resets the clock. The
+send is recorded in `account.inactivity_warning_at`, so it is not repeated every
+tick, and a later sign-in or metered minute moves the clock past it so the next
+cycle can warn again. The warning is best-effort: with no mailer configured the
+account is still deleted on schedule, with no warning. A send that fails (or a
+deletion that fails) is retried an hour later.
+
+At the threshold the account is removed through the very same
+`Store::delete_account` operation as the "delete my account" button — no second
+cascade path. Its keys are captured, the store rows are removed (invalidating
+its sessions and, because the store is the routing authority, its hostnames and
+keys), and its live tunnels are then closed with `KeyRevoked`. The sweep logs
+the number of warnings sent, accounts deleted and failures per tick.
 
 ## Schema
 
@@ -209,6 +281,11 @@ database must be rebuilt, and its machines re-paired. (The live relay was
 rebuilt rather than migrated.) Deployment tooling that expected incrementally
 applied migrations should treat the relay database as disposable before this
 change lands.
+
+Later migrations add on top of that baseline rather than squashing again:
+`m0002_usage_daily` introduces the day-grain `usage_daily` rollup and the live
+`usage_live` slot arrays, and `m0003_inactivity` adds `account.last_login_at`
+and `account.inactivity_warning_at` for the inactivity sweep.
 
 ## The nightly
 

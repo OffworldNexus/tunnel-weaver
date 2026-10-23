@@ -234,9 +234,6 @@ pub struct AltchaConfig {
     /// Upper bound on live spent-proof rows before verification fails closed.
     #[serde(default = "default_altcha_proof_cap")]
     pub proof_cap: u64,
-    /// How often the spent-proof sweep runs, in seconds.
-    #[serde(default = "default_altcha_sweep_secs")]
-    pub sweep_interval_secs: u64,
     /// Override for the public base URL of the ALTCHA API.
     ///
     /// Defaults to `https://<tunnel domain>`. Set for non-standard deployments,
@@ -259,7 +256,6 @@ impl AltchaConfig {
             default_key_prefix: default_altcha_key_prefix(),
             default_ttl_secs: default_altcha_ttl_secs(),
             proof_cap: default_altcha_proof_cap(),
-            sweep_interval_secs: default_altcha_sweep_secs(),
             api_base_url: None,
         }
     }
@@ -308,9 +304,6 @@ pub struct AccountConfig {
     /// Base URL of the Have I Been Pwned k-anonymity range API.
     #[serde(default = "default_account_hibp_url")]
     pub hibp_url: String,
-    /// How often expired tokens and sessions are swept, in seconds.
-    #[serde(default = "default_account_sweep_interval_secs")]
-    pub sweep_interval_secs: u64,
     /// Per-network budget for starting a signup.
     #[serde(default = "default_account_signup_budget")]
     pub signup: BudgetConfig,
@@ -328,9 +321,9 @@ pub struct AccountConfig {
     pub pair: BudgetConfig,
     /// How long a retired machine key stays in the key log, in days.
     ///
-    /// The log is an audit trail only; the periodic sweep (on
-    /// `sweep_interval_secs`) drops rows retired longer ago than this. Rows of
-    /// keys still in use are never dropped.
+    /// The log is an audit trail only; the nightly account sweep drops rows
+    /// retired longer ago than this. Rows of keys still in use are never
+    /// dropped.
     #[serde(default = "default_account_key_log_retention_days")]
     pub key_log_retention_days: u64,
     /// Public support address shown in the app footer as a `mailto:` link.
@@ -345,6 +338,19 @@ pub struct AccountConfig {
     /// a local endpoint in tests.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
+    /// Inactivity threshold, in seconds: an account with no activity for longer
+    /// than this is deleted by the periodic sweep.
+    ///
+    /// Activity is the later of the last sign-in, the newest metered minute and
+    /// "is live right now" (a live session or tunnel always wins).
+    #[serde(default = "default_account_inactive_after_secs")]
+    pub inactive_after_secs: u64,
+    /// How long before deletion the inactivity warning is sent, in seconds.
+    ///
+    /// Must be smaller than `inactive_after_secs`; the gap is the window in
+    /// which the owner can sign in to save the account.
+    #[serde(default = "default_account_inactivity_warning_before_secs")]
+    pub inactivity_warning_before_secs: u64,
 }
 
 impl Default for AccountConfig {
@@ -361,7 +367,6 @@ impl Default for AccountConfig {
             session_ttl_secs: default_account_session_ttl_secs(),
             cookie_secure: true,
             hibp_url: default_account_hibp_url(),
-            sweep_interval_secs: default_account_sweep_interval_secs(),
             signup: default_account_signup_budget(),
             login: default_account_login_budget(),
             resend: default_account_resend_budget(),
@@ -369,6 +374,8 @@ impl Default for AccountConfig {
             key_log_retention_days: default_account_key_log_retention_days(),
             support_email: None,
             base_url: None,
+            inactive_after_secs: default_account_inactive_after_secs(),
+            inactivity_warning_before_secs: default_account_inactivity_warning_before_secs(),
         }
     }
 }
@@ -434,11 +441,6 @@ fn default_account_hibp_url() -> String {
     "https://api.pwnedpasswords.com/range".to_string()
 }
 
-/// Default account sweep interval: 1 hour.
-fn default_account_sweep_interval_secs() -> u64 {
-    3_600
-}
-
 /// Default signup budget: a 10-request burst refilling at 10 per 10 minutes.
 fn default_account_signup_budget() -> BudgetConfig {
     BudgetConfig {
@@ -481,6 +483,16 @@ fn default_account_pair_budget() -> BudgetConfig {
 /// Default key log retention: one year.
 fn default_account_key_log_retention_days() -> u64 {
     365
+}
+
+/// Default inactivity threshold: twelve months.
+fn default_account_inactive_after_secs() -> u64 {
+    365 * 86_400
+}
+
+/// Default warning lead time: one month before deletion.
+fn default_account_inactivity_warning_before_secs() -> u64 {
+    30 * 86_400
 }
 
 /// One token bucket's burst and refill.
@@ -565,11 +577,6 @@ fn default_altcha_proof_cap() -> u64 {
     100_000
 }
 
-/// Default spent-proof sweep interval, in seconds.
-fn default_altcha_sweep_secs() -> u64 {
-    60
-}
-
 /// Rejects an armed [`AbuseConfig`] whose buckets could never admit anything.
 ///
 /// A disabled block is never rejected; its numbers are not in play.
@@ -626,9 +633,6 @@ fn validate_abuse_config(abuse: &AbuseConfig) -> Vec<String> {
         }
         if altcha.proof_cap < 1 {
             issues.push("abuse.altcha.proof_cap must be >= 1".into());
-        }
-        if altcha.sweep_interval_secs < 1 {
-            issues.push("abuse.altcha.sweep_interval_secs must be >= 1".into());
         }
     }
     issues
@@ -696,12 +700,22 @@ fn validate_account_config(account: &AccountConfig) -> Vec<String> {
         ("completion_ttl_secs", account.completion_ttl_secs),
         ("reset_ttl_secs", account.reset_ttl_secs),
         ("session_ttl_secs", account.session_ttl_secs),
-        ("sweep_interval_secs", account.sweep_interval_secs),
         ("key_log_retention_days", account.key_log_retention_days),
+        ("inactive_after_secs", account.inactive_after_secs),
+        (
+            "inactivity_warning_before_secs",
+            account.inactivity_warning_before_secs,
+        ),
     ] {
         if value < 1 {
             issues.push(format!("account.{name} must be >= 1"));
         }
+    }
+    if account.inactivity_warning_before_secs >= account.inactive_after_secs {
+        issues.push(
+            "account.inactivity_warning_before_secs must be smaller than account.inactive_after_secs"
+                .into(),
+        );
     }
     for (name, budget) in [
         ("signup", &account.signup),
@@ -890,5 +904,41 @@ mod tests {
             ..AccountConfig::default()
         };
         assert_eq!(account.key_log_cutoff(1_000), 1_000 - i64::MAX);
+    }
+
+    #[test]
+    fn inactivity_defaults_are_a_year_and_a_month() {
+        let account = AccountConfig::default();
+        assert_eq!(account.inactive_after_secs, 365 * 86_400);
+        assert_eq!(account.inactivity_warning_before_secs, 30 * 86_400);
+        // Absent keys fall back to the same defaults, so an existing config
+        // predating WVR-160 still gets the sweep armed.
+        let absent: AccountConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(absent.inactive_after_secs, 365 * 86_400);
+        assert_eq!(absent.inactivity_warning_before_secs, 30 * 86_400);
+    }
+
+    #[test]
+    fn warning_must_be_positive_and_precede_deletion() {
+        let account = AccountConfig {
+            inactive_after_secs: 100,
+            inactivity_warning_before_secs: 100,
+            ..AccountConfig::default()
+        };
+        assert!(
+            validate_account_config(&account)
+                .iter()
+                .any(|issue| issue.contains("inactivity_warning_before_secs must be smaller"))
+        );
+
+        let zero = AccountConfig {
+            inactivity_warning_before_secs: 0,
+            ..AccountConfig::default()
+        };
+        assert!(
+            validate_account_config(&zero)
+                .iter()
+                .any(|issue| issue == "account.inactivity_warning_before_secs must be >= 1")
+        );
     }
 }

@@ -14,7 +14,6 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use tokio::sync::{Mutex, Semaphore, broadcast};
-use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 pub use acme::{
@@ -26,7 +25,7 @@ pub use clock::MockClock;
 pub use clock::{Clock, SystemClock, format_unix_timestamp};
 pub use managed::{ManagedCert, ManagedCerts, Validation};
 pub use providers::{PROVIDERS, find_provider, format_providers_table};
-pub use renewal::{compute_backoff, should_renew};
+pub use renewal::{compute_backoff, renewal_at, should_renew};
 pub use resolver::{CertResolver, parse_certified_key};
 pub use state::CertState;
 
@@ -65,7 +64,8 @@ use crate::store::{NewCertificate, Store};
 /// - Deduplication of concurrent waiters
 /// - Certificate state tracking (`Pending`, `Ordering`, `Issued`, `Failed`, `Renewing`)
 /// - Systemd status mirroring for the tunnel wildcard
-/// - Background renewal loop (every 12 hours) with exponential backoff on failure
+/// - Scheduled renewal, woken when the first certificate enters its renewal
+///   window, with exponential backoff on failure
 ///
 /// The tunnel wildcard covers every tunnel hostname, so a wildcard renewal
 /// swaps it in atomically and a failure near expiry takes every tunnel down
@@ -602,7 +602,11 @@ impl CertManager {
     /// wildcard (and admin certificate) so a tunnel can be served the moment it
     /// registers.
     pub async fn renew_eligible(self: &Arc<Self>) -> Vec<Result<String, String>> {
-        let now = self.clock.now_unix();
+        self.renew_eligible_at(self.clock.now_unix()).await
+    }
+
+    /// [`renew_eligible`](Self::renew_eligible), judging eligibility at `now`.
+    pub async fn renew_eligible_at(self: &Arc<Self>, now: i64) -> Vec<Result<String, String>> {
         let mut results = Vec::new();
 
         for spec in self.managed.all() {
@@ -664,30 +668,80 @@ impl CertManager {
         results
     }
 
-    /// Spawns the background renewal loop task running every 12 hours (+ jitter).
-    pub fn start_renewal_loop(self: &Arc<Self>, shutdown_token: CancellationToken) {
-        let manager = Arc::clone(self);
-        tokio::spawn(async move {
-            info!("Certificate renewal background loop started");
-            let mut interval = tokio::time::interval(Duration::from_secs(12 * 3600));
+    /// The instant the renewal job next has work: the earliest of each managed
+    /// certificate's renewal-window opening or, for one whose last order
+    /// failed, its backoff retry. `None` when no certificate is stored yet —
+    /// eager issuance owns that phase.
+    pub async fn next_renewal_at(&self) -> Option<i64> {
+        let mut earliest: Option<i64> = None;
+        for spec in self.managed.all() {
+            let at = match self.status(&spec.name) {
+                CertState::Failed { next_retry, .. } => Some(next_retry),
+                _ => match self.store.get_certificate(&spec.name).await {
+                    Ok(Some(cert)) => Some(renewal_at(cert.not_before, cert.not_after)),
+                    Ok(None) => None,
+                    Err(e) => {
+                        warn!(hostname = %spec.name, error = %e, "Failed to read certificate for scheduling");
+                        None
+                    }
+                },
+            };
+            earliest = match (earliest, at) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (a, b) => a.or(b),
+            };
+        }
+        earliest
+    }
 
-            loop {
-                tokio::select! {
-                    _ = shutdown_token.cancelled() => {
-                        info!("Certificate renewal loop received cancellation, shutting down");
-                        break;
-                    }
-                    _ = interval.tick() => {
-                        debug!("Executing scheduled certificate renewal tick");
-                        let _ = manager.renew_eligible().await;
-                    }
-                }
-            }
-        });
+    /// The renewal job, as a scheduler [`Task`](crate::scheduler::Task).
+    pub fn renewal_task(self: &Arc<Self>) -> Arc<dyn crate::scheduler::Task> {
+        Arc::new(CertRenewalTask {
+            manager: Arc::clone(self),
+        })
     }
 
     /// Returns a reference to the dynamic certificate resolver.
     pub fn resolver(&self) -> Arc<CertResolver> {
         Arc::clone(&self.resolver)
+    }
+}
+
+/// The certificate renewal job, as a scheduler [`Task`](crate::scheduler::Task).
+///
+/// Runs at boot to catch up, then wakes when the first certificate enters its
+/// renewal window ([`CertManager::next_renewal_at`]).
+pub struct CertRenewalTask {
+    manager: Arc<CertManager>,
+}
+
+/// How soon to look again when no stored certificate says when: shorter than
+/// the renewal lead of any CA lifetime in use (a six-day certificate still
+/// opens its window two days before expiry), so a certificate issued meanwhile
+/// is never picked up late.
+const UNKNOWN_RECHECK: i64 = crate::scheduler::DAY;
+
+#[async_trait::async_trait]
+impl crate::scheduler::Task for CertRenewalTask {
+    fn name(&self) -> &'static str {
+        "cert-renewal"
+    }
+
+    async fn next_tick(&self, last_tick: Option<i64>, now: i64) -> i64 {
+        if last_tick.is_none() {
+            return now;
+        }
+        match self.manager.next_renewal_at().await {
+            Some(at) if at > now => at,
+            // Overdue but not marked failed: an order is in flight elsewhere.
+            // Look again after the shortest backoff rather than spin.
+            Some(_) => now + compute_backoff(1, None).as_secs() as i64,
+            None => now + UNKNOWN_RECHECK,
+        }
+    }
+
+    async fn run(&self, tick: i64) {
+        debug!("Executing scheduled certificate renewal tick");
+        let _ = self.manager.renew_eligible_at(tick).await;
     }
 }

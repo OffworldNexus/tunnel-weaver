@@ -599,6 +599,102 @@ impl EmailTemplate for Welcome {
     }
 }
 
+// --- The inactivity warning template ------------------------------
+
+/// `inactivity-warning.mjml`: the "your account will be deleted" body.
+#[derive(Template)]
+#[template(path = "email/inactivity-warning.mjml", escape = "html", ext = "mjml")]
+struct InactivityWarningMjml<'a> {
+    heading: &'a str,
+    intro: &'a str,
+    signin_url: &'a str,
+    expiry: &'a str,
+}
+
+/// `inactivity-warning.txt`: the authored plain-text twin.
+#[derive(Template)]
+#[template(path = "email/inactivity-warning.txt", escape = "none", ext = "txt")]
+struct InactivityWarningTxt<'a> {
+    heading: &'a str,
+    intro: &'a str,
+    signin_url: &'a str,
+    expiry: &'a str,
+    support_url: &'a str,
+}
+
+/// English copy for the inactivity warning template.
+const INACTIVITY_WARNING_SUBJECT: &str = "Your Tunnel Weaver account will be deleted";
+const INACTIVITY_WARNING_PREVIEW: &str =
+    "Sign in within a month or your account and its data will be removed.";
+const INACTIVITY_WARNING_HEADING: &str = "Your account is about to be deleted";
+
+/// The inactivity warning, sent once when an account has gone unused for almost
+/// the whole threshold.
+///
+/// `delete_on` is a human, timezone-qualified date and `signin_url` is the
+/// ordinary sign-in page — signing in there is what resets the clock. Both are
+/// supplied by the caller so the copy always matches the configured timeline
+/// rather than restating it.
+#[derive(Debug, Clone)]
+pub struct InactivityWarning {
+    /// Absolute HTTPS link to the sign-in page; signing in resets the clock.
+    pub signin_url: String,
+    /// Human, timezone-qualified deletion date.
+    pub delete_on: String,
+}
+
+impl InactivityWarning {
+    /// Stable template id.
+    pub const ID: &'static str = "inactivity-warning";
+}
+
+impl EmailTemplate for InactivityWarning {
+    fn id(&self) -> &'static str {
+        Self::ID
+    }
+
+    fn render(&self, env: &TemplateEnv) -> Result<Rendered, RenderError> {
+        if !crate::email::is_trusted_https(&self.signin_url) {
+            return Err(RenderError::UntrustedUrl(self.signin_url.clone()));
+        }
+        let intro = format!(
+            "Your Tunnel Weaver account has not been used for a long time. It will be deleted on {} unless you sign in. Signing in takes a moment and keeps everything as it is.",
+            self.delete_on
+        );
+        let expiry = "If you do nothing, the account and all of its data will be permanently removed on that date.";
+        let mjml_source = InactivityWarningMjml {
+            heading: INACTIVITY_WARNING_HEADING,
+            intro: &intro,
+            signin_url: &self.signin_url,
+            expiry,
+        }
+        .render()
+        .map_err(|e| RenderError::Template(e.to_string()))?;
+        let html = render_base(
+            INACTIVITY_WARNING_SUBJECT,
+            INACTIVITY_WARNING_PREVIEW,
+            &mjml_source,
+            &env.support_url,
+        )?;
+
+        let text = InactivityWarningTxt {
+            heading: INACTIVITY_WARNING_HEADING,
+            intro: &intro,
+            signin_url: &self.signin_url,
+            expiry,
+            support_url: &env.support_url,
+        }
+        .render()
+        .map_err(|e| RenderError::Template(e.to_string()))?;
+
+        Ok(Rendered {
+            subject: INACTIVITY_WARNING_SUBJECT.to_string(),
+            text,
+            html,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -721,6 +817,38 @@ mod tests {
         let err = PasswordChanged {
             event_time: "2026-10-12 14:01 UTC".into(),
             recovery_url: "http://relay.example.org/forgot-password".into(),
+        }
+        .render(&env())
+        .unwrap_err();
+        assert!(matches!(err, RenderError::UntrustedUrl(_)));
+    }
+
+    #[test]
+    fn inactivity_warning_carries_the_date_and_link_in_both_parts() {
+        let rendered = InactivityWarning {
+            signin_url: "https://relay.example.org/sign-in".into(),
+            delete_on: "2027-10-23 12:00 UTC".into(),
+        }
+        .render(&env())
+        .unwrap();
+        assert!(rendered.html.contains("2027-10-23 12:00 UTC"));
+        assert!(rendered.html.contains("https://relay.example.org/sign-in"));
+        assert!(rendered.text.contains("2027-10-23 12:00 UTC"));
+        assert!(rendered.text.contains("https://relay.example.org/sign-in"));
+        // Shared partials resolved; the footer's support link is present.
+        assert!(rendered.html.contains("TUNNEL WEAVER"));
+        assert!(rendered.html.contains("https://relay.example.org/support"));
+        assert!(rendered.html.contains("<html"));
+        assert!(!rendered.html.contains("mj-include"));
+        assert!(!rendered.text.contains('<'));
+        assert_eq!(rendered.subject, INACTIVITY_WARNING_SUBJECT);
+    }
+
+    #[test]
+    fn inactivity_warning_rejects_an_untrusted_link() {
+        let err = InactivityWarning {
+            signin_url: "http://relay.example.org/sign-in".into(),
+            delete_on: "2027-10-23 12:00 UTC".into(),
         }
         .render(&env())
         .unwrap_err();

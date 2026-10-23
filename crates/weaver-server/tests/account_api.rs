@@ -18,6 +18,7 @@ use tower::ServiceExt as _;
 
 use weaver_abuse::altcha::{Challenge, Payload, solve_challenge};
 use weaver_server::account::AccountRuntime;
+use weaver_server::account::inactivity;
 use weaver_server::account::password::BreachCheck;
 use weaver_server::account::router::router;
 use weaver_server::altcha::AltchaRuntime;
@@ -68,6 +69,16 @@ async fn setup() -> Fixture {
 /// Builds a fixture with the standard test config, letting `adjust` tweak the
 /// account policy (e.g. to disable the resend cooldown in a reset test).
 async fn setup_with(adjust: impl FnOnce(&mut AccountConfig)) -> Fixture {
+    setup_full(adjust, true).await
+}
+
+/// Like [`setup_with`], but with no mailer: the inactivity warning is skipped
+/// while deletion still proceeds.
+async fn setup_without_mailer(adjust: impl FnOnce(&mut AccountConfig)) -> Fixture {
+    setup_full(adjust, false).await
+}
+
+async fn setup_full(adjust: impl FnOnce(&mut AccountConfig), with_mailer: bool) -> Fixture {
     let dir = tempfile::tempdir().unwrap().keep();
     let store = Store::open(dir.join("account.db")).await.unwrap();
 
@@ -76,16 +87,18 @@ async fn setup_with(adjust: impl FnOnce(&mut AccountConfig)) -> Fixture {
     altcha.ensure_demo_client().await.unwrap();
 
     let sent = Arc::new(Mutex::new(Vec::new()));
-    let mailer: Arc<dyn Mailer> = Arc::new(Capture {
-        identity: MailerIdentity::new(
-            "stub",
-            "Stub",
-            Mailbox::new("no-reply@admin.test"),
-            "https://admin.test",
-            vec![],
-        )
-        .unwrap(),
-        sent: Arc::clone(&sent),
+    let mailer: Option<Arc<dyn Mailer>> = with_mailer.then(|| {
+        Arc::new(Capture {
+            identity: MailerIdentity::new(
+                "stub",
+                "Stub",
+                Mailbox::new("no-reply@admin.test"),
+                "https://admin.test",
+                vec![],
+            )
+            .unwrap(),
+            sent: Arc::clone(&sent),
+        }) as Arc<dyn Mailer>
     });
 
     let mut account_config = AccountConfig {
@@ -110,7 +123,7 @@ async fn setup_with(adjust: impl FnOnce(&mut AccountConfig)) -> Fixture {
         "admin.test",
         store.clone(),
         altcha,
-        Some(mailer),
+        mailer,
         weaver_server::live::LiveHub::new(),
         Arc::new(NoBreach),
     )
@@ -2612,4 +2625,265 @@ async fn disconnecting_an_offline_machine_is_a_no_op() {
         reply.body["disconnected"], false,
         "there is no live connection to drop"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Inactivity sweep (WVR-160).
+// ---------------------------------------------------------------------------
+
+/// A fixture tuned to a tiny inactivity timeline: warn at 500 s idle, delete at
+/// 1000 s. Real sign-ups activate "now", so a sweep time a little in the future
+/// keeps the account past its activation while staying in the same second-scale.
+async fn inactivity_fixture() -> Fixture {
+    setup_with(|cfg| {
+        cfg.inactive_after_secs = 1000;
+        cfg.inactivity_warning_before_secs = 500;
+    })
+    .await
+}
+
+/// The account id behind a registered address.
+async fn account_id_for(fixture: &Fixture, email: &str) -> i32 {
+    fixture
+        .account
+        .store
+        .email_identity_find(email)
+        .await
+        .unwrap()
+        .expect("the address has an account")
+        .account_id
+}
+
+#[tokio::test]
+async fn inactivity_sweep_warns_once_then_deletes() {
+    let fixture = inactivity_fixture().await;
+    register(
+        &fixture,
+        "Idle",
+        "idle@example.com",
+        "correct horse battery",
+    )
+    .await;
+    let account_id = account_id_for(&fixture, "idle@example.com").await;
+
+    // Idle 800 s: inside the warning window, not yet due for deletion, and far
+    // enough past activation to be a candidate.
+    let now = weaver_server::wall_clock::unix_secs() + 2000;
+    fixture
+        .account
+        .store
+        .account_record_login(account_id, now - 800)
+        .await
+        .unwrap();
+    let before = fixture.sent.lock().unwrap().len();
+
+    let report = inactivity::run(&fixture.account, None, now).await.unwrap();
+    assert_eq!(report.warned, 1);
+    assert_eq!(report.deleted, 0);
+    assert_eq!(
+        fixture.sent.lock().unwrap().len(),
+        before + 1,
+        "exactly one warning email"
+    );
+    let warned = fixture
+        .account
+        .store
+        .account_by_id(account_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(warned.inactivity_warning_at, Some(now));
+
+    // A second tick sends nothing: the warning is recorded.
+    let report = inactivity::run(&fixture.account, None, now + 10)
+        .await
+        .unwrap();
+    assert_eq!(report.warned, 0);
+    assert_eq!(report.deleted, 0);
+    assert_eq!(fixture.sent.lock().unwrap().len(), before + 1);
+
+    // Past the threshold the account is deleted through the shared path.
+    let report = inactivity::run(&fixture.account, None, now + 300)
+        .await
+        .unwrap();
+    assert_eq!(report.deleted, 1);
+    assert!(
+        fixture
+            .account
+            .store
+            .account_by_id(account_id)
+            .await
+            .unwrap()
+            .is_none(),
+        "the account is gone"
+    );
+}
+
+/// The sweep's own schedule: `next_event` names the exact second of the
+/// warning (the lead time *before* deletion, not after activity) and then of
+/// the deletion, and a run at each of those ticks does exactly that step.
+#[tokio::test]
+async fn inactivity_sweep_wakes_exactly_at_the_warning_then_the_deletion() {
+    let fixture = setup_with(|cfg| {
+        cfg.inactive_after_secs = 1000;
+        cfg.inactivity_warning_before_secs = 200;
+    })
+    .await;
+    register(
+        &fixture,
+        "Timed",
+        "timed@example.com",
+        "correct horse battery",
+    )
+    .await;
+    let account_id = account_id_for(&fixture, "timed@example.com").await;
+    let now = weaver_server::wall_clock::unix_secs() + 2000;
+    let last_seen = now - 600;
+    fixture
+        .account
+        .store
+        .account_record_login(account_id, last_seen)
+        .await
+        .unwrap();
+
+    // Idle 600 s of a 1000 s life with a 200 s lead: too early to warn.
+    let report = inactivity::run(&fixture.account, None, now).await.unwrap();
+    assert_eq!(report, inactivity::SweepReport::default());
+
+    let warn_at = inactivity::next_event(&fixture.account, now, now)
+        .await
+        .unwrap();
+    assert_eq!(warn_at, last_seen + 800);
+    let report = inactivity::run(&fixture.account, None, warn_at)
+        .await
+        .unwrap();
+    assert_eq!(report.warned, 1);
+
+    let delete_at = inactivity::next_event(&fixture.account, warn_at, warn_at)
+        .await
+        .unwrap();
+    assert_eq!(delete_at, last_seen + 1000);
+    let report = inactivity::run(&fixture.account, None, delete_at)
+        .await
+        .unwrap();
+    assert_eq!(report.deleted, 1);
+}
+
+#[tokio::test]
+async fn inactivity_sweep_signs_in_after_a_warning_and_spares_the_account() {
+    let fixture = inactivity_fixture().await;
+    register(
+        &fixture,
+        "Saved",
+        "saved@example.com",
+        "correct horse battery",
+    )
+    .await;
+    let account_id = account_id_for(&fixture, "saved@example.com").await;
+
+    let now = weaver_server::wall_clock::unix_secs() + 2000;
+    fixture
+        .account
+        .store
+        .account_record_login(account_id, now - 800)
+        .await
+        .unwrap();
+    assert_eq!(
+        inactivity::run(&fixture.account, None, now)
+            .await
+            .unwrap()
+            .warned,
+        1
+    );
+
+    // The owner signs in after the warning: the clock moves past it, so the
+    // account is neither warned again nor deleted.
+    let signed_in = now - 100;
+    fixture
+        .account
+        .store
+        .account_record_login(account_id, signed_in)
+        .await
+        .unwrap();
+    let report = inactivity::run(&fixture.account, None, now + 300)
+        .await
+        .unwrap();
+    assert_eq!(report.warned, 0);
+    assert_eq!(report.deleted, 0);
+    assert!(
+        fixture
+            .account
+            .store
+            .account_by_id(account_id)
+            .await
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[tokio::test]
+async fn inactivity_sweep_skips_an_account_with_a_live_session() {
+    let fixture = inactivity_fixture().await;
+    register(
+        &fixture,
+        "Online",
+        "online@example.com",
+        "correct horse battery",
+    )
+    .await;
+    let account_id = account_id_for(&fixture, "online@example.com").await;
+    // Sign in for real: the session outlives the sweep window below.
+    sign_in(&fixture, "online@example.com", "correct horse battery").await;
+
+    // Its sign-in is stale on paper, but the live session must win.
+    let now = weaver_server::wall_clock::unix_secs() + 2000;
+    fixture
+        .account
+        .store
+        .account_record_login(account_id, now - 5000)
+        .await
+        .unwrap();
+
+    let report = inactivity::run(&fixture.account, None, now).await.unwrap();
+    assert_eq!(report.warned, 0, "a live session is never warned");
+    assert_eq!(report.deleted, 0, "a live session is never deleted");
+    assert!(
+        fixture
+            .account
+            .store
+            .account_by_id(account_id)
+            .await
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[tokio::test]
+async fn inactivity_sweep_deletes_without_a_mailer() {
+    let fixture = setup_without_mailer(|cfg| {
+        cfg.inactive_after_secs = 1000;
+        cfg.inactivity_warning_before_secs = 500;
+    })
+    .await;
+    // No mailer means the signup flow cannot verify an address, so the account
+    // is created directly. Deletion needs no email identity.
+    let store = fixture.account.store.clone();
+    let account = store.create_account_without_login("Nomail").await.unwrap();
+
+    // The warning is skipped, but deletion still happens on schedule.
+    let now = weaver_server::wall_clock::unix_secs() + 2000;
+    store
+        .account_record_login(account.id, now - 800)
+        .await
+        .unwrap();
+    let report = inactivity::run(&fixture.account, None, now).await.unwrap();
+    assert_eq!(report.warned, 0);
+    assert_eq!(report.deleted, 0);
+    assert!(fixture.sent.lock().unwrap().is_empty(), "no email was sent");
+
+    let report = inactivity::run(&fixture.account, None, now + 300)
+        .await
+        .unwrap();
+    assert_eq!(report.deleted, 1);
+    assert!(store.account_by_id(account.id).await.unwrap().is_none());
 }

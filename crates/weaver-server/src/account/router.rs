@@ -747,6 +747,19 @@ async fn login(
         return err(StatusCode::UNAUTHORIZED, "invalid email or password");
     };
 
+    // Record the sign-in: this is the inactivity clock the sweep reads (WVR-160).
+    // If it cannot be recorded the clock would drift and the account could be
+    // swept while it is in use, so the sign-in fails rather than issuing a
+    // session the sweep does not know about.
+    if rt
+        .store
+        .account_record_login(account.id, now)
+        .await
+        .is_err()
+    {
+        return err(StatusCode::SERVICE_UNAVAILABLE, "temporarily unavailable");
+    }
+
     let raw = match rt.sessions.create(account.id, now).await {
         Ok(raw) => raw,
         Err(_) => return err(StatusCode::SERVICE_UNAVAILABLE, "temporarily unavailable"),
@@ -909,19 +922,9 @@ async fn delete_account(
         return err(StatusCode::FORBIDDEN, "request refused");
     }
 
-    // Close every live tunnel first, so none survives the rows to reconnect.
-    if let Some(registry) = tunnel.as_deref()
-        && let Some(person) = person_of(&rt, account.id).await
-        && let Ok(machines) = rt.store.list_machines(person.id).await
-    {
-        for machine in machines {
-            if let Some(key) = key_of(&machine) {
-                registry.close_connection(&key, CloseCode::KeyRevoked);
-            }
-        }
-    }
-
-    match rt.store.delete_account(account.id).await {
+    // The one shared deletion path closes every live tunnel first, so none
+    // survives the rows to reconnect, then removes the account and all it owns.
+    match rt.delete_account(account.id, tunnel.as_deref()).await {
         Ok(()) => with_cookie(
             with_cookie(
                 json_ok(json!({ "ok": true })),
@@ -2030,7 +2033,7 @@ fn human_duration(secs: u64) -> String {
 /// A human, timezone-qualified instant for security copy (e.g.
 /// `2026-10-12 14:01 UTC`). The zone comes from the server, so the exact string
 /// is environment-dependent and must not be asserted literally in tests.
-fn human_timestamp(secs: i64) -> String {
+pub(crate) fn human_timestamp(secs: i64) -> String {
     let zoned = jiff::Timestamp::from_second(secs)
         .map(|ts| ts.to_zoned(jiff::tz::TimeZone::system()))
         .unwrap_or_else(|_| jiff::Zoned::now());

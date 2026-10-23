@@ -661,6 +661,31 @@ fn report_conn_bytes(bytes: &ConnBytes, config: &HttpsEdgeConfig) {
     }
 }
 
+/// The per-connection byte-report timer, as a scheduler
+/// [`Task`](crate::scheduler::Task).
+///
+/// A visitor connection owns one of these; its 5 s tick samples the socket
+/// counters into metering. The connection's `select!` drives it via
+/// [`Scheduler::run_due`](crate::scheduler::Scheduler::run_due), so the timer
+/// never owns the I/O loop.
+struct VisitorReportTask {
+    bytes: Arc<ConnBytes>,
+    config: Arc<HttpsEdgeConfig>,
+}
+
+#[async_trait::async_trait]
+impl crate::scheduler::Task for VisitorReportTask {
+    fn name(&self) -> &'static str {
+        "visitor-byte-report"
+    }
+    async fn next_tick(&self, last_tick: Option<i64>, now: i64) -> i64 {
+        (last_tick.unwrap_or(now) + VISITOR_REPORT_INTERVAL.as_secs() as i64).max(now)
+    }
+    async fn run(&self, _tick: i64) {
+        report_conn_bytes(&self.bytes, &self.config);
+    }
+}
+
 /// Welcome/health/404 surface shared by the tunnel apex and the admin host.
 fn static_host_response(
     req: &Request<hyper::body::Incoming>,
@@ -819,9 +844,17 @@ pub async fn run_https_server_full(
                     let conn = auto.serve_connection_with_upgrades(io, service);
                     tokio::pin!(conn);
 
-                    let mut report_tick = tokio::time::interval(VISITOR_REPORT_INTERVAL);
-                    report_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                    // The connection's own scheduler: a single 5 s byte-report
+                    // timer, driven here rather than owning a loop of its own.
+                    let mut timers = crate::scheduler::Scheduler::new(vec![Arc::new(
+                        VisitorReportTask {
+                            bytes: Arc::clone(&bytes),
+                            config: Arc::clone(&report_config),
+                        },
+                    ) as Arc<dyn crate::scheduler::Task>])
+                    .await;
                     loop {
+                        let wait = timers.next_wait().unwrap_or(VISITOR_REPORT_INTERVAL);
                         tokio::select! {
                             res = conn.as_mut() => {
                                 if let Err(err) = res {
@@ -829,8 +862,8 @@ pub async fn run_https_server_full(
                                 }
                                 break;
                             }
-                            _ = report_tick.tick() => {
-                                report_conn_bytes(&bytes, &report_config);
+                            _ = tokio::time::sleep(wait) => {
+                                timers.run_due().await;
                             }
                             _ = conn_token.cancelled() => {
                                 conn.as_mut().graceful_shutdown();

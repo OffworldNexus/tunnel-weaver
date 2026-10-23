@@ -12,12 +12,16 @@
 
 use sea_orm::sea_query::{Expr, OnConflict};
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, QueryOrder, Set, TransactionTrait,
+    ActiveModelTrait, ColumnTrait, Condition, EntityTrait, QueryFilter, QueryOrder, QuerySelect,
+    Set, TransactionTrait,
 };
 
+use std::collections::{HashMap, HashSet};
+
 use super::entity::{
-    account, browser_session, domain, email_identity, email_verification, machine_key_log,
-    password_credential, password_reset_token, pending_registration, person, verification_token,
+    account, browser_session, domain, email_identity, email_verification, machine, machine_key_log,
+    password_credential, password_reset_token, pending_registration, person, service, usage_daily,
+    usage_live, verification_token,
 };
 use super::{Store, StoreError};
 
@@ -359,6 +363,39 @@ impl Store {
     /// Fetches an account by its stable id.
     pub async fn account_by_id(&self, id: i32) -> Result<Option<account::Model>, StoreError> {
         Ok(account::Entity::find_by_id(id).one(&self.db).await?)
+    }
+
+    /// Records a successful sign-in for `account_id` at `now` (Unix seconds).
+    ///
+    /// This is the inactivity clock: both the password login and the warning
+    /// link's sign-in call it, so any way in resets the clock. The historical
+    /// `inactivity_warning_at` is deliberately left in place — it is the record
+    /// that a warning went out, and the sweep compares it against the (now more
+    /// recent) sign-in to know the cycle restarted.
+    pub async fn account_record_login(&self, account_id: i32, now: i64) -> Result<(), StoreError> {
+        account::Entity::update_many()
+            .col_expr(account::Column::LastLoginAt, Expr::value(Some(now)))
+            .filter(account::Column::Id.eq(account_id))
+            .exec(&self.db)
+            .await?;
+        Ok(())
+    }
+
+    /// Records that the inactivity warning was emailed to `account_id` at `now`.
+    ///
+    /// Written only after a successful send, so a failed or absent mailer leaves
+    /// the column unset and the next tick may try again.
+    pub async fn account_mark_inactivity_warning(
+        &self,
+        account_id: i32,
+        now: i64,
+    ) -> Result<(), StoreError> {
+        account::Entity::update_many()
+            .col_expr(account::Column::InactivityWarningAt, Expr::value(Some(now)))
+            .filter(account::Column::Id.eq(account_id))
+            .exec(&self.db)
+            .await?;
+        Ok(())
     }
 
     /// Hard-deletes an account and everything it owns, atomically.
@@ -742,6 +779,276 @@ impl Store {
             .await?;
         Ok(result.rows_affected)
     }
+
+    // ----- inactivity sweep -----
+
+    /// Accounts whose sign-in is at least `threshold_secs` old at `now`, by id,
+    /// starting after `after_id` and bounded to `limit` — one page of the
+    /// inactivity sweep.
+    ///
+    /// "Activity" is the later of the last sign-in (or, for an account that has
+    /// never signed in, its activation) and the newest day any of its services
+    /// was metered — folding `usage_daily` and the live day together. A day
+    /// counts at its UTC midnight, which is deliberately a hair conservative:
+    /// the threshold is measured in months, so sub-day precision would only ever
+    /// delay the sweep. The sign-in prefilter is exact because usage can only
+    /// make an account *more* recent.
+    ///
+    /// Accounts with a live browser session are flagged, not filtered here, so
+    /// the caller can still count them.
+    pub async fn inactivity_candidates(
+        &self,
+        now: i64,
+        threshold_secs: i64,
+        after_id: i32,
+        limit: u64,
+    ) -> Result<Vec<InactivityCandidate>, StoreError> {
+        let cutoff = now.saturating_sub(threshold_secs);
+        let accounts = account::Entity::find()
+            .filter(account::Column::Id.gt(after_id))
+            .filter(account::Column::ActivatedAt.lte(cutoff))
+            .filter(
+                Condition::any()
+                    .add(account::Column::LastLoginAt.is_null())
+                    .add(account::Column::LastLoginAt.lte(cutoff)),
+            )
+            .order_by_asc(account::Column::Id)
+            .limit(limit)
+            .all(&self.db)
+            .await?;
+        if accounts.is_empty() {
+            return Ok(Vec::new());
+        }
+        let account_ids: Vec<i32> = accounts.iter().map(|a| a.id).collect();
+
+        let newest_usage = self.newest_usage_day_by_account(Some(&account_ids)).await?;
+        let live_sessions: HashSet<i32> = browser_session::Entity::find()
+            .filter(browser_session::Column::AccountId.is_in(account_ids.clone()))
+            .filter(browser_session::Column::InvalidatedAt.is_null())
+            .filter(browser_session::Column::ExpiresAt.gt(now))
+            .select_only()
+            .column(browser_session::Column::AccountId)
+            .into_tuple::<i32>()
+            .all(&self.db)
+            .await?
+            .into_iter()
+            .collect();
+        let emails: HashMap<i32, String> = email_identity::Entity::find()
+            .filter(email_identity::Column::AccountId.is_in(account_ids))
+            .all(&self.db)
+            .await?
+            .into_iter()
+            .map(|identity| (identity.account_id, identity.email))
+            .collect();
+
+        Ok(accounts
+            .into_iter()
+            .map(|account| {
+                let last_activity = activity_of(
+                    account.last_login_at.unwrap_or(account.activated_at),
+                    newest_usage.get(&account.id).copied(),
+                );
+                InactivityCandidate {
+                    account_id: account.id,
+                    name: account.name,
+                    email: emails.get(&account.id).cloned().unwrap_or_default(),
+                    last_activity,
+                    warning_at: account.inactivity_warning_at,
+                    has_live_session: live_sessions.contains(&account.id),
+                }
+            })
+            .collect())
+    }
+
+    /// The earliest inactivity event strictly after `after` (Unix seconds), or
+    /// `None` when no account has one pending.
+    ///
+    /// An account's events are its warning, at `activity + warn_after` unless
+    /// already sent for this stretch of idleness, and its deletion, at
+    /// `activity + delete_after`. Events at or before `after` belong to a tick
+    /// that already ran.
+    pub async fn inactivity_next_event(
+        &self,
+        after: i64,
+        warn_after: i64,
+        delete_after: i64,
+    ) -> Result<Option<i64>, StoreError> {
+        let accounts: Vec<(i32, i64, Option<i64>, Option<i64>)> = account::Entity::find()
+            .select_only()
+            .column(account::Column::Id)
+            .column(account::Column::ActivatedAt)
+            .column(account::Column::LastLoginAt)
+            .column(account::Column::InactivityWarningAt)
+            .into_tuple()
+            .all(&self.db)
+            .await?;
+        if accounts.is_empty() {
+            return Ok(None);
+        }
+        let newest_usage = self.newest_usage_day_by_account(None).await?;
+
+        Ok(accounts
+            .into_iter()
+            .flat_map(|(id, activated_at, last_login_at, warning_at)| {
+                let activity = activity_of(
+                    last_login_at.unwrap_or(activated_at),
+                    newest_usage.get(&id).copied(),
+                );
+                let warned = warning_at.is_some_and(|warned| warned >= activity);
+                let warning = (!warned).then(|| activity.saturating_add(warn_after));
+                let deletion = activity.saturating_add(delete_after);
+                warning.into_iter().chain([deletion])
+            })
+            .filter(|&at| at > after)
+            .min())
+    }
+
+    /// The newest metered day per account, across `usage_daily` and the live
+    /// day, for the accounts named in `account_ids` (every account on `None`).
+    ///
+    /// Walks `account → person → machine → service` in a handful of queries
+    /// rather than one join per account, and lets the database reduce usage to
+    /// one `MAX(day)` per service.
+    async fn newest_usage_day_by_account(
+        &self,
+        account_ids: Option<&[i32]>,
+    ) -> Result<HashMap<i32, i64>, StoreError> {
+        let mut people = person::Entity::find();
+        if let Some(account_ids) = account_ids {
+            people = people.filter(person::Column::AccountId.is_in(account_ids.to_vec()));
+        }
+        let person_to_account: HashMap<i32, i32> = people
+            .select_only()
+            .column(person::Column::Id)
+            .column(person::Column::AccountId)
+            .into_tuple::<(i32, i32)>()
+            .all(&self.db)
+            .await?
+            .into_iter()
+            .collect();
+        if person_to_account.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let mut machines = machine::Entity::find();
+        if account_ids.is_some() {
+            machines = machines.filter(
+                machine::Column::PersonId
+                    .is_in(person_to_account.keys().copied().collect::<Vec<_>>()),
+            );
+        }
+        let machine_to_account: HashMap<i32, i32> = machines
+            .select_only()
+            .column(machine::Column::Id)
+            .column(machine::Column::PersonId)
+            .into_tuple::<(i32, i32)>()
+            .all(&self.db)
+            .await?
+            .into_iter()
+            .filter_map(|(machine, person)| {
+                person_to_account
+                    .get(&person)
+                    .map(|account| (machine, *account))
+            })
+            .collect();
+        if machine_to_account.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let mut services = service::Entity::find();
+        if account_ids.is_some() {
+            services = services.filter(
+                service::Column::MachineId
+                    .is_in(machine_to_account.keys().copied().collect::<Vec<_>>()),
+            );
+        }
+        let service_to_account: HashMap<i32, i32> = services
+            .select_only()
+            .column(service::Column::Id)
+            .column(service::Column::MachineId)
+            .into_tuple::<(i32, i32)>()
+            .all(&self.db)
+            .await?
+            .into_iter()
+            .filter_map(|(service, machine)| {
+                machine_to_account
+                    .get(&machine)
+                    .map(|account| (service, *account))
+            })
+            .collect();
+        if service_to_account.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let service_ids: Option<Vec<i32>> =
+            account_ids.map(|_| service_to_account.keys().copied().collect());
+        let mut newest: HashMap<i32, i64> = HashMap::new();
+        for (service_id, day) in self.newest_day_by_service(service_ids.as_deref()).await? {
+            if let Some(account_id) = service_to_account.get(&service_id) {
+                newest
+                    .entry(*account_id)
+                    .and_modify(|current| *current = (*current).max(day))
+                    .or_insert(day);
+            }
+        }
+        Ok(newest)
+    }
+
+    /// The newest metered day per service, folded or live, for `service_ids`
+    /// (every service on `None`).
+    async fn newest_day_by_service(
+        &self,
+        service_ids: Option<&[i32]>,
+    ) -> Result<Vec<(i32, i64)>, StoreError> {
+        let mut folded = usage_daily::Entity::find();
+        let mut live = usage_live::Entity::find();
+        if let Some(service_ids) = service_ids {
+            folded = folded.filter(usage_daily::Column::ServiceId.is_in(service_ids.to_vec()));
+            live = live.filter(usage_live::Column::ServiceId.is_in(service_ids.to_vec()));
+        }
+        let mut days: Vec<(i32, i64)> = folded
+            .select_only()
+            .column(usage_daily::Column::ServiceId)
+            .column_as(usage_daily::Column::Day.max(), "day")
+            .group_by(usage_daily::Column::ServiceId)
+            .into_tuple::<(i32, i64)>()
+            .all(&self.db)
+            .await?;
+        days.extend(
+            live.select_only()
+                .column(usage_live::Column::ServiceId)
+                .column_as(usage_live::Column::Day.max(), "day")
+                .group_by(usage_live::Column::ServiceId)
+                .into_tuple::<(i32, i64)>()
+                .all(&self.db)
+                .await?,
+        );
+        Ok(days)
+    }
+}
+
+/// An account's last activity: its sign-in (or activation) or, when later, the
+/// UTC midnight of its newest metered day.
+fn activity_of(sign_in: i64, newest_day: Option<i64>) -> i64 {
+    newest_day.map_or(sign_in, |day| sign_in.max(day.saturating_mul(86_400)))
+}
+
+/// One account the inactivity sweep should consider (WVR-160).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InactivityCandidate {
+    pub account_id: i32,
+    /// Display name, for logs and the email's greeting.
+    pub name: String,
+    /// The account's verified address, empty when it has none.
+    pub email: String,
+    /// Unix seconds of last activity: the later of the last sign-in (or
+    /// activation) and the newest metered day.
+    pub last_activity: i64,
+    /// When the inactivity warning was last sent, if ever.
+    pub warning_at: Option<i64>,
+    /// Whether a live (unexpired, uninvalidated) browser session exists. A live
+    /// session means "active right now" and must never be swept.
+    pub has_live_session: bool,
 }
 
 /// Marks a pending registration complete inside a caller's transaction.

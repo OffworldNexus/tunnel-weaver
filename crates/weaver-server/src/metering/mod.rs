@@ -47,7 +47,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 #[cfg(test)]
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -68,9 +68,6 @@ const MINUTE_MS: i64 = 60_000;
 /// Minutes in a metering day. A slot run never crosses one, because a day is a
 /// separate row of the array.
 const MINUTES_PER_DAY: i64 = 24 * 60;
-
-/// How often the manager accrues open time and checks for a flush.
-const TICK: Duration = Duration::from_secs(1);
 
 /// Counters accumulated for one `(service_id, minute)` bucket.
 #[derive(Debug, Clone, Copy, Default)]
@@ -405,15 +402,24 @@ impl MeteringManager {
         }
     }
 
-    /// Spawns the flush job, returning its handle.
+    /// Spawns the flush job as a scheduler task, returning its handle.
     ///
-    /// The job ticks once a second, accruing open time and flushing on the
-    /// configured cadence. On `shutdown` it ticks once more and flushes; the
-    /// in-flight minute is still never written, because only complete minutes
-    /// are. Await the returned handle before closing the store.
+    /// The task ticks once a second, accruing open time and flushing on the
+    /// configured cadence. On `shutdown` it ticks once more, flushes, and folds
+    /// the day; the in-flight minute is still never written, because only
+    /// complete minutes are. Await the returned handle before closing the store.
     pub fn start(self: &Arc<Self>, shutdown: CancellationToken) -> JoinHandle<()> {
+        let task: Arc<dyn crate::scheduler::Task> = Arc::new(MeteringTask::new(Arc::clone(self)));
+        // The job's ticks come from the manager's own clock, the same one the
+        // observations are stamped with.
         let manager = Arc::clone(self);
-        tokio::spawn(async move { manager.run(shutdown).await })
+        let clock: crate::scheduler::Clock = Arc::new(move || manager.clock.now_ms());
+        tokio::spawn(async move {
+            crate::scheduler::Scheduler::with_clock(vec![task], clock)
+                .await
+                .run(shutdown)
+                .await
+        })
     }
 
     // ------------------------------------------------------------------
@@ -547,37 +553,64 @@ impl MeteringManager {
             live.publish(Change::visible_to(Viewer::Person(person)).entity(Entity::Statistics));
         }
     }
+}
 
-    async fn run(self: Arc<Self>, shutdown: CancellationToken) {
-        let mut ticker = tokio::time::interval(TICK);
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        let mut last = Instant::now();
-        let mut since_flush = Duration::ZERO;
-        loop {
-            tokio::select! {
-                _ = shutdown.cancelled() => break,
-                _ = ticker.tick() => {
-                    let now = Instant::now();
-                    since_flush += now.saturating_duration_since(last);
-                    last = now;
-                    let now_ms = self.clock.now_ms();
-                    self.tick_at(now_ms);
-                    if since_flush >= self.flush_interval {
-                        since_flush = Duration::ZERO;
-                        if let Err(e) = self.flush_at(now_ms).await {
-                            warn!(error = %e, "Usage flush failed");
-                        }
-                        self.maintain().await;
-                    }
-                }
-            }
+/// The metering flush job, as a scheduler [`Task`](crate::scheduler::Task).
+///
+/// Wakes on the epoch-aligned multiples of `flush_interval` (with the default
+/// 60 s, the instant each minute closes): only complete minutes are ever
+/// written, so that is the first moment there is something to write. Open time
+/// is accrued up to the tick right before the flush, split per minute, so no
+/// per-second tick is needed. Each flush also folds the day that just ended and
+/// sweeps past retention.
+pub struct MeteringTask {
+    manager: Arc<MeteringManager>,
+}
+
+impl MeteringTask {
+    /// Wraps a manager.
+    pub fn new(manager: Arc<MeteringManager>) -> Self {
+        Self { manager }
+    }
+
+    fn period(&self) -> i64 {
+        i64::try_from(self.manager.flush_interval.as_secs())
+            .unwrap_or(i64::MAX)
+            .max(1)
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::scheduler::Task for MeteringTask {
+    fn name(&self) -> &'static str {
+        "usage-metering"
+    }
+
+    async fn next_tick(&self, last_tick: Option<i64>, now: i64) -> i64 {
+        // The next boundary after both the last flush and the clock: a late
+        // wake-up skips the boundaries it slept through instead of replaying
+        // them, since one flush drains every closed minute.
+        let period = self.period();
+        let base = last_tick.map_or(now, |last| last.max(now));
+        (base.div_euclid(period) + 1).saturating_mul(period)
+    }
+
+    async fn run(&self, tick: i64) {
+        let tick_ms = tick.saturating_mul(1000);
+        self.manager.tick_at(tick_ms);
+        if let Err(e) = self.manager.flush_at(tick_ms).await {
+            warn!(error = %e, "Usage flush failed");
         }
-        let now_ms = self.clock.now_ms();
-        self.tick_at(now_ms);
-        if let Err(e) = self.flush_at(now_ms).await {
+        self.manager.maintain().await;
+    }
+
+    async fn shutdown(&self, now: i64) {
+        let now_ms = now.saturating_mul(1000);
+        self.manager.tick_at(now_ms);
+        if let Err(e) = self.manager.flush_at(now_ms).await {
             warn!(error = %e, "Final usage flush failed");
         }
-        self.maintain().await;
+        self.manager.maintain().await;
     }
 }
 
@@ -1013,9 +1046,9 @@ mod tests {
 
         let token = CancellationToken::new();
         let task = meter.start(token.clone());
-        // 50 ms of open time, produced by moving the pinned clock rather than by
-        // waiting for the wall clock to move.
-        clock.store(base + 50, Ordering::Relaxed);
+        // Open time, produced by moving the pinned clock rather than by waiting
+        // for the wall clock to move.
+        clock.store(base + 1_050, Ordering::Relaxed);
         token.cancel();
         let _ = task.await;
 
@@ -1037,7 +1070,7 @@ mod tests {
         assert_eq!(totals[0].bytes_out, 22);
         assert_eq!(totals[0].tunnel_in, 33);
         assert_eq!(totals[0].tunnel_out, 44);
-        assert_eq!(totals[0].open_ms, 50);
+        assert_eq!(totals[0].open_ms, 1_050);
     }
 
     #[tokio::test]

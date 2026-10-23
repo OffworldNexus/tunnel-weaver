@@ -69,7 +69,6 @@ fn sample_config() -> Config {
                 default_key_prefix: "00".into(),
                 default_ttl_secs: 300,
                 proof_cap: 1_000,
-                sweep_interval_secs: 60,
                 api_base_url: None,
             }),
         }),
