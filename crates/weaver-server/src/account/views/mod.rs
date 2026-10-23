@@ -172,12 +172,13 @@ async fn run<V: View>(
     tx: mpsc::Sender<Bytes>,
 ) {
     let mut changes = runtime.live.subscribe();
-    // Staggered, so the first heartbeat is a full period away: an immediate
+    // The heartbeat task's own first tick is a full period out: an immediate
     // heartbeat would only add noise to the first frame.
     let mut timers =
-        crate::scheduler::Scheduler::staggered(vec![
+        crate::scheduler::Scheduler::new(vec![
             Arc::new(HeartbeatTask { tx: tx.clone() }) as Arc<dyn crate::scheduler::Task>
-        ]);
+        ])
+        .await;
 
     let mut last: Option<Vec<u8>> = None;
     let mut viewer = Viewer::Anyone;
@@ -218,9 +219,10 @@ async fn run<V: View>(
 
         // Wait for a change this view cares about, or a keep-alive tick.
         loop {
-            let deadline = timers
-                .next_deadline()
-                .unwrap_or_else(|| tokio::time::Instant::now() + HEARTBEAT);
+            let now = crate::wall_clock::unix_secs();
+            let wait = timers.next_deadline().map_or(HEARTBEAT, |at| {
+                Duration::from_secs(at.saturating_sub(now).max(0) as u64)
+            });
             tokio::select! {
                 change = changes.recv() => match change {
                     Ok(change) if change.invalidates(viewer, &interests) => break,
@@ -228,7 +230,7 @@ async fn run<V: View>(
                     Err(broadcast::error::RecvError::Lagged(_)) => break,
                     Err(broadcast::error::RecvError::Closed) => return,
                 },
-                _ = tokio::time::sleep_until(deadline) => {
+                _ = tokio::time::sleep(wait) => {
                     timers.run_due().await;
                     // A failed heartbeat means the client is gone.
                     if tx.is_closed() {
@@ -254,8 +256,8 @@ impl crate::scheduler::Task for HeartbeatTask {
     fn name(&self) -> &'static str {
         "sse-heartbeat"
     }
-    fn next_tick(&self, _now: i64) -> Duration {
-        HEARTBEAT
+    async fn next_tick(&self, now: i64) -> i64 {
+        now + HEARTBEAT.as_secs() as i64
     }
     async fn run(&self, _now: i64) {
         let _ = self.tx.send(Bytes::from_static(b": ping\n\n")).await;

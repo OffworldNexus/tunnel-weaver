@@ -248,7 +248,7 @@ pub async fn run_server(
             ttl_ms,
         )));
     }
-    let scheduler = crate::scheduler::Scheduler::new(scheduler_tasks);
+    let scheduler = crate::scheduler::Scheduler::new(scheduler_tasks).await;
     info!(tasks = ?scheduler.names(), "periodic scheduler running");
     // Awaiting this runs every task's shutdown hook, including the final usage
     // flush, so the drain awaits it before the store closes.

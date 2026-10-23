@@ -691,8 +691,8 @@ impl crate::scheduler::Task for CertRenewalTask {
         "cert-renewal"
     }
 
-    fn next_tick(&self, _now: i64) -> Duration {
-        Duration::from_secs(12 * 3600)
+    async fn next_tick(&self, now: i64) -> i64 {
+        now + 12 * 3600
     }
 
     async fn run(&self, _now: i64) {

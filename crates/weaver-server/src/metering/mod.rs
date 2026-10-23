@@ -413,8 +413,12 @@ impl MeteringManager {
     /// complete minutes are. Await the returned handle before closing the store.
     pub fn start(self: &Arc<Self>, shutdown: CancellationToken) -> JoinHandle<()> {
         let task: Arc<dyn crate::scheduler::Task> = Arc::new(MeteringTask::new(Arc::clone(self)));
-        let scheduler = crate::scheduler::Scheduler::new(vec![task]);
-        tokio::spawn(async move { scheduler.run(shutdown).await })
+        tokio::spawn(async move {
+            crate::scheduler::Scheduler::new(vec![task])
+                .await
+                .run(shutdown)
+                .await
+        })
     }
 
     // ------------------------------------------------------------------
@@ -587,8 +591,8 @@ impl crate::scheduler::Task for MeteringTask {
         "usage-metering"
     }
 
-    fn next_tick(&self, _now: i64) -> Duration {
-        TICK
+    async fn next_tick(&self, now: i64) -> i64 {
+        now + TICK.as_secs() as i64
     }
 
     async fn run(&self, _now: i64) {

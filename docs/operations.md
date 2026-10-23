@@ -206,7 +206,10 @@ optional `shutdown`) driven by one process-wide `Scheduler` built in
 `server::run` (ADR 0012). The scheduler wakes at the earliest deadline and runs
 whatever is due; the drain awaits it, and its `shutdown` pass performs the
 metering task's final flush before the store closes. The startup log line
-`periodic scheduler running` lists the tasks by name.
+`periodic scheduler running` lists the tasks by name. Each task says *when* it
+next wants to run (an absolute Unix second), and the scheduler sleeps until the
+earliest deadline; a job may base its next wake-up on state it just read rather
+than a fixed interval.
 
 | Task | Cadence | Config |
 |---|---|---|
@@ -217,10 +220,10 @@ metering task's final flush before the store closes. The startup log line
 | `inactivity-sweep` | `account.sweep_interval_secs` | `account.inactive_after_secs`, `account.inactivity_warning_before_secs` |
 | `cert-renewal` | 12 h | — |
 
-Each task's first tick is immediate. Connections have their own scheduler for
-connection-local timers (`visitor-byte-report` every 5 s, `sse-heartbeat` every
-15 s); those share the `Task` seam but are driven from the connection's own
-`select!` rather than sleeping.
+Each task's `next_tick` decides when it next runs. Connections have their own
+scheduler for connection-local timers (`visitor-byte-report` every 5 s,
+`sse-heartbeat` every 15 s); those share the `Task` seam but are driven from the
+connection's own `select!` rather than sleeping.
 
 ## Abandoned accounts
 

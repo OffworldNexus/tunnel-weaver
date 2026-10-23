@@ -678,8 +678,8 @@ impl crate::scheduler::Task for VisitorReportTask {
     fn name(&self) -> &'static str {
         "visitor-byte-report"
     }
-    fn next_tick(&self, _now: i64) -> Duration {
-        VISITOR_REPORT_INTERVAL
+    async fn next_tick(&self, now: i64) -> i64 {
+        now + VISITOR_REPORT_INTERVAL.as_secs() as i64
     }
     async fn run(&self, _now: i64) {
         report_conn_bytes(&self.bytes, &self.config);
@@ -851,10 +851,12 @@ pub async fn run_https_server_full(
                             bytes: Arc::clone(&bytes),
                             config: Arc::clone(&report_config),
                         },
-                    ) as Arc<dyn crate::scheduler::Task>]);
+                    ) as Arc<dyn crate::scheduler::Task>])
+                    .await;
                     loop {
-                        let deadline = timers.next_deadline().unwrap_or_else(|| {
-                            tokio::time::Instant::now() + VISITOR_REPORT_INTERVAL
+                        let now = crate::wall_clock::unix_secs();
+                        let wait = timers.next_deadline().map_or(VISITOR_REPORT_INTERVAL, |at| {
+                            Duration::from_secs(at.saturating_sub(now).max(0) as u64)
                         });
                         tokio::select! {
                             res = conn.as_mut() => {
@@ -863,7 +865,7 @@ pub async fn run_https_server_full(
                                 }
                                 break;
                             }
-                            _ = tokio::time::sleep_until(deadline) => {
+                            _ = tokio::time::sleep(wait) => {
                                 timers.run_due().await;
                             }
                             _ = conn_token.cancelled() => {

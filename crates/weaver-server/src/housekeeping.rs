@@ -41,8 +41,8 @@ impl Task for AbuseSweepTask {
     fn name(&self) -> &'static str {
         "abuse-bucket-sweep"
     }
-    fn next_tick(&self, _now: i64) -> Duration {
-        ABUSE_SWEEP_INTERVAL
+    async fn next_tick(&self, now: i64) -> i64 {
+        now + ABUSE_SWEEP_INTERVAL.as_secs() as i64
     }
     async fn run(&self, _now: i64) {
         let cutoff = unix_ms() - self.ttl_ms;
@@ -69,8 +69,8 @@ impl Task for AltchaSweepTask {
     fn name(&self) -> &'static str {
         "altcha-proof-sweep"
     }
-    fn next_tick(&self, _now: i64) -> Duration {
-        self.interval
+    async fn next_tick(&self, now: i64) -> i64 {
+        now + self.interval.as_secs() as i64
     }
     async fn run(&self, _now: i64) {
         let cutoff = unix_ms();
@@ -103,8 +103,8 @@ impl Task for AccountSweepTask {
     fn name(&self) -> &'static str {
         "account-sweep"
     }
-    fn next_tick(&self, _now: i64) -> Duration {
-        self.interval
+    async fn next_tick(&self, now: i64) -> i64 {
+        now + self.interval.as_secs() as i64
     }
     async fn run(&self, _now: i64) {
         let cutoff = unix_secs();
@@ -153,8 +153,8 @@ impl Task for InactivitySweepTask {
     fn name(&self) -> &'static str {
         "inactivity-sweep"
     }
-    fn next_tick(&self, _now: i64) -> Duration {
-        self.interval
+    async fn next_tick(&self, now: i64) -> i64 {
+        now + self.interval.as_secs() as i64
     }
     async fn run(&self, now: i64) {
         match inactivity::run(&self.account, Some(&self.registry), now).await {
