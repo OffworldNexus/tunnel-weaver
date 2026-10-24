@@ -160,9 +160,15 @@ Then('the deletion lands me signed out on the sign-in page', async function () {
 });
 
 Then('the old session no longer authenticates', async function () {
-  const status = await this.page.evaluate(async () => (await fetch('/api/account/me')).status);
-  if (status !== 401) {
-    throw new Error(`Expected "/api/account/me" to answer 401 for the deleted session, got ${status}.`);
+  // The session stream answers anyone; for no session it sends one `none`
+  // state and ends, so the whole body can be read.
+  const level = await this.page.evaluate(async () => {
+    const body = await (await fetch('/api/account/me')).text();
+    const data = body.split('\n').find((line) => line.startsWith('data: '));
+    return data ? JSON.parse(data.slice('data: '.length)).level : '';
+  });
+  if (level !== 'none') {
+    throw new Error(`Expected the session stream to say "none" for the deleted session, got "${level}".`);
   }
 });
 

@@ -7,14 +7,23 @@
 //! exemption by accident.
 //!
 //! The reference *redirects* to the first step; an API cannot 302, so here the
-//! gate returns a `403` naming the required level and the step, and the
-//! SvelteKit side performs the navigation.
+//! refusal (`401` with no session, `403` with one too weak) carries two headers
+//! and the SvelteKit side decides what to do with them:
+//!
+//! - `x-weaver-required-level`: the level the route needs (`basic`, `strong`);
+//! - `x-weaver-upgrade-paths`: a JSON array of options, each an ordered array
+//!   of `{"step", "reaches"}` — the step to take and the level it would leave
+//!   the session at, preferred first — e.g.
+//!   `[[{"step":"verify_email_otp","reaches":"strong"}]]`.
+//!
+//! Only refusals carry them: the console knows statically which level each of
+//! its actions needs, and learns the ways up from the `me` stream.
 
 use std::sync::Arc;
 
 use axum::Json;
 use axum::extract::{Request, State};
-use axum::http::{Method, StatusCode, header};
+use axum::http::{HeaderValue, Method, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use serde_json::json;
@@ -23,16 +32,22 @@ use crate::account::AccountRuntime;
 use crate::account::session::{self, SESSION_COOKIE};
 use crate::wall_clock::unix_secs;
 
-use super::{AuthLevel, AuthManager, ClientAddr, SessionContext};
+use super::{AuthLevel, AuthManager, ClientAddr, SessionContext, WireStep};
 
 /// The longest `User-Agent` recorded on an `auth_event` row.
 const USER_AGENT_MAX_LEN: usize = 2000;
+
+/// The refusal header naming the level the route needs.
+pub const REQUIRED_LEVEL_HEADER: &str = "x-weaver-required-level";
+
+/// The refusal header listing the options that would reach it (JSON).
+pub const UPGRADE_PATHS_HEADER: &str = "x-weaver-upgrade-paths";
 
 /// The deny-by-default level gate over the account API.
 ///
 /// A request with no session to a route that needs one is a `401` (so the SPA's
 /// "session expired" handling keeps working); a session that is merely too weak
-/// is a `403` naming the step that would lift it.
+/// is a `403`. Both name the required level and the ways up in headers.
 pub async fn gate(State(rt): State<Arc<AccountRuntime>>, mut req: Request, next: Next) -> Response {
     let now = unix_secs();
     let live = match session::cookie(req.headers(), SESSION_COOKIE) {
@@ -59,6 +74,7 @@ pub async fn gate(State(rt): State<Arc<AccountRuntime>>, mut req: Request, next:
 
     let manager = AuthManager::new(
         rt.store.clone(),
+        rt.live.clone(),
         session,
         rt.config.session_ttl_secs as i64,
         now,
@@ -71,30 +87,37 @@ pub async fn gate(State(rt): State<Arc<AccountRuntime>>, mut req: Request, next:
     if required == AuthLevel::None {
         return next.run(req).await;
     }
-    if session.is_none() {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(json!({ "error": "not signed in" })),
-        )
-            .into_response();
-    }
-    if manager.satisfies(required).await {
+    let (status, message) = if session.is_none() {
+        (StatusCode::UNAUTHORIZED, "not signed in")
+    } else if manager.satisfies(required).await {
         return next.run(req).await;
+    } else {
+        (StatusCode::FORBIDDEN, "second factor required")
+    };
+    let options = manager.upgrade_paths(required).await;
+    refusal(status, message, required, &options)
+}
+
+/// A level refusal: the status and `{error}` body every refusal has, plus the
+/// two headers that tell the client what would have been enough and how to
+/// get there.
+fn refusal(
+    status: StatusCode,
+    message: &str,
+    required: AuthLevel,
+    options: &[Vec<WireStep>],
+) -> Response {
+    let mut response = (status, Json(json!({ "error": message }))).into_response();
+    let headers = response.headers_mut();
+    headers.insert(
+        REQUIRED_LEVEL_HEADER,
+        HeaderValue::from_static(required.as_str()),
+    );
+    let options = serde_json::to_string(options).unwrap_or_else(|_| "[]".to_string());
+    if let Ok(value) = HeaderValue::from_str(&options) {
+        headers.insert(UPGRADE_PATHS_HEADER, value);
     }
-    let step = manager
-        .best_step(required)
-        .await
-        .map(|step| step.as_str())
-        .unwrap_or("login");
-    (
-        StatusCode::FORBIDDEN,
-        Json(json!({
-            "error": "second factor required",
-            "required": required.as_str(),
-            "step": step,
-        })),
-    )
-        .into_response()
+    response
 }
 
 /// The level a route requires: `Strong` unless the exact (method, path) is on
@@ -116,7 +139,11 @@ fn required_level(method: &Method, path: &str) -> AuthLevel {
 /// the password step of sign-in (which mints a `Basic` session).
 fn is_public(method: &Method, path: &str) -> bool {
     match path {
-        "/api/account/altcha/challenge" | "/api/account/config" => *method == Method::GET,
+        // `me` answers anyone: an anonymous visitor is told `none` on the stream
+        // itself, which an `EventSource` can read and a `401` it could not.
+        "/api/account/altcha/challenge" | "/api/account/config" | "/api/account/me" => {
+            *method == Method::GET
+        }
         "/api/account/signup"
         | "/api/account/resend"
         | "/api/account/verify"
@@ -130,10 +157,9 @@ fn is_public(method: &Method, path: &str) -> bool {
 }
 
 /// The minimum to climb from `Basic` to `Strong`, plus leaving: verify and
-/// re-send the code, read the level, and sign out.
+/// re-send the code, and sign out.
 fn is_basic(method: &Method, path: &str) -> bool {
     match path {
-        "/api/account/me" => *method == Method::GET,
         "/api/account/login/verify" | "/api/account/login/resend" | "/api/account/logout" => {
             *method == Method::POST
         }
@@ -155,14 +181,15 @@ mod tests {
             required_level(&Method::GET, "/api/account/config"),
             AuthLevel::None
         );
+        // The session stream tells an anonymous visitor so itself.
+        assert_eq!(
+            required_level(&Method::GET, "/api/account/me"),
+            AuthLevel::None
+        );
     }
 
     #[test]
     fn climb_routes_need_basic() {
-        assert_eq!(
-            required_level(&Method::GET, "/api/account/me"),
-            AuthLevel::Basic
-        );
         assert_eq!(
             required_level(&Method::POST, "/api/account/login/verify"),
             AuthLevel::Basic

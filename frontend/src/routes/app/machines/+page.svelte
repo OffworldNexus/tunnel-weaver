@@ -28,6 +28,7 @@
 		revokeMachine
 	} from '#lib/app/machines';
 	import { timeAgo } from '#lib/app/time';
+	import { stepUp } from '#lib/app/upgrade';
 	import { setMeta } from '#lib/console/meta.svelte';
 	import PairMachineDialog from '#lib/console/PairMachineDialog.svelte';
 	import { search } from '#lib/console/search.svelte';
@@ -196,8 +197,11 @@
 		}
 		const target = renaming;
 		busy = true;
-		const res = await renameMachine(target.id, renameValue);
+		const res = await renameMachine(target.id, renameValue, stepUp);
 		busy = false;
+		if (res.refused) {
+			return;
+		}
 		if (!res.ok || !res.data) {
 			notify('error', res.error ?? 'We could not rename that machine. Please try again.');
 			return;
@@ -213,8 +217,11 @@
 		}
 		const target = disconnecting;
 		busy = true;
-		const res = await disconnectMachine(target.id);
+		const res = await disconnectMachine(target.id, stepUp);
 		busy = false;
+		if (res.refused) {
+			return;
+		}
 		disconnecting = null;
 		if (!res.ok || !res.data) {
 			notify('error', res.error ?? 'We could not kick that machine. Please try again.');
@@ -235,8 +242,11 @@
 		}
 		const target = revoking;
 		busy = true;
-		const res = await revokeMachine(target.id);
+		const res = await revokeMachine(target.id, stepUp);
 		busy = false;
+		if (res.refused) {
+			return;
+		}
 		revoking = null;
 		if (!res.ok) {
 			notify('error', res.error ?? 'We could not revoke that machine. Please try again.');

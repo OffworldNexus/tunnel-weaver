@@ -1,19 +1,20 @@
 <script lang="ts">
 	/**
 	 * The signed-in console layout: it mounts the shell for every `/app` route.
-	 * The root layout settles the session before this layout renders, so a
-	 * signed-out visitor here (an expired session, or a link opened after
-	 * signing out) is simply sent to sign-in.
+	 *
+	 * It follows the session stream: the console needs `strong`, so whenever
+	 * the level is lower — on arrival, or because a drop has just landed — the
+	 * person is sent up the path the stream names (to sign-in once the session
+	 * is gone). A drop announced ahead of time is told to the person first.
 	 */
 	import type { Snippet } from 'svelte';
 
 	import { notify } from '#lib/account/notices';
-	import { useSession } from '#lib/app/session.svelte';
+	import { atLeast, useSession } from '#lib/app/session.svelte';
+	import { climb } from '#lib/app/upgrade';
 	import { meta } from '#lib/console/meta.svelte';
 	import Shell from '#lib/console/Shell.svelte';
 	import Page from '#lib/ui/Page.svelte';
-	import { goto } from '$app/navigation';
-	import { resolve } from '$app/paths';
 
 	interface Props {
 		children: Snippet;
@@ -23,20 +24,25 @@
 
 	const session = useSession();
 
-	// The session probe lives in the root layout and runs on every navigation;
-	// when it settles without a user, the console is not a place to be. A
-	// `basic` session (password only) is sent to the code step instead — the
-	// sibling `+layout.ts` already redirects before any page load runs, and this
-	// covers the case where the layout renders without a navigation.
 	$effect(() => {
-		if (!session.user) {
-			notify('error', 'Your session has expired. Please sign in again.');
-			void goto(resolve('/(auth)/sign-in'), { replace: true });
+		if (!atLeast(session.level, 'strong')) {
+			void climb('strong');
+		}
+	});
+
+	// Only a drop below what the console needs is worth a word: `certain`
+	// ageing into `strong` takes nothing away from it.
+	$effect(() => {
+		const notice = session.notice;
+		if (notice.at === 0 || atLeast(notice.to, 'strong')) {
 			return;
 		}
-		if (session.user.auth_level === 'basic') {
-			void goto(resolve('/(auth)/verify-code'), { replace: true });
-		}
+		notify(
+			'error',
+			notice.to === 'none'
+				? `Your session ends in ${notice.in} seconds. Save your work and sign in again.`
+				: `Your sign-in expires in ${notice.in} seconds; you will be asked for a new code.`
+		);
 	});
 </script>
 
@@ -44,7 +50,7 @@
 	<title>Console · Tunnel Weaver</title>
 </svelte:head>
 
-{#if session.user && session.user.auth_level === 'strong'}
+{#if atLeast(session.level, 'strong')}
 	<Shell title={meta.title} subtitle={meta.subtitle} crumbs={meta.crumbs}>
 		{@render children()}
 	</Shell>

@@ -6,6 +6,8 @@
 	import { notify } from '#lib/account/notices';
 	import { signInSchema } from '#lib/account/schemas';
 	import { flow } from '#lib/account/state';
+	import { session } from '#lib/app/session.svelte';
+	import { stepUp } from '#lib/app/upgrade';
 	import Keycap from '#lib/ui/Keycap.svelte';
 	import Page from '#lib/ui/Page.svelte';
 	import { goto } from '$app/navigation';
@@ -22,15 +24,18 @@
 	let showPassword = $state(false);
 
 	const sf = jsonForm(signInSchema, { email: carried.email ?? '', password: '' }, async (data) => {
-		const res = await api('/api/account/login', { ...data, altcha: proof });
+		const res = await api('POST', '/api/account/login', { ...data, altcha: proof }, stepUp);
 		altcha?.reset();
 		if (!res.ok) {
 			return res.error ?? 'That email and password did not match.';
 		}
 		flow.clear();
-		// The password is only the first factor: the relay has opened a session
-		// that can do nothing but enter the emailed code, so the next page is the
-		// code step. That page, not this one, decides on the pairing detour.
+		// A session exists now: reopen the stream (it closed on the anonymous
+		// answer) and wait for it to say so. The password is only the first
+		// factor, so the next page is the code step; that page, not this one,
+		// decides on the pairing detour.
+		session.restart();
+		await session.reached('basic');
 		await goto(resolve('/(auth)/verify-code'));
 	});
 

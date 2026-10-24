@@ -3,10 +3,10 @@
 //! A console stream is one [`View`](crate::account::views::View) re-rendered
 //! whenever something it showed has changed. Three things describe a change:
 //!
-//! * a **viewer scope** — whose consoles may see it (one person today, everyone
-//!   or an organisation later);
-//! * an **entity scope** — what kind of thing changed (a machine, a tunnel, or
-//!   the metered statistics);
+//! * a **viewer scope** — whose consoles may see it (one person, one account's
+//!   sessions, everyone, or an organisation later);
+//! * an **entity scope** — what kind of thing changed (a machine, a tunnel, the
+//!   metered statistics, or a session's authentication);
 //! * and, optionally, **which ids** of that entity changed.
 //!
 //! A view declares the opposite: the [`Interest`]s its last render is sensitive
@@ -36,6 +36,9 @@ pub enum Viewer {
     Anyone,
     /// One person's consoles only.
     Person(i32),
+    /// One account's sessions — wider than a person, because an account that
+    /// has not paired yet has no person but still has sessions to watch.
+    Account(i32),
 }
 
 impl Viewer {
@@ -58,6 +61,10 @@ pub enum Entity {
     Tunnel,
     /// The metered traffic rollup. Meta — carries no ids.
     Statistics,
+    /// A browser session's authentication: its level rose, or it ended. The
+    /// ids are session ids; none means every session of the account (a
+    /// password change or a deletion retires them all). WVR-167.
+    Session,
 }
 
 /// The ids a change touches, or that a view cares about.
@@ -258,6 +265,21 @@ mod tests {
         assert!(added.invalidates(person(), &[Interest::these(Entity::Machine, [9])]));
         // But not a view of a different entity.
         assert!(!added.invalidates(person(), &[Interest::all(Entity::Tunnel)]));
+    }
+
+    #[test]
+    fn a_session_change_reaches_that_session_or_all_of_the_account() {
+        let account = Viewer::Account(4);
+        let watching = [Interest::these(Entity::Session, [11])];
+        let verified = Change::visible_to(account).entity(Entity::Session).id(11);
+        assert!(verified.invalidates(account, &watching));
+        let elsewhere = Change::visible_to(account).entity(Entity::Session).id(12);
+        assert!(!elsewhere.invalidates(account, &watching));
+        // A password change retires every session of the account.
+        let everywhere = Change::visible_to(account).entity(Entity::Session);
+        assert!(everywhere.invalidates(account, &watching));
+        // An account scope is not a person scope, even with the same number.
+        assert!(!everywhere.invalidates(Viewer::Person(4), &watching));
     }
 
     #[test]

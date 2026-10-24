@@ -47,17 +47,28 @@ pub enum StepKind {
     Login,
     /// Enter the emailed second-factor code.
     VerifyEmailOtp,
-    /// Re-type the password (reserved for a future step-up).
+    /// Re-type the password: what `Certain` asks for once the sign-in's own
+    /// password proof has aged out. No page performs it yet (WVR-165).
     ConfirmPassword,
 }
 
 impl StepKind {
-    /// The stable wire name, echoed by the gate's `403`.
+    /// The stable wire name, echoed by the gate's refusal.
     pub const fn as_str(self) -> &'static str {
         match self {
             StepKind::Login => "login",
             StepKind::VerifyEmailOtp => "verify_email_otp",
             StepKind::ConfirmPassword => "confirm_password",
+        }
+    }
+
+    /// The proof this step records, at the instant it is taken.
+    pub const fn proves(self) -> Option<ProofKind> {
+        match self {
+            // Signing in opens a session and checks the password; the session
+            // exists is what `levels_after` adds on top.
+            StepKind::Login | StepKind::ConfirmPassword => Some(ProofKind::Password),
+            StepKind::VerifyEmailOtp => Some(ProofKind::EmailOtp),
         }
     }
 }
@@ -115,7 +126,8 @@ impl AuthPath for PasswordEmailOtpPath {
         if current < AuthLevel::Strong && target >= AuthLevel::Strong {
             steps.push(Step(StepKind::VerifyEmailOtp));
         }
-        if target >= AuthLevel::Certain {
+        // A password typed moments ago (at sign-in, say) already counts.
+        if target >= AuthLevel::Certain && !situation.has_valid(ProofKind::Password) {
             steps.push(Step(StepKind::ConfirmPassword));
         }
         if steps.is_empty() {
@@ -128,6 +140,39 @@ impl AuthPath for PasswordEmailOtpPath {
 
 /// Every path, in preference order.
 pub static PATHS: &[&dyn AuthPath] = &[&PasswordEmailOtpPath];
+
+/// The best level any path grants `situation`.
+pub fn level_of(situation: &Situation) -> AuthLevel {
+    PATHS
+        .iter()
+        .map(|path| path.current_level(situation))
+        .max()
+        .unwrap_or(AuthLevel::None)
+}
+
+/// The level the session would hold after each of `steps`, in order.
+///
+/// Simulated, not tabulated: a step's outcome depends on the proofs already
+/// held. Entering the emailed code moments after signing in lands at `Certain`,
+/// because the password proof is still alive; the same step ten minutes later
+/// lands at `Strong`. That is what tells a client where a climb will actually
+/// leave it.
+pub fn levels_after(situation: &Situation, steps: &[Step]) -> Vec<AuthLevel> {
+    let mut walk = situation.clone();
+    let mut levels = Vec::with_capacity(steps.len());
+    for step in steps {
+        if step.0 == StepKind::Login {
+            // A sign-in leaves a session behind; the id is not what any level
+            // reads, only that there is one.
+            walk.account_id = walk.account_id.or(Some(0));
+        }
+        if let Some(proof) = step.0.proves() {
+            walk.proofs.insert(proof, walk.now);
+        }
+        levels.push(level_of(&walk));
+    }
+    levels
+}
 
 #[cfg(test)]
 mod tests {
@@ -192,6 +237,62 @@ mod tests {
         assert_eq!(
             PasswordEmailOtpPath.steps_to(&basic, AuthLevel::Strong),
             vec![vec![Step(StepKind::VerifyEmailOtp)]]
+        );
+    }
+
+    #[test]
+    fn a_step_reaches_different_levels_depending_on_the_proofs() {
+        // Just signed in: the code alone lands at Certain.
+        let fresh = situation(true, &[(ProofKind::Password, 1_000)], 1_000);
+        assert_eq!(
+            levels_after(&fresh, &[Step(StepKind::VerifyEmailOtp)]),
+            vec![AuthLevel::Certain]
+        );
+        // Ten minutes later the password proof is gone: the code lands at
+        // Strong, and only re-typing the password reaches Certain.
+        let stale = situation(true, &[(ProofKind::Password, 1_000)], 1_700);
+        assert_eq!(
+            levels_after(
+                &stale,
+                &[
+                    Step(StepKind::VerifyEmailOtp),
+                    Step(StepKind::ConfirmPassword),
+                ]
+            ),
+            vec![AuthLevel::Strong, AuthLevel::Certain]
+        );
+    }
+
+    #[test]
+    fn a_climb_from_anonymous_starts_with_a_session() {
+        let anon = situation(false, &[], 1_000);
+        assert_eq!(
+            levels_after(&anon, &[Step(StepKind::Login)]),
+            vec![AuthLevel::Basic]
+        );
+    }
+
+    #[test]
+    fn certain_asks_for_the_password_only_once_it_has_aged_out() {
+        // Just signed in: the code alone reaches Certain.
+        let fresh = situation(true, &[(ProofKind::Password, 1_000)], 1_000);
+        assert_eq!(
+            PasswordEmailOtpPath.steps_to(&fresh, AuthLevel::Certain),
+            vec![vec![Step(StepKind::VerifyEmailOtp)]]
+        );
+        // Later, Strong needs the password re-typed.
+        let strong = situation(
+            true,
+            &[(ProofKind::Password, 1_000), (ProofKind::EmailOtp, 1_000)],
+            2_000,
+        );
+        assert_eq!(
+            PasswordEmailOtpPath.current_level(&strong),
+            AuthLevel::Strong
+        );
+        assert_eq!(
+            PasswordEmailOtpPath.steps_to(&strong, AuthLevel::Certain),
+            vec![vec![Step(StepKind::ConfirmPassword)]]
         );
     }
 }

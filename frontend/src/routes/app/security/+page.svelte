@@ -4,6 +4,7 @@
 	import { notify } from '#lib/account/notices';
 	import { flow } from '#lib/account/state';
 	import { useSession } from '#lib/app/session.svelte';
+	import { stepUp } from '#lib/app/upgrade';
 	import { setMeta } from '#lib/console/meta.svelte';
 	import ConfirmDeleteDialog from '#lib/ui/ConfirmDeleteDialog.svelte';
 	import Icon from '#lib/ui/Icon.svelte';
@@ -30,10 +31,16 @@
 
 	async function deleteAccount(address: string) {
 		busy = true;
-		const res = await api('/api/account/delete', { address });
+		// Success ends every session; do not let the guard see it before we leave.
+		session.detach();
+		const res = await api('POST', '/api/account/delete', { address }, stepUp);
 		busy = false;
 		confirming = false;
 		if (!res.ok) {
+			session.restart();
+			if (res.refused) {
+				return;
+			}
 			notify('error', res.error ?? 'We could not delete your account. Please try again.');
 			return;
 		}

@@ -13,10 +13,12 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
+use crate::live::LiveHub;
 use crate::store::account::NewAuthEvent;
 use crate::store::{Store, StoreError};
 
-use super::{AuthLevel, EventKind, PATHS, ProofKind, Situation, Step, StepKind};
+use super::paths::{PATHS, level_of, levels_after};
+use super::{AuthLevel, EventKind, ProofKind, Situation, Step, WireStep};
 
 /// The long identifier (an address, an account name) an `auth_event` row may
 /// carry; bounded so a crafted field cannot bloat the trail.
@@ -38,6 +40,9 @@ pub struct AuthManager(Arc<Inner>);
 
 struct Inner {
     store: Store,
+    /// Where a recorded proof is announced, so a session's open streams reload
+    /// its proofs and re-plan their next expiry.
+    live: LiveHub,
     session: Option<SessionContext>,
     session_ttl_secs: i64,
     now: i64,
@@ -52,6 +57,7 @@ impl AuthManager {
     /// lifetime in the request is measured against the same instant.
     pub fn new(
         store: Store,
+        live: LiveHub,
         session: Option<SessionContext>,
         session_ttl_secs: i64,
         now: i64,
@@ -60,6 +66,7 @@ impl AuthManager {
     ) -> Self {
         AuthManager(Arc::new(Inner {
             store,
+            live,
             session,
             session_ttl_secs,
             now,
@@ -94,12 +101,21 @@ impl AuthManager {
 
     /// The session's level: the best any path grants.
     pub async fn level(&self) -> AuthLevel {
-        let situation = self.situation().await;
-        PATHS
-            .iter()
-            .map(|path| path.current_level(&situation))
-            .max()
-            .unwrap_or(AuthLevel::None)
+        level_of(&self.situation().await)
+    }
+
+    /// The same request's manager re-pointed at `session` and `now`: a long-lived
+    /// stream loads the trail of the session it watches with this.
+    pub fn at(&self, session: Option<SessionContext>, now: i64) -> AuthManager {
+        AuthManager::new(
+            self.0.store.clone(),
+            self.0.live.clone(),
+            session,
+            self.0.session_ttl_secs,
+            now,
+            self.0.ip_address.clone(),
+            self.0.user_agent.clone(),
+        )
     }
 
     /// Whether the session is at least `required`.
@@ -107,27 +123,11 @@ impl AuthManager {
         self.level().await >= required
     }
 
-    /// Every path's options to reach `target`: the path the session was opened
-    /// with first, then shortest first.
-    pub async fn steps_to(&self, target: AuthLevel) -> Vec<Vec<Step>> {
-        let situation = self.situation().await;
-        let mut options = Vec::new();
-        for path in PATHS {
-            let active = path.proofs().iter().any(|kind| situation.was_used(*kind));
-            for option in path.steps_to(&situation, target) {
-                options.push((!active, option.len(), option));
-            }
-        }
-        options.sort_by_key(|(inactive, length, _)| (*inactive, *length));
-        options.into_iter().map(|(_, _, option)| option).collect()
-    }
-
-    /// The preferred first step towards `target`, if any path can get there.
-    pub async fn best_step(&self, target: AuthLevel) -> Option<StepKind> {
-        self.steps_to(target)
-            .await
-            .into_iter()
-            .find_map(|steps| steps.first().map(|step| step.0))
+    /// The ways to reach `target`, each an ordered run of steps, the preferred
+    /// first, and each step labelled with the level it would leave the session
+    /// at (see [`levels_after`]).
+    pub async fn upgrade_paths(&self, target: AuthLevel) -> Vec<Vec<WireStep>> {
+        upgrade_paths(&self.situation().await, target)
     }
 
     // --- tell --------------------------------------------------------------
@@ -224,6 +224,20 @@ impl AuthManager {
             .await?;
         // The next "ask" must see the row just written.
         *self.0.proofs.lock().expect("proofs mutex poisoned") = None;
+        // A new proof changes the session's proof list: its open streams must
+        // reload it and re-plan the next expiry. Other kinds change nothing a
+        // level is derived from.
+        if ProofKind::parse(kind.as_str()).is_some()
+            && let (Some(account_id), Some(session_id)) = (account_id, session_id)
+        {
+            super::watch::session_changed(
+                &self.0.live,
+                SessionContext {
+                    session_id,
+                    account_id,
+                },
+            );
+        }
         Ok(())
     }
 
@@ -263,6 +277,86 @@ impl AuthManager {
     }
 }
 
+/// Every path's options to reach `target`: the path the session was opened
+/// with first, then shortest first.
+pub fn steps_to(situation: &Situation, target: AuthLevel) -> Vec<Vec<Step>> {
+    let mut options = Vec::new();
+    for path in PATHS {
+        let active = path.proofs().iter().any(|kind| situation.was_used(*kind));
+        for option in path.steps_to(situation, target) {
+            options.push((!active, option.len(), option));
+        }
+    }
+    options.sort_by_key(|(inactive, length, _)| (*inactive, *length));
+    options.into_iter().map(|(_, _, option)| option).collect()
+}
+
+/// The ways to reach `target` from `situation`, each an ordered run of steps,
+/// the preferred first, and each step labelled with the level taking it would
+/// leave the session at.
+pub fn upgrade_paths(situation: &Situation, target: AuthLevel) -> Vec<Vec<WireStep>> {
+    steps_to(situation, target)
+        .into_iter()
+        .map(|steps| {
+            let reaches = levels_after(situation, &steps);
+            steps
+                .into_iter()
+                .zip(reaches)
+                .map(|(step, reaches)| WireStep {
+                    step: step.0.as_str(),
+                    reaches: reaches.as_str(),
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// The instants, in order and after `situation.now`, at which a proof expires
+/// before the session itself ends at `session_ends_at`.
+fn expiries(situation: &Situation, session_ends_at: i64) -> Vec<i64> {
+    let mut instants: Vec<i64> = situation
+        .proofs
+        .iter()
+        .map(|(kind, at)| at + kind.max_age_secs(situation.session_ttl_secs))
+        .filter(|instant| *instant > situation.now && *instant < session_ends_at)
+        .collect();
+    instants.sort_unstable();
+    instants
+}
+
+/// The next instant anything derived from `situation` changes: the next proof
+/// expiry (the level or the ways up move there), or the session's end.
+pub fn next_expiry(situation: &Situation, session_ends_at: i64) -> i64 {
+    expiries(situation, session_ends_at)
+        .first()
+        .copied()
+        .unwrap_or(session_ends_at)
+}
+
+/// The next instant the level of `situation` falls, and what it falls to.
+///
+/// Read off the proofs alone: each expires at its occurrence plus its lifetime,
+/// so the candidates are those instants, in order, and the first at which the
+/// derived level is lower is the drop. With none, the session's own end is the
+/// drop, to `None`. `None` when there is no session to drop from.
+pub fn next_drop(situation: &Situation, session_ends_at: i64) -> Option<(i64, AuthLevel)> {
+    let current = level_of(situation);
+    if current == AuthLevel::None {
+        return None;
+    }
+    for instant in expiries(situation, session_ends_at) {
+        let later = Situation {
+            now: instant,
+            ..situation.clone()
+        };
+        let level = level_of(&later);
+        if level < current {
+            return Some((instant, level));
+        }
+    }
+    Some((session_ends_at, AuthLevel::None))
+}
+
 /// Truncates a recorded identifier to a bounded length.
 fn truncate(value: &str) -> String {
     let trimmed = value.trim();
@@ -285,6 +379,55 @@ mod tests {
         // The recorded event kind and the proof kind it feeds must be one string.
         assert_eq!(EventKind::Password.as_str(), ProofKind::Password.as_str());
         assert_eq!(EventKind::EmailOtp.as_str(), ProofKind::EmailOtp.as_str());
+    }
+
+    fn situation(proofs: &[(ProofKind, i64)], now: i64, ttl: i64) -> Situation {
+        Situation {
+            account_id: Some(1),
+            proofs: proofs.iter().copied().collect(),
+            now,
+            session_ttl_secs: ttl,
+        }
+    }
+
+    #[test]
+    fn a_certain_session_drops_to_strong_when_the_password_ages_out() {
+        let s = situation(
+            &[(ProofKind::Password, 100), (ProofKind::EmailOtp, 200)],
+            250,
+            1_000,
+        );
+        assert_eq!(next_drop(&s, 5_000), Some((400, AuthLevel::Strong)));
+        assert_eq!(next_expiry(&s, 5_000), 400);
+    }
+
+    #[test]
+    fn a_strong_session_drops_to_basic_when_the_code_ages_out() {
+        // The password proof is long gone; the code proof ages out before the
+        // session row does.
+        let s = situation(
+            &[(ProofKind::Password, 100), (ProofKind::EmailOtp, 200)],
+            500,
+            1_000,
+        );
+        assert_eq!(next_drop(&s, 5_000), Some((1_200, AuthLevel::Basic)));
+    }
+
+    #[test]
+    fn a_basic_session_changes_at_the_password_expiry_without_dropping() {
+        // The ways up change when the password ages out (Certain then needs it
+        // re-typed), so that is the next re-check; the level only drops at the
+        // session's end.
+        let s = situation(&[(ProofKind::Password, 200)], 250, 1_000);
+        assert_eq!(next_expiry(&s, 1_200), 500);
+        assert_eq!(next_drop(&s, 1_200), Some((1_200, AuthLevel::None)));
+    }
+
+    #[test]
+    fn no_session_has_no_drop() {
+        let mut s = situation(&[], 250, 1_000);
+        s.account_id = None;
+        assert_eq!(next_drop(&s, 1_200), None);
     }
 
     #[test]

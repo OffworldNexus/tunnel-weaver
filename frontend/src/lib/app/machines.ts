@@ -3,7 +3,7 @@
  * read and mutated through the same-origin JSON client. Every call returns the
  * raw `ApiResult` so the page can tell an error from an empty list.
  */
-import { api } from '#lib/account/api';
+import { api, type RefusalHandler } from '#lib/account/api';
 
 /** A service a machine declares, with the hostnames the relay serves for it. */
 export interface MachineService {
@@ -100,7 +100,7 @@ export function machinesUrl({ page, perPage, q, health }: MachineQuery = {}): st
 
 /** `GET /api/account/machines` — one page of the signed-in person's machines. */
 export function listMachines(query: MachineQuery = {}) {
-	return api<MachinePage>(machinesUrl(query));
+	return api<MachinePage>('GET', machinesUrl(query));
 }
 
 /** The account-API URL for one machine. */
@@ -110,20 +110,30 @@ export function machineUrl(id: number): string {
 
 /** `GET /api/account/machines/{id}` — one machine. */
 export function getMachine(id: number) {
-	return api<Machine>(machineUrl(id));
+	return api<Machine>('GET', machineUrl(id));
 }
 
 /** `POST /api/account/machines/{id}/rename` — rename, re-deriving its hostnames. */
-export function renameMachine(id: number, name: string) {
-	return api<{ ok: boolean; name: string }>(`/api/account/machines/${id}/rename`, { name });
+export function renameMachine(id: number, name: string, onRefusal: RefusalHandler) {
+	return api<{ ok: boolean; name: string }>(
+		'POST',
+		`/api/account/machines/${id}/rename`,
+		{ name },
+		onRefusal
+	);
 }
 
 /** `POST /api/account/machines/{id}/disconnect` — drop the live tunnel, keep the key. */
-export function disconnectMachine(id: number) {
-	return api<{ ok: boolean; disconnected: boolean }>(`/api/account/machines/${id}/disconnect`, {});
+export function disconnectMachine(id: number, onRefusal: RefusalHandler) {
+	return api<{ ok: boolean; disconnected: boolean }>(
+		'POST',
+		`/api/account/machines/${id}/disconnect`,
+		{},
+		onRefusal
+	);
 }
 
 /** `POST /api/account/machines/{id}/revoke` — revoke the key and delete the machine. */
-export function revokeMachine(id: number) {
-	return api<{ ok: boolean }>(`/api/account/machines/${id}/revoke`, {});
+export function revokeMachine(id: number, onRefusal: RefusalHandler) {
+	return api<{ ok: boolean }>('POST', `/api/account/machines/${id}/revoke`, {}, onRefusal);
 }

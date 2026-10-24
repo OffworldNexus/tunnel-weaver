@@ -1,10 +1,10 @@
 //! The ordered authentication strength of a session.
 //!
-//! Spaced by ten so an intermediate level can be inserted later without
-//! renumbering, exactly as the reference does. WVR-167 uses `Basic` and
-//! `Strong`; `None` is "no session" and is never stored; `Certain` is declared
-//! but unused, so WVR-165's step-up (re-typing the password before a sensitive
-//! action) is a value rather than a renumbering.
+//! `None` is "no session" and is never stored. `Basic` is the password alone,
+//! `Strong` adds the second factor, `Certain` is `Strong` plus a password typed
+//! moments ago — what a sensitive action will ask for (WVR-165). Each is a
+//! level of its own, on the wire too: a client planning an action needs to
+//! know which one it holds and which one the action needs.
 
 /// How strongly a request has been authenticated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -15,22 +15,27 @@ pub enum AuthLevel {
     Basic,
     /// The second factor (the emailed code) is alive.
     Strong,
-    /// `Strong` plus a password re-typed moments ago. Nothing requires it yet.
+    /// `Strong` plus a password re-typed moments ago.
     Certain,
 }
 
 impl AuthLevel {
-    /// The wire name, used in `GET /api/account/me` and the gate's `403`.
-    ///
-    /// `Certain` reports as `strong`: the wire only has to distinguish "the
-    /// second factor is still pending" from "it is done", so the extra rank
-    /// stays server-side until a client needs it (the numeric ordering is what
-    /// the gate compares).
+    /// Every level, weakest first.
+    pub const ALL: [AuthLevel; 4] = [
+        AuthLevel::None,
+        AuthLevel::Basic,
+        AuthLevel::Strong,
+        AuthLevel::Certain,
+    ];
+
+    /// The wire name, used in the `GET /api/account/me` stream and the gate's
+    /// refusal headers.
     pub const fn as_str(self) -> &'static str {
         match self {
             AuthLevel::None => "none",
             AuthLevel::Basic => "basic",
-            AuthLevel::Strong | AuthLevel::Certain => "strong",
+            AuthLevel::Strong => "strong",
+            AuthLevel::Certain => "certain",
         }
     }
 }
@@ -47,10 +52,8 @@ mod tests {
     }
 
     #[test]
-    fn wire_names_are_stable() {
-        assert_eq!(AuthLevel::Basic.as_str(), "basic");
-        assert_eq!(AuthLevel::Strong.as_str(), "strong");
-        // `Certain` is not a client-visible level yet.
-        assert_eq!(AuthLevel::Certain.as_str(), "strong");
+    fn wire_names_are_stable_and_distinct() {
+        let names: Vec<&str> = AuthLevel::ALL.iter().map(|level| level.as_str()).collect();
+        assert_eq!(names, ["none", "basic", "strong", "certain"]);
     }
 }

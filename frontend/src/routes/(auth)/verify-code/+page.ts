@@ -13,16 +13,17 @@
  * page renders, and re-running it is harmless: the cooldown is the guard.
  */
 import { api } from '#lib/account/api';
+import { session } from '#lib/app/session.svelte';
+import { stepUp } from '#lib/app/upgrade';
 
 import type { PageLoad } from './$types';
 
 export const load: PageLoad = async ({ parent }) => {
-	const { session } = await parent();
-	if (session?.auth_level !== 'basic') {
+	await parent();
+	if (session.level !== 'basic') {
 		return { codeSent: false };
 	}
-	// `{}` so the client sends a POST; a body-less call would be a GET.
-	const res = await api<{ status: string }>('/api/account/login/resend', {});
+	const res = await api<{ status: string }>('POST', '/api/account/login/resend', {}, stepUp);
 	// `cooldown` means a code was just sent, so nothing went out now; anything
 	// else is a real send (or a failure, which the page reports).
 	return { codeSent: res.ok && res.data?.status === 'second_factor' };

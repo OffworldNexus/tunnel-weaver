@@ -16,7 +16,10 @@
 //!   trail (the `auth_event` rows that are also the level's source) and the
 //!   session plumbing.
 //! - [`gate`]: the deny-by-default middleware over `/api/account/*` that
-//!   refuses a session below the level a route requires.
+//!   refuses a session below the level a route requires, naming the level and
+//!   the upgrade options in response headers.
+//! - [`watch`]: the `GET /api/account/me` event stream — the session's level,
+//!   the way up to every higher one, and each drop announced before it lands.
 //!
 //! The rule the whole plane exists to enforce: **a second factor is never
 //! optional**. A session that has only proven the password can do exactly one
@@ -27,13 +30,14 @@ pub mod level;
 pub mod manager;
 pub mod paths;
 pub mod proof;
+pub mod watch;
 
 use std::net::SocketAddr;
 
 pub use gate::gate;
 pub use level::AuthLevel;
 pub use manager::{AuthManager, SessionContext};
-pub use paths::{PATHS, Situation, Step, StepKind};
+pub use paths::{PATHS, Situation, Step, StepKind, level_of};
 pub use proof::ProofKind;
 
 /// The kind of an `auth_event` row.
@@ -70,6 +74,19 @@ impl EventKind {
             EventKind::Logout => "logout",
         }
     }
+}
+
+/// One step of an upgrade option as the wire spells it.
+///
+/// `reaches` is where taking the step would leave the session, which the
+/// server works out from the proofs it holds now: it is not a property of the
+/// step alone. WVR-165 adds no field here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct WireStep {
+    /// The stable step name.
+    pub step: &'static str,
+    /// The level the session would hold once this step is taken.
+    pub reaches: &'static str,
 }
 
 /// The peer address of the request.

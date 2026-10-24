@@ -16,6 +16,7 @@
 	import { verifyCodeSchema } from '#lib/account/schemas';
 	import { pairing } from '#lib/account/state';
 	import { useSession } from '#lib/app/session.svelte';
+	import { stepUp } from '#lib/app/upgrade';
 	import Keycap from '#lib/ui/Keycap.svelte';
 	import Page from '#lib/ui/Page.svelte';
 	import { goto } from '$app/navigation';
@@ -40,10 +41,16 @@
 	});
 
 	const sf = jsonForm(verifyCodeSchema, { code: '' }, async (values) => {
-		const res = await api('/api/account/login/verify', values);
+		const res = await api('POST', '/api/account/login/verify', values, stepUp);
+		if (res.refused) {
+			return;
+		}
 		if (!res.ok) {
 			return res.error ?? 'That code was not accepted. Try again.';
 		}
+		// The stream reports the new level on its own; move on once it has, so
+		// the console's guard does not see the old one.
+		await session.reached('strong');
 		await goto(resolve(pairing.load().detour ? '/pair' : '/app'));
 	});
 
@@ -53,9 +60,11 @@
 	async function resend(): Promise<void> {
 		resending = true;
 		resent = '';
-		// `{}` so the client sends a POST; a body-less call would be a GET.
-		const res = await api<{ status: string }>('/api/account/login/resend', {});
+		const res = await api<{ status: string }>('POST', '/api/account/login/resend', {}, stepUp);
 		resending = false;
+		if (res.refused) {
+			return;
+		}
 		if (!res.ok) {
 			resent = res.error ?? 'We could not send a new code. Try again.';
 			return;
@@ -74,7 +83,9 @@
 	 */
 	async function startOver(): Promise<void> {
 		startingOver = true;
-		await api('/api/account/logout', {});
+		// Leaving either way: a refusal here means the session is already gone.
+		await api('POST', '/api/account/logout', {}, () => {});
+		session.stop();
 		// A full load, like the other session-ending flows: it keeps the router
 		// from reading a session that was just retired.
 		window.location.assign(resolve('/(auth)/sign-in'));
@@ -85,12 +96,12 @@
 	<title>Enter your code · Tunnel Weaver</title>
 </svelte:head>
 
-{#if session.user?.auth_level === 'basic'}
+{#if session.level === 'basic'}
 	<Page labelledby="verify-code-title">
 		<h1 id="verify-code-title">Enter your code</h1>
 		<p class="lede">
 			We emailed a six-digit code to
-			<strong>{session.user.email || 'your address'}</strong>.
+			<strong>{session.user?.email || 'your address'}</strong>.
 		</p>
 
 		<form class="form" method="POST" use:enhance novalidate>

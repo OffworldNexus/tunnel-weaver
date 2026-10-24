@@ -230,9 +230,17 @@ async fn call(
         .unwrap();
     let status = response.status();
     let headers = response.headers().clone();
-    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-        .await
-        .unwrap();
+    let is_stream = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.starts_with("text/event-stream"));
+    let bytes = if is_stream {
+        first_event_data(response.into_body()).await
+    } else {
+        axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+    };
     let parsed = if bytes.is_empty() {
         serde_json::Value::Null
     } else {
@@ -244,6 +252,85 @@ async fn call(
         body: parsed,
         len: bytes.len(),
     }
+}
+
+/// The `data` of the first event on an SSE body (comments skipped), then the
+/// stream is dropped — which is how a client leaves.
+async fn first_event_data(body: Body) -> bytes::Bytes {
+    let (_, data) = Events::new(body).next().await.expect("a first event");
+    bytes::Bytes::from(data)
+}
+
+/// The wall clock, in Unix seconds.
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+}
+
+/// An SSE body read event by event.
+struct Events {
+    body: Body,
+    buffer: String,
+}
+
+impl Events {
+    fn new(body: Body) -> Self {
+        Events {
+            body,
+            buffer: String::new(),
+        }
+    }
+
+    /// The next event's `(name, data)`, comments skipped; `None` once the
+    /// stream has ended.
+    async fn next(&mut self) -> Option<(String, String)> {
+        use http_body_util::BodyExt;
+        loop {
+            while let Some(end) = self.buffer.find("\n\n") {
+                let event: String = self.buffer.drain(..end + 2).collect();
+                let name = event
+                    .lines()
+                    .find_map(|line| line.strip_prefix("event: "))
+                    .unwrap_or("message")
+                    .to_string();
+                let data: Vec<&str> = event
+                    .lines()
+                    .filter_map(|line| line.strip_prefix("data: "))
+                    .collect();
+                if !data.is_empty() {
+                    return Some((name, data.join("\n")));
+                }
+            }
+            let frame = tokio::time::timeout(std::time::Duration::from_secs(5), self.body.frame())
+                .await
+                .expect("the stream sends its next event promptly")?
+                .unwrap();
+            if let Ok(chunk) = frame.into_data() {
+                self.buffer.push_str(std::str::from_utf8(&chunk).unwrap());
+            }
+        }
+    }
+
+    /// The next event, which must be a `state`, parsed.
+    async fn state(&mut self) -> serde_json::Value {
+        let (name, data) = self.next().await.expect("a state event");
+        assert_eq!(name, "state", "{data}");
+        serde_json::from_str(&data).unwrap()
+    }
+}
+
+/// The `GET /api/account/me` stream's first `state` for a session cookie.
+async fn me(fixture: &Fixture, session: &str) -> Reply {
+    call(
+        &fixture.router,
+        "GET",
+        "/api/account/me",
+        &[("cookie", format!("__Host-weaver_session={session}"))],
+        None,
+    )
+    .await
 }
 
 /// Extracts the raw verification token from the last captured email.
@@ -389,23 +476,20 @@ async fn full_lifecycle_signup_verify_login_logout() {
     .await;
     assert_eq!(verified.status, StatusCode::OK, "{:?}", verified.body);
 
-    // Identity, with the Unicode name preserved.
-    let me = call(
-        &fixture.router,
-        "GET",
-        "/api/account/me",
-        &[("cookie", format!("__Host-weaver_session={session}"))],
-        None,
-    )
-    .await;
-    assert_eq!(me.status, StatusCode::OK);
-    assert_eq!(me.body["name"], "Rémy");
-    assert_eq!(me.body["email"], "remy@example.com");
-    // The second factor is done, so the session is finished.
-    assert_eq!(me.body["auth_level"], "strong");
+    // Identity, with the Unicode name preserved, on the session stream.
+    let state = me(&fixture, &session).await;
+    assert_eq!(state.status, StatusCode::OK);
+    assert_eq!(state.body["me"]["name"], "Rémy");
+    assert_eq!(state.body["me"]["email"], "remy@example.com");
+    // The second factor is done and the password was typed moments ago, so the
+    // session is at the top: nothing above it is offered, and the next drop is
+    // the password proof ageing out, to `strong`.
+    assert_eq!(state.body["level"], "certain");
+    assert_eq!(state.body["paths"], serde_json::json!([]));
+    assert_eq!(state.body["drop"]["to"], "strong");
     // The Security page's "Password is set" state is driven by this flag.
     assert_eq!(
-        me.body["has_password"], true,
+        state.body["me"]["has_password"], true,
         "a password account reports a live credential"
     );
 
@@ -436,16 +520,16 @@ async fn full_lifecycle_signup_verify_login_logout() {
     .await;
     assert_eq!(logout.status, StatusCode::OK);
 
-    // The old cookie no longer authenticates.
-    let after = call(
-        &fixture.router,
-        "GET",
-        "/api/account/me",
-        &[("cookie", format!("__Host-weaver_session={session}"))],
-        None,
-    )
-    .await;
-    assert_eq!(after.status, StatusCode::UNAUTHORIZED);
+    // The old cookie no longer authenticates: the stream says `none`, with the
+    // way back in.
+    let after = me(&fixture, &session).await;
+    assert_eq!(after.body["level"], "none");
+    assert_eq!(after.body["paths"][0]["to"], "basic");
+    assert_eq!(
+        after.body["paths"][0]["options"],
+        serde_json::json!([[{ "step": "login", "reaches": "basic" }]])
+    );
+    assert!(after.body.get("me").is_none(), "{:?}", after.body);
 
     // Logging in again after logout succeeds with the same credentials,
     // and the fresh session authenticates. This proves logout retires the
@@ -461,17 +545,204 @@ async fn full_lifecycle_signup_verify_login_logout() {
     .await;
     assert_eq!(verified2.status, StatusCode::OK, "{:?}", verified2.body);
 
-    let me2 = call(
+    let me2 = me(&fixture, &session2).await;
+    assert_eq!(me2.body["level"], "certain");
+    assert_eq!(me2.body["me"]["name"], "Rémy");
+    assert_eq!(me2.body["me"]["email"], "remy@example.com");
+}
+
+/// The session stream is live: an open one is told the moment the code is
+/// accepted and the moment the session ends, and an anonymous one ends after
+/// saying so.
+#[tokio::test]
+async fn the_session_stream_follows_the_level() {
+    let fixture = setup().await;
+    register(
+        &fixture,
+        "Rémy",
+        "stream@example.com",
+        "correct horse battery",
+    )
+    .await;
+
+    let anonymous = fixture
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/account/me")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(anonymous.status(), StatusCode::OK);
+    let mut events = Events::new(anonymous.into_body());
+    assert_eq!(events.state().await["level"], "none");
+    assert!(events.next().await.is_none(), "an anonymous stream ends");
+
+    let (session, csrf) = login_step(&fixture, "stream@example.com", "correct horse battery").await;
+    let open = fixture
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/account/me")
+                .header("cookie", format!("__Host-weaver_session={session}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let mut events = Events::new(open.into_body());
+    assert_eq!(events.state().await["level"], "basic");
+
+    let accepted = verify_code(
+        &fixture,
+        &session,
+        &csrf,
+        &latest_signin_code(&fixture.sent),
+    )
+    .await;
+    assert_eq!(accepted.status, StatusCode::OK, "{:?}", accepted.body);
+    let strong = events.state().await;
+    assert_eq!(strong["level"], "certain");
+    assert_eq!(strong["me"]["email"], "stream@example.com");
+
+    let logout = call(
         &fixture.router,
-        "GET",
-        "/api/account/me",
-        &[("cookie", format!("__Host-weaver_session={session2}"))],
+        "POST",
+        "/api/account/logout",
+        &[
+            (
+                "cookie",
+                format!("__Host-weaver_session={session}; __Host-weaver_csrf={csrf}"),
+            ),
+            ("x-csrf-token", csrf.clone()),
+        ],
         None,
     )
     .await;
-    assert_eq!(me2.status, StatusCode::OK);
-    assert_eq!(me2.body["name"], "Rémy");
-    assert_eq!(me2.body["email"], "remy@example.com");
+    assert_eq!(logout.status, StatusCode::OK);
+    assert_eq!(events.state().await["level"], "none");
+    assert!(events.next().await.is_none(), "a signed-out stream ends");
+}
+
+/// Where a step leaves you is worked out from the proofs, not tabulated: the
+/// same emailed code lands at `certain` while the password proof is alive and at
+/// `strong` once it has aged out, and only then does the way to `certain` grow a
+/// second step.
+#[tokio::test]
+async fn the_ways_up_follow_the_password_proof() {
+    use sea_orm::ConnectionTrait as _;
+
+    let fixture = setup().await;
+    register(
+        &fixture,
+        "Rémy",
+        "ways-up@example.com",
+        "correct horse battery",
+    )
+    .await;
+    let (session, _) = login_step(&fixture, "ways-up@example.com", "correct horse battery").await;
+
+    let fresh = me(&fixture, &session).await;
+    assert_eq!(
+        fresh.body["paths"][1]["options"],
+        serde_json::json!([[{ "step": "verify_email_otp", "reaches": "certain" }]])
+    );
+
+    // Ten minutes on: the password proof is past its lifetime.
+    fixture
+        .account
+        .store
+        .db()
+        .execute_unprepared(
+            "UPDATE auth_event SET occurred_at = occurred_at - 600 WHERE kind = 'password'",
+        )
+        .await
+        .unwrap();
+
+    let stale = me(&fixture, &session).await;
+    assert_eq!(stale.body["level"], "basic");
+    // To `strong`, the code is still the whole way.
+    assert_eq!(
+        stale.body["paths"][0],
+        serde_json::json!({
+            "to": "strong",
+            "options": [[{ "step": "verify_email_otp", "reaches": "strong" }]],
+        })
+    );
+    // To `certain`, it is not: the password has to be re-typed as well, and the
+    // stream says where each step leaves the session.
+    assert_eq!(
+        stale.body["paths"][1],
+        serde_json::json!({
+            "to": "certain",
+            "options": [[
+                { "step": "verify_email_otp", "reaches": "strong" },
+                { "step": "confirm_password", "reaches": "certain" },
+            ]],
+        })
+    );
+}
+
+/// A drop is announced before it lands, then lands as a `state` of its own.
+#[tokio::test]
+async fn the_session_stream_announces_a_drop_before_it_lands() {
+    let fixture = setup().await;
+    register(
+        &fixture,
+        "Rémy",
+        "drop@example.com",
+        "correct horse battery",
+    )
+    .await;
+    let (session, _) = sign_in(&fixture, "drop@example.com", "correct horse battery").await;
+
+    use sea_orm::ConnectionTrait as _;
+
+    // Bring the session's end inside the announcement lead.
+    let ends_at = unix_now() + 2;
+    fixture
+        .account
+        .store
+        .db()
+        .execute_unprepared(&format!(
+            "UPDATE browser_session SET expires_at = {ends_at} WHERE invalidated_at IS NULL"
+        ))
+        .await
+        .unwrap();
+
+    let open = fixture
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/account/me")
+                .header("cookie", format!("__Host-weaver_session={session}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let mut events = Events::new(open.into_body());
+    let state = events.state().await;
+    assert_eq!(state["level"], "certain");
+    assert_eq!(
+        state["drop"],
+        serde_json::json!({ "at": ends_at, "to": "none" })
+    );
+
+    let (name, data) = events.next().await.expect("a drop announcement");
+    assert_eq!(name, "drop", "{data}");
+    let announced: serde_json::Value = serde_json::from_str(&data).unwrap();
+    assert_eq!(announced["at"], ends_at);
+    assert_eq!(announced["to"], "none");
+    assert!(announced["in"].as_i64().unwrap() <= 2);
+
+    assert_eq!(events.state().await["level"], "none");
+    assert!(events.next().await.is_none());
 }
 
 /// WVR-167: the password alone does not sign anyone in. The session it opens is
@@ -492,19 +763,31 @@ async fn login_is_not_complete_until_the_emailed_code() {
         login_step(&fixture, "twofactor@example.com", "correct horse battery").await;
     let cookie = format!("__Host-weaver_session={session}");
 
-    // The session exists but is unfinished.
-    let me = call(
-        &fixture.router,
-        "GET",
-        "/api/account/me",
-        &[("cookie", cookie.clone())],
-        None,
-    )
-    .await;
-    assert_eq!(me.status, StatusCode::OK);
-    assert_eq!(me.body["auth_level"], "basic");
+    // The session exists but is unfinished, and the stream says how to finish
+    // it, and when it ends unless finished.
+    let state = me(&fixture, &session).await;
+    assert_eq!(state.status, StatusCode::OK);
+    assert_eq!(state.body["level"], "basic");
+    // The password was typed moments ago, so the emailed code alone lands at
+    // `certain`: that is where the stream says the step leaves the session.
+    assert_eq!(
+        state.body["paths"],
+        serde_json::json!([
+            {
+                "to": "strong",
+                "options": [[{ "step": "verify_email_otp", "reaches": "certain" }]],
+            },
+            {
+                "to": "certain",
+                "options": [[{ "step": "verify_email_otp", "reaches": "certain" }]],
+            },
+        ])
+    );
+    assert_eq!(state.body["drop"]["to"], "none");
+    assert!(state.body["drop"]["at"].as_i64().is_some());
 
-    // Every protected endpoint is refused, naming the step that would lift it.
+    // Every protected endpoint is refused, naming in headers the level that
+    // would have been enough and the way there.
     let machines = call(
         &fixture.router,
         "GET",
@@ -519,8 +802,29 @@ async fn login_is_not_complete_until_the_emailed_code() {
         "{:?}",
         machines.body
     );
-    assert_eq!(machines.body["required"], "strong");
-    assert_eq!(machines.body["step"], "verify_email_otp");
+    assert_eq!(machines.headers["x-weaver-required-level"], "strong");
+    assert_eq!(
+        machines.headers["x-weaver-upgrade-paths"],
+        r#"[[{"step":"verify_email_otp","reaches":"certain"}]]"#
+    );
+
+    // So is a write.
+    let rename = call(
+        &fixture.router,
+        "POST",
+        "/api/account/machines/1/rename",
+        &[
+            (
+                "cookie",
+                format!("__Host-weaver_session={session}; __Host-weaver_csrf={csrf}"),
+            ),
+            ("x-csrf-token", csrf.clone()),
+        ],
+        Some(serde_json::json!({ "name": "laptop" })),
+    )
+    .await;
+    assert_eq!(rename.status, StatusCode::FORBIDDEN, "{:?}", rename.body);
+    assert_eq!(rename.headers["x-weaver-required-level"], "strong");
 
     // A wrong code is refused and leaves the session unfinished.
     let code = latest_signin_code(&fixture.sent);
@@ -532,28 +836,14 @@ async fn login_is_not_complete_until_the_emailed_code() {
         "{:?}",
         refused.body
     );
-    let still_basic = call(
-        &fixture.router,
-        "GET",
-        "/api/account/me",
-        &[("cookie", cookie.clone())],
-        None,
-    )
-    .await;
-    assert_eq!(still_basic.body["auth_level"], "basic");
+    let still_basic = me(&fixture, &session).await;
+    assert_eq!(still_basic.body["level"], "basic");
 
     // The emailed code finishes it, and protected endpoints answer.
     let accepted = verify_code(&fixture, &session, &csrf, &code).await;
     assert_eq!(accepted.status, StatusCode::OK, "{:?}", accepted.body);
-    let me = call(
-        &fixture.router,
-        "GET",
-        "/api/account/me",
-        &[("cookie", cookie.clone())],
-        None,
-    )
-    .await;
-    assert_eq!(me.body["auth_level"], "strong");
+    let state = me(&fixture, &session).await;
+    assert_eq!(state.body["level"], "certain");
     let avatar = call(
         &fixture.router,
         "GET",
@@ -1117,8 +1407,7 @@ async fn reset_revokes_every_existing_session() {
     )
     .await;
     assert_eq!(
-        me.status,
-        StatusCode::UNAUTHORIZED,
+        me.body["level"], "none",
         "a reset signs the user out everywhere"
     );
 
@@ -1413,8 +1702,7 @@ async fn change_password_swaps_the_credential_and_signs_out_everywhere() {
     )
     .await;
     assert_eq!(
-        me.status,
-        StatusCode::UNAUTHORIZED,
+        me.body["level"], "none",
         "a change signs the user out everywhere"
     );
 
@@ -1467,8 +1755,7 @@ async fn change_password_refuses_a_wrong_current_password_without_side_effects()
     )
     .await;
     assert_eq!(
-        me.status,
-        StatusCode::OK,
+        me.body["level"], "certain",
         "a refusal leaves the session alone"
     );
     // The refusal sent nothing. (Checked before the `signs_in` probes below:
@@ -1547,11 +1834,7 @@ async fn change_password_revokes_a_second_session_too() {
             None,
         )
         .await;
-        assert_eq!(
-            me.status,
-            StatusCode::UNAUTHORIZED,
-            "every session is revoked"
-        );
+        assert_eq!(me.body["level"], "none", "every session is revoked");
     }
 }
 
@@ -1749,8 +2032,7 @@ async fn delete_account_requires_a_session_and_a_same_origin_csrf_request() {
     )
     .await;
     assert_eq!(
-        me.status,
-        StatusCode::OK,
+        me.body["level"], "certain",
         "the account survives a refused delete: {:?}",
         me.body
     );
@@ -1810,11 +2092,7 @@ async fn delete_account_re_checks_the_address_and_lands_the_owner_signed_out() {
         None,
     )
     .await;
-    assert_eq!(
-        me.status,
-        StatusCode::UNAUTHORIZED,
-        "a delete ends every session"
-    );
+    assert_eq!(me.body["level"], "none", "a delete ends every session");
     assert!(
         !signs_in(&fixture, email, "correct horse battery").await,
         "the account is gone"
@@ -2417,7 +2695,7 @@ async fn machines_fixture(fixture: &Fixture) -> (Browser, i32, i32) {
     let browser = Browser::new(fixture, "Rémy", "remy@example.com").await;
     let me = browser.get(fixture, "/api/account/me").await;
     assert_eq!(me.status, StatusCode::OK, "{:?}", me.body);
-    let account_id = me.body["id"].as_i64().expect("account id") as i32;
+    let account_id = me.body["me"]["id"].as_i64().expect("account id") as i32;
 
     let store = &fixture.account.store;
     let person = store

@@ -13,8 +13,8 @@
 	 * The guard lives in the layout, not in each page, because gating here keeps
 	 * it ahead of the page's own work: the children never mount, so `verify` and
 	 * `reset` never spend their single-use link tokens on the way out. (The root
-	 * layout has already settled the session, so this layout only ever runs with
-	 * a known user or none.)
+	 * layout holds until the session stream's first frame, and the guard follows
+	 * every later one.)
 	 */
 	import type { Snippet } from 'svelte';
 
@@ -35,14 +35,14 @@
 
 	/** Whether this page is allowed to render for the current session. */
 	const visible = $derived(
-		!session.user || (session.user.auth_level === 'basic' && page.url.pathname === verifyCode)
+		session.level === 'none' || (session.level === 'basic' && page.url.pathname === verifyCode)
 	);
 
 	$effect(() => {
-		if (!session.user) {
+		if (session.level === 'none') {
 			return;
 		}
-		if (session.user.auth_level === 'basic') {
+		if (session.level === 'basic') {
 			if (page.url.pathname !== verifyCode) {
 				void goto(verifyCode, { replace: true });
 			}

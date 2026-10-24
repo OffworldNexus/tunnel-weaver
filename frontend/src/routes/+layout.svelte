@@ -6,15 +6,14 @@
 	import Keycap from '#lib/ui/Keycap.svelte';
 	import Page from '#lib/ui/Page.svelte';
 	import Toaster from '#lib/ui/Toaster.svelte';
-	import { refreshAll } from '$app/navigation';
 
 	import type { LayoutProps } from './$types';
 
-	let { data, children }: LayoutProps = $props();
+	let { children }: LayoutProps = $props();
 
-	// The root `+layout.ts` load already read the session — before this route's
-	// own loads ran — so the whole app shares one freshly read identity.
-	provideSession(() => data.session);
+	// The root `+layout.ts` load opened the session stream and waited for its
+	// first frame, so the whole app shares one live identity.
+	const session = provideSession();
 
 	// Warm the constants; the pages that need them report a failure themselves.
 	ensureConfig().catch(() => {});
@@ -23,17 +22,17 @@
 <a class="skip-link" href="#main">Skip to content</a>
 <Toaster />
 
-{#if data.error}
+{#if session.ready}
+	{@render children()}
+{:else if session.error}
 	<!-- Fail loudly: an unreachable relay is not a signed-out visitor. -->
 	<Page labelledby="session-error-title" center>
 		<h1 id="session-error-title">We could not reach the server</h1>
-		<p class="notice-error" role="alert">{data.error}</p>
+		<p class="notice-error" role="alert">{session.error}</p>
 		<div class="actions">
-			<Keycap type="button" onclick={() => refreshAll()} wide>Try again</Keycap>
+			<Keycap type="button" onclick={() => session.restart()} wide>Try again</Keycap>
 		</div>
 	</Page>
-{:else}
-	{@render children()}
 {/if}
 
 <style lang="scss">

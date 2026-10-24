@@ -23,7 +23,7 @@ let loading: Promise<AccountConfig> | null = null;
 
 /** Fetches `/api/account/config` once; a failed fetch is retried on the next call. */
 export function ensureConfig(): Promise<AccountConfig> {
-	loading ??= api<AccountConfig>('/api/account/config').then((res) => {
+	loading ??= api<AccountConfig>('GET', '/api/account/config').then((res) => {
 		if (!res.ok || !res.data) {
 			loading = null;
 			throw new Error(res.error ?? 'config unavailable');

@@ -25,7 +25,7 @@ use serde_json::{Value, json};
 
 use weaver_abuse::AltchaError;
 
-use crate::account::auth::{AuthLevel, AuthManager, SessionContext};
+use crate::account::auth::{AuthManager, SessionContext, watch};
 use crate::account::session::{self, CSRF_COOKIE, CSRF_HEADER, SESSION_COOKIE};
 use crate::account::views::{
     USAGE_WINDOW_SECS, key_of, load_error, owned_machine, person_of, person_services, signed_in,
@@ -705,7 +705,10 @@ async fn reset_complete(
         })
         .await
     {
-        Ok(_) => json_ok(json!({ "outcome": "reset" })),
+        Ok(account) => {
+            watch::sessions_changed(&rt.live, account.id);
+            json_ok(json!({ "outcome": "reset" }))
+        }
         Err(StoreError::Conflict(_)) => err(
             StatusCode::BAD_REQUEST,
             "this link has expired or has already been used",
@@ -873,7 +876,7 @@ async fn login_verify(
                 return err(StatusCode::SERVICE_UNAVAILABLE, "temporarily unavailable");
             }
             tracing::info!(account_id = session.account_id, "Second factor verified");
-            json_ok(json!({ "ok": true, "auth_level": AuthLevel::Strong.as_str() }))
+            json_ok(json!({ "ok": true }))
         }
         Err(error) => {
             let _ = manager.email_otp_failed(session).await;
@@ -939,39 +942,17 @@ async fn login_resend(
     json_ok(json!({ "status": "second_factor" }))
 }
 
-/// `GET /api/account/me` — the signed-in identity and its authentication level.
+/// `GET /api/account/me` — the session's identity and authentication, as an
+/// event stream (see [`crate::account::auth::watch`]).
 ///
-/// This is reachable at `Basic` on purpose: the level is what tells the console
-/// whether the second factor is still pending (`basic`) or done (`strong`).
+/// Reachable by anyone: an anonymous visitor is answered with a `none` state
+/// rather than a `401`, which an `EventSource` could not read.
 async fn me(
     State(rt): State<Arc<AccountRuntime>>,
     Extension(manager): Extension<AuthManager>,
     headers: HeaderMap,
 ) -> Response {
-    let Some(account) = signed_in(&rt, &headers).await else {
-        return err(StatusCode::UNAUTHORIZED, "not signed in");
-    };
-    let email = rt
-        .store
-        .email_identity_for_account(account.id)
-        .await
-        .ok()
-        .flatten()
-        .map(|identity| identity.email);
-    // Drives the Security page's "Password is set" state: a live credential
-    // exists for every email/password account today, but the flag keeps the
-    // panel honest once passkeys or SSO arrive.
-    let has_password = rt
-        .store
-        .password_current_for(account.id)
-        .await
-        .ok()
-        .flatten()
-        .is_some();
-    let auth_level = manager.level().await.as_str();
-    json_ok(
-        json!({ "id": account.id, "name": account.name, "email": email, "has_password": has_password, "auth_level": auth_level }),
-    )
+    watch::serve(rt, manager, &headers)
 }
 
 /// How large an avatar may be asked to be, and the size used when unprompted.
@@ -1047,6 +1028,11 @@ async fn logout(
     }
     if let Some(raw) = session::cookie(&headers, SESSION_COOKIE) {
         let _ = rt.sessions.invalidate(&raw, unix_secs()).await;
+    }
+    // Announced only once the row is retired, so a stream that reloads on it
+    // finds the session gone rather than briefly without its proofs.
+    if let Some(session) = manager.session() {
+        watch::session_changed(&rt.live, session);
     }
     with_cookie(
         json_ok(json!({ "ok": true })),
@@ -1821,6 +1807,7 @@ async fn change_password(
                     }
                 });
             }
+            watch::sessions_changed(&rt.live, account.id);
             // Every session is now dead, this one included: clear the cookie so
             // the browser does not keep presenting a session that no longer
             // exists, and let the SPA send the user to sign in again.

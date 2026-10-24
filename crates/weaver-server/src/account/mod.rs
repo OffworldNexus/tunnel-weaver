@@ -196,6 +196,7 @@ impl AccountRuntime {
         };
 
         self.store.delete_account(account_id).await?;
+        auth::watch::sessions_changed(&self.live, account_id);
 
         if let Some(registry) = tunnel {
             for key in keys {
