@@ -149,7 +149,7 @@ fn sample_config(https_port: u16) -> Config {
         usage_retention_secs: 31_536_000,
         relay_ips: Vec::new(),
         setup_complete: false,
-        email: None,
+        email: Some(weaver_server::config::test_email_config()),
         abuse: None,
         account: account_config(format!("https://localhost:{https_port}")),
     }

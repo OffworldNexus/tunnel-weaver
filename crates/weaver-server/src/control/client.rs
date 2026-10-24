@@ -318,7 +318,13 @@ pub async fn client_status(socket_path: &Path, json: bool) -> i32 {
             }
         }
         None => {
-            println!("  {:<14} {}", "Status:".dark_grey(), "disabled".dark_grey());
+            // Email is required (WVR-167): an absent block is a misconfiguration
+            // the daemon refuses, not a supported "off" state.
+            println!(
+                "  {:<14} {}",
+                "Status:".dark_grey(),
+                "not configured (required)".yellow()
+            );
         }
     }
     println!();

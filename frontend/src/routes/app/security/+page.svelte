@@ -62,6 +62,18 @@
 	{/if}
 </Panel>
 
+<Panel
+	title="Two-factor authentication"
+	subtitle="A second factor protects your account even if your password leaks. It is always on."
+>
+	<p class="state"><Icon name="check" size={16} /> Enabled · email codes</p>
+	<p class="state__note">
+		Every sign-in sends a one-time code to
+		<strong>{session.user?.email || 'your address'}</strong>. The relay's email provider is
+		therefore required, and there is no way to turn the second factor off.
+	</p>
+</Panel>
+
 <Panel danger title="Danger zone" subtitle="Irreversible actions. There is no way back.">
 	<div class="danger">
 		<div class="danger__copy">
@@ -103,6 +115,14 @@
 
 	.state :global(svg) {
 		color: var(--tw-online);
+	}
+
+	.state__note {
+		margin: 8px 0 0;
+		color: var(--tw-muted);
+		font-size: 14px;
+		line-height: 1.5;
+		max-width: 60ch;
 	}
 
 	.danger {

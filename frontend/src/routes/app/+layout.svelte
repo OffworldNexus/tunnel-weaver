@@ -24,11 +24,18 @@
 	const session = useSession();
 
 	// The session probe lives in the root layout and runs on every navigation;
-	// when it settles without a user, the console is not a place to be.
+	// when it settles without a user, the console is not a place to be. A
+	// `basic` session (password only) is sent to the code step instead — the
+	// sibling `+layout.ts` already redirects before any page load runs, and this
+	// covers the case where the layout renders without a navigation.
 	$effect(() => {
 		if (!session.user) {
 			notify('error', 'Your session has expired. Please sign in again.');
 			void goto(resolve('/(auth)/sign-in'), { replace: true });
+			return;
+		}
+		if (session.user.auth_level === 'basic') {
+			void goto(resolve('/(auth)/verify-code'), { replace: true });
 		}
 	});
 </script>
@@ -37,7 +44,7 @@
 	<title>Console · Tunnel Weaver</title>
 </svelte:head>
 
-{#if session.user}
+{#if session.user && session.user.auth_level === 'strong'}
 	<Shell title={meta.title} subtitle={meta.subtitle} crumbs={meta.crumbs}>
 		{@render children()}
 	</Shell>

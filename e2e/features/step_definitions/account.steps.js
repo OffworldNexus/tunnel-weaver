@@ -2,7 +2,7 @@
 
 import { Then, When } from '@cucumber/cucumber';
 import * as assert from '../support/assertions.js';
-import { latestMailBySubject, latestMailLink, mailLinks, poll } from '../support/harness.js';
+import { latestMailBySubject, latestMailLink, mailCount, mailLinks, poll } from '../support/harness.js';
 import { createAccount, openVerificationLink, press, setPassword } from '../support/flow.js';
 
 const RESET_LINK = /https:\/\/localhost:\d+\/reset#token=[0-9a-f]+/g;
@@ -56,6 +56,17 @@ Then('no reset email is sent', async function () {
   if (links.length > 0) throw new Error(`Expected no reset email, but got: ${links.join(', ')}`);
 });
 
+// WVR-167: arriving at the code step asks the relay for a code. The cooldown
+// makes that a no-op right after the password step, so a normal sign-in must
+// leave exactly one code email — a second one means the arrival send duplicated.
+Then('exactly one {string} email is sent', async function (subject) {
+  await new Promise((resolve) => setTimeout(resolve, 3_000));
+  const count = await mailCount(subject);
+  if (count !== 1) {
+    throw new Error(`Expected exactly one ${JSON.stringify(subject)} email, but the mailbox holds ${count}.`);
+  }
+});
+
 // ----- password change -------------------------------------------------------
 
 When('I change my password from {string} to {string}', async function (current, next) {
@@ -67,6 +78,13 @@ When('I change my password from {string} to {string}', async function (current, 
 
 Then('the Password panel shows {string}', async function (state) {
   const panel = this.page.getByRole('region', { name: 'Password', exact: true });
+  await panel.getByText(state).waitFor();
+});
+
+// WVR-167: the second factor is fixed, not a setting — the panel reports it as
+// enabled for email codes and offers no control that could turn it off.
+Then('the Two-factor authentication panel shows {string}', async function (state) {
+  const panel = this.page.getByRole('region', { name: 'Two-factor authentication', exact: true });
   await panel.getByText(state).waitFor();
 });
 

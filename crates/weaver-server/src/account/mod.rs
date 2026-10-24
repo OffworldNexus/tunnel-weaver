@@ -8,10 +8,12 @@
 //! The plane is always on; [`crate::config::AccountConfig`] only tunes it. The
 //! runtime is built once at startup and shared through the edge config.
 
+pub mod auth;
 pub mod inactivity;
 pub mod pairing;
 pub mod password;
 pub mod router;
+pub mod second_factor;
 pub mod session;
 pub mod views;
 

@@ -18,7 +18,16 @@ Feature: Account lifecycle
     And the verified email is shown as the account address
     When I set the password to "correct-horse-battery-staple"
     Then I see "Your account is active. Sign in to continue."
-    When I sign in with the password "correct-horse-battery-staple"
+    # WVR-167: the password is only the first factor. This journey now walks the
+    # code step too — stopped at, refused, then accepted — so the second factor
+    # is proven to be reached before the console rather than hidden in a helper.
+    When I sign in with the password "correct-horse-battery-staple", without the code
+    Then I see the "Enter your code" heading
+    And exactly one "Your Tunnel Weaver sign-in code" email is sent
+    When I submit a wrong code
+    Then I see the error "That code is not right. Check it and try again."
+    And I see the "Enter your code" heading
+    When I enter the code from my email
     Then I see the signed-in identity for "Ada Lovelace"
     When I sign out
     Then I see the "Sign in" heading
@@ -27,6 +36,7 @@ Feature: Account lifecycle
     When I follow the "Security" link
     Then I see the "Security" heading
     And the Password panel shows "Password is set"
+    And the Two-factor authentication panel shows "Enabled · email codes"
     When I follow the "Change password" link
     Then I see the "Change your password" heading
     When I change my password from "correct-horse-battery-staple" to "correct-horse-battery-staple-2"

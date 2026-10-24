@@ -32,7 +32,7 @@ fn create_valid_test_config(
         usage_retention_secs: 31_536_000,
         relay_ips: Vec::new(),
         setup_complete: false,
-        email: None,
+        email: Some(weaver_server::config::test_email_config()),
         abuse: None,
         account: Default::default(),
     }
@@ -305,9 +305,9 @@ async fn test_control_socket_daemon_suite() {
         assert_eq!(val["ok"], true);
         assert_eq!(val["tunnel_domain"], "weaver.test");
         assert_eq!(val["admin_domain"], "relay-admin.test");
-        // Three migrations: `m0001_init`, `m0002_usage_daily` and
-        // `m0003_inactivity`.
-        assert_eq!(val["schema_version"], 3);
+        // Four migrations: `m0001_init`, `m0002_usage_daily`,
+        // `m0003_inactivity` and `m0004_auth_levels`.
+        assert_eq!(val["schema_version"], 4);
         // The seeded tunnel wildcard reports issued; the admin certificate has
         // no stored row and is still pending, so it counts as ordering.
         assert_eq!(val["cert_counts"]["issued"], 1);
@@ -633,7 +633,7 @@ async fn test_cert_wait_streaming_failed_exit_4_and_renew_rate_limit() {
         usage_retention_secs: 31_536_000,
         relay_ips: Vec::new(),
         setup_complete: false,
-        email: None,
+        email: Some(weaver_server::config::test_email_config()),
         abuse: None,
         account: Default::default(),
     });

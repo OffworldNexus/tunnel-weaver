@@ -16,7 +16,9 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use thiserror::Error;
 
-pub use template::{InactivityWarning, Joke, Otp, PasswordChanged, Reset, Verification, Welcome};
+pub use template::{
+    InactivityWarning, Joke, Otp, PasswordChanged, Reset, SignInCode, Verification, Welcome,
+};
 
 use crate::config::EmailConfig;
 

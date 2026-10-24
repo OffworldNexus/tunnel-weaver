@@ -1,0 +1,82 @@
+//! Authentication levels, proofs and the gate (WVR-167).
+//!
+//! This mirrors the auth-levels-and-proofs design used in `jonator`
+//! (`people/auth/{levels,paths,manager,gate}.py`): the session's authentication
+//! is a *level* derived from the *proofs* still alive on it, not a flag stored
+//! anywhere.
+//!
+//! - [`level`]: the ordered [`AuthLevel`] enum. `Basic` is "one factor, the
+//!   password", `Strong` is "the second factor is alive".
+//! - [`proof`]: the [`ProofKind`] set and each kind's lifetime. WVR-167 uses
+//!   `password` and `email_otp`; WVR-164/165/166 add kinds, never a redesign.
+//! - [`paths`]: the [`AuthPath`] trait — *how* one authenticates, the level it
+//!   currently grants and the steps it offers to climb. Only the password +
+//!   emailed-code path exists today; the trait is the extension seam.
+//! - [`manager`]: the per-request [`AuthManager`], sole owner of the audit
+//!   trail (the `auth_event` rows that are also the level's source) and the
+//!   session plumbing.
+//! - [`gate`]: the deny-by-default middleware over `/api/account/*` that
+//!   refuses a session below the level a route requires.
+//!
+//! The rule the whole plane exists to enforce: **a second factor is never
+//! optional**. A session that has only proven the password can do exactly one
+//! thing besides leaving — climb to `Strong` by entering an emailed code.
+
+pub mod gate;
+pub mod level;
+pub mod manager;
+pub mod paths;
+pub mod proof;
+
+use std::net::SocketAddr;
+
+pub use gate::gate;
+pub use level::AuthLevel;
+pub use manager::{AuthManager, SessionContext};
+pub use paths::{PATHS, Situation, Step, StepKind};
+pub use proof::ProofKind;
+
+/// The kind of an `auth_event` row.
+///
+/// The rows are simultaneously the audit trail and the raw material the level
+/// is derived from: the `password` and `email_otp` kinds are proofs (see
+/// [`ProofKind`]), the rest are recorded for the record's sake. Adding a kind is
+/// a value, not a migration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EventKind {
+    /// The password was checked and a session opened (first factor).
+    Password,
+    /// The email factor was engaged — a code was issued or re-sent.
+    EmailOtpIssued,
+    /// An emailed code was accepted.
+    EmailOtp,
+    /// An emailed code was refused (wrong, expired or attempt-capped).
+    EmailOtpFailed,
+    /// A password check failed, before any session existed.
+    LoginFailed,
+    /// The session was closed; proofs before it cannot be revived.
+    Logout,
+}
+
+impl EventKind {
+    /// The stable string stored in `auth_event.kind`.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            EventKind::Password => "password",
+            EventKind::EmailOtpIssued => "email_otp_issued",
+            EventKind::EmailOtp => "email_otp",
+            EventKind::EmailOtpFailed => "email_otp_failed",
+            EventKind::LoginFailed => "login_failed",
+            EventKind::Logout => "logout",
+        }
+    }
+}
+
+/// The peer address of the request.
+///
+/// Inserted into request extensions by the edge so the [`AuthManager`] can
+/// record it on every `auth_event` row. It travels as a request extension
+/// rather than an extractor because the raw-hyper edge is the only layer that
+/// knows the socket address; the axum router never sees a `ConnectInfo`.
+#[derive(Debug, Clone, Copy)]
+pub struct ClientAddr(pub SocketAddr);

@@ -477,17 +477,14 @@ pub struct ConfigureArgs {
 
 /// Email settings shared by `configure` (and, in part, `setup`).
 ///
-/// `--email-provider` and `--no-email` conflict; passing any other email flag
-/// without `--email-provider` is an error rather than a silent default.
+/// Email is a hard requirement (WVR-167): the second factor is an emailed code,
+/// so there is no flag to turn email off. Passing any email flag without
+/// `--email-provider` is an error rather than a silent default.
 #[derive(Args, Debug, Clone, Default)]
 pub struct EmailArgs {
     /// Transactional email provider id (see `providers email`).
-    #[arg(long, value_name = "ID", conflicts_with = "no_email")]
+    #[arg(long, value_name = "ID")]
     pub email_provider: Option<String>,
-
-    /// Disable email accounts, clearing any configured provider.
-    #[arg(long)]
-    pub no_email: bool,
 
     /// Verified sender address.
     #[arg(long, value_name = "ADDRESS")]
@@ -795,11 +792,7 @@ async fn main() {
 
             match email_decision {
                 ConfigureEmail::Preserve(email) => {
-                    config.email = email;
-                }
-                ConfigureEmail::Disable => {
-                    config.email = None;
-                    let _ = weaver_server::email::otp::PendingOtp::clear(&store).await;
+                    config.email = Some(email);
                 }
                 ConfigureEmail::Verify(code) => {
                     match weaver_server::email::otp::PendingOtp::load(&store).await {
@@ -1086,10 +1079,8 @@ async fn handle_send_a_joke(args: SendAJokeArgs, db_path: PathBuf) -> i32 {
 
 /// What a `configure` invocation decided about email.
 enum ConfigureEmail {
-    /// No email flags: keep whatever was stored.
-    Preserve(Option<weaver_server::config::EmailConfig>),
-    /// `--no-email`: clear it.
-    Disable,
+    /// No email flags: keep the stored block.
+    Preserve(weaver_server::config::EmailConfig),
     /// `--email-otp CODE`: verify the pending challenge.
     Verify(String),
     /// First run: the config was built and validated; send an OTP next.
@@ -1098,18 +1089,26 @@ enum ConfigureEmail {
 
 /// Decides how `configure` changes the email block, building and validating a
 /// new one when the flags ask for it.
+///
+/// There is no "disable" outcome (WVR-167): email is what delivers the second
+/// factor, and a config without it is rejected at load. So neither an explicit
+/// flag nor the absence of one may leave the block empty.
 fn decide_configure_email(
     settings: &EmailArgs,
     existing: Option<weaver_server::config::EmailConfig>,
 ) -> Result<ConfigureEmail, String> {
-    if settings.no_email {
-        return Ok(ConfigureEmail::Disable);
-    }
     if let Some(code) = settings.email_otp.clone() {
         return Ok(ConfigureEmail::Verify(code));
     }
     if !settings.configures_email() {
-        return Ok(ConfigureEmail::Preserve(existing));
+        return match existing {
+            Some(cfg) => Ok(ConfigureEmail::Preserve(cfg)),
+            None => Err(
+                "email is required: pass --email-provider and its credentials (the emailed \
+                 second factor is the sign-in)"
+                    .into(),
+            ),
+        };
     }
     let cfg = settings.to_config()?;
     let issues = weaver_server::email::providers::validate_email_config(&cfg);
@@ -1239,7 +1238,7 @@ async fn resolve_setup_email(
     }
 
     match weaver_server::setup::interactive::prompt_email_config() {
-        Ok(cfg) => cfg,
+        Ok(cfg) => Some(cfg),
         Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {
             eprintln!("\n{} Cancelled by user.", "•".blue());
             std::process::exit(130);
@@ -1957,6 +1956,17 @@ async fn handle_setup(args: SetupArgs, db_path: PathBuf) {
         &admin_email,
     )
     .await;
+
+    // Email is a hard requirement (WVR-167): it carries the second factor, so
+    // setup must not write a config the daemon will then refuse to load.
+    if email_config.is_none() {
+        eprintln!(
+            "{} email is required: pass --email-provider and its credentials \
+             (the emailed second factor is the sign-in)",
+            "✗ Error:".red().bold()
+        );
+        std::process::exit(2);
+    }
 
     let mut gathered = weaver_server::setup::interactive::GatheredConfig {
         tunnel_domain: tunnel_domain.clone(),

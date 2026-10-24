@@ -156,7 +156,7 @@ fn base_config() -> Config {
         usage_retention_secs: 31_536_000,
         relay_ips: Vec::new(),
         setup_complete: false,
-        email: None,
+        email: Some(weaver_server::config::test_email_config()),
         abuse: None,
         account: AccountConfig::default(),
     }
@@ -299,6 +299,69 @@ async fn register(fixture: &Fixture, name: &str, email: &str, password: &str) {
     assert_eq!(reply.body["outcome"], "activated");
 }
 
+/// The six-digit code from the newest captured sign-in email.
+///
+/// The test's stand-in for the person reading their inbox: the plain-text twin
+/// carries the code alone on its line.
+fn latest_signin_code(sent: &Arc<Mutex<Vec<Email>>>) -> String {
+    sent.lock()
+        .unwrap()
+        .iter()
+        .rev()
+        .find(|email| email.subject == "Your Tunnel Weaver sign-in code")
+        .and_then(|email| {
+            email
+                .text
+                .lines()
+                .map(str::trim)
+                .find(|line| line.len() == 6 && line.chars().all(|c| c.is_ascii_digit()))
+                .map(str::to_string)
+        })
+        .expect("a sign-in code email was captured")
+}
+
+/// The password step of a sign-in: opens a `Basic` session and emails a code.
+/// Returns the `(session, csrf)` cookie pair.
+async fn login_step(fixture: &Fixture, email: &str, password: &str) -> (String, String) {
+    let login = call(
+        &fixture.router,
+        "POST",
+        "/api/account/login",
+        &[],
+        Some(serde_json::json!({
+            "email": email,
+            "password": password,
+            "altcha": solved(&fixture.account, "login").await,
+        })),
+    )
+    .await;
+    assert_eq!(login.status, StatusCode::OK, "{:?}", login.body);
+    (
+        login
+            .cookie("__Host-weaver_session")
+            .expect("session cookie set"),
+        login.cookie("__Host-weaver_csrf").expect("csrf cookie set"),
+    )
+}
+
+/// The code step of a sign-in, with the double-submit CSRF pair attached.
+async fn verify_code(fixture: &Fixture, session: &str, csrf: &str, code: &str) -> Reply {
+    call(
+        &fixture.router,
+        "POST",
+        "/api/account/login/verify",
+        &[
+            (
+                "cookie",
+                format!("__Host-weaver_session={session}; __Host-weaver_csrf={csrf}"),
+            ),
+            ("x-csrf-token", csrf.to_string()),
+        ],
+        Some(serde_json::json!({ "code": code })),
+    )
+    .await
+}
+
 /// The authoritative end-to-end happy path: signup → emailed link →
 /// initial password → login → signed-in identity → logout → login again.
 #[tokio::test]
@@ -315,25 +378,16 @@ async fn full_lifecycle_signup_verify_login_logout() {
     // A verification email and a welcome email were sent.
     assert_eq!(fixture.sent.lock().unwrap().len(), 2);
 
-    // Log in.
-    let altcha = solved(&fixture.account, "login").await;
-    let login = call(
-        &fixture.router,
-        "POST",
-        "/api/account/login",
-        &[],
-        Some(serde_json::json!({
-            "email": "remy@example.com",
-            "password": "correct horse battery",
-            "altcha": altcha
-        })),
+    // Log in: the password step, then the emailed code (WVR-167).
+    let (session, csrf) = login_step(&fixture, "remy@example.com", "correct horse battery").await;
+    let verified = verify_code(
+        &fixture,
+        &session,
+        &csrf,
+        &latest_signin_code(&fixture.sent),
     )
     .await;
-    assert_eq!(login.status, StatusCode::OK, "{:?}", login.body);
-    let session = login
-        .cookie("__Host-weaver_session")
-        .expect("session cookie set");
-    let csrf = login.cookie("__Host-weaver_csrf").expect("csrf cookie set");
+    assert_eq!(verified.status, StatusCode::OK, "{:?}", verified.body);
 
     // Identity, with the Unicode name preserved.
     let me = call(
@@ -347,6 +401,8 @@ async fn full_lifecycle_signup_verify_login_logout() {
     assert_eq!(me.status, StatusCode::OK);
     assert_eq!(me.body["name"], "Rémy");
     assert_eq!(me.body["email"], "remy@example.com");
+    // The second factor is done, so the session is finished.
+    assert_eq!(me.body["auth_level"], "strong");
     // The Security page's "Password is set" state is driven by this flag.
     assert_eq!(
         me.body["has_password"], true,
@@ -394,24 +450,16 @@ async fn full_lifecycle_signup_verify_login_logout() {
     // Logging in again after logout succeeds with the same credentials,
     // and the fresh session authenticates. This proves logout retires the
     // session rather than poisoning the account (login rotates the token).
-    let altcha = solved(&fixture.account, "login").await;
-    let relogin = call(
-        &fixture.router,
-        "POST",
-        "/api/account/login",
-        &[],
-        Some(serde_json::json!({
-            "email": "remy@example.com",
-            "password": "correct horse battery",
-            "altcha": altcha
-        })),
+    let (session2, csrf2) = login_step(&fixture, "remy@example.com", "correct horse battery").await;
+    assert_ne!(session2, session, "login must mint a new session token");
+    let verified2 = verify_code(
+        &fixture,
+        &session2,
+        &csrf2,
+        &latest_signin_code(&fixture.sent),
     )
     .await;
-    assert_eq!(relogin.status, StatusCode::OK, "{:?}", relogin.body);
-    let session2 = relogin
-        .cookie("__Host-weaver_session")
-        .expect("fresh session cookie set");
-    assert_ne!(session2, session, "login must mint a new session token");
+    assert_eq!(verified2.status, StatusCode::OK, "{:?}", verified2.body);
 
     let me2 = call(
         &fixture.router,
@@ -424,6 +472,160 @@ async fn full_lifecycle_signup_verify_login_logout() {
     assert_eq!(me2.status, StatusCode::OK);
     assert_eq!(me2.body["name"], "Rémy");
     assert_eq!(me2.body["email"], "remy@example.com");
+}
+
+/// WVR-167: the password alone does not sign anyone in. The session it opens is
+/// `basic` — it may read its own level, enter the code, and leave, and nothing
+/// else — and the emailed code must be accepted, once, to finish.
+#[tokio::test]
+async fn login_is_not_complete_until_the_emailed_code() {
+    let fixture = setup().await;
+    register(
+        &fixture,
+        "Rémy",
+        "twofactor@example.com",
+        "correct horse battery",
+    )
+    .await;
+
+    let (session, csrf) =
+        login_step(&fixture, "twofactor@example.com", "correct horse battery").await;
+    let cookie = format!("__Host-weaver_session={session}");
+
+    // The session exists but is unfinished.
+    let me = call(
+        &fixture.router,
+        "GET",
+        "/api/account/me",
+        &[("cookie", cookie.clone())],
+        None,
+    )
+    .await;
+    assert_eq!(me.status, StatusCode::OK);
+    assert_eq!(me.body["auth_level"], "basic");
+
+    // Every protected endpoint is refused, naming the step that would lift it.
+    let machines = call(
+        &fixture.router,
+        "GET",
+        "/api/account/machines",
+        &[("cookie", cookie.clone())],
+        None,
+    )
+    .await;
+    assert_eq!(
+        machines.status,
+        StatusCode::FORBIDDEN,
+        "{:?}",
+        machines.body
+    );
+    assert_eq!(machines.body["required"], "strong");
+    assert_eq!(machines.body["step"], "verify_email_otp");
+
+    // A wrong code is refused and leaves the session unfinished.
+    let code = latest_signin_code(&fixture.sent);
+    let wrong = if code == "000000" { "000001" } else { "000000" };
+    let refused = verify_code(&fixture, &session, &csrf, wrong).await;
+    assert_eq!(
+        refused.status,
+        StatusCode::BAD_REQUEST,
+        "{:?}",
+        refused.body
+    );
+    let still_basic = call(
+        &fixture.router,
+        "GET",
+        "/api/account/me",
+        &[("cookie", cookie.clone())],
+        None,
+    )
+    .await;
+    assert_eq!(still_basic.body["auth_level"], "basic");
+
+    // The emailed code finishes it, and protected endpoints answer.
+    let accepted = verify_code(&fixture, &session, &csrf, &code).await;
+    assert_eq!(accepted.status, StatusCode::OK, "{:?}", accepted.body);
+    let me = call(
+        &fixture.router,
+        "GET",
+        "/api/account/me",
+        &[("cookie", cookie.clone())],
+        None,
+    )
+    .await;
+    assert_eq!(me.body["auth_level"], "strong");
+    let avatar = call(
+        &fixture.router,
+        "GET",
+        "/api/account/avatar",
+        &[("cookie", cookie.clone())],
+        None,
+    )
+    .await;
+    assert_eq!(avatar.status, StatusCode::OK);
+
+    // The code is single-use: replaying it changes nothing (and is refused).
+    let replay = verify_code(&fixture, &session, &csrf, &code).await;
+    assert_eq!(replay.status, StatusCode::BAD_REQUEST, "{:?}", replay.body);
+
+    // A half-signed-in person can still leave.
+    let logout = call(
+        &fixture.router,
+        "POST",
+        "/api/account/logout",
+        &[
+            (
+                "cookie",
+                format!("__Host-weaver_session={session}; __Host-weaver_csrf={csrf}"),
+            ),
+            ("x-csrf-token", csrf.clone()),
+        ],
+        None,
+    )
+    .await;
+    assert_eq!(logout.status, StatusCode::OK, "{:?}", logout.body);
+}
+
+/// WVR-167: asking for another code replaces the pending one, so only the newest
+/// code is accepted.
+#[tokio::test]
+async fn a_resend_replaces_the_previous_sign_in_code() {
+    // The cooldown would refuse the immediate re-send; it is a separate policy.
+    let fixture = setup_with(|config| config.resend_cooldown_secs = 0).await;
+    register(
+        &fixture,
+        "Rémy",
+        "resend-code@example.com",
+        "correct horse battery",
+    )
+    .await;
+
+    let (session, csrf) =
+        login_step(&fixture, "resend-code@example.com", "correct horse battery").await;
+    let first = latest_signin_code(&fixture.sent);
+
+    let resend = call(
+        &fixture.router,
+        "POST",
+        "/api/account/login/resend",
+        &[
+            (
+                "cookie",
+                format!("__Host-weaver_session={session}; __Host-weaver_csrf={csrf}"),
+            ),
+            ("x-csrf-token", csrf.clone()),
+        ],
+        None,
+    )
+    .await;
+    assert_eq!(resend.status, StatusCode::OK, "{:?}", resend.body);
+    let second = latest_signin_code(&fixture.sent);
+
+    // The replaced code stops working; the fresh one takes.
+    let stale = verify_code(&fixture, &session, &csrf, &first).await;
+    assert_eq!(stale.status, StatusCode::BAD_REQUEST, "{:?}", stale.body);
+    let fresh = verify_code(&fixture, &session, &csrf, &second).await;
+    assert_eq!(fresh.status, StatusCode::OK, "{:?}", fresh.body);
 }
 
 #[tokio::test]
@@ -659,6 +861,27 @@ async fn wait_for_mail_count(sent: &Mutex<Vec<Email>>, expected: usize) {
         "expected {expected} captured emails, got {}",
         sent.lock().unwrap().len()
     );
+}
+
+/// Waits (bounded) for a captured email with an exact subject, returning it.
+///
+/// The password-change notification is sent off the response path, and by the
+/// time a test looks, a later sign-in code can be the newest message — so the
+/// test finds its mail by subject rather than by position.
+async fn wait_for_mail_subject(sent: &Mutex<Vec<Email>>, subject: &str) -> Email {
+    for _ in 0..300 {
+        if let Some(email) = sent
+            .lock()
+            .unwrap()
+            .iter()
+            .rev()
+            .find(|email| email.subject == subject)
+        {
+            return email.clone();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("no captured email with subject {subject:?}");
 }
 
 /// Requests a reset link and waits for the detached email, returning the
@@ -1104,27 +1327,13 @@ async fn reset_routes_refuse_cross_origin_requests() {
 
 // ----- change password -----------------------------------------------------
 
-/// Signs in and returns the (session, csrf) cookie pair the change flow needs.
+/// Signs in completely — password step then emailed code — and returns the
+/// `(session, csrf)` cookie pair the change flow needs.
 async fn sign_in(fixture: &Fixture, email: &str, password: &str) -> (String, String) {
-    let login = call(
-        &fixture.router,
-        "POST",
-        "/api/account/login",
-        &[],
-        Some(serde_json::json!({
-            "email": email,
-            "password": password,
-            "altcha": solved(&fixture.account, "login").await,
-        })),
-    )
-    .await;
-    assert_eq!(login.status, StatusCode::OK, "{:?}", login.body);
-    (
-        login
-            .cookie("__Host-weaver_session")
-            .expect("session cookie set"),
-        login.cookie("__Host-weaver_csrf").expect("csrf cookie set"),
-    )
+    let (session, csrf) = login_step(fixture, email, password).await;
+    let verified = verify_code(fixture, &session, &csrf, &latest_signin_code(&fixture.sent)).await;
+    assert_eq!(verified.status, StatusCode::OK, "{:?}", verified.body);
+    (session, csrf)
 }
 
 /// Whether a password signs in (a fresh ALTCHA-guarded login attempt).
@@ -1177,7 +1386,6 @@ async fn change_password_swaps_the_credential_and_signs_out_everywhere() {
     let email = "change@example.com";
     register(&fixture, "Rémy", email, "correct horse battery").await;
     let (session, csrf) = sign_in(&fixture, email, "correct horse battery").await;
-    let before = fixture.sent.lock().unwrap().len();
 
     let reply = change_password(
         &fixture,
@@ -1220,10 +1428,7 @@ async fn change_password_swaps_the_credential_and_signs_out_everywhere() {
     );
 
     // The owner is told, off the response path.
-    wait_for_mail_count(&fixture.sent, before + 1).await;
-    let sent = fixture.sent.lock().unwrap();
-    let notification = sent.last().expect("a notification email");
-    assert_eq!(notification.subject, "Your password was changed");
+    let notification = wait_for_mail_subject(&fixture.sent, "Your password was changed").await;
     assert!(
         notification.text.contains("was changed on"),
         "the notice carries the event time: {}",
@@ -1266,6 +1471,15 @@ async fn change_password_refuses_a_wrong_current_password_without_side_effects()
         StatusCode::OK,
         "a refusal leaves the session alone"
     );
+    // The refusal sent nothing. (Checked before the `signs_in` probes below:
+    // each password check now emails a sign-in code of its own, WVR-167.)
+    assert_eq!(
+        fixture.sent.lock().unwrap().len(),
+        before,
+        "a refusal emails nothing"
+    );
+
+    // The credential is unchanged.
     assert!(
         signs_in(&fixture, email, "correct horse battery").await,
         "the credential is unchanged"
@@ -1273,11 +1487,6 @@ async fn change_password_refuses_a_wrong_current_password_without_side_effects()
     assert!(
         !signs_in(&fixture, email, "a much better password").await,
         "the rejected password was not applied"
-    );
-    assert_eq!(
-        fixture.sent.lock().unwrap().len(),
-        before,
-        "a refusal emails nothing"
     );
 }
 
@@ -1346,9 +1555,9 @@ async fn change_password_revokes_a_second_session_too() {
     }
 }
 
-/// The endpoint is authenticated and CSRF-protected: like `logout`, the
-/// same-origin/CSRF guard runs first, and a well-formed request without a live
-/// session is refused as unauthenticated.
+/// The endpoint is authenticated and CSRF-protected: the level gate refuses a
+/// request with no session before the handler runs, and a request that holds a
+/// session but fails the same-origin/CSRF guard is refused by the handler.
 #[tokio::test]
 async fn change_password_requires_a_session_and_a_same_origin_csrf_request() {
     let fixture = setup().await;
@@ -1360,8 +1569,7 @@ async fn change_password_requires_a_session_and_a_same_origin_csrf_request() {
         "new_password": "a much better password",
     }));
 
-    // No cookies at all: the CSRF guard refuses before the session is examined,
-    // the same order `logout` uses.
+    // No cookies at all: the level gate refuses before the handler's guard runs.
     let bare = call(
         &fixture.router,
         "POST",
@@ -1370,7 +1578,7 @@ async fn change_password_requires_a_session_and_a_same_origin_csrf_request() {
         body.clone(),
     )
     .await;
-    assert_eq!(bare.status, StatusCode::FORBIDDEN, "{:?}", bare.body);
+    assert_eq!(bare.status, StatusCode::UNAUTHORIZED, "{:?}", bare.body);
 
     // A browser-declared cross-site fetch → 403.
     let cross_site = call(
@@ -1453,8 +1661,9 @@ async fn delete_account(fixture: &Fixture, session: &str, csrf: &str, address: &
 }
 
 /// The endpoint is authenticated and CSRF-protected exactly like `logout`: the
-/// same-origin/CSRF guard runs first, and a well-formed request without a live
-/// session is refused as unauthenticated.
+/// level gate refuses a request with no session before the handler runs, and a
+/// request that holds a session but fails the same-origin/CSRF guard is refused
+/// by the handler.
 #[tokio::test]
 async fn delete_account_requires_a_session_and_a_same_origin_csrf_request() {
     let fixture = setup().await;
@@ -1463,7 +1672,7 @@ async fn delete_account_requires_a_session_and_a_same_origin_csrf_request() {
     let (session, csrf) = sign_in(&fixture, email, "correct horse battery").await;
     let body = Some(serde_json::json!({ "address": email }));
 
-    // No cookies at all: the CSRF guard refuses before the session is examined.
+    // No cookies at all: the level gate refuses before the handler's guard runs.
     let bare = call(
         &fixture.router,
         "POST",
@@ -1472,7 +1681,7 @@ async fn delete_account_requires_a_session_and_a_same_origin_csrf_request() {
         body.clone(),
     )
     .await;
-    assert_eq!(bare.status, StatusCode::FORBIDDEN, "{:?}", bare.body);
+    assert_eq!(bare.status, StatusCode::UNAUTHORIZED, "{:?}", bare.body);
 
     // A browser-declared cross-site fetch → 403.
     let cross_site = call(

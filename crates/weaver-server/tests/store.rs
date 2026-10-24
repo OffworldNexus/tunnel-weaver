@@ -4,8 +4,8 @@ use std::path::PathBuf;
 use sea_orm::{ConnectionTrait, DbBackend, Statement};
 use tempfile::TempDir;
 use weaver_server::store::account::{
-    ActivationOutcome, ActivationRequest, NewPasswordResetToken, NewPendingRegistration,
-    NewVerificationToken, ResetRequest,
+    ActivationOutcome, ActivationRequest, NewAuthEvent, NewPasswordResetToken,
+    NewPendingRegistration, NewVerificationToken, ResetRequest,
 };
 use weaver_server::{Config, ConfigError, Store, StoreError};
 
@@ -46,7 +46,7 @@ fn sample_config() -> Config {
         usage_retention_secs: 31_536_000,
         relay_ips: Vec::new(),
         setup_complete: false,
-        email: None,
+        email: Some(weaver_server::config::test_email_config()),
         abuse: None,
         account: Default::default(),
     }
@@ -115,19 +115,19 @@ async fn test_store_open_runs_migrations_and_is_idempotent() {
         let store = Store::open(&db_path).await.expect("open failed");
         let count: i64 = scalar(
             &store,
-            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN ('config', 'acme_account', 'domains', 'certificates', 'cert_events', 'seaql_migrations', 'person', 'machine', 'machine_key_log', 'service', 'usage_daily', 'usage_live', 'challenge', 'abuse_bucket')",
+            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN ('config', 'acme_account', 'domains', 'certificates', 'cert_events', 'seaql_migrations', 'person', 'machine', 'machine_key_log', 'service', 'usage_daily', 'usage_live', 'challenge', 'abuse_bucket', 'auth_event', 'login_challenge')",
         )
         .await;
-        assert_eq!(count, 14);
-        assert_eq!(store.schema_version().await.expect("schema_version"), 3);
+        assert_eq!(count, 16);
+        assert_eq!(store.schema_version().await.expect("schema_version"), 4);
     }
 
     // Re-open existing database: should succeed and not re-apply migrations
     {
         let store = Store::open(&db_path).await.expect("re-open failed");
         let migration_count: i64 = scalar(&store, "SELECT count(*) FROM seaql_migrations").await;
-        assert_eq!(migration_count, 3);
-        assert_eq!(store.schema_version().await.expect("schema_version"), 3);
+        assert_eq!(migration_count, 4);
+        assert_eq!(store.schema_version().await.expect("schema_version"), 4);
     }
 }
 
@@ -413,6 +413,11 @@ async fn test_set_config_mutates_single_key() {
         ("listen_http", "\"127.0.0.1:8080\""),
         ("listen_https", "\"127.0.0.1:8443\""),
         ("control_socket", "\"/tmp/control.sock\""),
+        // Email is required (WVR-167), so the block must be there too.
+        (
+            "email",
+            "{\"provider\":\"resend\",\"from\":\"no-reply@weaver.test\",\"api_key\":\"test-api-key\"}",
+        ),
     ] {
         store.set_config(k, v).await.expect("set_config failed");
     }
@@ -2722,11 +2727,20 @@ async fn test_inactivity_candidates_flag_only_live_sessions() {
     let t0 = 1_800_000_000;
     let now = t0 + YEAR;
     let live = activated(&store, "Live", "live@example.com").await;
+    let pending = activated(&store, "Pending", "pending@example.com").await;
     let expired = activated(&store, "Expired", "expired@example.com").await;
     let invalidated = activated(&store, "Invalidated", "invalidated@example.com").await;
-    // A live, unexpired session...
-    store
+
+    // A live, unexpired session that has passed the second factor...
+    let proven = store
         .session_create(live.id, "live-hash", now - 60, now + 3600)
+        .await
+        .unwrap();
+    email_otp_proof(&store, live.id, proven.id, now - 30).await;
+    // ...versus a live one that only proved the password: a half-signed-in
+    // session is not activity (WVR-167)...
+    store
+        .session_create(pending.id, "pending-hash", now - 60, now + 3600)
         .await
         .unwrap();
     // ...versus one that is already expired...
@@ -2734,11 +2748,13 @@ async fn test_inactivity_candidates_flag_only_live_sessions() {
         .session_create(expired.id, "expired-hash", now - 7200, now - 3600)
         .await
         .unwrap();
-    // ...versus one that was explicitly retired.
-    store
+    // ...versus one that was explicitly retired, even though it had proven the
+    // second factor.
+    let retired = store
         .session_create(invalidated.id, "invalidated-hash", now - 60, now + 3600)
         .await
         .unwrap();
+    email_otp_proof(&store, invalidated.id, retired.id, now - 30).await;
     store
         .session_invalidate("invalidated-hash", now)
         .await
@@ -2754,6 +2770,10 @@ async fn test_inactivity_candidates_flag_only_live_sessions() {
         "an unexpired session marks the account live"
     );
     assert!(
+        !row(pending.id).has_live_session,
+        "a session that only proved the password is not activity (WVR-167)"
+    );
+    assert!(
         !row(expired.id).has_live_session,
         "an expired session does not"
     );
@@ -2761,6 +2781,23 @@ async fn test_inactivity_candidates_flag_only_live_sessions() {
         !row(invalidated.id).has_live_session,
         "an invalidated session does not"
     );
+}
+
+/// Records the emailed-code proof against `session_id`, the way a completed
+/// sign-in does (WVR-167).
+async fn email_otp_proof(store: &Store, account_id: i32, session_id: i32, at: i64) {
+    store
+        .auth_event_insert(NewAuthEvent {
+            account_id: Some(account_id),
+            session_id: Some(session_id),
+            kind: "email_otp".to_string(),
+            occurred_at: at,
+            ip_address: String::new(),
+            user_agent: String::new(),
+            attempted: String::new(),
+        })
+        .await
+        .unwrap();
 }
 
 #[tokio::test]

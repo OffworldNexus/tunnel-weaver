@@ -5,7 +5,7 @@
 	import { jsonForm } from '#lib/account/form';
 	import { notify } from '#lib/account/notices';
 	import { signInSchema } from '#lib/account/schemas';
-	import { flow, pairing } from '#lib/account/state';
+	import { flow } from '#lib/account/state';
 	import Keycap from '#lib/ui/Keycap.svelte';
 	import Page from '#lib/ui/Page.svelte';
 	import { goto } from '$app/navigation';
@@ -28,10 +28,10 @@
 			return res.error ?? 'That email and password did not match.';
 		}
 		flow.clear();
-		// A pairing detour sent the person here: return to its confirmation. The
-		// root layout re-reads the session as part of this navigation, so the
-		// destination is decided against the session the relay just established.
-		await goto(resolve(pairing.load().detour ? '/pair' : '/app'));
+		// The password is only the first factor: the relay has opened a session
+		// that can do nothing but enter the emailed code, so the next page is the
+		// code step. That page, not this one, decides on the pairing detour.
+		await goto(resolve('/(auth)/verify-code'));
 	});
 
 	const { form, errors, message, submitting, enhance } = sf;

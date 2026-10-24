@@ -2,9 +2,9 @@
 
 ## Testing
 
-- Full suite (fast): `cargo test --workspace` (~100s, timeout 240000ms)
+- Full suite (fast): `cargo test --workspace` (~115s, timeout 300000ms)
 - CI-strength property tests: `PROPTEST_CASES=2000 PROPTEST_RNG_SEED=67 cargo test -p weaver-mux` (~70s, timeout 300000ms)
-- Ignored e2e suite: `cargo test --workspace -- --ignored` (~9s warm, timeout 60000ms)
+- Ignored e2e suite: `cargo test --workspace -- --ignored` (~1s warm, timeout 60000ms)
 - Format check: `cargo fmt --check` (~1s, timeout 30000ms)
 - Clippy: `cargo clippy --workspace --all-targets -- -D warnings` (~5s, timeout 120000ms)
 - Dependency policy: `cargo deny check` (~2s, timeout 60000ms)
@@ -16,10 +16,13 @@
   `cd frontend && pnpm run build` (~3s, timeout 180000ms). Must exit 0 and
   externalize the bootstrap (no inline `<script>` in `build/index.html`).
 - Browser BDD (Cucumber + Playwright against the real server):
-  `cd e2e && pnpm test` (~53s, timeout 300000ms); one-time
+  `cd e2e && pnpm test` (~70s, timeout 300000ms); one-time
   `pnpm exec playwright install chromium`. It rebuilds
   `weaver-server --example e2e_server` first, so stop any running copy of that
-  binary (a live one blocks the relink with `ETXTBSY`).
+  binary (a live one blocks the relink with `ETXTBSY`). A single feature file
+  still runs through `cucumber.mjs`, whose `paths` glob wins over a CLI
+  argument — to narrow a run, use `--name`. The bootstrap bundle's content hash
+  differs between identical-source builds, so compare sources, not bundle names.
 - Type-check the SPA: `pnpm -C frontend run check` (svelte-check, ~10s,
   timeout 120000ms). Must report 0 errors and 0 warnings.
 - Lint the SPA: `pnpm -C frontend run lint` (Prettier check + type-aware
@@ -28,11 +31,13 @@
 - Conformance (nightly / PR to develop only, needs the DO droplet): h2spec
   and Autobahn run in `.github/workflows/nightly.yml`; allow-lists live in
   `ci/conformance/*-allowlist.txt`, one case per line with a justification.
-- Last measured: 2026-10-24, full suite 641 passed/0 failed/4 ignored (101s),
-  e2e 25 scenarios/273 steps passed (61s), SPA lint and svelte-check clean.
-  (Prior: 2026-10-23, 619 passed/4 ignored (107s), e2e 21 scenarios/227 steps
-  (53s); 2026-10-19, 577 passed (100s), e2e 18 scenarios/193 steps (43s);
-  2026-10-12, 559 passed (100s) after WVR-50; 550 passed (72s).)
+- Last measured: 2026-10-24, full suite 664 passed/0 failed/4 ignored (115s),
+  e2e 25 scenarios/282 steps passed (74s), ignored e2e 4 passed (1s), SPA lint
+  and svelte-check clean, fmt/clippy/deny/fuzz clean.
+  (Prior: 2026-10-24, 641 passed/4 ignored (101s), e2e 25 scenarios/273 steps
+  (61s); 2026-10-23, 619 passed/4 ignored (107s), e2e 21/227 (53s); 2026-10-19,
+  577 passed (100s), e2e 18/193 (43s); 2026-10-12, 559 passed (100s) after
+  WVR-50; 550 passed (72s).)
 
 ## Conventions
 

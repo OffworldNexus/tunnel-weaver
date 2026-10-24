@@ -19,18 +19,19 @@ use axum::extract::{Path, Query, Request, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
-use axum::{Extension, Json, Router};
+use axum::{Extension, Json, Router, middleware};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
 use weaver_abuse::AltchaError;
 
+use crate::account::auth::{AuthLevel, AuthManager, SessionContext};
 use crate::account::session::{self, CSRF_COOKIE, CSRF_HEADER, SESSION_COOKIE};
 use crate::account::views::{
     USAGE_WINDOW_SECS, key_of, load_error, owned_machine, person_of, person_services, signed_in,
 };
-use crate::account::{AccountRuntime, pairing, views};
-use crate::email::{Mailbox, PasswordChanged, Reset, Verification, Welcome};
+use crate::account::{AccountRuntime, pairing, second_factor, views};
+use crate::email::{Mailbox, PasswordChanged, Reset, SignInCode, Verification, Welcome};
 use crate::live::{Change, Entity, Viewer};
 use crate::metrics::{Function, Metric, MetricsQuery, MetricsStore};
 use crate::store::StoreError;
@@ -78,6 +79,8 @@ pub fn router(runtime: Arc<AccountRuntime>, tunnel: Option<Arc<TunnelRegistry>>)
         .route("/api/account/reset/check", post(reset_check))
         .route("/api/account/reset/complete", post(reset_complete))
         .route("/api/account/login", post(login))
+        .route("/api/account/login/verify", post(login_verify))
+        .route("/api/account/login/resend", post(login_resend))
         .route("/api/account/me", get(me))
         .route("/api/account/avatar", get(avatar))
         .route("/api/account/logout", post(logout))
@@ -98,6 +101,12 @@ pub fn router(runtime: Arc<AccountRuntime>, tunnel: Option<Arc<TunnelRegistry>>)
         .route(pair::PAIR_REJECT_PATH, post(pair_reject))
         .fallback(spa)
         .layer(Extension(tunnel))
+        // Deny by default: every `/api/account/*` request must hold the level it
+        // needs, and the gate is what builds the request's `AuthManager` (WVR-167).
+        .layer(middleware::from_fn_with_state(
+            runtime.clone(),
+            crate::account::auth::gate,
+        ))
         .with_state(runtime)
 }
 
@@ -705,9 +714,19 @@ async fn reset_complete(
     }
 }
 
-/// `POST /api/account/login` — verify credentials and start a session.
+/// `POST /api/account/login` — verify the password and start the second factor.
+///
+/// Success opens a `Basic` session (the password factor is proven) and emails a
+/// one-time code. It does **not** sign anyone in: the session can reach nothing
+/// but the climb until `POST /api/account/login/verify` accepts the code. If the
+/// code cannot be sent the session is rolled back, rather than leaving a page
+/// that can never be satisfied.
+///
+/// The sign-in is recorded on the inactivity clock (WVR-160) only once the code
+/// is accepted, so an abandoned second step is never mistaken for activity.
 async fn login(
     State(rt): State<Arc<AccountRuntime>>,
+    Extension(manager): Extension<AuthManager>,
     headers: HeaderMap,
     Json(req): Json<LoginRequest>,
 ) -> Response {
@@ -743,63 +762,216 @@ async fn login(
     };
     let hash = stored.as_deref().unwrap_or(&rt.dummy_hash);
     let password_ok = rt.passwords.verify(&req.password, hash);
-    let Some(account) = account.filter(|_| password_ok) else {
+    let Some(account) = account.as_ref().filter(|_| password_ok) else {
+        let _ = manager
+            .login_failed(req.email.trim(), account.as_ref().map(|account| account.id))
+            .await;
         return err(StatusCode::UNAUTHORIZED, "invalid email or password");
     };
 
-    // Record the sign-in: this is the inactivity clock the sweep reads (WVR-160).
-    // If it cannot be recorded the clock would drift and the account could be
-    // swept while it is in use, so the sign-in fails rather than issuing a
-    // session the sweep does not know about.
-    if rt
+    // The second factor travels by email, so an account without an address
+    // cannot sign in. Only test-only fixtures lack one; treat it as an
+    // unreachable state, never a bypass.
+    let Some(identity) = rt
         .store
-        .account_record_login(account.id, now)
+        .email_identity_for_account(account.id)
         .await
-        .is_err()
-    {
-        return err(StatusCode::SERVICE_UNAVAILABLE, "temporarily unavailable");
-    }
+        .ok()
+        .flatten()
+    else {
+        tracing::warn!(
+            account_id = account.id,
+            "sign-in blocked: account has no email address"
+        );
+        return err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "sign-in is temporarily unavailable",
+        );
+    };
 
     let raw = match rt.sessions.create(account.id, now).await {
         Ok(raw) => raw,
         Err(_) => return err(StatusCode::SERVICE_UNAVAILABLE, "temporarily unavailable"),
     };
+    let Some(session) = rt
+        .store
+        .session_live(&session::token_hash(&raw), now)
+        .await
+        .ok()
+        .flatten()
+    else {
+        let _ = rt.sessions.invalidate(&raw, now).await;
+        return err(StatusCode::SERVICE_UNAVAILABLE, "temporarily unavailable");
+    };
+    let context = SessionContext {
+        session_id: session.id,
+        account_id: account.id,
+    };
+
+    let Ok(code) = second_factor::issue(&rt.store, session.id, now).await else {
+        let _ = rt.sessions.invalidate(&raw, now).await;
+        return err(StatusCode::SERVICE_UNAVAILABLE, "temporarily unavailable");
+    };
+    if manager.password_checked(context).await.is_err()
+        || manager.email_otp_issued(context).await.is_err()
+    {
+        let _ = rt.sessions.invalidate(&raw, now).await;
+        return err(StatusCode::SERVICE_UNAVAILABLE, "temporarily unavailable");
+    }
+    if let Err(error) = send_signin_code(&rt, &account.name, &identity.email, &code).await {
+        tracing::warn!(account_id = account.id, error = %error, "sign-in code email was not sent");
+        let _ = rt.sessions.invalidate(&raw, now).await;
+        return err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "we could not send your code; try again",
+        );
+    }
+
     let csrf = session::new_token();
-    let response = json_ok(json!({ "ok": true, "name": account.name }));
+    let response = json_ok(json!({ "status": "second_factor" }));
     let response = with_cookie(response, rt.sessions.session_cookie(&raw));
     with_cookie(response, rt.sessions.csrf_cookie(&csrf))
 }
 
-/// `GET /api/account/me` — the signed-in identity.
-async fn me(State(rt): State<Arc<AccountRuntime>>, headers: HeaderMap) -> Response {
-    let Some(raw) = session::cookie(&headers, SESSION_COOKIE) else {
+/// Body of a `POST /api/account/login/verify`.
+#[derive(Deserialize)]
+struct LoginVerifyRequest {
+    code: String,
+}
+
+/// `POST /api/account/login/verify` — accept the emailed code and finish signing
+/// in (CSRF-protected).
+///
+/// This is the only place a session becomes `Strong`, and the only place the
+/// inactivity clock advances. A refusal is a `400` (never a `401`, which the SPA
+/// would read as "session expired") and invites a re-send.
+async fn login_verify(
+    State(rt): State<Arc<AccountRuntime>>,
+    Extension(manager): Extension<AuthManager>,
+    headers: HeaderMap,
+    Json(req): Json<LoginVerifyRequest>,
+) -> Response {
+    if !origin_ok(&headers, &rt.base_url) || !csrf_ok(&headers) {
+        return err(StatusCode::FORBIDDEN, "request refused");
+    }
+    let Some(session) = manager.session() else {
         return err(StatusCode::UNAUTHORIZED, "not signed in");
     };
-    match rt.sessions.account(&raw, unix_secs()).await {
-        Ok(Some(account)) => {
-            let email = rt
+    let now = unix_secs();
+    match second_factor::verify(&rt.store, session.session_id, &req.code, now).await {
+        Ok(()) => {
+            if manager.email_otp_verified(session).await.is_err() {
+                return err(StatusCode::SERVICE_UNAVAILABLE, "temporarily unavailable");
+            }
+            // The sign-in is complete only now: this is what the sweep reads.
+            if rt
                 .store
-                .email_identity_for_account(account.id)
+                .account_record_login(session.account_id, now)
                 .await
-                .ok()
-                .flatten()
-                .map(|identity| identity.email);
-            // Drives the Security page's "Password is set" state: a live
-            // credential exists for every email/password account today, but the
-            // flag keeps the panel honest once passkeys or SSO arrive.
-            let has_password = rt
-                .store
-                .password_current_for(account.id)
-                .await
-                .ok()
-                .flatten()
-                .is_some();
-            json_ok(
-                json!({ "id": account.id, "name": account.name, "email": email, "has_password": has_password }),
-            )
+                .is_err()
+            {
+                return err(StatusCode::SERVICE_UNAVAILABLE, "temporarily unavailable");
+            }
+            tracing::info!(account_id = session.account_id, "Second factor verified");
+            json_ok(json!({ "ok": true, "auth_level": AuthLevel::Strong.as_str() }))
         }
-        _ => err(StatusCode::UNAUTHORIZED, "not signed in"),
+        Err(error) => {
+            let _ = manager.email_otp_failed(session).await;
+            tracing::warn!(
+                account_id = session.account_id,
+                reason = ?error,
+                "Second factor refused"
+            );
+            err(StatusCode::BAD_REQUEST, error.message())
+        }
     }
+}
+
+/// `POST /api/account/login/resend` — send a fresh code for the same sign-in
+/// (CSRF-protected, throttled).
+///
+/// Re-issuing replaces the challenge, so the previous code stops working and the
+/// attempt count and TTL restart.
+async fn login_resend(
+    State(rt): State<Arc<AccountRuntime>>,
+    Extension(manager): Extension<AuthManager>,
+    headers: HeaderMap,
+) -> Response {
+    if !origin_ok(&headers, &rt.base_url) || !csrf_ok(&headers) {
+        return err(StatusCode::FORBIDDEN, "request refused");
+    }
+    let Some(session) = manager.session() else {
+        return err(StatusCode::UNAUTHORIZED, "not signed in");
+    };
+    let now = unix_secs();
+
+    // Enforce the re-send cooldown against the last issued code.
+    if let Some(last_sent_at) = second_factor::last_sent_at(&rt.store, session.session_id).await
+        && now - last_sent_at < rt.config.resend_cooldown_secs as i64
+    {
+        return json_ok(json!({ "status": "cooldown" }));
+    }
+
+    let Some(identity) = rt
+        .store
+        .email_identity_for_account(session.account_id)
+        .await
+        .ok()
+        .flatten()
+    else {
+        return err(StatusCode::SERVICE_UNAVAILABLE, "temporarily unavailable");
+    };
+    let Ok(Some(account)) = rt.store.account_by_id(session.account_id).await else {
+        return err(StatusCode::SERVICE_UNAVAILABLE, "temporarily unavailable");
+    };
+
+    let Ok(code) = second_factor::issue(&rt.store, session.session_id, now).await else {
+        return err(StatusCode::SERVICE_UNAVAILABLE, "temporarily unavailable");
+    };
+    let _ = manager.email_otp_issued(session).await;
+    if let Err(error) = send_signin_code(&rt, &account.name, &identity.email, &code).await {
+        tracing::warn!(account_id = account.id, error = %error, "sign-in code email was not sent");
+        return err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "we could not send your code; try again",
+        );
+    }
+    json_ok(json!({ "status": "second_factor" }))
+}
+
+/// `GET /api/account/me` — the signed-in identity and its authentication level.
+///
+/// This is reachable at `Basic` on purpose: the level is what tells the console
+/// whether the second factor is still pending (`basic`) or done (`strong`).
+async fn me(
+    State(rt): State<Arc<AccountRuntime>>,
+    Extension(manager): Extension<AuthManager>,
+    headers: HeaderMap,
+) -> Response {
+    let Some(account) = signed_in(&rt, &headers).await else {
+        return err(StatusCode::UNAUTHORIZED, "not signed in");
+    };
+    let email = rt
+        .store
+        .email_identity_for_account(account.id)
+        .await
+        .ok()
+        .flatten()
+        .map(|identity| identity.email);
+    // Drives the Security page's "Password is set" state: a live credential
+    // exists for every email/password account today, but the flag keeps the
+    // panel honest once passkeys or SSO arrive.
+    let has_password = rt
+        .store
+        .password_current_for(account.id)
+        .await
+        .ok()
+        .flatten()
+        .is_some();
+    let auth_level = manager.level().await.as_str();
+    json_ok(
+        json!({ "id": account.id, "name": account.name, "email": email, "has_password": has_password, "auth_level": auth_level }),
+    )
 }
 
 /// How large an avatar may be asked to be, and the size used when unprompted.
@@ -858,9 +1030,20 @@ async fn avatar(
 }
 
 /// `POST /api/account/logout` — invalidate the current session (CSRF-protected).
-async fn logout(State(rt): State<Arc<AccountRuntime>>, headers: HeaderMap) -> Response {
+///
+/// Reachable at `Basic` too: a half-signed-in person must still be able to
+/// leave. The trail is closed before the session is retired, so a proof given
+/// earlier on this session can never be revived.
+async fn logout(
+    State(rt): State<Arc<AccountRuntime>>,
+    Extension(manager): Extension<AuthManager>,
+    headers: HeaderMap,
+) -> Response {
     if !origin_ok(&headers, &rt.base_url) || !csrf_ok(&headers) {
         return err(StatusCode::FORBIDDEN, "request refused");
+    }
+    if let Some(session) = manager.session() {
+        let _ = manager.logged_out(session).await;
     }
     if let Some(raw) = session::cookie(&headers, SESSION_COOKIE) {
         let _ = rt.sessions.invalidate(&raw, unix_secs()).await;
@@ -1789,6 +1972,29 @@ async fn send_verification(
     let template = Verification {
         verification_url: rt.verification_url(&raw),
         expires_in: human_duration(rt.config.verification_ttl_secs),
+    };
+    let email = mailer.compose(to, &template).map_err(|e| e.to_string())?;
+    mailer.send(&email).await.map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Composes and sends the sign-in second-factor code.
+///
+/// `code` is the plaintext code; it is never logged here. A failure is returned
+/// so the caller can fail the sign-in closed rather than leaving a page that can
+/// never be satisfied.
+async fn send_signin_code(
+    rt: &AccountRuntime,
+    name: &str,
+    email: &str,
+    code: &str,
+) -> Result<(), String> {
+    let Some(mailer) = &rt.mailer else {
+        return Err("email is not configured".into());
+    };
+    let to = Mailbox::parse(email, Some(name.to_string())).map_err(|e| e.to_string())?;
+    let template = SignInCode {
+        code: code.to_string(),
     };
     let email = mailer.compose(to, &template).map_err(|e| e.to_string())?;
     mailer.send(&email).await.map_err(|e| e.to_string())?;

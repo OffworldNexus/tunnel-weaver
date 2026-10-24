@@ -2,7 +2,8 @@
 
 import { Given, Then, When } from '@cucumber/cucumber';
 import * as assert from '../support/assertions.js';
-import { press, registerAccount, signIn } from '../support/flow.js';
+import { SIGN_IN_CODE_SUBJECT, enterSignInCode, press, registerAccount, signIn } from '../support/flow.js';
+import { latestMailCode } from '../support/harness.js';
 
 const PAGES = {
   landing: '/',
@@ -14,6 +15,7 @@ const PAGES = {
   'existing-account': '/existing-account',
   'check-email': '/check-email',
   'set-password': '/set-password',
+  'verify-code': '/verify-code',
   'reset request': '/forgot-password',
   account: '/app'
 };
@@ -42,8 +44,38 @@ When('I follow the {string} link', async function (name) {
   await this.page.getByRole('link', { name, exact: true }).first().click();
 });
 
-When('I sign in with the (wrong )password {string}', async function (password) {
+When('I sign in with the password {string}', async function (password) {
   await signIn(this, password);
+  // The password is only the first factor: the sign-in is complete once the
+  // emailed code is entered (WVR-167).
+  await enterSignInCode(this);
+});
+
+When('I sign in with the wrong password {string}', async function (password) {
+  // A wrong password never reaches the second factor; the caller asserts the
+  // generic refusal.
+  await signIn(this, password);
+});
+
+// WVR-167: the two halves of the sign-in, exposed so a feature can assert the
+// code step is reached (and what it refuses) rather than having both factors
+// run inside one step.
+When('I sign in with the password {string}, without the code', async function (password) {
+  await signIn(this, password);
+  await assert.seeHeading(this.page, 'Enter your code');
+});
+
+When('I enter the code from my email', async function () {
+  await enterSignInCode(this);
+});
+
+When('I submit a wrong code', async function () {
+  // Derived from the newest code, never hardcoded, so it can never collide
+  // with the one that was actually emailed.
+  const code = await latestMailCode(SIGN_IN_CODE_SUBJECT);
+  const wrong = code === '000000' ? '000001' : '000000';
+  await this.page.getByLabel('Code', { exact: true }).fill(wrong);
+  await press(this, 'Continue');
 });
 
 When('I sign out', async function () {

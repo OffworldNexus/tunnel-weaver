@@ -74,6 +74,15 @@
 			await goto(resolve('/(auth)/sign-in'));
 			return;
 		}
+		// A session that has only proven the password cannot look anything up
+		// yet — the relay refuses every protected endpoint until the emailed code
+		// is accepted — so send them to the code step, keeping the detour so the
+		// approval resumes here (WVR-167).
+		if (session.user.auth_level === 'basic') {
+			pairing.save({ detour: true });
+			await goto(resolve('/(auth)/verify-code'));
+			return;
+		}
 
 		const res = await api<Lookup>('/api/account/pair/lookup', { handle });
 		if (!res.ok || !res.data) {

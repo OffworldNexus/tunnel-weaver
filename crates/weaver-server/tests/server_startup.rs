@@ -33,7 +33,7 @@ fn create_valid_test_config(http_port: u16, https_port: u16) -> Config {
         usage_retention_secs: 31_536_000,
         relay_ips: Vec::new(),
         setup_complete: false,
-        email: None,
+        email: Some(weaver_server::config::test_email_config()),
         abuse: None,
         account: Default::default(),
     }

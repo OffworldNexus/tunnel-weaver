@@ -11,6 +11,15 @@
  */
 import { getContext, setContext } from 'svelte';
 
+/**
+ * How strongly the relay says the current session is authenticated.
+ *
+ * `basic` means the password is proven but the emailed second factor is still
+ * pending: the session exists yet can reach nothing but the code step.
+ * `strong` means the second factor is done. WVR-167.
+ */
+export type AuthLevel = 'basic' | 'strong';
+
 export interface Me {
 	id: number;
 	name: string;
@@ -18,6 +27,12 @@ export interface Me {
 	email: string;
 	/** Whether the account has a password credential; not every sign-in method needs one. */
 	has_password: boolean;
+	/**
+	 * The authentication level, reported by `GET /api/account/me` on every
+	 * navigation. It is what the guards branch on, and it exists because a
+	 * session can now be live without being finished.
+	 */
+	auth_level: AuthLevel;
 }
 
 export interface Session {

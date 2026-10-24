@@ -16,6 +16,7 @@ use http::header::COOKIE;
 use sha2::{Digest, Sha256};
 
 use crate::store::entity::account;
+use crate::store::entity::browser_session;
 use crate::store::{Store, StoreError};
 
 /// Session cookie name. The `__Host-` prefix forces `Secure; Path=/` and forbids
@@ -118,6 +119,24 @@ impl Sessions {
             return Ok(None);
         };
         self.store.account_by_id(session.account_id).await
+    }
+
+    /// Resolves a raw cookie token to its live session row and account.
+    ///
+    /// The row is needed where the authentication trail is written or read: its
+    /// id ties a login's `auth_event` rows together (WVR-167).
+    pub async fn live(
+        &self,
+        raw: &str,
+        now: i64,
+    ) -> Result<Option<(browser_session::Model, account::Model)>, StoreError> {
+        let Some(session) = self.store.session_live(&token_hash(raw), now).await? else {
+            return Ok(None);
+        };
+        let Some(account) = self.store.account_by_id(session.account_id).await? else {
+            return Ok(None);
+        };
+        Ok(Some((session, account)))
     }
 
     /// Invalidates the current session (logout). Returns whether a live row was

@@ -329,7 +329,7 @@ async fn spawn_test_relay(tunnel_domain: &str) -> TestRelay {
         usage_retention_secs: 31_536_000,
         relay_ips: Vec::new(),
         setup_complete: false,
-        email: None,
+        email: Some(weaver_server::config::test_email_config()),
         abuse: None,
         account: Default::default(),
     });
@@ -2210,7 +2210,7 @@ async fn test_client_leaving_during_cert_issuance_does_not_leave_hostname_active
         usage_retention_secs: 31_536_000,
         relay_ips: Vec::new(),
         setup_complete: false,
-        email: None,
+        email: Some(weaver_server::config::test_email_config()),
         abuse: None,
         account: Default::default(),
     });

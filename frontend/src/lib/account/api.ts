@@ -4,6 +4,9 @@
  * Every request rides the session cookie and echoes the double-submit CSRF
  * cookie in `x-csrf-token`. It never throws: an unreachable relay comes back as
  * `status: 0` carrying {@link NETWORK_ERROR}, so callers handle one shape.
+ *
+ * The method follows the body: no body is a GET. A `POST` that takes no body
+ * must therefore pass `{}`, or it will be sent — and refused — as a GET.
  */
 
 export const NETWORK_ERROR = 'We could not reach the server. Check your connection and try again.';
