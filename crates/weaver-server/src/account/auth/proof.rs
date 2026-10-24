@@ -32,20 +32,17 @@ impl ProofKind {
         }
     }
 
-    /// Parses a stored `auth_event.kind`, or `None` when it is not a proof.
-    pub fn parse(kind: &str) -> Option<Self> {
-        ProofKind::ALL.into_iter().find(|k| k.as_str() == kind)
-    }
-
     /// How long an occurrence of this kind stays alive, in seconds.
     ///
-    /// The password proof is short (the reference's five minutes): it only
-    /// distinguishes `Certain` from `Strong`. The emailed-code proof lives as
-    /// long as the session it was given on, so a completed second factor holds
-    /// for the whole session rather than demanding a mid-session re-step-up.
-    pub const fn max_age_secs(self, session_ttl_secs: i64) -> i64 {
+    /// The password proof is short (the reference's five minutes, and the
+    /// `account.confirm_window_secs` policy): it only distinguishes `Certain`
+    /// from `Strong`, and it is the window a step-up is good for. The
+    /// emailed-code proof lives as long as the session it was given on, so a
+    /// completed second factor holds for the whole session rather than
+    /// demanding a mid-session re-step-up.
+    pub const fn max_age_secs(self, session_ttl_secs: i64, confirm_window_secs: i64) -> i64 {
         match self {
-            ProofKind::Password => 300,
+            ProofKind::Password => confirm_window_secs,
             ProofKind::EmailOtp => session_ttl_secs,
         }
     }
@@ -56,16 +53,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn round_trips_through_the_stored_name() {
+    fn the_sign_in_proof_names_are_the_stored_ones() {
+        // `manager` holds the other half: every proof has an event writing it.
         for kind in ProofKind::ALL {
-            assert_eq!(ProofKind::parse(kind.as_str()), Some(kind));
+            assert!(!kind.as_str().is_empty());
         }
-        assert_eq!(ProofKind::parse("logout"), None);
     }
 
     #[test]
     fn otp_lifetime_tracks_the_session() {
-        assert_eq!(ProofKind::EmailOtp.max_age_secs(86_400), 86_400);
-        assert!(ProofKind::Password.max_age_secs(86_400) < 86_400);
+        assert_eq!(ProofKind::EmailOtp.max_age_secs(86_400, 300), 86_400);
+        assert_eq!(ProofKind::Password.max_age_secs(86_400, 300), 300);
     }
 }

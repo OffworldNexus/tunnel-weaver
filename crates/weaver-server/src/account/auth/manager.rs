@@ -45,6 +45,8 @@ struct Inner {
     live: LiveHub,
     session: Option<SessionContext>,
     session_ttl_secs: i64,
+    /// How long a password proof keeps `Certain`, which is what a step-up buys.
+    confirm_window_secs: i64,
     now: i64,
     ip_address: String,
     user_agent: String,
@@ -55,11 +57,13 @@ struct Inner {
 impl AuthManager {
     /// Builds the manager for a request. `now` is captured once so every
     /// lifetime in the request is measured against the same instant.
+    #[allow(clippy::too_many_arguments)] // The request's context is threaded explicitly; none of it derives from another.
     pub fn new(
         store: Store,
         live: LiveHub,
         session: Option<SessionContext>,
         session_ttl_secs: i64,
+        confirm_window_secs: i64,
         now: i64,
         ip_address: String,
         user_agent: String,
@@ -69,6 +73,7 @@ impl AuthManager {
             live,
             session,
             session_ttl_secs,
+            confirm_window_secs,
             now,
             ip_address,
             user_agent,
@@ -96,6 +101,7 @@ impl AuthManager {
             proofs: self.proofs().await,
             now: self.0.now,
             session_ttl_secs: self.0.session_ttl_secs,
+            confirm_window_secs: self.0.confirm_window_secs,
         }
     }
 
@@ -112,6 +118,7 @@ impl AuthManager {
             self.0.live.clone(),
             session,
             self.0.session_ttl_secs,
+            self.0.confirm_window_secs,
             now,
             self.0.ip_address.clone(),
             self.0.user_agent.clone(),
@@ -136,6 +143,34 @@ impl AuthManager {
     pub async fn password_checked(&self, session: SessionContext) -> Result<(), StoreError> {
         self.record(
             EventKind::Password,
+            Some(session.account_id),
+            Some(session.session_id),
+            "",
+        )
+        .await
+    }
+
+    /// The password was checked again on this session to step up to `Certain`
+    /// — the `confirm_password` step. It proves the same thing the sign-in did,
+    /// so it renews that proof's window rather than adding a new kind.
+    pub async fn password_confirmed(&self, session: SessionContext) -> Result<(), StoreError> {
+        self.record(
+            EventKind::PasswordConfirmed,
+            Some(session.account_id),
+            Some(session.session_id),
+            "",
+        )
+        .await
+    }
+
+    /// A step-up password check was refused. The session keeps whatever proofs
+    /// it had; this is on the record only.
+    pub async fn password_confirmation_failed(
+        &self,
+        session: SessionContext,
+    ) -> Result<(), StoreError> {
+        self.record(
+            EventKind::PasswordConfirmFailed,
             Some(session.account_id),
             Some(session.session_id),
             "",
@@ -227,7 +262,7 @@ impl AuthManager {
         // A new proof changes the session's proof list: its open streams must
         // reload it and re-plan the next expiry. Other kinds change nothing a
         // level is derived from.
-        if ProofKind::parse(kind.as_str()).is_some()
+        if kind.proof().is_some()
             && let (Some(account_id), Some(session_id)) = (account_id, session_id)
         {
             super::watch::session_changed(
@@ -262,10 +297,17 @@ impl AuthManager {
         let mut proofs = BTreeMap::new();
         let mut logged_out_at: Option<i64> = None;
         for (kind, at) in latest {
-            if kind == EventKind::Logout.as_str() {
-                logged_out_at = Some(at);
-            } else if let Some(proof) = ProofKind::parse(&kind) {
-                proofs.insert(proof, at);
+            match EventKind::parse(&kind) {
+                Some(EventKind::Logout) => logged_out_at = Some(at),
+                // Several events feed one proof (a sign-in and a step-up both
+                // prove the password); `latest_by_kind` already kept the newest
+                // row of each, so the newest proof wins.
+                Some(event) => {
+                    if let Some(proof) = event.proof() {
+                        proofs.insert(proof, at);
+                    }
+                }
+                None => {}
             }
         }
         // A logout ends the trail: earlier proofs cannot be revived by a session
@@ -317,7 +359,7 @@ fn expiries(situation: &Situation, session_ends_at: i64) -> Vec<i64> {
     let mut instants: Vec<i64> = situation
         .proofs
         .iter()
-        .map(|(kind, at)| at + kind.max_age_secs(situation.session_ttl_secs))
+        .map(|(kind, at)| at + situation.max_age(*kind))
         .filter(|instant| *instant > situation.now && *instant < session_ends_at)
         .collect();
     instants.sort_unstable();
@@ -381,12 +423,37 @@ mod tests {
         assert_eq!(EventKind::EmailOtp.as_str(), ProofKind::EmailOtp.as_str());
     }
 
+    #[test]
+    fn every_event_kind_round_trips_and_the_proofs_are_reachable() {
+        for kind in EventKind::ALL {
+            assert_eq!(EventKind::parse(kind.as_str()), Some(kind));
+        }
+        assert_eq!(EventKind::parse("not-a-kind"), None);
+        // The two ways of proving the password are distinct rows but one proof.
+        assert_eq!(EventKind::Password.proof(), Some(ProofKind::Password));
+        assert_eq!(
+            EventKind::PasswordConfirmed.proof(),
+            Some(ProofKind::Password)
+        );
+        assert_eq!(EventKind::Logout.proof(), None);
+        // Every proof the levels read is written by some event.
+        for proof in ProofKind::ALL {
+            assert!(
+                EventKind::ALL
+                    .into_iter()
+                    .any(|kind| kind.proof() == Some(proof)),
+                "{proof:?} has no event recording it"
+            );
+        }
+    }
+
     fn situation(proofs: &[(ProofKind, i64)], now: i64, ttl: i64) -> Situation {
         Situation {
             account_id: Some(1),
             proofs: proofs.iter().copied().collect(),
             now,
             session_ttl_secs: ttl,
+            confirm_window_secs: 300,
         }
     }
 

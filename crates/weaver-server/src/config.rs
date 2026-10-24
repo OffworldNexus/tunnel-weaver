@@ -314,6 +314,14 @@ pub struct AccountConfig {
     /// Browser-session lifetime, in seconds.
     #[serde(default = "default_account_session_ttl_secs")]
     pub session_ttl_secs: u64,
+    /// How long a password check keeps a session at `Certain`, in seconds —
+    /// the window a `confirm_password` step-up is good for.
+    ///
+    /// Sensitive actions (deleting the account) need `Certain`, so this is how
+    /// long a console that has been left open can still do them without asking
+    /// for the password again.
+    #[serde(default = "default_account_confirm_window_secs")]
+    pub confirm_window_secs: u64,
     /// Whether session cookies carry the `Secure` attribute. Disable only for
     /// local plain-HTTP development, where browsers drop `Secure` cookies.
     #[serde(default = "default_true")]
@@ -382,6 +390,7 @@ impl Default for AccountConfig {
             completion_ttl_secs: default_account_completion_ttl_secs(),
             reset_ttl_secs: default_account_reset_ttl_secs(),
             session_ttl_secs: default_account_session_ttl_secs(),
+            confirm_window_secs: default_account_confirm_window_secs(),
             cookie_secure: true,
             hibp_url: default_account_hibp_url(),
             signup: default_account_signup_budget(),
@@ -451,6 +460,11 @@ fn default_account_reset_ttl_secs() -> u64 {
 /// Default session lifetime: 30 days.
 fn default_account_session_ttl_secs() -> u64 {
     2_592_000
+}
+
+/// Default step-up window: 5 minutes.
+fn default_account_confirm_window_secs() -> u64 {
+    300
 }
 
 /// Default breach-check endpoint.
@@ -717,6 +731,7 @@ fn validate_account_config(account: &AccountConfig) -> Vec<String> {
         ("completion_ttl_secs", account.completion_ttl_secs),
         ("reset_ttl_secs", account.reset_ttl_secs),
         ("session_ttl_secs", account.session_ttl_secs),
+        ("confirm_window_secs", account.confirm_window_secs),
         ("key_log_retention_days", account.key_log_retention_days),
         ("inactive_after_secs", account.inactive_after_secs),
         (

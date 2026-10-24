@@ -23,13 +23,20 @@ pub struct Situation {
     pub now: i64,
     /// The configured session lifetime, which the emailed-code proof borrows.
     pub session_ttl_secs: i64,
+    /// The configured step-up window: how long a password proof keeps `Certain`.
+    pub confirm_window_secs: i64,
 }
 
 impl Situation {
+    /// How long a proof of `kind` stays alive on this session.
+    pub fn max_age(&self, kind: ProofKind) -> i64 {
+        kind.max_age_secs(self.session_ttl_secs, self.confirm_window_secs)
+    }
+
     /// Whether `kind` was proven within its lifetime.
     pub fn has_valid(&self, kind: ProofKind) -> bool {
         match self.proofs.get(&kind) {
-            Some(&at) => self.now - at < kind.max_age_secs(self.session_ttl_secs),
+            Some(&at) => self.now - at < self.max_age(kind),
             None => false,
         }
     }
@@ -184,6 +191,7 @@ mod tests {
             proofs: proofs.iter().copied().collect(),
             now,
             session_ttl_secs: 86_400,
+            confirm_window_secs: 300,
         }
     }
 

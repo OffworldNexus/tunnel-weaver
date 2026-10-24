@@ -50,6 +50,11 @@ pub use proof::ProofKind;
 pub enum EventKind {
     /// The password was checked and a session opened (first factor).
     Password,
+    /// The password was checked again on a live session to step up to
+    /// `Certain` — the `confirm_password` step (WVR-165).
+    PasswordConfirmed,
+    /// A step-up password check was refused; the session stays where it was.
+    PasswordConfirmFailed,
     /// The email factor was engaged — a code was issued or re-sent.
     EmailOtpIssued,
     /// An emailed code was accepted.
@@ -63,15 +68,50 @@ pub enum EventKind {
 }
 
 impl EventKind {
+    /// Every kind, for parsing a stored row.
+    pub const ALL: [EventKind; 8] = [
+        EventKind::Password,
+        EventKind::PasswordConfirmed,
+        EventKind::PasswordConfirmFailed,
+        EventKind::EmailOtpIssued,
+        EventKind::EmailOtp,
+        EventKind::EmailOtpFailed,
+        EventKind::LoginFailed,
+        EventKind::Logout,
+    ];
+
     /// The stable string stored in `auth_event.kind`.
     pub const fn as_str(self) -> &'static str {
         match self {
             EventKind::Password => "password",
+            EventKind::PasswordConfirmed => "password_confirmed",
+            EventKind::PasswordConfirmFailed => "password_confirm_failed",
             EventKind::EmailOtpIssued => "email_otp_issued",
             EventKind::EmailOtp => "email_otp",
             EventKind::EmailOtpFailed => "email_otp_failed",
             EventKind::LoginFailed => "login_failed",
             EventKind::Logout => "logout",
+        }
+    }
+
+    /// Parses a stored `auth_event.kind`.
+    pub fn parse(kind: &str) -> Option<Self> {
+        EventKind::ALL.into_iter().find(|k| k.as_str() == kind)
+    }
+
+    /// The proof this event records — what the level is derived from, or `None`
+    /// for an event that only has to be on the record. Several events can feed
+    /// the same proof: a sign-in and a step-up both prove the password, and the
+    /// later one is what the level reads.
+    pub const fn proof(self) -> Option<ProofKind> {
+        match self {
+            EventKind::Password | EventKind::PasswordConfirmed => Some(ProofKind::Password),
+            EventKind::EmailOtp => Some(ProofKind::EmailOtp),
+            EventKind::PasswordConfirmFailed
+            | EventKind::EmailOtpIssued
+            | EventKind::EmailOtpFailed
+            | EventKind::LoginFailed
+            | EventKind::Logout => None,
         }
     }
 }

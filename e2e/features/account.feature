@@ -106,17 +106,59 @@ Feature: Account lifecycle
   # of its own instead of borrowing the one the read-only journeys leave behind.
   # It walks the whole destructive journey: the Danger zone gate, the signed-out
   # landing with its notice, and the proof that nothing of the account survives.
+  #
+  # WVR-167: the gate is now two dialogs, the password step-up in front of the
+  # confirmation, so this journey carries the step-up's refusals (a wrong
+  # password, both ways of leaving it) and the renewal of `certain` that lets the
+  # delete through. It lands its deletion the way the harness makes
+  # deterministic: the proof ages out at the filled-in confirmation, the submit
+  # is refused, the password returns, and the delete resumes on its own with the
+  # address never typed a second time.
   Scenario: Deleting my account from the Danger zone leaves nothing behind
     Given an account exists for "Ada Lovelace" with the password "correct-horse-battery-staple"
     When I sign in with the password "correct-horse-battery-staple"
     Then I see the signed-in identity for "Ada Lovelace"
     When I follow the "Security" link
     Then I see the "Security" heading
+    # WVR-167: the harness runs `account.confirm_window_secs: 2`, so the proof the
+    # sign-in minted has already aged out by the time the danger zone is reached.
+    # The password step-up is the ordinary way in here, not an edge case.
+    Then my password proof has aged out
+    # WVR-167: leaving the step-up — both ways out — costs nothing: the dialogs
+    # close, the console stays where it is, and the account is untouched.
     When I open the delete confirmation
+    Then I am asked for my password first
+    When I cancel the password step-up
+    Then the delete flow is closed
+    And the session level is "strong"
+    When I open the delete confirmation
+    Then I am asked for my password first
+    When I dismiss the password step-up with Escape
+    Then the delete flow is closed
+    # WVR-167: a wrong password is refused on its own field, the dialog stays
+    # open, and the level does not move — a failed proof lifts nothing.
+    When I open the delete confirmation
+    Then I am asked for my password first
+    When I confirm the password "definitely-not-my-password"
+    Then the password step-up reports "that is not your password" on its field
+    And the password step-up is still open
+    And the session level is "strong"
+    # WVR-167: the right password renews `certain` over the session stream, in
+    # place — no reload — and that renewal is what opens the confirmation.
+    When I confirm the password "correct-horse-battery-staple"
+    Then confirming my password renews my session to "certain" without a reload
+    And I see the "Delete your account?" heading
     Then the delete confirmation is locked
     When I type my email into the confirmation
     Then the delete confirmation is unlocked
-    When I confirm the deletion
+    # WVR-167: let the renewed proof age out with the confirmation already filled
+    # in. The submit is refused for want of `certain`, the password step-up comes
+    # back, and the delete then resumes on its own — the address is never retyped.
+    When my password proof has aged out
+    And I confirm the deletion
+    Then I am asked for my password first
+    And the delete confirmation is closed
+    When I confirm the password "correct-horse-battery-staple"
     Then the deletion lands me signed out on the sign-in page
     And I see "Your account and all its data have been deleted."
     And the old session no longer authenticates

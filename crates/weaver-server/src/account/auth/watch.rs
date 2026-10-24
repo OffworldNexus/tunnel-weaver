@@ -87,7 +87,9 @@ struct Watched {
     ends_at: i64,
     /// The latest occurrence of each live proof.
     proofs: BTreeMap<ProofKind, i64>,
+    /// The two lifetimes the proofs are measured against (see [`Situation`]).
     session_ttl_secs: i64,
+    confirm_window_secs: i64,
     me: Value,
 }
 
@@ -99,6 +101,7 @@ impl Watched {
             proofs: self.proofs.clone(),
             now,
             session_ttl_secs: self.session_ttl_secs,
+            confirm_window_secs: self.confirm_window_secs,
         }
     }
 }
@@ -137,6 +140,7 @@ async fn load(
         ends_at: row.expires_at,
         proofs: situation.proofs,
         session_ttl_secs: situation.session_ttl_secs,
+        confirm_window_secs: situation.confirm_window_secs,
         me: json!({
             "id": account.id,
             "name": account.name,
@@ -157,6 +161,7 @@ fn state(watched: Option<&Watched>, now: i64) -> (Value, Option<Plan>) {
             proofs: BTreeMap::new(),
             now,
             session_ttl_secs: 0,
+            confirm_window_secs: 0,
         },
     };
     let level = level_of(&situation);

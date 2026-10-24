@@ -111,21 +111,163 @@ Then('the password change notification email is sent', async function () {
   await latestMailBySubject('Your password was changed');
 });
 
-// ----- account deletion (WVR-29) ---------------------------------------------
+// ----- account deletion (WVR-29, WVR-167) ------------------------------------
+
+/** The Danger-zone keycap, never the confirm keycap inside a dialog. */
+function dangerButton(page) {
+  return page
+    .getByRole('region', { name: 'Danger zone' })
+    .getByRole('button', { name: 'Delete account', exact: true });
+}
+
+/** The delete confirmation dialog (WVR-29). */
+function deleteDialog(page) {
+  return page.getByRole('dialog', { name: 'Delete your account?' });
+}
 
 /** The confirm keycap inside the open dialog, never the Danger-zone opener. */
 function confirmButton(page) {
-  return page
-    .getByRole('dialog', { name: 'Delete your account?' })
-    .getByRole('button', { name: 'Delete account' });
+  return deleteDialog(page).getByRole('button', { name: 'Delete account', exact: true });
 }
 
+/**
+ * The password step-up dialog (WVR-167): the gate in front of the confirmation
+ * whenever the password proof has aged out, which in this harness is always
+ * (`account.confirm_window_secs: 2`).
+ */
+function passwordDialog(page) {
+  return page.getByRole('dialog', { name: 'Confirm your password' });
+}
+
+/**
+ * The level the session stream reports right now (WVR-167).
+ *
+ * Read from inside the page, so the session cookie is the real one — the way
+ * `machine.steps.js` reads a stream — with the two differences
+ * `/api/account/me` forces: its frames are named `state` rather than unnamed,
+ * and each read opens its own connection, whose first frame is the state at that
+ * instant. That last part is what makes a proof that has aged out observable
+ * without waiting on a push.
+ */
+async function currentLevel(page) {
+  return page.evaluate(
+    () =>
+      new Promise((resolve, reject) => {
+        const source = new EventSource('/api/account/me');
+        const timer = setTimeout(() => {
+          source.close();
+          reject(new Error('The session stream sent no state frame.'));
+        }, 5_000);
+        source.addEventListener('state', (event) => {
+          clearTimeout(timer);
+          source.close();
+          resolve(JSON.parse(event.data).level);
+        });
+        source.onerror = () => {
+          clearTimeout(timer);
+          source.close();
+          reject(new Error('The session stream errored.'));
+        };
+      })
+  );
+}
+
+/** Polls the session stream until it reports `level`. */
+async function waitForLevel(world, level) {
+  let seen = '';
+  await poll(
+    async () => {
+      seen = await currentLevel(world.page);
+      return seen === level ? true : undefined;
+    },
+    () => `The session stream reported "${seen}" where "${level}" was expected.`,
+    { timeoutMs: 10_000, everyMs: 200 }
+  );
+}
+
+// WVR-167: the Danger-zone keycap now opens the password step-up, and the
+// confirmation only follows it. The marker is set before the click so the flow
+// can prove it never reloaded the page: a navigation would wipe the window.
 When('I open the delete confirmation', async function () {
-  const danger = this.page.getByRole('region', { name: 'Danger zone' });
-  await danger.getByRole('button', { name: 'Delete account' }).click();
-  await this.page
-    .getByRole('dialog', { name: 'Delete your account?' })
-    .waitFor({ state: 'visible' });
+  await this.page.evaluate(() => {
+    window.__liveProbe = 'kept';
+  });
+  await dangerButton(this.page).click();
+});
+
+// ----- the password step-up (WVR-167) ----------------------------------------
+
+Then('I am asked for my password first', async function () {
+  await passwordDialog(this.page).waitFor({ state: 'visible' });
+  await assert.seeHeading(this.page, 'Confirm your password');
+});
+
+When('I confirm the password {string}', async function (password) {
+  const dialog = passwordDialog(this.page);
+  await dialog.getByLabel('Password', { exact: true }).fill(password);
+  await dialog.getByRole('button', { name: 'Confirm', exact: true }).click();
+});
+
+// The same three parts the change-password refusal is held to: the alert on the
+// field, `aria-invalid`, and the field described by the message — the refusal is
+// answered where the mistake was made, not in a dialog that closed.
+Then('the password step-up reports {string} on its field', async function (text) {
+  const dialog = passwordDialog(this.page);
+  const field = dialog.getByLabel('Password', { exact: true });
+  await dialog.getByRole('alert').filter({ hasText: text }).waitFor({ state: 'visible' });
+  if ((await field.getAttribute('aria-invalid')) !== 'true') {
+    throw new Error('Expected the password field to be marked invalid.');
+  }
+  const describedBy = await field.getAttribute('aria-describedby');
+  const description = describedBy ? await dialog.locator(`#${describedBy}`).innerText() : '';
+  if (!description.includes(text)) {
+    throw new Error(`Expected the password field to be described by "${text}", got "${description}".`);
+  }
+});
+
+Then('the password step-up is still open', async function () {
+  await passwordDialog(this.page).waitFor({ state: 'visible' });
+});
+
+When('I cancel the password step-up', async function () {
+  const dialog = passwordDialog(this.page);
+  await dialog.getByRole('button', { name: 'Cancel', exact: true }).click();
+});
+
+When('I dismiss the password step-up with Escape', async function () {
+  await passwordDialog(this.page).waitFor({ state: 'visible' });
+  await this.page.keyboard.press('Escape');
+});
+
+// Nothing is left of the flow: both dialogs gone, and the console still where it
+// was — a cancelled step-up ends where it started, account and session intact.
+Then('the delete flow is closed', async function () {
+  await passwordDialog(this.page).waitFor({ state: 'hidden' });
+  await deleteDialog(this.page).waitFor({ state: 'hidden' });
+  await assert.seeHeading(this.page, 'Security');
+});
+
+// WVR-167: `certain` is renewed over the session stream, and the renewal has to
+// land in place — the confirmation the person is about to fill in lives in this
+// document.
+Then('confirming my password renews my session to {string} without a reload', async function (level) {
+  await waitForLevel(this, level);
+  const probe = await this.page.evaluate(() => window.__liveProbe);
+  if (probe !== 'kept') {
+    throw new Error('The page reloaded during the step-up; the renewal must land in place.');
+  }
+});
+
+Then('the session level is {string}', async function (level) {
+  await waitForLevel(this, level);
+});
+
+// The harness runs `account.confirm_window_secs: 2` (production is 300), so a
+// password proof is spent about two seconds after it is given. This step reads
+// the stream until it says so rather than sleeping: it waits out the window, and
+// a proof that somehow stayed alive fails here instead of later.
+Then('my password proof has aged out', async function () {
+  await waitForLevel(this, 'strong');
 });
 
 // The gate is convenience only — the relay re-checks the address — but a locked
@@ -139,7 +281,9 @@ Then('the delete confirmation is locked', async function () {
 });
 
 When('I type my email into the confirmation', async function () {
-  await this.page.getByLabel(/to confirm/).fill(this.email);
+  // The accessible name embeds the address ("Type ada@example.com to confirm:"),
+  // so the label is matched by its tail and scoped to the open dialog.
+  await deleteDialog(this.page).getByLabel(/to confirm:$/).fill(this.email);
 });
 
 Then('the delete confirmation is unlocked', async function () {
@@ -152,6 +296,12 @@ Then('the delete confirmation is unlocked', async function () {
 
 When('I confirm the deletion', async function () {
   await confirmButton(this.page).click();
+});
+
+// WVR-167: a submit refused for want of `certain` takes the confirmation away
+// with it, and the password step-up takes its place.
+Then('the delete confirmation is closed', async function () {
+  await deleteDialog(this.page).waitFor({ state: 'hidden' });
 });
 
 Then('the deletion lands me signed out on the sign-in page', async function () {

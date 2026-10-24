@@ -86,6 +86,7 @@ pub fn router(runtime: Arc<AccountRuntime>, tunnel: Option<Arc<TunnelRegistry>>)
         .route("/api/account/logout", post(logout))
         .route("/api/account/delete", post(delete_account))
         .route("/api/account/password", post(change_password))
+        .route("/api/account/confirm-password", post(confirm_password))
         .route("/api/account/machines", get(machines_list))
         .route("/api/account/overview", get(overview))
         .route("/api/account/metrics", get(metrics))
@@ -1040,6 +1041,69 @@ async fn logout(
     )
 }
 
+/// Body of a `POST /api/account/confirm-password`.
+#[derive(Deserialize)]
+struct ConfirmPasswordRequest {
+    password: String,
+}
+
+/// `POST /api/account/confirm-password` — the `confirm_password` step: type the
+/// password again to reach `Certain` (CSRF-protected).
+///
+/// A destructive action asks for `Certain` — the password proven moments ago —
+/// so this is how a `Strong` session gets back there without signing out and in
+/// again. The proof it writes is the same one the sign-in writes, at the instant
+/// it is checked, so it renews the window rather than opening a second one; the
+/// session's streams announce it at once and the console sees the new level
+/// without asking.
+///
+/// Reachable at `Strong` (the gate's default): a session that has not passed the
+/// second factor climbs to `Strong` first, and only then comes here.
+async fn confirm_password(
+    State(rt): State<Arc<AccountRuntime>>,
+    Extension(manager): Extension<AuthManager>,
+    headers: HeaderMap,
+    Json(req): Json<ConfirmPasswordRequest>,
+) -> Response {
+    if !origin_ok(&headers, &rt.base_url) || !csrf_ok(&headers) {
+        return err(StatusCode::FORBIDDEN, "request refused");
+    }
+    let Some(session) = manager.session() else {
+        return err(StatusCode::UNAUTHORIZED, "not signed in");
+    };
+
+    // A live credential is guaranteed for accounts that can sign in with a
+    // password, so its absence is a server-side inconsistency rather than a
+    // refusal to describe.
+    let stored = rt
+        .store
+        .password_current_for(session.account_id)
+        .await
+        .ok()
+        .flatten()
+        .map(|credential| credential.encoded_hash);
+    let Some(stored) = stored else {
+        return err(StatusCode::SERVICE_UNAVAILABLE, "temporarily unavailable");
+    };
+    if !rt.passwords.verify(&req.password, &stored) {
+        let _ = manager.password_confirmation_failed(session).await;
+        return field_error(
+            StatusCode::BAD_REQUEST,
+            FIELD_PASSWORD,
+            "that is not your password",
+        );
+    }
+
+    if manager.password_confirmed(session).await.is_err() {
+        return err(StatusCode::SERVICE_UNAVAILABLE, "temporarily unavailable");
+    }
+    tracing::info!(
+        account_id = session.account_id,
+        "Password confirmed for a step-up"
+    );
+    json_ok(json!({ "ok": true }))
+}
+
 /// Body of a delete-account request.
 #[derive(Deserialize)]
 struct DeleteAccountRequest {
@@ -1052,9 +1116,12 @@ struct DeleteAccountRequest {
 
 /// `POST /api/account/delete` — irreversibly delete the signed-in account.
 ///
-/// Strictly authenticated: same-origin and CSRF checked, then a live session is
-/// required (there is deliberately no password re-authentication yet — a
-/// stronger step is a later story). The typed address is re-checked **here**
+/// The gate demands `Certain`, not merely `Strong`: the password must have been
+/// proven moments ago, so an unattended console cannot delete the account on a
+/// session that has been open for hours. The console answers that refusal with
+/// its password step (`POST /api/account/confirm-password`) and submits again —
+/// and is refused again if the proof aged out while the confirmation was open.
+/// Same-origin and CSRF are checked here as well. The typed address is re-checked **here**
 /// against the account's real address, or its display name when it has no email
 /// identity: the client-side gate is convenience, this is the control. Both
 /// comparisons trim and case-fold, so casing or stray whitespace still matches.
@@ -2049,6 +2116,8 @@ async fn send_password_changed(
 /// The password inputs a refusal can be attributed to, so the SPA can
 /// render the message on the offending field instead of form-wide.
 const FIELD_CURRENT_PASSWORD: &str = "current_password";
+/// The field a refused `confirm_password` step-up names.
+const FIELD_PASSWORD: &str = "password";
 const FIELD_NEW_PASSWORD: &str = "new_password";
 
 /// Maps a password-policy failure onto a status and a safe, user-facing message.

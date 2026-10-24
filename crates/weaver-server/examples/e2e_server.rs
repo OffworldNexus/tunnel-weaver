@@ -119,6 +119,9 @@ fn account_config(base_url: String) -> AccountConfig {
         argon2_memory_kib: 8,
         argon2_iterations: 1,
         argon2_parallelism: 1,
+        // A step-up lasts five minutes in production, which no browser test can
+        // wait for. Two seconds keeps the `certain` path (and its expiry) walkable.
+        confirm_window_secs: 2,
         signup: generous(),
         login: generous(),
         resend: generous(),

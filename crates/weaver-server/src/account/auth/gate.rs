@@ -77,6 +77,7 @@ pub async fn gate(State(rt): State<Arc<AccountRuntime>>, mut req: Request, next:
         rt.live.clone(),
         session,
         rt.config.session_ttl_secs as i64,
+        rt.config.confirm_window_secs as i64,
         now,
         ip_address,
         user_agent,
@@ -121,7 +122,8 @@ fn refusal(
 }
 
 /// The level a route requires: `Strong` unless the exact (method, path) is on
-/// the public front door or the list of routes needed to climb.
+/// the public front door, on the list of routes needed to climb, or asks for a
+/// step-up.
 fn required_level(method: &Method, path: &str) -> AuthLevel {
     if !path.starts_with("/api/account/") {
         return AuthLevel::None;
@@ -131,6 +133,9 @@ fn required_level(method: &Method, path: &str) -> AuthLevel {
     }
     if is_basic(method, path) {
         return AuthLevel::Basic;
+    }
+    if is_certain(method, path) {
+        return AuthLevel::Certain;
     }
     AuthLevel::Strong
 }
@@ -167,6 +172,17 @@ fn is_basic(method: &Method, path: &str) -> bool {
     }
 }
 
+/// The routes that ask for `Certain` — the password proven moments ago, not
+/// merely a second factor passed at some point in the session's life.
+///
+/// Only actions that lose something irreversibly belong here: an unattended
+/// unlocked browser must not be able to delete the account in one click. The
+/// console answers the refusal with the `confirm_password` step, and the same
+/// gate refuses again if the proof has aged out by the time it is submitted.
+fn is_certain(method: &Method, path: &str) -> bool {
+    matches!((method, path), (&Method::POST, "/api/account/delete"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -197,13 +213,35 @@ mod tests {
     }
 
     #[test]
+    fn only_the_irreversible_actions_ask_for_certain() {
+        assert_eq!(
+            required_level(&Method::POST, "/api/account/delete"),
+            AuthLevel::Certain
+        );
+        // Reading the route does not, and neither does its neighbour.
+        assert_eq!(
+            required_level(&Method::GET, "/api/account/delete"),
+            AuthLevel::Strong
+        );
+        assert_eq!(
+            required_level(&Method::POST, "/api/account/delete/all"),
+            AuthLevel::Strong
+        );
+        // The step that reaches `Certain` must not itself require it.
+        assert_eq!(
+            required_level(&Method::POST, "/api/account/confirm-password"),
+            AuthLevel::Strong
+        );
+    }
+
+    #[test]
     fn everything_else_on_the_api_is_strong() {
         for (method, path) in [
             (Method::GET, "/api/account/machines"),
             (Method::GET, "/api/account/overview"),
             (Method::GET, "/api/account/avatar"),
             (Method::POST, "/api/account/password"),
-            (Method::POST, "/api/account/delete"),
+            (Method::POST, "/api/account/confirm-password"),
             (Method::POST, "/api/account/pair/accept"),
             (Method::POST, "/api/account/some/future/route"),
         ] {

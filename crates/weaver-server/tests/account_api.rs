@@ -1926,6 +1926,24 @@ async fn change_password_requires_a_session_and_a_same_origin_csrf_request() {
 // ----- delete account ------------------------------------------------------
 
 /// Posts a delete-account request with the double-submit CSRF pair attached.
+/// The `confirm_password` step-up, with the double-submit CSRF pair attached.
+async fn confirm_password(fixture: &Fixture, session: &str, csrf: &str, password: &str) -> Reply {
+    call(
+        &fixture.router,
+        "POST",
+        "/api/account/confirm-password",
+        &[
+            (
+                "cookie",
+                format!("__Host-weaver_session={session}; __Host-weaver_csrf={csrf}"),
+            ),
+            ("x-csrf-token", csrf.to_string()),
+        ],
+        Some(serde_json::json!({ "password": password })),
+    )
+    .await
+}
+
 async fn delete_account(fixture: &Fixture, session: &str, csrf: &str, address: &str) -> Reply {
     call(
         &fixture.router,
@@ -2036,6 +2054,93 @@ async fn delete_account_requires_a_session_and_a_same_origin_csrf_request() {
         "the account survives a refused delete: {:?}",
         me.body
     );
+}
+
+/// Deleting needs `Certain`: the password proven moments ago, not merely a
+/// second factor passed earlier in the session. The refusal names the level and
+/// the step, the step lifts the level, and the retry goes through.
+#[tokio::test]
+async fn deleting_needs_a_recent_password() {
+    use sea_orm::ConnectionTrait as _;
+
+    let fixture = setup().await;
+    let email = "step-up@example.com";
+    register(&fixture, "Rémy", email, "correct horse battery").await;
+    let (session, csrf) = sign_in(&fixture, email, "correct horse battery").await;
+
+    // A sign-in proves the password, so the session starts `Certain` and the
+    // gate lets the delete through — this is a fresh credential, not a bypass.
+    let state = me(&fixture, &session).await;
+    assert_eq!(state.body["level"], "certain");
+
+    // Let the password proof age out; the session is `Strong` again.
+    fixture
+        .account
+        .store
+        .db()
+        .execute_unprepared(
+            "UPDATE auth_event SET occurred_at = occurred_at - 600 \
+             WHERE kind IN ('password', 'password_confirmed')",
+        )
+        .await
+        .unwrap();
+    let state = me(&fixture, &session).await;
+    assert_eq!(state.body["level"], "strong");
+    assert_eq!(state.body["drop"]["to"], "none");
+
+    // The delete is refused, naming the level and the way back up.
+    let refused = delete_account(&fixture, &session, &csrf, email).await;
+    assert_eq!(refused.status, StatusCode::FORBIDDEN, "{:?}", refused.body);
+    assert_eq!(refused.headers["x-weaver-required-level"], "certain");
+    assert_eq!(
+        refused.headers["x-weaver-upgrade-paths"],
+        r#"[[{"step":"confirm_password","reaches":"certain"}]]"#
+    );
+
+    // A wrong password is refused on the field and lifts nothing.
+    let wrong = confirm_password(&fixture, &session, &csrf, "not my password").await;
+    assert_eq!(wrong.status, StatusCode::BAD_REQUEST, "{:?}", wrong.body);
+    assert_eq!(wrong.body["field"], "password");
+    assert_eq!(me(&fixture, &session).await.body["level"], "strong");
+    let still_refused = delete_account(&fixture, &session, &csrf, email).await;
+    assert_eq!(still_refused.status, StatusCode::FORBIDDEN);
+
+    // The refusal is on the trail as an event of its own.
+    let trail = || async {
+        fixture
+            .account
+            .store
+            .db()
+            .query_all_raw(sea_orm::Statement::from_string(
+                sea_orm::DatabaseBackend::Sqlite,
+                "SELECT kind FROM auth_event ORDER BY id",
+            ))
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.try_get::<String>("", "kind").unwrap())
+            .collect::<Vec<String>>()
+    };
+    let kinds = trail().await;
+    assert!(
+        kinds.contains(&"password_confirm_failed".to_string()),
+        "{kinds:?}"
+    );
+
+    // The right password lifts it, and the delete then goes through.
+    let confirmed = confirm_password(&fixture, &session, &csrf, "correct horse battery").await;
+    assert_eq!(confirmed.status, StatusCode::OK, "{:?}", confirmed.body);
+    let state = me(&fixture, &session).await;
+    assert_eq!(state.body["level"], "certain");
+    // Read before the delete: removing the account takes its trail with it.
+    let kinds = trail().await;
+    assert!(
+        kinds.contains(&"password_confirmed".to_string()),
+        "{kinds:?}"
+    );
+
+    let deleted = delete_account(&fixture, &session, &csrf, email).await;
+    assert_eq!(deleted.status, StatusCode::OK, "{:?}", deleted.body);
 }
 
 /// The typed address is the control, not the client-side convenience: a wrong
