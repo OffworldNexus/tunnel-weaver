@@ -12,7 +12,10 @@ import { getOverview, OVERVIEW_ROWS } from '#lib/app/overview';
 
 import type { PageLoad } from './$types';
 
-export const load: PageLoad = async ({ depends }) => {
+export const load: PageLoad = async ({ depends, parent }) => {
+	// Wait for the root layout's session load first, so `GET /api/account/me`
+	// is issued before this page's own requests.
+	await parent();
 	depends('app:machines');
 
 	const [overview, page] = await Promise.all([

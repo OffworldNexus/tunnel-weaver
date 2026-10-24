@@ -22,12 +22,12 @@
 
 	<p class="lede">
 		An account already exists for {#if email}<strong>{email}</strong>{:else}that address{/if}. Sign
-		in to continue, or <a href={resolve('/forgot-password')}>reset your password</a> if you need a new
-		one.
+		in to continue, or <a href={resolve('/(auth)/forgot-password')}>reset your password</a> if you need
+		a new one.
 	</p>
 
 	<div class="actions">
-		<Keycap wide href={resolve('/sign-in')}>Sign in</Keycap>
+		<Keycap wide href={resolve('/(auth)/sign-in')}>Sign in</Keycap>
 	</div>
 </Page>
 

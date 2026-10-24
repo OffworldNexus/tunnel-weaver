@@ -40,10 +40,10 @@
 		}
 		if (res.data.outcome === 'set_password') {
 			flow.save({ completion_token: res.data.completion_token, email: res.data.email });
-			await goto(resolve('/set-password'));
+			await goto(resolve('/(auth)/set-password'));
 		} else {
 			flow.save({ email: res.data.email });
-			await goto(resolve('/existing-account'));
+			await goto(resolve('/(auth)/existing-account'));
 		}
 	}
 
@@ -67,11 +67,11 @@
 		<p class="lede">{message}</p>
 		<div class="actions">
 			{#if canResend}
-				<Keycap wide href={resolve('/check-email')}>Request a new link</Keycap>
+				<Keycap wide href={resolve('/(auth)/check-email')}>Request a new link</Keycap>
 			{/if}
-			<Keycap wide variant="ghost" href={resolve('/sign-up')}>Start again</Keycap>
+			<Keycap wide variant="ghost" href={resolve('/(auth)/sign-up')}>Start again</Keycap>
 		</div>
 	{/if}
 
-	<p class="switch"><a href={resolve('/sign-in')}>Back to sign in</a></p>
+	<p class="switch"><a href={resolve('/(auth)/sign-in')}>Back to sign in</a></p>
 </Page>

@@ -41,7 +41,7 @@
 		</p>
 
 		<div class="actions">
-			<Keycap wide variant="ghost" href={resolve('/sign-in')}>Back to sign in</Keycap>
+			<Keycap wide variant="ghost" href={resolve('/(auth)/sign-in')}>Back to sign in</Keycap>
 		</div>
 	{:else}
 		<h1 id="reset-request-title">Reset your password</h1>
@@ -61,6 +61,6 @@
 			</Keycap>
 		</form>
 
-		<p class="switch"><a href={resolve('/sign-in')}>Back to sign in</a></p>
+		<p class="switch"><a href={resolve('/(auth)/sign-in')}>Back to sign in</a></p>
 	{/if}
 </Page>

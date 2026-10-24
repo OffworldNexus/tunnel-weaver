@@ -1,7 +1,10 @@
 <script lang="ts">
+	import { useSession } from '#lib/app/session.svelte';
 	import WeaverMark from '#lib/brand/WeaverMark.svelte';
 	import Keycap from '#lib/ui/Keycap.svelte';
 	import { resolve } from '$app/paths';
+
+	const session = useSession();
 </script>
 
 <!-- Full-viewport hero: decorative CSS-only tunnel art around the weaver mark,
@@ -28,8 +31,12 @@
 	</p>
 
 	<div class="hero__actions">
-		<Keycap wide href={resolve('/sign-up')}>Create account</Keycap>
-		<Keycap wide variant="ghost" href={resolve('/sign-in')}>Sign in</Keycap>
+		{#if session.user}
+			<Keycap wide href={resolve('/app')}>Open your console</Keycap>
+		{:else}
+			<Keycap wide href={resolve('/(auth)/sign-up')}>Create account</Keycap>
+			<Keycap wide variant="ghost" href={resolve('/(auth)/sign-in')}>Sign in</Keycap>
+		{/if}
 	</div>
 
 	<p class="hero__tagline">Small bird. Strong connections.</p>

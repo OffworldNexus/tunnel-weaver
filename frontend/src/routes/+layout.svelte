@@ -1,16 +1,20 @@
 <script lang="ts">
 	import '../styles/global.scss';
 
-	import type { Snippet } from 'svelte';
-
 	import { ensureConfig } from '#lib/account/config.svelte';
+	import { provideSession } from '#lib/app/session.svelte';
+	import Keycap from '#lib/ui/Keycap.svelte';
+	import Page from '#lib/ui/Page.svelte';
 	import Toaster from '#lib/ui/Toaster.svelte';
+	import { refreshAll } from '$app/navigation';
 
-	interface Props {
-		children: Snippet;
-	}
+	import type { LayoutProps } from './$types';
 
-	let { children }: Props = $props();
+	let { data, children }: LayoutProps = $props();
+
+	// The root `+layout.ts` load already read the session — before this route's
+	// own loads ran — so the whole app shares one freshly read identity.
+	provideSession(() => data.session);
 
 	// Warm the constants; the pages that need them report a failure themselves.
 	ensureConfig().catch(() => {});
@@ -19,7 +23,18 @@
 <a class="skip-link" href="#main">Skip to content</a>
 <Toaster />
 
-{@render children()}
+{#if data.error}
+	<!-- Fail loudly: an unreachable relay is not a signed-out visitor. -->
+	<Page labelledby="session-error-title" center>
+		<h1 id="session-error-title">We could not reach the server</h1>
+		<p class="notice-error" role="alert">{data.error}</p>
+		<div class="actions">
+			<Keycap type="button" onclick={() => refreshAll()} wide>Try again</Keycap>
+		</div>
+	</Page>
+{:else}
+	{@render children()}
+{/if}
 
 <style lang="scss">
 	.skip-link {

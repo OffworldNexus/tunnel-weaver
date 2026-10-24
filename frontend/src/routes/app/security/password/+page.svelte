@@ -8,11 +8,10 @@
 	import NewPassword from '#lib/account/NewPassword.svelte';
 	import { changePasswordSchema } from '#lib/account/schemas';
 	import { flow } from '#lib/account/state';
-	import { me } from '#lib/app/me.svelte';
+	import { useSession } from '#lib/app/session.svelte';
 	import { setMeta } from '#lib/console/meta.svelte';
 	import Keycap from '#lib/ui/Keycap.svelte';
 	import Panel from '#lib/ui/Panel.svelte';
-	import { goto } from '$app/navigation';
 	import { resolve } from '$app/paths';
 
 	setMeta({
@@ -20,6 +19,8 @@
 		subtitle: 'For your security, confirm your current password first.',
 		crumbs: [{ label: 'Security', href: '/app/security' }, { label: 'Change password' }]
 	});
+
+	const session = useSession();
 
 	// Refusals the relay scoped to one input, rendered on that field.
 	let currentError = $state('');
@@ -33,11 +34,14 @@
 			newError = '';
 			const res = await api('/api/account/password', data);
 			if (res.ok) {
+				// A full load (not a `goto`): the relay ended every session, this
+				// one included, and a client-side navigation would let the console
+				// report it as a spurious expiry. Sign-in shows the notice.
 				flow.save({
 					notice: 'Your password has been changed. Sign in with your new password.',
-					email: me.value?.email
+					email: session.user?.email
 				});
-				await goto(resolve('/sign-in'));
+				window.location.assign(resolve('/(auth)/sign-in'));
 				return;
 			}
 			const error = res.error ?? 'We could not change your password. Please try again.';

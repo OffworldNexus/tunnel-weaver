@@ -3,13 +3,12 @@
 	import { api } from '#lib/account/api';
 	import { notify } from '#lib/account/notices';
 	import { flow } from '#lib/account/state';
-	import { me } from '#lib/app/me.svelte';
+	import { useSession } from '#lib/app/session.svelte';
 	import { setMeta } from '#lib/console/meta.svelte';
 	import ConfirmDeleteDialog from '#lib/ui/ConfirmDeleteDialog.svelte';
 	import Icon from '#lib/ui/Icon.svelte';
 	import Keycap from '#lib/ui/Keycap.svelte';
 	import Panel from '#lib/ui/Panel.svelte';
-	import { goto } from '$app/navigation';
 	import { resolve } from '$app/paths';
 
 	setMeta({
@@ -21,11 +20,13 @@
 	let confirming = $state(false);
 	let busy = $state(false);
 
+	const session = useSession();
+
 	/**
 	 * What the user must type back: the address when there is one, else the
 	 * display name — the same pair the relay re-checks server-side.
 	 */
-	const expected = $derived(me.value?.email || me.value?.name || '');
+	const expected = $derived(session.user?.email || session.user?.name || '');
 
 	async function deleteAccount(address: string) {
 		busy = true;
@@ -36,11 +37,11 @@
 			notify('error', res.error ?? 'We could not delete your account. Please try again.');
 			return;
 		}
-		// The relay removed every session and cleared both cookies: drop the
-		// in-memory identity so the guard lands on sign-in, carrying a notice.
-		me.value = null;
+		// The relay removed every session and cleared both cookies. A full load
+		// (not a `goto`) keeps the console from watching the session lapse and
+		// reporting a spurious "session expired"; sign-in shows the notice.
 		flow.save({ notice: 'Your account and all its data have been deleted.' });
-		await goto(resolve('/sign-in'));
+		window.location.assign(resolve('/(auth)/sign-in'));
 	}
 </script>
 
@@ -54,7 +55,7 @@
 		</Keycap>
 	{/snippet}
 
-	{#if me.value?.has_password}
+	{#if session.user?.has_password}
 		<p class="state"><Icon name="check" size={16} /> Password is set</p>
 	{:else}
 		<p class="state">No password is set</p>

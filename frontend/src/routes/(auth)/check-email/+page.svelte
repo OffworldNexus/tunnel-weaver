@@ -61,7 +61,7 @@
 
 	function useAnotherEmail() {
 		flow.clear();
-		void goto(resolve('/sign-up'));
+		void goto(resolve('/(auth)/sign-up'));
 	}
 </script>
 
@@ -97,11 +97,11 @@
 	{:else}
 		<p class="lede">This page needs a signup in progress. Start one to get a verification link.</p>
 		<div class="actions">
-			<Keycap wide href={resolve('/sign-up')}>Create an account</Keycap>
+			<Keycap wide href={resolve('/(auth)/sign-up')}>Create an account</Keycap>
 		</div>
 	{/if}
 
-	<p class="switch"><a href={resolve('/sign-in')}>Back to sign in</a></p>
+	<p class="switch"><a href={resolve('/(auth)/sign-in')}>Back to sign in</a></p>
 </Page>
 
 <style lang="scss">

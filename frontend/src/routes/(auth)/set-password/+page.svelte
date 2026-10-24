@@ -27,9 +27,9 @@
 		}
 		if (res.data.outcome === 'activated') {
 			flow.save({ notice: 'Your account is active. Sign in to continue.' });
-			await goto(resolve('/sign-in'));
+			await goto(resolve('/(auth)/sign-in'));
 		} else {
-			await goto(resolve('/existing-account'));
+			await goto(resolve('/(auth)/existing-account'));
 		}
 	});
 
@@ -67,9 +67,9 @@
 	{:else}
 		<p class="lede">This password setup link has expired. Start again to verify your email.</p>
 		<div class="actions">
-			<Keycap wide href={resolve('/sign-up')}>Start again</Keycap>
+			<Keycap wide href={resolve('/(auth)/sign-up')}>Start again</Keycap>
 		</div>
 	{/if}
 
-	<p class="switch"><a href={resolve('/sign-in')}>Back to sign in</a></p>
+	<p class="switch"><a href={resolve('/(auth)/sign-in')}>Back to sign in</a></p>
 </Page>

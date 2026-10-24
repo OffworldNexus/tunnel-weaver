@@ -65,6 +65,9 @@ Feature: Account lifecycle
     And I see "Your password has been reset. Sign in with your new password."
     When I sign in with the password "correct-horse-battery-staple-2"
     Then I see the signed-in identity for "Ada Lovelace"
+    # WVR-168: a signed-in visitor is sent off the auth pages, so the spent link
+    # is only observable once signed out again.
+    When I sign out
     When I open the reset link again
     Then I see the "Link expired or used" heading
 

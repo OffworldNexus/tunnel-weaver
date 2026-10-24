@@ -17,6 +17,11 @@ export const seeHeading = (page, name) =>
 export const seeLink = (page, name) =>
   waitVisible(page, page.getByRole('link', { name, exact: true }).first(), `the link "${name}"`);
 
+export async function seeNoLink(page, name) {
+  const count = await page.getByRole('link', { name, exact: true }).count();
+  if (count !== 0) throw new Error(`Expected no link "${name}" at ${page.url()}, but found ${count}.`);
+}
+
 export const seeText = (page, text, { exact = false } = {}) =>
   waitVisible(page, page.getByText(text, { exact }).first(), `the text "${text}"`);
 

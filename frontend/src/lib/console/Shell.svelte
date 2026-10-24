@@ -9,14 +9,14 @@
 
 	import { api } from '#lib/account/api';
 	import { notify } from '#lib/account/notices';
-	import { me } from '#lib/app/me.svelte';
+	import { flow } from '#lib/account/state';
+	import { useSession } from '#lib/app/session.svelte';
 	import WeaverMark from '#lib/brand/WeaverMark.svelte';
 	import BirdAvatar from '#lib/console/BirdAvatar.svelte';
 	import { navSections } from '#lib/console/nav';
 	import SearchField from '#lib/console/SearchField.svelte';
 	import ThemeToggle from '#lib/console/ThemeToggle.svelte';
 	import Icon from '#lib/ui/Icon.svelte';
-	import { goto } from '$app/navigation';
 	import { resolve } from '$app/paths';
 	import { page } from '$app/state';
 
@@ -29,6 +29,8 @@
 	}
 
 	let { title = '', subtitle = '', crumbs = [], actions, children }: Props = $props();
+
+	const session = useSession();
 
 	const sections = navSections();
 	const hrefs = sections.flatMap((section) => section.items.map((item) => item.href));
@@ -46,13 +48,16 @@
 	async function doSignOut() {
 		signingOut = true;
 		const res = await api('/api/account/logout', {});
-		signingOut = false;
 		if (!res.ok) {
+			signingOut = false;
 			notify('error', res.error ?? 'We could not sign you out. Please try again.');
 			return;
 		}
-		notify('success', 'You have been signed out.');
-		await goto(resolve('/sign-in'));
+		// A full load, not a `goto`: the session is gone, and a client-side
+		// navigation would let the console's guard watch it lapse and report a
+		// spurious "session expired". The sign-in page shows the notice instead.
+		flow.save({ notice: 'You have been signed out.' });
+		window.location.assign(resolve('/(auth)/sign-in'));
 	}
 </script>
 
@@ -94,8 +99,8 @@
 		</nav>
 
 		<div class="sidebar__foot">
-			{#if me.value}
-				{@const account = me.value}
+			{#if session.user}
+				{@const account = session.user}
 				<div class="who">
 					<BirdAvatar size={36} />
 					<div class="who__text">

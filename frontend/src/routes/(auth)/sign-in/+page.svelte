@@ -28,7 +28,9 @@
 			return res.error ?? 'That email and password did not match.';
 		}
 		flow.clear();
-		// A pairing detour sent the person here: return to its confirmation.
+		// A pairing detour sent the person here: return to its confirmation. The
+		// root layout re-reads the session as part of this navigation, so the
+		// destination is decided against the session the relay just established.
 		await goto(resolve(pairing.load().detour ? '/pair' : '/app'));
 	});
 
@@ -71,7 +73,7 @@
 				</p>{/if}
 		</div>
 
-		<p><a href={resolve('/forgot-password')}>Forgot password?</a></p>
+		<p><a href={resolve('/(auth)/forgot-password')}>Forgot password?</a></p>
 
 		<Altcha purpose="login" bind:this={altcha} bind:payload={proof} />
 
@@ -84,5 +86,5 @@
 		</Keycap>
 	</form>
 
-	<p class="switch"><a href={resolve('/sign-up')}>Create an account</a></p>
+	<p class="switch"><a href={resolve('/(auth)/sign-up')}>Create an account</a></p>
 </Page>
