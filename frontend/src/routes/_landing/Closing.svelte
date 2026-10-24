@@ -1,9 +1,12 @@
 <script lang="ts">
+	import { useSession } from '#lib/app/session.svelte';
 	import Icon from '#lib/ui/Icon.svelte';
 	import Keycap from '#lib/ui/Keycap.svelte';
 	import { resolve } from '$app/paths';
 
 	import { REPO_URL } from './repo';
+
+	const session = useSession();
 </script>
 
 <!-- Closing CTA: repeat the primary action at the end of the page. -->
@@ -11,11 +14,19 @@
 	<div class="closing__panel">
 		<h2 class="closing__title">Ready to open a tunnel?</h2>
 		<p class="closing__text">
-			Create an account, verify your email, and your first hostname is a few minutes away.
+			{#if session.user}
+				Your machines, tunnels and traffic are waiting in the console.
+			{:else}
+				Create an account, verify your email, and your first hostname is a few minutes away.
+			{/if}
 		</p>
 		<div class="closing__actions">
-			<Keycap href={resolve('/sign-up')}>Create account</Keycap>
-			<Keycap variant="ghost" href={resolve('/sign-in')}>Sign in</Keycap>
+			{#if session.user}
+				<Keycap href={resolve('/app')}>Open your console</Keycap>
+			{:else}
+				<Keycap href={resolve('/(auth)/sign-up')}>Create account</Keycap>
+				<Keycap variant="ghost" href={resolve('/(auth)/sign-in')}>Sign in</Keycap>
+			{/if}
 			<Keycap variant="ghost" href={REPO_URL} target="_blank" rel="noopener noreferrer">
 				<span class="closing__cta"><Icon name="github" />Get on GitHub</span>
 			</Keycap>

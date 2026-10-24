@@ -22,7 +22,7 @@
 	import { api } from '#lib/account/api';
 	import { pairing } from '#lib/account/state';
 	import { fingerprint } from '#lib/app/fingerprint';
-	import { ensureMe } from '#lib/app/me.svelte';
+	import { useSession } from '#lib/app/session.svelte';
 	import Keycap from '#lib/ui/Keycap.svelte';
 	import Page from '#lib/ui/Page.svelte';
 	import { goto } from '$app/navigation';
@@ -54,6 +54,8 @@
 	let message = $state('');
 	let busy = $state(false);
 
+	const session = useSession();
+
 	async function load(): Promise<void> {
 		phase = 'checking';
 		handle =
@@ -65,15 +67,11 @@
 		pairing.save({ handle, detour: undefined });
 		void goto(resolve('/pair'), { replace: true, shallow: true });
 
-		const session = await ensureMe();
-		if (session.status === 'unauthenticated') {
+		// The root layout settles the session before this page mounts. A
+		// signed-out visitor is sent through sign-in and returned here.
+		if (!session.user) {
 			pairing.save({ detour: true });
-			await goto(resolve('/sign-in'));
-			return;
-		}
-		if (session.status === 'error') {
-			message = session.message;
-			phase = 'error';
+			await goto(resolve('/(auth)/sign-in'));
 			return;
 		}
 

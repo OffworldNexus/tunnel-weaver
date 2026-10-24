@@ -7,6 +7,13 @@ import { press, registerAccount, signIn } from '../support/flow.js';
 const PAGES = {
   landing: '/',
   'sign-up': '/sign-up',
+  'sign-in': '/sign-in',
+  'forgot-password': '/forgot-password',
+  reset: '/reset',
+  verify: '/verify',
+  'existing-account': '/existing-account',
+  'check-email': '/check-email',
+  'set-password': '/set-password',
   'reset request': '/forgot-password',
   account: '/app'
 };
@@ -50,6 +57,17 @@ Then('I see the {string} heading', async function (name) {
 
 Then('I see a link to {string}', async function (name) {
   await assert.seeLink(this.page, name);
+});
+
+Then('I do not see a link to {string}', async function (name) {
+  await assert.seeNoLink(this.page, name);
+});
+
+// WVR-168: a signed-in visitor who reaches an account-entry page is sent on to
+// the console instead.
+Then('I land on my console', async function () {
+  await this.page.waitForURL(/\/app$/);
+  await assert.seeHeading(this.page, 'Overview');
 });
 
 Then('I see the error {string}', async function (text) {

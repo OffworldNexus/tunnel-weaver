@@ -24,7 +24,7 @@
 			return res.error ?? 'We could not start your signup. Please try again.';
 		}
 		flow.save({ flow: res.data.flow, email: data.email });
-		await goto(resolve('/check-email'));
+		await goto(resolve('/(auth)/check-email'));
 	});
 
 	const { form, errors, message, submitting, enhance } = sf;
@@ -67,5 +67,5 @@
 		</Keycap>
 	</form>
 
-	<p class="switch">Already have an account? <a href={resolve('/sign-in')}>Sign in</a></p>
+	<p class="switch">Already have an account? <a href={resolve('/(auth)/sign-in')}>Sign in</a></p>
 </Page>

@@ -34,7 +34,7 @@
 			phase = 'invalid';
 			return;
 		}
-		void goto(resolve('/reset'), { replace: true, shallow: true });
+		void goto(resolve('/(auth)/reset'), { replace: true, shallow: true });
 		const res = await api<{ valid: boolean; email?: string }>('/api/account/reset/check', {
 			token
 		});
@@ -58,7 +58,7 @@
 			return res.error ?? 'We could not reset your password. Request a new link and try again.';
 		}
 		flow.save({ notice: 'Your password has been reset. Sign in with your new password.', email });
-		await goto(resolve('/sign-in'));
+		await goto(resolve('/(auth)/sign-in'));
 	});
 
 	const { form, errors, message, submitting, enhance } = sf;
@@ -95,15 +95,17 @@
 			</Keycap>
 		</form>
 
-		<p class="switch"><a href={resolve('/sign-in')}>Back to sign in</a></p>
+		<p class="switch"><a href={resolve('/(auth)/sign-in')}>Back to sign in</a></p>
 	{:else}
 		<h1 id="reset-title">Link expired or used</h1>
 		<p class="lede">This link is no longer available. Request a fresh one to continue.</p>
 
 		<div class="actions">
-			<Keycap wide variant="ghost" href={resolve('/forgot-password')}>Request a new link</Keycap>
+			<Keycap wide variant="ghost" href={resolve('/(auth)/forgot-password')}
+				>Request a new link</Keycap
+			>
 		</div>
 
-		<p class="switch"><a href={resolve('/sign-in')}>Back to sign in</a></p>
+		<p class="switch"><a href={resolve('/(auth)/sign-in')}>Back to sign in</a></p>
 	{/if}
 </Page>

@@ -1,17 +1,16 @@
 <script lang="ts">
 	/**
-	 * The signed-in console layout: it confirms the session once on entry and
-	 * mounts the shell for every `/app` route. A signed-out visitor is sent to
-	 * sign-in; until the session is known a bare holding page is shown.
+	 * The signed-in console layout: it mounts the shell for every `/app` route.
+	 * The root layout settles the session before this layout renders, so a
+	 * signed-out visitor here (an expired session, or a link opened after
+	 * signing out) is simply sent to sign-in.
 	 */
 	import type { Snippet } from 'svelte';
-	import { untrack } from 'svelte';
 
 	import { notify } from '#lib/account/notices';
-	import { ensureMe, me } from '#lib/app/me.svelte';
+	import { useSession } from '#lib/app/session.svelte';
 	import { meta } from '#lib/console/meta.svelte';
 	import Shell from '#lib/console/Shell.svelte';
-	import Keycap from '#lib/ui/Keycap.svelte';
 	import Page from '#lib/ui/Page.svelte';
 	import { goto } from '$app/navigation';
 	import { resolve } from '$app/paths';
@@ -22,28 +21,15 @@
 
 	let { children }: Props = $props();
 
-	let checking = $state(true);
-	let error = $state('');
+	const session = useSession();
 
-	async function check() {
-		checking = true;
-		error = '';
-		const outcome = await ensureMe();
-		if (outcome.status === 'unauthenticated') {
-			notify('error', 'Your session has expired. Please sign in again.');
-			await goto(resolve('/sign-in'));
-		} else if (outcome.status === 'error') {
-			error = outcome.message;
-		}
-		checking = false;
-	}
-
-	// One-shot: the session is confirmed once on entry, so the effect reads
-	// nothing reactively (`untrack`) and never re-runs.
+	// The session probe lives in the root layout and runs on every navigation;
+	// when it settles without a user, the console is not a place to be.
 	$effect(() => {
-		untrack(() => {
-			void check();
-		});
+		if (!session.user) {
+			notify('error', 'Your session has expired. Please sign in again.');
+			void goto(resolve('/(auth)/sign-in'), { replace: true });
+		}
 	});
 </script>
 
@@ -51,21 +37,13 @@
 	<title>Console · Tunnel Weaver</title>
 </svelte:head>
 
-{#if me.value}
+{#if session.user}
 	<Shell title={meta.title} subtitle={meta.subtitle} crumbs={meta.crumbs}>
 		{@render children()}
 	</Shell>
 {:else}
 	<Page labelledby="app-title">
 		<h1 id="app-title">Your account</h1>
-		{#if checking}
-			<p class="lede" aria-live="polite">Checking your session…</p>
-		{:else if error}
-			<p class="notice-error" role="alert">{error}</p>
-			<div class="actions">
-				<Keycap type="button" onclick={check} wide>Try again</Keycap>
-				<Keycap wide variant="ghost" href={resolve('/sign-in')}>Back to sign in</Keycap>
-			</div>
-		{/if}
+		<p class="lede" role="status">Checking your session…</p>
 	</Page>
 {/if}
