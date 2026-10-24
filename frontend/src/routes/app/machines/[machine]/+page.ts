@@ -13,7 +13,10 @@ import { getMachine } from '#lib/app/machines';
 
 import type { PageLoad } from './$types';
 
-export const load: PageLoad = async ({ params, depends }) => {
+export const load: PageLoad = async ({ params, depends, parent }) => {
+	// Wait for the root layout's session load first, so `GET /api/account/me`
+	// is issued before this page's own requests.
+	await parent();
 	depends('app:machines');
 
 	const id = Number(params.machine);

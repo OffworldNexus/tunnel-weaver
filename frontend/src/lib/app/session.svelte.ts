@@ -1,17 +1,15 @@
 /**
- * The signed-in identity, owned by the root layout.
+ * The signed-in identity, read once per navigation by the root layout's `load`
+ * and shared with every page through Svelte context.
  *
  * The session cookie is httpOnly, so the browser can only learn who is signed
- * in by asking the relay. The root layout creates one `Session`, re-reads it on
- * mount and — awaited — on every navigation (`onNavigate`), and publishes it
- * through Svelte context; every page reads it with `useSession()` instead of
- * issuing a request of its own. One probe per navigation is what keeps the
- * whole app — the console, the auth pages and the public landing page —
- * agreeing about who is signed in.
+ * in by asking the relay. The root layout's load runs before the destination's
+ * own loads, and the protected page loads `await parent()` — so
+ * `GET /api/account/me` is the first request a navigation issues, and no page
+ * fetches its own data before the session is known. Pages read the result with
+ * `useSession()` instead of issuing a query of their own.
  */
 import { getContext, setContext } from 'svelte';
-
-import { api } from '#lib/account/api';
 
 export interface Me {
 	id: number;
@@ -22,54 +20,24 @@ export interface Me {
 	has_password: boolean;
 }
 
-/**
- * `loading` only until the first probe settles. Later probes keep the last
- * settled status, so a same-app navigation never flashes the holding gate.
- */
-export type SessionStatus = 'loading' | 'ready' | 'error';
+export interface Session {
+	/** The signed-in account, or null when signed out. */
+	readonly user: Me | null;
+}
 
 const KEY = Symbol('weaver.session');
 
 /**
- * The one session for the running app. Read reactively (`session.user`); the
- * root layout is the only thing that writes it, through `refresh()`.
+ * Publishes the session read from the root layout's `load`. The accessor — not
+ * a snapshot — is kept so a navigation that replaces the layout data is seen by
+ * every reader. Root layout only.
  */
-export class Session {
-	/** The signed-in account, or null when signed out. */
-	user = $state<Me | null>(null);
-	/** Whether the first probe has settled, and whether it failed. */
-	status = $state<SessionStatus>('loading');
-	/** Why the last probe failed; shown by the root layout's error gate. */
-	error = $state('');
-
-	/**
-	 * Re-reads the session from the relay. Called on mount and, awaited, on
-	 * every navigation. The first call moves `loading` to a settled status;
-	 * later calls leave `loading` untouched so the holding gate never reappears
-	 * mid-session. A failed probe fails loudly: it lands on `error` rather than
-	 * being mistaken for a signed-out visitor.
-	 */
-	async refresh(): Promise<void> {
-		const res = await api<Me>('/api/account/me');
-		if (res.ok && res.data) {
-			this.user = res.data;
-			this.status = 'ready';
-			this.error = '';
-		} else if (res.status === 401) {
-			this.user = null;
-			this.status = 'ready';
-			this.error = '';
-		} else {
-			this.user = null;
-			this.status = 'error';
-			this.error = res.error ?? 'We could not verify your session. Try again.';
+export function provideSession(user: () => Me | null): Session {
+	const session: Session = {
+		get user() {
+			return user();
 		}
-	}
-}
-
-/** Creates the session and publishes it to every descendant. Root layout only. */
-export function provideSession(): Session {
-	const session = new Session();
+	};
 	setContext(KEY, session);
 	return session;
 }
