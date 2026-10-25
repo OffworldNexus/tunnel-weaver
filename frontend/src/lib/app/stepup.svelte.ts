@@ -21,10 +21,13 @@
  */
 import { api } from '#lib/account/api';
 
-import { type AuthLevel, session } from './session.svelte';
+import { atLeast, type AuthLevel, session } from './session.svelte';
 
 /** The `confirm_password` step's endpoint. */
 const CONFIRM_PASSWORD_URL = '/api/account/confirm-password';
+
+/** The relay's answer when the session turns out to have nothing to confirm. */
+const CONFLICT = 409;
 
 class StepUp {
 	/** Whether the popin is showing. The root layout binds it. */
@@ -71,6 +74,15 @@ class StepUp {
 			this.open = false;
 			this.#settle(false);
 		});
+		if (res.status === CONFLICT) {
+			// The relay says this sign-in is already confirmed, so there was nothing
+			// to ask for: a console that was behind on its level. Whatever asked can
+			// carry on from what it holds.
+			this.busy = false;
+			this.open = false;
+			this.#settle(atLeast(session.level, this.#required));
+			return;
+		}
 		if (!res.ok) {
 			this.busy = false;
 			if (!res.refused) {

@@ -2,14 +2,14 @@
 	/**
 	 * The signed-in console layout: it mounts the shell for every `/app` route.
 	 *
-	 * It follows the session stream: the console needs `strong`, so whenever
-	 * the level is lower — on arrival, or because a drop has just landed — the
-	 * person is sent up the path the stream names (to sign-in once the session
-	 * is gone). A drop announced ahead of time is told to the person first.
+	 * It follows the session stream: the console needs `strong`, so whenever the
+	 * level it holds is lower — on arrival, or once the relay has said it fell —
+	 * the person is sent up the way the stream names (to sign-in once the session
+	 * is gone). Because the relay reports a fall a little early, that happens
+	 * before the strict level is gone rather than after it.
 	 */
 	import type { Snippet } from 'svelte';
 
-	import { notify } from '#lib/account/notices';
 	import { atLeast, useSession } from '#lib/app/session.svelte';
 	import { climb } from '#lib/app/upgrade';
 	import { meta } from '#lib/console/meta.svelte';
@@ -28,21 +28,6 @@
 		if (!atLeast(session.level, 'strong')) {
 			void climb('strong');
 		}
-	});
-
-	// Only a drop below what the console needs is worth a word: `certain`
-	// ageing into `strong` takes nothing away from it.
-	$effect(() => {
-		const notice = session.notice;
-		if (notice.at === 0 || atLeast(notice.to, 'strong')) {
-			return;
-		}
-		notify(
-			'error',
-			notice.to === 'none'
-				? `Your session ends in ${notice.in} seconds. Save your work and sign in again.`
-				: `Your sign-in expires in ${notice.in} seconds; you will be asked for a new code.`
-		);
 	});
 </script>
 

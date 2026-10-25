@@ -1051,7 +1051,7 @@ struct ConfirmPasswordRequest {
 /// password again to reach `Certain` (CSRF-protected).
 ///
 /// A destructive action asks for `Certain` — the password proven moments ago —
-/// so this is how a `Strong` session gets back there without signing out and in
+/// so this is how a `strong` session gets back there without signing out and in
 /// again. The proof it writes is the same one the sign-in writes, at the instant
 /// it is checked, so it renews the window rather than opening a second one; the
 /// session's streams announce it at once and the console sees the new level
@@ -1059,6 +1059,13 @@ struct ConfirmPasswordRequest {
 ///
 /// Reachable at `Strong` (the gate's default): a session that has not passed the
 /// second factor climbs to `Strong` first, and only then comes here.
+///
+/// **It is only served where it is expected.** A session that already holds
+/// `Certain` — the console having been told so, the lead window included — has
+/// nothing to confirm, so it is refused rather than given another Argon2
+/// verification and another `auth_event` row. That makes proving a password
+/// something a client cannot ask for at will: at most once per step-up window,
+/// which is exactly what the window is for.
 async fn confirm_password(
     State(rt): State<Arc<AccountRuntime>>,
     Extension(manager): Extension<AuthManager>,
@@ -1071,6 +1078,16 @@ async fn confirm_password(
     let Some(session) = manager.session() else {
         return err(StatusCode::UNAUTHORIZED, "not signed in");
     };
+    let now = unix_secs();
+    let Some(raw) = session::cookie(&headers, SESSION_COOKIE) else {
+        return err(StatusCode::UNAUTHORIZED, "not signed in");
+    };
+    let Some((row, _)) = rt.sessions.live(&raw, now).await.ok().flatten() else {
+        return err(StatusCode::UNAUTHORIZED, "not signed in");
+    };
+    if !manager.step_up_expected(row.expires_at).await {
+        return err(StatusCode::CONFLICT, "this sign-in is already confirmed");
+    }
 
     // A live credential is guaranteed for accounts that can sign in with a
     // password, so its absence is a server-side inconsistency rather than a

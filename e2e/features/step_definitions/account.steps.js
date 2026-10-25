@@ -131,23 +131,29 @@ function confirmButton(page) {
 }
 
 /**
- * The password step-up dialog (WVR-167): the gate in front of the confirmation
- * whenever the password proof has aged out, which in this harness is always
- * (`account.confirm_window_secs: 2`).
+ * The password step-up popin (WVR-167): the gate in front of the confirmation
+ * whenever the console is not holding `certain` — which this harness reaches a
+ * few seconds after a sign-in or a step-up, so the journey waits for it.
  */
 function passwordDialog(page) {
   return page.getByRole('dialog', { name: 'Confirm your password' });
 }
 
 /**
- * The level the session stream reports right now (WVR-167).
+ * The level the console *holds* right now (WVR-167).
+ *
+ * The stream reports the level to hold, not the relay's own: a fall inside the
+ * relay's 5-second lead arrives already reported, so `strong` read here means the
+ * console has stopped trusting `certain`, seconds before the relay would refuse a
+ * `certain` action. That is the level every guard in the console reads, so it is
+ * the level a test has to read too.
  *
  * Read from inside the page, so the session cookie is the real one — the way
  * `machine.steps.js` reads a stream — with the two differences
  * `/api/account/me` forces: its frames are named `state` rather than unnamed,
  * and each read opens its own connection, whose first frame is the state at that
- * instant. That last part is what makes a proof that has aged out observable
- * without waiting on a push.
+ * instant. That last part is what makes a fall observable without waiting on a
+ * push.
  */
 async function currentLevel(page) {
   return page.evaluate(
@@ -172,7 +178,7 @@ async function currentLevel(page) {
   );
 }
 
-/** Polls the session stream until it reports `level`. */
+/** Polls the stream until the level the console holds is `level`. */
 async function waitForLevel(world, level) {
   let seen = '';
   await poll(
@@ -180,14 +186,16 @@ async function waitForLevel(world, level) {
       seen = await currentLevel(world.page);
       return seen === level ? true : undefined;
     },
-    () => `The session stream reported "${seen}" where "${level}" was expected.`,
-    { timeoutMs: 10_000, everyMs: 200 }
+    () => `The console never held "${level}"; the stream last said "${seen}".`,
+    { timeoutMs: 15_000, everyMs: 200 }
   );
 }
 
-// WVR-167: the Danger-zone keycap now opens the password step-up, and the
-// confirmation only follows it. The marker is set before the click so the flow
-// can prove it never reloaded the page: a navigation would wipe the window.
+// WVR-167: once the console has stopped holding `certain` — which the journey
+// waits for before this, since the relay reports a fall seconds early — the
+// Danger-zone keycap opens the password step-up, and the confirmation only
+// follows it. The marker is set before the click so the flow can prove it never
+// reloaded the page: a navigation would wipe the window.
 When('I open the delete confirmation', async function () {
   await this.page.evaluate(() => {
     window.__liveProbe = 'kept';
@@ -258,16 +266,8 @@ Then('confirming my password renews my session to {string} without a reload', as
   }
 });
 
-Then('the session level is {string}', async function (level) {
+Then('the console holds my session as {string}', async function (level) {
   await waitForLevel(this, level);
-});
-
-// The harness runs `account.confirm_window_secs: 2` (production is 300), so a
-// password proof is spent about two seconds after it is given. This step reads
-// the stream until it says so rather than sleeping: it waits out the window, and
-// a proof that somehow stayed alive fails here instead of later.
-Then('my password proof has aged out', async function () {
-  await waitForLevel(this, 'strong');
 });
 
 // The gate is convenience only — the relay re-checks the address — but a locked
@@ -299,8 +299,9 @@ When('I confirm the deletion', async function () {
 });
 
 // WVR-167: the confirmation does not outlive the proof behind it — the open
-// confirmation is handed back to the step-up the moment `certain` lapses, so
-// this asserts it is gone by the time the password is asked for again.
+// confirmation is handed back to the step-up the moment the console stops
+// holding `certain`, so this asserts it is gone by the time the password is
+// asked for again.
 Then('the delete confirmation is closed', async function () {
   await deleteDialog(this.page).waitFor({ state: 'hidden' });
 });

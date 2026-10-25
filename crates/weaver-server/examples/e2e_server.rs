@@ -120,8 +120,11 @@ fn account_config(base_url: String) -> AccountConfig {
         argon2_iterations: 1,
         argon2_parallelism: 1,
         // A step-up lasts five minutes in production, which no browser test can
-        // wait for. Two seconds keeps the `certain` path (and its expiry) walkable.
-        confirm_window_secs: 2,
+        // wait for. Twelve seconds keeps the `certain` window walkable — and
+        // leaves seven seconds of it that the console still *holds* `certain`
+        // for, after the relay has already reported the fall (its lead is five),
+        // which is the whole point of the lead.
+        confirm_window_secs: 12,
         signup: generous(),
         login: generous(),
         resend: generous(),

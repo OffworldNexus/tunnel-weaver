@@ -61,17 +61,6 @@ export interface LevelPaths {
 	options: UpgradePath[];
 }
 
-/** When the level next falls (Unix seconds, the relay's clock) and to what. */
-export interface Drop {
-	at: number;
-	to: AuthLevel;
-}
-
-/** A drop announced ahead of time; `in` is the seconds left when it was sent. */
-export interface DropNotice extends Drop {
-	in: number;
-}
-
 export interface Me {
 	id: number;
 	name: string;
@@ -81,10 +70,19 @@ export interface Me {
 	has_password: boolean;
 }
 
-/** One `state` event. `me` and `drop` exist exactly while a session is live. */
+/**
+ * One `state` event: the level the console holds, the ways up from it, and the
+ * identity — the identity exactly while a session is live.
+ *
+ * The level is the one the relay says to hold, which is the session's own level
+ * or, within the relay's lead, the one a fall will leave it at. Nothing else
+ * about the future is sent: how long a level lasts, and what it falls to, is the
+ * relay's business, and a console that holds a level can always be refused for it
+ * and climb from there.
+ */
 export type SessionState =
 	| { level: 'none'; paths: LevelPaths[] }
-	| { level: 'basic' | 'strong' | 'certain'; paths: LevelPaths[]; me: Me; drop: Drop };
+	| { level: 'basic' | 'strong' | 'certain'; paths: LevelPaths[]; me: Me };
 
 const STREAM_URL = '/api/account/me';
 
@@ -94,8 +92,6 @@ const UNREACHABLE = 'We could not verify your session. Try again.';
 /** How long a caller waits for a level before giving up on the stream. */
 const WAIT_MS = 10_000;
 
-const NO_NOTICE: DropNotice = { at: 0, in: 0, to: 'none' };
-
 class SessionStream {
 	/** The latest `state`; anonymous until the first frame says otherwise. */
 	state = $state<SessionState>({ level: 'none', paths: [] });
@@ -103,8 +99,6 @@ class SessionStream {
 	ready = $state(false);
 	/** Why the first frame could not be read; empty once one has. */
 	error = $state('');
-	/** The pending drop announcement; `at` is 0 when there is none. */
-	notice = $state<DropNotice>(NO_NOTICE);
 
 	#source: EventSource | undefined;
 	#waiters: { done: () => boolean; resolve: () => void }[] = [];
@@ -141,23 +135,12 @@ class SessionStream {
 			this.state = next;
 			this.ready = true;
 			this.error = '';
-			if (next.level === 'none' || next.drop.at !== this.notice.at) {
-				this.notice = NO_NOTICE;
-			}
 			// Anonymous: nothing more will happen on this stream until a sign-in
 			// starts, so do not hold it open (or let it reconnect).
 			if (next.level === 'none') {
 				this.#close(source);
 			}
 			this.#settle();
-		});
-
-		source.addEventListener('drop', (event: MessageEvent<string>) => {
-			try {
-				this.notice = JSON.parse(event.data) as DropNotice;
-			} catch {
-				// A malformed announcement is dropped; the state that follows is not.
-			}
 		});
 
 		source.addEventListener('error', () => {
@@ -177,7 +160,6 @@ class SessionStream {
 			this.#close(this.#source);
 		}
 		this.state = { level: 'none', paths: [] };
-		this.notice = NO_NOTICE;
 	}
 
 	/**

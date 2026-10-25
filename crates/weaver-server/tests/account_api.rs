@@ -261,14 +261,6 @@ async fn first_event_data(body: Body) -> bytes::Bytes {
     bytes::Bytes::from(data)
 }
 
-/// The wall clock, in Unix seconds.
-fn unix_now() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs() as i64
-}
-
 /// An SSE body read event by event.
 struct Events {
     body: Body,
@@ -482,11 +474,11 @@ async fn full_lifecycle_signup_verify_login_logout() {
     assert_eq!(state.body["me"]["name"], "Rémy");
     assert_eq!(state.body["me"]["email"], "remy@example.com");
     // The second factor is done and the password was typed moments ago, so the
-    // session is at the top: nothing above it is offered, and the next drop is
-    // the password proof ageing out, to `strong`.
+    // session is at the top: nothing above it is offered, and there is no policy
+    // to read — only the level.
     assert_eq!(state.body["level"], "certain");
     assert_eq!(state.body["paths"], serde_json::json!([]));
-    assert_eq!(state.body["drop"]["to"], "strong");
+    assert!(state.body.get("drop").is_none(), "{:?}", state.body);
     // The Security page's "Password is set" state is driven by this flag.
     assert_eq!(
         state.body["me"]["has_password"], true,
@@ -687,62 +679,60 @@ async fn the_ways_up_follow_the_password_proof() {
     );
 }
 
-/// A drop is announced before it lands, then lands as a `state` of its own.
+/// The console holds the level a fall within the lead will leave it at, before
+/// the fall is real — and the relay still judges its requests against what it
+/// holds, so neither side is ever surprised.
 #[tokio::test]
-async fn the_session_stream_announces_a_drop_before_it_lands() {
+async fn the_session_stream_holds_the_level_a_fall_will_leave() {
+    use sea_orm::ConnectionTrait as _;
+
     let fixture = setup().await;
     register(
         &fixture,
         "Rémy",
-        "drop@example.com",
+        "lead@example.com",
         "correct horse battery",
     )
     .await;
-    let (session, _) = sign_in(&fixture, "drop@example.com", "correct horse battery").await;
+    let (session, csrf) = sign_in(&fixture, "lead@example.com", "correct horse battery").await;
 
-    use sea_orm::ConnectionTrait as _;
-
-    // Bring the session's end inside the announcement lead.
-    let ends_at = unix_now() + 2;
+    // Bring the password proof to within the lead of ageing out, which is a real
+    // fall to `strong`: the relay is still of `certain`, the console is not.
+    let expires_in = weaver_server::account::auth::manager::LEVEL_LEAD_SECS - 2;
     fixture
         .account
         .store
         .db()
         .execute_unprepared(&format!(
-            "UPDATE browser_session SET expires_at = {ends_at} WHERE invalidated_at IS NULL"
+            "UPDATE auth_event SET occurred_at = occurred_at - (300 - {expires_in}) \
+             WHERE kind IN ('password', 'password_confirmed')"
         ))
         .await
         .unwrap();
 
-    let open = fixture
-        .router
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri("/api/account/me")
-                .header("cookie", format!("__Host-weaver_session={session}"))
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    let mut events = Events::new(open.into_body());
-    let state = events.state().await;
-    assert_eq!(state["level"], "certain");
+    let state = me(&fixture, &session).await;
+    assert_eq!(state.body["level"], "strong");
+    // The ways up are the ones that will hold after the fall, not before it.
     assert_eq!(
-        state["drop"],
-        serde_json::json!({ "at": ends_at, "to": "none" })
+        state.body["paths"],
+        serde_json::json!([{
+            "to": "certain",
+            "options": [[{ "step": "confirm_password", "reaches": "certain" }]],
+        }])
     );
 
-    let (name, data) = events.next().await.expect("a drop announcement");
-    assert_eq!(name, "drop", "{data}");
-    let announced: serde_json::Value = serde_json::from_str(&data).unwrap();
-    assert_eq!(announced["at"], ends_at);
-    assert_eq!(announced["to"], "none");
-    assert!(announced["in"].as_i64().unwrap() <= 2);
-
-    assert_eq!(events.state().await["level"], "none");
-    assert!(events.next().await.is_none());
+    // What the console holds is what it is judged against: the step-up it is
+    // about to be told to take is served, and served once.
+    let confirmed = confirm_password(&fixture, &session, &csrf, "correct horse battery").await;
+    assert_eq!(confirmed.status, StatusCode::OK, "{:?}", confirmed.body);
+    let again = confirm_password(&fixture, &session, &csrf, "correct horse battery").await;
+    assert_eq!(
+        again.status,
+        StatusCode::CONFLICT,
+        "a session that holds `certain` has nothing to confirm: {:?}",
+        again.body
+    );
+    assert_eq!(me(&fixture, &session).await.body["level"], "certain");
 }
 
 /// WVR-167: the password alone does not sign anyone in. The session it opens is
@@ -783,8 +773,7 @@ async fn login_is_not_complete_until_the_emailed_code() {
             },
         ])
     );
-    assert_eq!(state.body["drop"]["to"], "none");
-    assert!(state.body["drop"]["at"].as_i64().is_some());
+    assert!(state.body.get("drop").is_none(), "{:?}", state.body);
 
     // Every protected endpoint is refused, naming in headers the level that
     // would have been enough and the way there.
@@ -2086,7 +2075,7 @@ async fn deleting_needs_a_recent_password() {
         .unwrap();
     let state = me(&fixture, &session).await;
     assert_eq!(state.body["level"], "strong");
-    assert_eq!(state.body["drop"]["to"], "none");
+    assert!(state.body.get("drop").is_none(), "{:?}", state.body);
 
     // The delete is refused, naming the level and the way back up.
     let refused = delete_account(&fixture, &session, &csrf, email).await;

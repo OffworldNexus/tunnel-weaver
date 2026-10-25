@@ -110,6 +110,23 @@ impl AuthManager {
         level_of(&self.situation().await)
     }
 
+    /// The level the console holds — see [`believed_level`].
+    pub async fn believed_level(&self, session_ends_at: i64) -> AuthLevel {
+        believed_level(&self.situation().await, session_ends_at)
+    }
+
+    /// Whether proving the password again is *expected* of this session.
+    ///
+    /// Only a console that does not hold `Certain` may ask — which includes the
+    /// lead window, where it has already been told the level fell. This is what
+    /// keeps the step-up from being a way to spend Argon2 and write `auth_event`
+    /// rows at will: the proof it records is one the session can already be
+    /// asked for exactly once per step-up window, and a request outside that is
+    /// refused rather than served.
+    pub async fn step_up_expected(&self, session_ends_at: i64) -> bool {
+        self.believed_level(session_ends_at).await < AuthLevel::Certain
+    }
+
     /// The same request's manager re-pointed at `session` and `now`: a long-lived
     /// stream loads the trail of the session it watches with this.
     pub fn at(&self, session: Option<SessionContext>, now: i64) -> AuthManager {
@@ -331,6 +348,31 @@ pub fn steps_to(situation: &Situation, target: AuthLevel) -> Vec<Vec<Step>> {
     }
     options.sort_by_key(|(inactive, length, _)| (*inactive, *length));
     options.into_iter().map(|(_, _, option)| option).collect()
+}
+
+/// How long before a level actually falls the console is told it has.
+///
+/// The console only ever holds a level; it is never told that a fall is coming,
+/// or to what — that is the relay's policy, not its business. So the relay
+/// reports the level the session *will* hold once a fall is this close, and a
+/// client that acts on what it holds is never refused for a millisecond that
+/// passed. Enforcement is untouched: the fall is real at its own instant.
+///
+/// The same window decides whether a step-up is expected (see
+/// [`AuthManager::step_up_expected`]), so the console and the relay agree on the
+/// level throughout.
+pub const LEVEL_LEAD_SECS: i64 = 5;
+
+/// The level the console holds: the session's own level, or the level a fall
+/// within [`LEVEL_LEAD_SECS`] will leave it at.
+///
+/// This is what the console is shown, and what a request from it is judged
+/// against, so the two can never disagree by the width of a fall.
+pub fn believed_level(situation: &Situation, session_ends_at: i64) -> AuthLevel {
+    match next_drop(situation, session_ends_at) {
+        Some((at, to)) if at - situation.now <= LEVEL_LEAD_SECS => to,
+        _ => level_of(situation),
+    }
 }
 
 /// The ways to reach `target` from `situation`, each an ordered run of steps,

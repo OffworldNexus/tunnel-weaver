@@ -112,37 +112,39 @@ Feature: Account lifecycle
   # password, both ways of leaving it) and the renewal of `certain` that lets the
   # delete through. It lands its deletion the way the harness makes
   # deterministic: the open confirmation is handed back to the step-up by itself
-  # the moment the proof lapses — no click, no refused submit — and the delete
-  # then lands from the empty confirmation the password reopens.
+  # the moment the console stops holding `certain` — no click, no refused submit
+  # — and the delete then lands from the empty confirmation the password reopens.
   Scenario: Deleting my account from the Danger zone leaves nothing behind
     Given an account exists for "Ada Lovelace" with the password "correct-horse-battery-staple"
     When I sign in with the password "correct-horse-battery-staple"
     Then I see the signed-in identity for "Ada Lovelace"
     When I follow the "Security" link
     Then I see the "Security" heading
-    # WVR-167: the harness runs `account.confirm_window_secs: 2`, so the proof the
-    # sign-in minted has already aged out by the time the danger zone is reached.
-    # The password step-up is the ordinary way in here, not an edge case.
-    Then my password proof has aged out
+    # WVR-167: the harness's step-up window is 12 s and the relay reports a fall
+    # 5 s before it happens, so the console stops holding `certain` about 7 s
+    # after the sign-in. Waited for rather than assumed — the click below must
+    # meet the password step-up, not an eager confirmation.
+    Then the console holds my session as "strong"
     # WVR-167: leaving the step-up — both ways out — costs nothing: the dialogs
     # close, the console stays where it is, and the account is untouched.
     When I open the delete confirmation
     Then I am asked for my password first
     When I cancel the password step-up
     Then the delete flow is closed
-    And the session level is "strong"
+    And the console holds my session as "strong"
     When I open the delete confirmation
     Then I am asked for my password first
     When I dismiss the password step-up with Escape
     Then the delete flow is closed
     # WVR-167: a wrong password is refused on its own field, the dialog stays
-    # open, and the level does not move — a failed proof lifts nothing.
+    # open, and the level the console holds does not move — a failed proof lifts
+    # nothing.
     When I open the delete confirmation
     Then I am asked for my password first
     When I confirm the password "definitely-not-my-password"
     Then the password step-up reports "that is not your password" on its field
     And the password step-up is still open
-    And the session level is "strong"
+    And the console holds my session as "strong"
     # WVR-167: the right password renews `certain` over the session stream, in
     # place — no reload — and that renewal is what opens the confirmation.
     When I confirm the password "correct-horse-battery-staple"
@@ -151,12 +153,12 @@ Feature: Account lifecycle
     Then the delete confirmation is locked
     When I type my email into the confirmation
     Then the delete confirmation is unlocked
-    # WVR-167: the confirmation does not outlive the proof behind it. The moment
-    # `certain` lapses, the open confirmation is handed back to the step-up by
-    # itself — no click, no refused submit — and the confirmation the password
-    # reopens starts empty, so the address is typed again and the delete lands
-    # inside the fresh window.
-    When my password proof has aged out
+    # WVR-167: the confirmation does not outlive the proof behind it. The console
+    # holds `certain` for ~7 s after the step-up, and the moment it stops, the
+    # open confirmation is handed back to the step-up by itself — no click, no
+    # refused submit — and the confirmation the password reopens starts empty, so
+    # the address is typed again and the delete lands inside the fresh window.
+    When the console holds my session as "strong"
     Then I am asked for my password first
     And the delete confirmation is closed
     When I confirm the password "correct-horse-battery-staple"

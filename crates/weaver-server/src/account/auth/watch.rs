@@ -5,33 +5,33 @@
 //!
 //! ```json
 //! { "level": "basic",
-//!   "paths": [{ "to": "strong", "options": [["verify_email_otp"]] }],
-//!   "me": { "id": 1, "name": "…", "email": "…", "has_password": true },
-//!   "drop": { "at": 1761300000, "to": "none" } }
+//!   "paths": [{ "to": "strong", "options": [[{ "step": "verify_email_otp", "reaches": "strong" }]] }],
+//!   "me": { "id": 1, "name": "…", "email": "…", "has_password": true } }
 //! ```
 //!
-//! `paths` names, for every level above the current one, the options (each an
-//! ordered list of steps) that would reach it — they depend on how the account
-//! authenticates, so the client cannot guess them. `me` and `drop` are present
-//! exactly while a session is live; `drop` is the next instant the level falls.
+//! The console is told a *level*, never a policy: `paths` names, for every level
+//! above the one it holds, the options (each an ordered list of steps) that would
+//! reach it — they depend on how the account authenticates, so the client cannot
+//! guess them — and `me` is the identity. There is no "a fall is coming, to
+//! this, at that time": the console holds what it holds, and the relay says
+//! [`LEVEL_LEAD_SECS`] early what it will hold next, which is the whole of the
+//! UI's business.
 //!
 //! The stream holds the session's proofs in memory and derives everything from
-//! them. Each proof expires at a known instant, so the next drop is computed,
-//! not polled: a timer is set for it, a `drop` event announces it
-//! [`DROP_LEAD_SECS`] ahead (with `in`, the seconds left, so the client need not
-//! trust its own clock), and when it fires the level is recomputed from the
-//! same proofs and the next drop planned. The store is read again only when the
-//! proof list itself changes — a proof recorded by the [`AuthManager`], or the
-//! session retired — which is announced on the [`LiveHub`] as an
-//! [`Entity::Session`] change. The timers are [`Task`]s on a per-stream
-//! [`Scheduler`], as for the console's own streams.
+//! them. Each proof expires at a known instant, so the frame's future is
+//! computed, not polled: one timer wakes at the instant the held level or the
+//! ways up change, and the store is read again only when the proof list itself
+//! changes — a proof recorded by the [`AuthManager`], or the session retired —
+//! which is announced on the [`LiveHub`] as an [`Entity::Session`] change. The
+//! timers are [`Task`]s on a per-stream [`Scheduler`], as for the console's own
+//! streams.
 //!
 //! An anonymous request gets one `state` with `"level": "none"` and the stream
 //! ends: the client closes it and opens a new one once a sign-in starts.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
 use axum::http::HeaderMap;
@@ -48,12 +48,8 @@ use crate::scheduler::{Scheduler, Task};
 use crate::store::StoreError;
 use crate::wall_clock::unix_secs;
 
-use super::manager::{next_drop, next_expiry, upgrade_paths};
+use super::manager::{LEVEL_LEAD_SECS, next_drop, next_expiry, upgrade_paths};
 use super::{AuthLevel, AuthManager, ProofKind, SessionContext, Situation, level_of};
-
-/// How long before a level drops the stream announces it — enough for the
-/// console to warn, and for a write already in flight to land before it.
-pub const DROP_LEAD_SECS: i64 = 30;
 
 /// Announces that one session's proof list changed (a proof recorded, the
 /// session retired).
@@ -150,54 +146,73 @@ async fn load(
     }))
 }
 
-/// The `state` body at `now`, and the drop to plan for (`None`: nothing left
-/// to watch, so the stream ends).
-fn state(watched: Option<&Watched>, now: i64) -> (Value, Option<Plan>) {
+/// The `state` body the console holds at `now`, and when it next changes
+/// (`None`: nothing left to watch, so the stream ends).
+///
+/// The body is computed as of the level the console holds — the session's level,
+/// or the one a fall within [`LEVEL_LEAD_SECS`] will leave, so the console hears
+/// about a fall before the relay enforces it. Everything else in the frame (the
+/// ways up, the identity) is read at that same instant, so the frame is one
+/// coherent state rather than a mixture of before and after.
+fn state(watched: Option<&Watched>, now: i64) -> (Value, Option<i64>) {
     let watched = watched.filter(|watched| now < watched.ends_at);
-    let situation = match watched {
-        Some(watched) => watched.situation(now),
-        None => Situation {
+    let Some(current) = watched else {
+        // Nobody signed in: `none`, and the ways in. There is nothing to watch,
+        // so the stream ends here.
+        let situation = Situation {
             account_id: None,
             proofs: BTreeMap::new(),
             now,
             session_ttl_secs: 0,
             confirm_window_secs: 0,
-        },
+        };
+        return (frame(&situation, None), None);
     };
-    let level = level_of(&situation);
+
+    let now_situation = current.situation(now);
+    let (fall_at, _) =
+        next_drop(&now_situation, current.ends_at).unwrap_or((current.ends_at, AuthLevel::None));
+    // A fall this close is not news to wait for: the console holds the level it
+    // will leave it at.
+    let at = if fall_at - now <= LEVEL_LEAD_SECS {
+        fall_at
+    } else {
+        now
+    };
+    let situation = current.situation(at);
+    let body = frame(&situation, Some(current));
+
+    // Wake when the held level changes: the next fall's lead, or the next proof
+    // expiry (which moves the ways up), whichever comes first.
+    let next = next_drop(&situation, current.ends_at)
+        .map(|(at, _)| at - LEVEL_LEAD_SECS)
+        .unwrap_or(i64::MAX);
+    let wake = next_expiry(&situation, current.ends_at)
+        .min(next)
+        .max(now + 1);
+    (body, Some(wake))
+}
+
+/// One `state` frame: the level at `situation`'s instant, the ways up from it,
+/// and the identity.
+fn frame(situation: &Situation, watched: Option<&Watched>) -> Value {
+    let level = level_of(situation);
     let paths: Vec<Value> = AuthLevel::ALL
         .into_iter()
         .filter(|target| *target > level)
         .filter_map(|target| {
-            let options = upgrade_paths(&situation, target);
+            let options = upgrade_paths(situation, target);
             (!options.is_empty()).then(|| json!({ "to": target.as_str(), "options": options }))
         })
         .collect();
-    let Some(watched) = watched else {
-        return (json!({ "level": level.as_str(), "paths": paths }), None);
-    };
-    let (at, to) =
-        next_drop(&situation, watched.ends_at).unwrap_or((watched.ends_at, AuthLevel::None));
-    let body = json!({
-        "level": level.as_str(),
-        "paths": paths,
-        "me": watched.me,
-        "drop": { "at": at, "to": to.as_str() },
-    });
-    let plan = Plan {
-        drop: (at, to),
-        recheck_at: next_expiry(&situation, watched.ends_at),
-    };
-    (body, Some(plan))
-}
-
-/// The instants a stream has to wake at, read off its proofs.
-struct Plan {
-    /// The next drop of the level: announced ahead of time.
-    drop: (i64, AuthLevel),
-    /// The next proof expiry (or the session's end): the level or the ways up
-    /// change there, so the state is recomputed and sent.
-    recheck_at: i64,
+    match watched {
+        Some(watched) => json!({
+            "level": level.as_str(),
+            "paths": paths,
+            "me": watched.me,
+        }),
+        None => json!({ "level": level.as_str(), "paths": paths }),
+    }
 }
 
 async fn run(rt: Arc<AccountRuntime>, manager: AuthManager, raw: String, tx: mpsc::Sender<Bytes>) {
@@ -211,42 +226,33 @@ async fn run(rt: Arc<AccountRuntime>, manager: AuthManager, raw: String, tx: mps
             return;
         }
     };
-    // The drop already announced, so re-planning does not announce it twice.
-    let announced = Arc::new(AtomicI64::new(0));
 
     loop {
-        let (body, plan) = state(watched.as_ref(), unix_secs());
+        let (body, wake) = state(watched.as_ref(), unix_secs());
         let body = serde_json::to_vec(&body).unwrap_or_default();
         if tx.send(sse_event("state", &body)).await.is_err() {
             return;
         }
-        let (Some(current), Some(plan)) = (watched.as_ref(), plan) else {
+        let (Some(current), Some(wake)) = (watched.as_ref(), wake) else {
             return;
         };
-        let (at, to) = plan.drop;
         let viewer = Viewer::Account(current.session.account_id);
         let interests = [Interest::these(
             Entity::Session,
             [current.session.session_id],
         )];
 
-        let expired = Arc::new(AtomicBool::new(false));
-        let mut tasks: Vec<Arc<dyn Task>> = vec![
+        // One timer, at the instant the held level or the ways up change; and the
+        // keep-alive, which also notices a peer that has gone away.
+        let changed = Arc::new(AtomicBool::new(false));
+        let timers: Vec<Arc<dyn Task>> = vec![
             Arc::new(HeartbeatTask { tx: tx.clone() }),
-            Arc::new(ExpiryTask {
-                at: plan.recheck_at,
-                expired: Arc::clone(&expired),
+            Arc::new(BeliefTask {
+                at: wake,
+                changed: Arc::clone(&changed),
             }),
         ];
-        if announced.load(Ordering::Relaxed) != at {
-            tasks.push(Arc::new(AnnounceTask {
-                at,
-                to,
-                tx: tx.clone(),
-                announced: Arc::clone(&announced),
-            }));
-        }
-        let mut timers = Scheduler::new(tasks).await;
+        let mut timers = Scheduler::new(timers).await;
 
         loop {
             let wait = timers.next_wait().unwrap_or(HEARTBEAT);
@@ -257,7 +263,7 @@ async fn run(rt: Arc<AccountRuntime>, manager: AuthManager, raw: String, tx: mps
                         match load(&rt, &manager, &raw, unix_secs()).await {
                             Ok(reloaded) => watched = reloaded,
                             // Keep planning from the proofs already known; the
-                            // next change or drop tries again.
+                            // next change or expiry tries again.
                             Err(error) => {
                                 tracing::warn!(%error, "the session stream could not reload its proofs");
                                 continue;
@@ -279,8 +285,9 @@ async fn run(rt: Arc<AccountRuntime>, manager: AuthManager, raw: String, tx: mps
                     if tx.is_closed() {
                         return;
                     }
-                    // A proof expired: recompute from the proofs already held.
-                    if expired.load(Ordering::Relaxed) {
+                    // The level the console holds moved: recompute from the
+                    // proofs already in hand.
+                    if changed.load(Ordering::Relaxed) {
                         break;
                     }
                 }
@@ -289,45 +296,17 @@ async fn run(rt: Arc<AccountRuntime>, manager: AuthManager, raw: String, tx: mps
     }
 }
 
-/// Sends the `drop` announcement [`DROP_LEAD_SECS`] before the drop — or at
-/// once, for a drop planned inside the lead.
-struct AnnounceTask {
+/// Fires when the level the console holds changes — the next fall's lead, or the
+/// next proof expiry.
+struct BeliefTask {
     at: i64,
-    to: AuthLevel,
-    tx: mpsc::Sender<Bytes>,
-    announced: Arc<AtomicI64>,
+    changed: Arc<AtomicBool>,
 }
 
 #[async_trait]
-impl Task for AnnounceTask {
+impl Task for BeliefTask {
     fn name(&self) -> &'static str {
-        "session-drop-announcement"
-    }
-    async fn next_tick(&self, last_tick: Option<i64>, now: i64) -> i64 {
-        match last_tick {
-            None => (self.at - DROP_LEAD_SECS).max(now),
-            Some(_) => i64::MAX,
-        }
-    }
-    async fn run(&self, tick: i64) {
-        let body = json!({ "at": self.at, "in": self.at - tick, "to": self.to.as_str() });
-        let body = serde_json::to_vec(&body).unwrap_or_default();
-        if self.tx.send(sse_event("drop", &body)).await.is_ok() {
-            self.announced.store(self.at, Ordering::Relaxed);
-        }
-    }
-}
-
-/// Fires at the next proof expiry (or the session's end).
-struct ExpiryTask {
-    at: i64,
-    expired: Arc<AtomicBool>,
-}
-
-#[async_trait]
-impl Task for ExpiryTask {
-    fn name(&self) -> &'static str {
-        "session-proof-expiry"
+        "session-belief"
     }
     async fn next_tick(&self, last_tick: Option<i64>, _now: i64) -> i64 {
         match last_tick {
@@ -336,6 +315,6 @@ impl Task for ExpiryTask {
         }
     }
     async fn run(&self, _tick: i64) {
-        self.expired.store(true, Ordering::Relaxed);
+        self.changed.store(true, Ordering::Relaxed);
     }
 }
