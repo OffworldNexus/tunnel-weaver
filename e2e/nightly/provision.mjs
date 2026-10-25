@@ -17,6 +17,12 @@
  * storage-state file (`--state`), so `verify` can sign in once and `approve` can
  * reuse that session.
  *
+ * The sign-in code is read back from Resend's Receiving API here rather than by
+ * the caller, unlike the two links: the relay mails it the moment the password
+ * is submitted, and it is only valid for that sign-in — so it has to be read and
+ * entered inside the same browser session, before anything else can ask for a
+ * fresh one (WVR-167).
+ *
  * Run from the `e2e` workspace so `playwright` resolves:
  *
  *   node nightly/provision.mjs signup  --base https://<admin> --email <addr>
@@ -29,6 +35,12 @@
 import { existsSync } from 'node:fs';
 import { parseArgs } from 'node:util';
 import { chromium } from 'playwright';
+
+/** Resend's inbound-message endpoint: where the relay's own mail is read back. */
+const RECEIVING = 'https://api.resend.com/emails/receiving';
+
+/** The subject of the second-factor sign-in code. */
+const SIGNIN_SUBJECT = /sign-in code/i;
 
 /** Exit non-zero with the URL, the DOM text and a screenshot. */
 async function fail(reason, page, screenshotPath) {
@@ -88,6 +100,62 @@ async function press(page, name, screenshotPath) {
   } catch (error) {
     await fail(`could not press "${name}": ${error.message}`, page, screenshotPath);
   }
+}
+
+/** The Resend API key this run reads the mailbox with. */
+function resendKey() {
+  const key = process.env.RESEND_API_KEY;
+  if (!key) {
+    console.error('provision: RESEND_API_KEY is required to read the sign-in code back');
+    process.exit(2);
+  }
+  return key;
+}
+
+/** Every id already in the receiving mailbox, so an older run's mail is ignored. */
+async function receivedIds(key) {
+  const res = await fetch(`${RECEIVING}?limit=20`, {
+    headers: { Authorization: `Bearer ${key}` }
+  });
+  if (!res.ok) {
+    console.error(`provision: the receiving API answered ${res.status}`);
+    process.exit(2);
+  }
+  const body = await res.json();
+  return new Set((body.data ?? []).map((message) => message.id));
+}
+
+/**
+ * Waits for the six-digit code the relay just mailed, read back through Resend's
+ * Receiving API — never from the relay's own database. Only a message that
+ * arrived after `seen` was taken, addressed to `email` and carrying the sign-in
+ * subject, can be this sign-in's.
+ */
+async function waitForSigninCode(key, email, seen, page, screenshotPath) {
+  for (let attempt = 0; attempt < 30; attempt += 1) {
+    const list = await fetch(`${RECEIVING}?limit=20`, {
+      headers: { Authorization: `Bearer ${key}` }
+    });
+    const body = await list.json();
+    const message = (body.data ?? []).find(
+      (candidate) =>
+        !seen.has(candidate.id) &&
+        (candidate.to ?? []).includes(email) &&
+        SIGNIN_SUBJECT.test(candidate.subject ?? '')
+    );
+    if (message) {
+      const detail = await fetch(`${RECEIVING}/${message.id}`, {
+        headers: { Authorization: `Bearer ${key}` }
+      });
+      const content = await detail.json();
+      const code = /\b\d{6}\b/.exec(`${content.text ?? ''}\n${content.html ?? ''}`);
+      if (code) {
+        return code[0];
+      }
+    }
+    await new Promise((resolve) => setTimeout(resolve, 2_000));
+  }
+  await fail(`never received the sign-in code email at ${email}`, page, screenshotPath);
 }
 
 function common() {
@@ -161,7 +229,17 @@ async function verify(opts) {
 
     await page.getByLabel('Email', { exact: true }).fill(opts.email);
     await page.getByLabel('Password', { exact: true }).fill(opts.password);
+    // WVR-167: the password is only the first factor. The code is read back
+    // here, after the password is submitted and before anything could ask for
+    // another one, and entered in the session that asked for it.
+    const key = resendKey();
+    const seen = await receivedIds(key);
     await press(page, 'Sign in', opts.screenshot);
+    await waitForPath(page, /\/verify-code$/, 'the second-factor step', opts.screenshot);
+    await waitForHeading(page, 'Enter your code', 'verify-code', opts.screenshot);
+    const code = await waitForSigninCode(key, opts.email, seen, page, opts.screenshot);
+    await page.getByLabel('Code', { exact: true }).fill(code);
+    await press(page, 'Continue', opts.screenshot);
     await waitForPath(page, /\/app$/, 'the signed-in shell', opts.screenshot);
     await context.storageState({ path: opts.state });
     console.log(`provision: verified and signed in as ${opts.email}`);
