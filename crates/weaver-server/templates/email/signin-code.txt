@@ -1,0 +1,11 @@
+{{ heading }}
+
+{{ intro }}
+
+{{ code }}
+
+{{ expiry }}
+
+{{ safety }}
+
+{{ support_url }}

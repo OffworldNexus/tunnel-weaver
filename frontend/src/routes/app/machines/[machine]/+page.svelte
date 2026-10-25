@@ -21,6 +21,7 @@
 		revokeMachine
 	} from '#lib/app/machines';
 	import { date, timeAgo } from '#lib/app/time';
+	import { climb } from '#lib/app/upgrade';
 	import { setMeta } from '#lib/console/meta.svelte';
 	import Badge from '#lib/ui/Badge.svelte';
 	import ConfirmDeleteDialog from '#lib/ui/ConfirmDeleteDialog.svelte';
@@ -80,8 +81,11 @@
 			return;
 		}
 		busy = true;
-		const res = await renameMachine(machine.id, renameValue);
+		const res = await renameMachine(machine.id, renameValue, climb);
 		busy = false;
+		if (res.refused) {
+			return;
+		}
 		if (!res.ok || !res.data) {
 			notify('error', res.error ?? 'We could not rename that machine. Please try again.');
 			return;
@@ -94,8 +98,11 @@
 	async function confirmDisconnect() {
 		const target = machine;
 		busy = true;
-		const res = await disconnectMachine(target.id);
+		const res = await disconnectMachine(target.id, climb);
 		busy = false;
+		if (res.refused) {
+			return;
+		}
 		disconnecting = false;
 		if (!res.ok || !res.data) {
 			notify('error', res.error ?? 'We could not kick that machine. Please try again.');
@@ -113,8 +120,11 @@
 	async function confirmRevoke() {
 		const target = machine;
 		busy = true;
-		const res = await revokeMachine(target.id);
+		const res = await revokeMachine(target.id, climb);
 		busy = false;
+		if (res.refused) {
+			return;
+		}
 		revoking = false;
 		if (!res.ok) {
 			notify('error', res.error ?? 'We could not revoke that machine. Please try again.');

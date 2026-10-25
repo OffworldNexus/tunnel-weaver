@@ -119,6 +119,12 @@ fn account_config(base_url: String) -> AccountConfig {
         argon2_memory_kib: 8,
         argon2_iterations: 1,
         argon2_parallelism: 1,
+        // A step-up lasts five minutes in production, which no browser test can
+        // wait for. Twelve seconds keeps the `certain` window walkable — and
+        // leaves seven seconds of it that the console still *holds* `certain`
+        // for, after the relay has already reported the fall (its lead is five),
+        // which is the whole point of the lead.
+        confirm_window_secs: 12,
         signup: generous(),
         login: generous(),
         resend: generous(),
@@ -149,7 +155,7 @@ fn sample_config(https_port: u16) -> Config {
         usage_retention_secs: 31_536_000,
         relay_ips: Vec::new(),
         setup_complete: false,
-        email: None,
+        email: Some(weaver_server::config::test_email_config()),
         abuse: None,
         account: account_config(format!("https://localhost:{https_port}")),
     }

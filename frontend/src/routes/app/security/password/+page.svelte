@@ -9,6 +9,7 @@
 	import { changePasswordSchema } from '#lib/account/schemas';
 	import { flow } from '#lib/account/state';
 	import { useSession } from '#lib/app/session.svelte';
+	import { climb } from '#lib/app/upgrade';
 	import { setMeta } from '#lib/console/meta.svelte';
 	import Keycap from '#lib/ui/Keycap.svelte';
 	import Panel from '#lib/ui/Panel.svelte';
@@ -32,7 +33,15 @@
 		async (data) => {
 			currentError = '';
 			newError = '';
-			const res = await api('/api/account/password', data);
+			// Success ends every session; do not let the guard see it before we leave.
+			session.detach();
+			const res = await api('POST', '/api/account/password', data, climb);
+			if (!res.ok) {
+				session.restart();
+			}
+			if (res.refused) {
+				return;
+			}
 			if (res.ok) {
 				// A full load (not a `goto`): the relay ended every session, this
 				// one included, and a client-side navigation would let the console

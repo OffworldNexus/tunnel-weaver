@@ -121,6 +121,9 @@ impl Task for AccountSweepTask {
         if let Err(err) = self.store.session_sweep(tick).await {
             warn!(error = %err, "session sweep failed");
         }
+        if let Err(err) = self.store.login_challenge_sweep(tick).await {
+            warn!(error = %err, "login challenge sweep failed");
+        }
         let key_log_cutoff = self.config.key_log_cutoff(tick);
         if let Err(err) = self.store.sweep_machine_key_log(key_log_cutoff).await {
             warn!(error = %err, "machine key log sweep failed");

@@ -38,6 +38,16 @@ const OTP_PREVIEW: &str = "Use this code to prove your Tunnel Weaver email provi
 const OTP_INTRO: &str = "Enter this code to prove your email provider.";
 const OTP_SAFETY: &str = "If you did not request this, you can ignore this message.";
 
+/// Copy for the sign-in second-factor variant (WVR-167). The setup variant's
+/// words are about proving a provider; a person signing in needs a message
+/// about finishing a sign-in — same code, different sentence.
+const SIGNIN_SUBJECT: &str = "Your Tunnel Weaver sign-in code";
+const SIGNIN_PREVIEW: &str = "Use this code to finish signing in.";
+const SIGNIN_HEADING: &str = "Finish signing in";
+const SIGNIN_INTRO: &str = "Enter this code to finish signing in.";
+const SIGNIN_SAFETY: &str =
+    "If you did not try to sign in, someone may know your password — change it now.";
+
 // --- Shared partials (copied from docs/brand/emails/partials) --------------
 
 /// `partials/head.mjml`: title, preview, and the shared MJML attribute table.
@@ -235,6 +245,94 @@ impl EmailTemplate for Otp {
         Ok(Rendered {
             subject: otp::OTP_SUBJECT.to_string(),
             text: otp::otp_body(&self.code, &env.support_url),
+            html,
+        })
+    }
+}
+
+// --- The sign-in second-factor template ------------------------------------
+
+/// `signin-code.mjml`: the second-factor body; it includes the three shared
+/// partials, like the setup OTP variant, but carries sign-in copy.
+#[derive(Template)]
+#[template(path = "email/signin-code.mjml", escape = "html", ext = "mjml")]
+struct SignInCodeMjml<'a> {
+    heading: &'a str,
+    intro: &'a str,
+    /// The numeric code; escaped like every other value.
+    code: &'a str,
+    expiry: &'a str,
+    safety: &'a str,
+}
+
+/// `signin-code.txt`: the authored plain-text twin. The code sits on its own
+/// line, which is also what the e2e harness greps for.
+#[derive(Template)]
+#[template(path = "email/signin-code.txt", escape = "none", ext = "txt")]
+struct SignInCodeTxt<'a> {
+    heading: &'a str,
+    intro: &'a str,
+    code: &'a str,
+    expiry: &'a str,
+    safety: &'a str,
+    support_url: &'a str,
+}
+
+/// The emailed one-time code that completes a sign-in (WVR-167).
+///
+/// Distinct from [`Otp`], which proves the *provider* during setup/configure:
+/// same six-digit shape, different purpose and copy.
+#[derive(Debug, Clone)]
+pub struct SignInCode {
+    /// The numeric code sent to the person signing in.
+    pub code: String,
+}
+
+impl SignInCode {
+    /// Stable template id.
+    pub const ID: &'static str = "signin-code";
+}
+
+impl EmailTemplate for SignInCode {
+    fn id(&self) -> &'static str {
+        Self::ID
+    }
+
+    fn render(&self, env: &TemplateEnv) -> Result<Rendered, RenderError> {
+        let expiry = format!(
+            "It expires in {} minutes.",
+            crate::email::otp::OTP_TTL_SECS / 60
+        );
+        let mjml_source = SignInCodeMjml {
+            heading: SIGNIN_HEADING,
+            intro: SIGNIN_INTRO,
+            code: &self.code,
+            expiry: &expiry,
+            safety: SIGNIN_SAFETY,
+        }
+        .render()
+        .map_err(|e| RenderError::Template(e.to_string()))?;
+        let html = render_base(
+            SIGNIN_SUBJECT,
+            SIGNIN_PREVIEW,
+            &mjml_source,
+            &env.support_url,
+        )?;
+
+        let text = SignInCodeTxt {
+            heading: SIGNIN_HEADING,
+            intro: SIGNIN_INTRO,
+            code: &self.code,
+            expiry: &expiry,
+            safety: SIGNIN_SAFETY,
+            support_url: &env.support_url,
+        }
+        .render()
+        .map_err(|e| RenderError::Template(e.to_string()))?;
+
+        Ok(Rendered {
+            subject: SIGNIN_SUBJECT.to_string(),
+            text,
             html,
         })
     }

@@ -61,13 +61,13 @@ pub use overview::Overview;
 /// Keep-alive comment cadence: long enough to be free, short enough to defeat a
 /// typical 30–60 s idle timeout in a proxy, and it doubles as the read that
 /// notices a peer that has gone away.
-const HEARTBEAT: Duration = Duration::from_secs(15);
+pub(crate) const HEARTBEAT: Duration = Duration::from_secs(15);
 
 /// How long a burst of changes is allowed to collect before one re-render.
 const COALESCE: Duration = Duration::from_millis(200);
 
 /// Frames buffered between the render loop and the socket.
-const FRAME_BUFFER: usize = 8;
+pub(crate) const FRAME_BUFFER: usize = 8;
 
 /// The frame sent when the session behind a stream is gone.
 const EXPIRED_FRAME: &[u8] = b"event: expired\ndata: {}\n\n";
@@ -148,6 +148,12 @@ fn serve_stream<V: View>(
 ) -> Response {
     let (tx, rx) = mpsc::channel::<Bytes>(FRAME_BUFFER);
     tokio::spawn(run::<V>(runtime, tunnel, parts, tx));
+    sse_response(rx)
+}
+
+/// An SSE response whose body is every frame `rx` yields, until its sender is
+/// dropped.
+pub(crate) fn sse_response(rx: mpsc::Receiver<Bytes>) -> Response {
     let frames = stream::unfold(rx, |mut rx| async move {
         rx.recv()
             .await
@@ -244,8 +250,8 @@ async fn run<V: View>(
 ///
 /// One per open stream; its tick sends an SSE comment so a proxy or a browser
 /// does not time an idle stream out.
-struct HeartbeatTask {
-    tx: mpsc::Sender<Bytes>,
+pub(crate) struct HeartbeatTask {
+    pub(crate) tx: mpsc::Sender<Bytes>,
 }
 
 #[async_trait::async_trait]
@@ -276,8 +282,18 @@ async fn coalesce(changes: &mut broadcast::Receiver<Change>) {
 /// Frames a JSON body as one SSE event, splitting multi-line bodies so every
 /// line keeps its `data:` prefix.
 fn sse_data(body: &[u8]) -> Bytes {
+    sse_event("", body)
+}
+
+/// Frames a JSON body as one SSE event named `event` (unnamed when empty).
+pub(crate) fn sse_event(event: &str, body: &[u8]) -> Bytes {
     let text = String::from_utf8_lossy(body);
-    let mut frame = String::with_capacity(text.len() + 16);
+    let mut frame = String::with_capacity(text.len() + event.len() + 24);
+    if !event.is_empty() {
+        frame.push_str("event: ");
+        frame.push_str(event);
+        frame.push('\n');
+    }
     for line in text.split('\n') {
         frame.push_str("data: ");
         frame.push_str(line);

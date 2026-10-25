@@ -19,10 +19,11 @@
 	 */
 	import { untrack } from 'svelte';
 
-	import { api } from '#lib/account/api';
+	import { api, type RefusalHandler } from '#lib/account/api';
 	import { pairing } from '#lib/account/state';
 	import { fingerprint } from '#lib/app/fingerprint';
-	import { useSession } from '#lib/app/session.svelte';
+	import { atLeast, useSession } from '#lib/app/session.svelte';
+	import { climb } from '#lib/app/upgrade';
 	import Keycap from '#lib/ui/Keycap.svelte';
 	import Page from '#lib/ui/Page.svelte';
 	import { goto } from '$app/navigation';
@@ -56,6 +57,15 @@
 
 	const session = useSession();
 
+	/**
+	 * A refusal mid-approval (the level dropped since the page opened): keep
+	 * the detour, so the approval resumes here once the person is back up.
+	 */
+	const resumeAfterClimb: RefusalHandler = async (required, options) => {
+		pairing.save({ detour: true });
+		await climb(required, options);
+	};
+
 	async function load(): Promise<void> {
 		phase = 'checking';
 		handle =
@@ -67,15 +77,17 @@
 		pairing.save({ handle, detour: undefined });
 		void goto(resolve('/pair'), { replace: true, shallow: true });
 
-		// The root layout settles the session before this page mounts. A
-		// signed-out visitor is sent through sign-in and returned here.
-		if (!session.user) {
+		// The root layout holds until the session stream's first frame. Approving
+		// needs `strong`: anyone below it is sent up the path the stream names —
+		// sign-in for a visitor, the code step for a password-only session —
+		// keeping the detour so the approval resumes here (WVR-167).
+		if (!atLeast(session.level, 'strong')) {
 			pairing.save({ detour: true });
-			await goto(resolve('/(auth)/sign-in'));
+			await climb('strong');
 			return;
 		}
 
-		const res = await api<Lookup>('/api/account/pair/lookup', { handle });
+		const res = await api<Lookup>('POST', '/api/account/pair/lookup', { handle }, resumeAfterClimb);
 		if (!res.ok || !res.data) {
 			message = res.error ?? 'We could not check this pairing request.';
 			phase = 'error';
@@ -102,7 +114,12 @@
 	async function act(path: string, body: object, success: 'done' | 'rejected'): Promise<void> {
 		busy = true;
 		message = '';
-		const res = await api<{ ok: boolean; message?: string }>(path, { handle, ...body });
+		const res = await api<{ ok: boolean; message?: string }>(
+			'POST',
+			path,
+			{ handle, ...body },
+			resumeAfterClimb
+		);
 		busy = false;
 		if (res.data?.ok) {
 			pairing.clear();

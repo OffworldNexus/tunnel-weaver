@@ -47,8 +47,12 @@
 
 	async function doSignOut() {
 		signingOut = true;
-		const res = await api('/api/account/logout', {});
-		if (!res.ok) {
+		session.detach();
+		// A refusal means the session is already gone — where this was going
+		// anyway — so it is handled as a sign-out like any other.
+		const res = await api('POST', '/api/account/logout', {}, () => {});
+		if (!res.ok && !res.refused) {
+			session.restart();
 			signingOut = false;
 			notify('error', res.error ?? 'We could not sign you out. Please try again.');
 			return;

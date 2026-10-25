@@ -95,13 +95,15 @@ pub struct Config {
     /// first boot does not race an unreachable zone.
     #[serde(default)]
     pub setup_complete: bool,
-    /// Optional transactional-email configuration.
+    /// Transactional-email configuration.
     ///
-    /// Absent means email is disabled: the server still boots and every caller
-    /// receives [`crate::email::MailerError::NotConfigured`]. Present means the
-    /// nested block is validated by [`Config::load`]. Credentials live here
-    /// because the config JSON is stored in the 0600 SQLite database — the same
-    /// trust model as the ACME EAB material and certificate private keys.
+    /// Required: the sign-in second factor is an emailed code (WVR-167), so a
+    /// relay that cannot send mail cannot sign anyone in. [`Config::load`]
+    /// rejects an absent block; it is still `Option` at the type level only so a
+    /// `configure`-built value can be assembled before the OTP proof decides it.
+    /// Credentials live here because the config JSON is stored in the 0600 SQLite
+    /// database — the same trust model as the ACME EAB material and certificate
+    /// private keys.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub email: Option<EmailConfig>,
     /// Optional request-budget configuration for the relay's own web surface.
@@ -154,6 +156,21 @@ pub struct EmailConfig {
     /// Transactional template id, required by template-only providers (Loops).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub template_id: Option<String>,
+}
+
+/// A syntactically valid email block for tests, fixtures and the harness.
+///
+/// Email is a hard requirement (WVR-167), so every boot path needs a block that
+/// passes validation. Nothing here reaches the network: a transport is only
+/// built, never used, and the sender domain is a reserved example.
+#[cfg(any(test, feature = "test-util"))]
+pub fn test_email_config() -> EmailConfig {
+    EmailConfig {
+        provider: "resend".to_string(),
+        from: "no-reply@weaver.test".to_string(),
+        api_key: Some("test-api-key".to_string()),
+        ..EmailConfig::default()
+    }
 }
 
 /// Redacts credentials so `EmailConfig` can sit inside `Config`'s derived
@@ -297,6 +314,14 @@ pub struct AccountConfig {
     /// Browser-session lifetime, in seconds.
     #[serde(default = "default_account_session_ttl_secs")]
     pub session_ttl_secs: u64,
+    /// How long a password check keeps a session at `Certain`, in seconds —
+    /// the window a `confirm_password` step-up is good for.
+    ///
+    /// Sensitive actions (deleting the account) need `Certain`, so this is how
+    /// long a console that has been left open can still do them without asking
+    /// for the password again.
+    #[serde(default = "default_account_confirm_window_secs")]
+    pub confirm_window_secs: u64,
     /// Whether session cookies carry the `Secure` attribute. Disable only for
     /// local plain-HTTP development, where browsers drop `Secure` cookies.
     #[serde(default = "default_true")]
@@ -365,6 +390,7 @@ impl Default for AccountConfig {
             completion_ttl_secs: default_account_completion_ttl_secs(),
             reset_ttl_secs: default_account_reset_ttl_secs(),
             session_ttl_secs: default_account_session_ttl_secs(),
+            confirm_window_secs: default_account_confirm_window_secs(),
             cookie_secure: true,
             hibp_url: default_account_hibp_url(),
             signup: default_account_signup_budget(),
@@ -434,6 +460,11 @@ fn default_account_reset_ttl_secs() -> u64 {
 /// Default session lifetime: 30 days.
 fn default_account_session_ttl_secs() -> u64 {
     2_592_000
+}
+
+/// Default step-up window: 5 minutes.
+fn default_account_confirm_window_secs() -> u64 {
+    300
 }
 
 /// Default breach-check endpoint.
@@ -700,6 +731,7 @@ fn validate_account_config(account: &AccountConfig) -> Vec<String> {
         ("completion_ttl_secs", account.completion_ttl_secs),
         ("reset_ttl_secs", account.reset_ttl_secs),
         ("session_ttl_secs", account.session_ttl_secs),
+        ("confirm_window_secs", account.confirm_window_secs),
         ("key_log_retention_days", account.key_log_retention_days),
         ("inactive_after_secs", account.inactive_after_secs),
         (
@@ -846,10 +878,17 @@ impl Config {
             validation_issues.push("acme_provider 'custom' requires acme_directory URL".into());
         }
 
-        // Email is opt-in: an absent block means the server boots with email
-        // disabled, while a present block must fully validate.
-        if let Some(email) = &config.email {
-            validation_issues.extend(crate::email::providers::validate_email_config(email));
+        // Email is a hard requirement (WVR-167): the second factor is an emailed
+        // code, so a relay that cannot send mail cannot sign anyone in. An absent
+        // block is a validation failure, never a degraded mode with the second
+        // factor quietly unavailable.
+        match &config.email {
+            Some(email) => {
+                validation_issues.extend(crate::email::providers::validate_email_config(email));
+            }
+            None => validation_issues.push(
+                "email is required: configure an email provider (the emailed second factor is the sign-in)".into(),
+            ),
         }
 
         // Abuse limits are opt-in; an armed block must be internally coherent.

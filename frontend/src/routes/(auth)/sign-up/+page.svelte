@@ -9,6 +9,7 @@
 	import { jsonForm } from '#lib/account/form';
 	import { signUpSchema } from '#lib/account/schemas';
 	import { flow } from '#lib/account/state';
+	import { climb } from '#lib/app/upgrade';
 	import Keycap from '#lib/ui/Keycap.svelte';
 	import Page from '#lib/ui/Page.svelte';
 	import { goto } from '$app/navigation';
@@ -18,7 +19,12 @@
 	let proof = $state('');
 
 	const sf = jsonForm(signUpSchema, { name: '', email: '' }, async (data) => {
-		const res = await api<{ flow: string }>('/api/account/signup', { ...data, altcha: proof });
+		const res = await api<{ flow: string }>(
+			'POST',
+			'/api/account/signup',
+			{ ...data, altcha: proof },
+			climb
+		);
 		altcha?.reset();
 		if (!res.ok || !res.data) {
 			return res.error ?? 'We could not start your signup. Please try again.';

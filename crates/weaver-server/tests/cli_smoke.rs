@@ -94,10 +94,40 @@ fn test_weaver_server_db_flag_and_env_accepted() {
     assert!(output.status.success());
 }
 
+/// A minimal valid config that already carries an email block, so `configure`
+/// can preserve it. A *first* `configure` without email flags is refused — see
+/// [`test_configure_without_email_is_refused`].
+fn seeded_config() -> weaver_server::Config {
+    weaver_server::Config {
+        tunnel_domain: "seed.example.com".into(),
+        admin_domain: "relay.example.net".into(),
+        admin_email: "seed@example.com".into(),
+        acme_provider: "letsencrypt".into(),
+        listen_http: "0.0.0.0:80".parse().unwrap(),
+        listen_https: "0.0.0.0:443".parse().unwrap(),
+        control_socket: std::env::temp_dir().join("weaver-cli-smoke.sock"),
+        acme_directory: None,
+        acme_eab_kid: None,
+        acme_eab_hmac: None,
+        acme_root_ca_pem: None,
+        acme_fallback_providers: vec![],
+        usage_flush_interval_secs: 60,
+        usage_retention_secs: 31_536_000,
+        relay_ips: vec![],
+        setup_complete: false,
+        email: Some(weaver_server::config::test_email_config()),
+        abuse: None,
+        account: Default::default(),
+    }
+}
+
+/// Email is a hard requirement (WVR-167): the second factor is an emailed code,
+/// so a first `configure` without a provider is refused, rather than writing a
+/// config the daemon would reject at load.
 #[test]
-fn test_weaver_server_configure_command() {
+fn test_configure_without_email_is_refused() {
     let dir = tempdir().unwrap();
-    let db_path = dir.path().join("configured.db");
+    let db_path = dir.path().join("refused.db");
     let bin_path = env!("CARGO_BIN_EXE_weaver-server");
 
     let output = Command::new(bin_path)
@@ -117,12 +147,56 @@ fn test_weaver_server_configure_command() {
         .output()
         .expect("failed to execute weaver-server configure");
 
-    assert!(output.status.success());
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--email-provider"),
+        "Expected a refusal naming --email-provider, got: {stderr}"
+    );
+}
+
+#[test]
+fn test_weaver_server_configure_command() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("configured.db");
+    let bin_path = env!("CARGO_BIN_EXE_weaver-server");
+
+    // Seed an existing email block: `configure` preserves it and never writes a
+    // config without one (WVR-167). The two-step OTP that sets one from scratch
+    // is covered by the email tests.
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let store = Store::open(&db_path).await.unwrap();
+        store.save_config(&seeded_config()).await.unwrap();
+        store.close().await.unwrap();
+    });
+
+    let output = Command::new(bin_path)
+        .arg("--db")
+        .arg(&db_path)
+        .arg("configure")
+        .arg("--tunnel-domain")
+        .arg("test.example.com")
+        .arg("--admin-domain")
+        .arg("relay.example.net")
+        .arg("--admin-email")
+        .arg("admin@example.com")
+        .arg("--listen-http")
+        .arg("8080")
+        .arg("--listen-https")
+        .arg("8443")
+        .output()
+        .expect("failed to execute weaver-server configure");
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("Configuration saved"));
 
     // Verify store loads valid config with dual-stack bare ports parsed
-    let rt = tokio::runtime::Runtime::new().unwrap();
     let config = rt.block_on(async {
         let store = Store::open(&db_path).await.unwrap();
         let cfg = store.load_config().await.unwrap();
@@ -139,6 +213,10 @@ fn test_weaver_server_configure_command() {
     assert_eq!(
         config.listen_https,
         "[::]:8443".parse::<std::net::SocketAddr>().unwrap()
+    );
+    assert!(
+        config.email.is_some(),
+        "configure must carry the email block forward"
     );
 
     // Non-root headless configure — verify headless flag writes config to SQLite database
@@ -157,7 +235,11 @@ fn test_weaver_server_configure_command() {
         .output()
         .expect("failed to execute weaver-server configure --headless");
 
-    assert!(headless_output.status.success());
+    assert!(
+        headless_output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&headless_output.stderr)
+    );
     let config2 = rt.block_on(async {
         let store = Store::open(&db_path).await.unwrap();
         store.load_config().await.unwrap()
@@ -253,8 +335,11 @@ fn test_configure_headless_missing_email_exits_2() {
     );
 }
 
+/// Headless boundaries that must never hang: `setup` without an email provider
+/// stops before elevation (email is required, WVR-167), and `uninstall` stops at
+/// the passwordless-sudo check. Both exit 2.
 #[test]
-fn test_setup_headless_sudo_password_required_exits_2_no_hang() {
+fn test_headless_setup_and_uninstall_fail_fast_exit_2() {
     use std::os::unix::fs::PermissionsExt;
 
     // Create a fake sudo that always fails with exit 1 (simulating password requirement / failure)
@@ -287,12 +372,12 @@ fn test_setup_headless_sudo_password_required_exits_2_no_hang() {
     assert_eq!(
         output.status.code(),
         Some(2),
-        "Expected exit code 2 when non-interactive sudo fails"
+        "Expected exit code 2 when headless setup has no email provider"
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("sudo") || stderr.contains("Root privileges"),
-        "Expected error message mentioning sudo or root privileges, got: {stderr}"
+        stderr.contains("--email-provider"),
+        "Expected the email requirement to stop setup before elevation, got: {stderr}"
     );
 
     // Privilege escalation boundary in headless mode — uninstall --headless also terminates
@@ -473,6 +558,15 @@ fn test_configure_usage_flush_interval_round_trips() {
     let db_path = dir.path().join("flushinterval.db");
     let bin_path = env!("CARGO_BIN_EXE_weaver-server");
 
+    // Seed an email block: `configure` preserves an existing one, and will not
+    // write a config without one (WVR-167).
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let store = Store::open(&db_path).await.unwrap();
+        store.save_config(&seeded_config()).await.unwrap();
+        store.close().await.unwrap();
+    });
+
     let output = Command::new(bin_path)
         .arg("--db")
         .arg(&db_path)
@@ -495,7 +589,6 @@ fn test_configure_usage_flush_interval_round_trips() {
         String::from_utf8_lossy(&output.stderr)
     );
 
-    let rt = tokio::runtime::Runtime::new().unwrap();
     let config = rt.block_on(async {
         let store = Store::open(&db_path).await.unwrap();
         store.load_config().await.unwrap()

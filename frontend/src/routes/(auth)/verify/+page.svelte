@@ -14,6 +14,7 @@
 
 	import { api } from '#lib/account/api';
 	import { flow } from '#lib/account/state';
+	import { climb } from '#lib/app/upgrade';
 	import Keycap from '#lib/ui/Keycap.svelte';
 	import Page from '#lib/ui/Page.svelte';
 	import { goto } from '$app/navigation';
@@ -33,7 +34,7 @@
 			message = 'This link is missing its token.';
 			return;
 		}
-		const res = await api<VerifyOutcome>('/api/account/verify', { token });
+		const res = await api<VerifyOutcome>('POST', '/api/account/verify', { token }, climb);
 		if (!res.ok || !res.data) {
 			message = res.error ?? 'This link has expired or has already been used.';
 			return;

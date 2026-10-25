@@ -5,7 +5,9 @@
 	import { jsonForm } from '#lib/account/form';
 	import { notify } from '#lib/account/notices';
 	import { signInSchema } from '#lib/account/schemas';
-	import { flow, pairing } from '#lib/account/state';
+	import { flow } from '#lib/account/state';
+	import { session } from '#lib/app/session.svelte';
+	import { climb } from '#lib/app/upgrade';
 	import Keycap from '#lib/ui/Keycap.svelte';
 	import Page from '#lib/ui/Page.svelte';
 	import { goto } from '$app/navigation';
@@ -22,16 +24,19 @@
 	let showPassword = $state(false);
 
 	const sf = jsonForm(signInSchema, { email: carried.email ?? '', password: '' }, async (data) => {
-		const res = await api('/api/account/login', { ...data, altcha: proof });
+		const res = await api('POST', '/api/account/login', { ...data, altcha: proof }, climb);
 		altcha?.reset();
 		if (!res.ok) {
 			return res.error ?? 'That email and password did not match.';
 		}
 		flow.clear();
-		// A pairing detour sent the person here: return to its confirmation. The
-		// root layout re-reads the session as part of this navigation, so the
-		// destination is decided against the session the relay just established.
-		await goto(resolve(pairing.load().detour ? '/pair' : '/app'));
+		// A session exists now: reopen the stream (it closed on the anonymous
+		// answer) and wait for it to say so. The password is only the first
+		// factor, so the next page is the code step; that page, not this one,
+		// decides on the pairing detour.
+		session.restart();
+		await session.reached('basic');
+		await goto(resolve('/(auth)/verify-code'));
 	});
 
 	const { form, errors, message, submitting, enhance } = sf;

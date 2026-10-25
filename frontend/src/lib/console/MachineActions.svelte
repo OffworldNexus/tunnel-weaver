@@ -14,6 +14,7 @@
 	 */
 	import { notify } from '#lib/account/notices';
 	import { disconnectMachine, type Machine, renameMachine, revokeMachine } from '#lib/app/machines';
+	import { climb } from '#lib/app/upgrade';
 	import ConfirmDeleteDialog from '#lib/ui/ConfirmDeleteDialog.svelte';
 	import Dialog from '#lib/ui/Dialog.svelte';
 	import Icon from '#lib/ui/Icon.svelte';
@@ -38,8 +39,11 @@
 			return;
 		}
 		busy = true;
-		const res = await renameMachine(machine.id, renameValue);
+		const res = await renameMachine(machine.id, renameValue, climb);
 		busy = false;
+		if (res.refused) {
+			return;
+		}
 		if (!res.ok || !res.data) {
 			notify('error', res.error ?? 'We could not rename that machine. Please try again.');
 			return;
@@ -51,8 +55,11 @@
 
 	async function confirmKick() {
 		busy = true;
-		const res = await disconnectMachine(machine.id);
+		const res = await disconnectMachine(machine.id, climb);
 		busy = false;
+		if (res.refused) {
+			return;
+		}
 		kicking = false;
 		if (!res.ok || !res.data) {
 			notify('error', res.error ?? 'We could not kick that machine. Please try again.');
@@ -69,8 +76,11 @@
 
 	async function confirmRevoke() {
 		busy = true;
-		const res = await revokeMachine(machine.id);
+		const res = await revokeMachine(machine.id, climb);
 		busy = false;
+		if (res.refused) {
+			return;
+		}
 		revoking = false;
 		if (!res.ok) {
 			notify('error', res.error ?? 'We could not revoke that machine. Please try again.');

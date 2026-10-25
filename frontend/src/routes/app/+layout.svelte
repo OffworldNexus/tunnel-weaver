@@ -1,19 +1,20 @@
 <script lang="ts">
 	/**
 	 * The signed-in console layout: it mounts the shell for every `/app` route.
-	 * The root layout settles the session before this layout renders, so a
-	 * signed-out visitor here (an expired session, or a link opened after
-	 * signing out) is simply sent to sign-in.
+	 *
+	 * It follows the session stream: the console needs `strong`, so whenever the
+	 * level it holds is lower — on arrival, or once the relay has said it fell —
+	 * the person is sent up the way the stream names (to sign-in once the session
+	 * is gone). Because the relay reports a fall a little early, that happens
+	 * before the strict level is gone rather than after it.
 	 */
 	import type { Snippet } from 'svelte';
 
-	import { notify } from '#lib/account/notices';
-	import { useSession } from '#lib/app/session.svelte';
+	import { atLeast, useSession } from '#lib/app/session.svelte';
+	import { climb } from '#lib/app/upgrade';
 	import { meta } from '#lib/console/meta.svelte';
 	import Shell from '#lib/console/Shell.svelte';
 	import Page from '#lib/ui/Page.svelte';
-	import { goto } from '$app/navigation';
-	import { resolve } from '$app/paths';
 
 	interface Props {
 		children: Snippet;
@@ -23,12 +24,9 @@
 
 	const session = useSession();
 
-	// The session probe lives in the root layout and runs on every navigation;
-	// when it settles without a user, the console is not a place to be.
 	$effect(() => {
-		if (!session.user) {
-			notify('error', 'Your session has expired. Please sign in again.');
-			void goto(resolve('/(auth)/sign-in'), { replace: true });
+		if (!atLeast(session.level, 'strong')) {
+			void climb('strong');
 		}
 	});
 </script>
@@ -37,7 +35,7 @@
 	<title>Console · Tunnel Weaver</title>
 </svelte:head>
 
-{#if session.user}
+{#if atLeast(session.level, 'strong')}
 	<Shell title={meta.title} subtitle={meta.subtitle} crumbs={meta.crumbs}>
 		{@render children()}
 	</Shell>

@@ -361,7 +361,9 @@ async fn configure_two_step_otp_then_send() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn send_a_joke_without_email_exits_nonzero() {
+async fn send_a_joke_without_email_is_refused_by_validation() {
+    // Email is a hard requirement (WVR-167): a config without a provider is
+    // refused at load, so the operator learns at the command, not silently.
     let temp = TempDir::new().unwrap();
     let db = temp.path().join("weaver.db");
     let store = weaver_server::Store::open(&db).await.unwrap();
@@ -396,5 +398,5 @@ async fn send_a_joke_without_email_exits_nonzero() {
         db.to_str().unwrap(),
     ]);
     assert!(!out.status.success());
-    assert!(String::from_utf8_lossy(&out.stderr).contains("email is not configured"));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("email is required"));
 }

@@ -19,11 +19,18 @@ use sea_orm::{
 use std::collections::{HashMap, HashSet};
 
 use super::entity::{
-    account, browser_session, domain, email_identity, email_verification, machine, machine_key_log,
-    password_credential, password_reset_token, pending_registration, person, service, usage_daily,
-    usage_live, verification_token,
+    account, auth_event, browser_session, domain, email_identity, email_verification,
+    login_challenge, machine, machine_key_log, password_credential, password_reset_token,
+    pending_registration, person, service, usage_daily, usage_live, verification_token,
 };
 use super::{Store, StoreError};
+
+/// `auth_event.kind` for the emailed-code proof.
+///
+/// Kept as a literal here rather than imported from `account::auth` so the store
+/// layer keeps knowing nothing about the account plane's types. The value must
+/// match `account::auth::EventKind::EmailOtp`; a test there asserts the pair.
+const PROOF_EMAIL_OTP: &str = "email_otp";
 
 /// Caller-supplied fields for a new in-flight signup.
 #[derive(Debug, Clone)]
@@ -50,6 +57,36 @@ pub struct NewVerificationToken {
     pub purpose: String,
     pub issued_at: i64,
     pub expires_at: i64,
+}
+
+/// Caller-supplied fields for one authentication-trail row (WVR-167).
+#[derive(Debug, Clone)]
+pub struct NewAuthEvent {
+    /// The account the event concerns, when it concerns one.
+    pub account_id: Option<i32>,
+    /// The browser session the event belongs to, when one existed.
+    pub session_id: Option<i32>,
+    /// One of the `account::auth::EventKind` strings.
+    pub kind: String,
+    pub occurred_at: i64,
+    /// Peer address, or empty when unknown.
+    pub ip_address: String,
+    /// Truncated `User-Agent`, or empty when unknown.
+    pub user_agent: String,
+    /// The identifier a failed login was attempted against; empty otherwise.
+    pub attempted: String,
+}
+
+/// Caller-supplied fields for a pending sign-in challenge (WVR-167).
+#[derive(Debug, Clone)]
+pub struct NewLoginChallenge {
+    pub session_id: i32,
+    /// SHA-256 digest (base64) of the issued code; the raw code is never stored.
+    pub code_hash: String,
+    pub created_at: i64,
+    pub expires_at: i64,
+    pub max_attempts: i32,
+    pub last_sent_at: i64,
 }
 
 /// Everything the atomic activation needs. The token and pending registration
@@ -754,6 +791,166 @@ impl Store {
         Ok(result.rows_affected)
     }
 
+    // ----- authentication trail (WVR-167) -----
+
+    /// Appends one `auth_event` row.
+    ///
+    /// Never refused for a missing session or account: a failed password check
+    /// that matched nothing is a real, recordable absence.
+    pub async fn auth_event_insert(&self, event: NewAuthEvent) -> Result<(), StoreError> {
+        auth_event::ActiveModel {
+            account_id: Set(event.account_id),
+            session_id: Set(event.session_id),
+            kind: Set(event.kind),
+            occurred_at: Set(event.occurred_at),
+            ip_address: Set(event.ip_address),
+            user_agent: Set(event.user_agent),
+            attempted: Set(event.attempted),
+            ..Default::default()
+        }
+        .insert(&self.db)
+        .await?;
+        Ok(())
+    }
+
+    /// The latest occurrence of each `auth_event` kind on `session_id`, as
+    /// `(kind, occurred_at)` pairs — one indexed query, the level's source.
+    pub async fn auth_event_latest_by_kind(
+        &self,
+        session_id: i32,
+    ) -> Result<Vec<(String, i64)>, StoreError> {
+        Ok(auth_event::Entity::find()
+            .filter(auth_event::Column::SessionId.eq(session_id))
+            .select_only()
+            .column(auth_event::Column::Kind)
+            .column_as(auth_event::Column::OccurredAt.max(), "latest")
+            .group_by(auth_event::Column::Kind)
+            .into_tuple::<(String, i64)>()
+            .all(&self.db)
+            .await?)
+    }
+
+    /// The accounts holding a live session that has passed the second factor.
+    ///
+    /// This is what the inactivity sweep must read: a session that only proved
+    /// the password (or one that never reached `Strong`) must not keep a dormant
+    /// account alive. Because the emailed-code proof lives as long as its
+    /// session, a live session with an `email_otp` row is a `Strong` one.
+    pub async fn strong_session_accounts(&self, now: i64) -> Result<HashSet<i32>, StoreError> {
+        let live: Vec<(i32, i32)> = browser_session::Entity::find()
+            .filter(browser_session::Column::InvalidatedAt.is_null())
+            .filter(browser_session::Column::ExpiresAt.gt(now))
+            .select_only()
+            .column(browser_session::Column::AccountId)
+            .column(browser_session::Column::Id)
+            .into_tuple::<(i32, i32)>()
+            .all(&self.db)
+            .await?;
+        if live.is_empty() {
+            return Ok(HashSet::new());
+        }
+        let session_ids: Vec<i32> = live.iter().map(|(_, session_id)| *session_id).collect();
+        let proven: HashSet<i32> = auth_event::Entity::find()
+            .filter(auth_event::Column::SessionId.is_in(session_ids))
+            .filter(auth_event::Column::Kind.eq(PROOF_EMAIL_OTP))
+            .select_only()
+            .column(auth_event::Column::SessionId)
+            .into_tuple::<i32>()
+            .all(&self.db)
+            .await?
+            .into_iter()
+            .collect();
+        Ok(live
+            .into_iter()
+            .filter(|(_, session_id)| proven.contains(session_id))
+            .map(|(account_id, _)| account_id)
+            .collect())
+    }
+
+    // ----- pending sign-in challenges (WVR-167) -----
+
+    /// Issues or replaces the pending emailed-code challenge for a session.
+    ///
+    /// Replacing is the point: only the newest code is ever accepted, and its
+    /// TTL, attempt count and cooldown clock all restart with it.
+    pub async fn login_challenge_upsert(
+        &self,
+        challenge: NewLoginChallenge,
+    ) -> Result<(), StoreError> {
+        login_challenge::Entity::insert(login_challenge::ActiveModel {
+            session_id: Set(challenge.session_id),
+            code_hash: Set(challenge.code_hash),
+            created_at: Set(challenge.created_at),
+            expires_at: Set(challenge.expires_at),
+            attempts: Set(0),
+            max_attempts: Set(challenge.max_attempts),
+            last_sent_at: Set(challenge.last_sent_at),
+            consumed_at: Set(None),
+            ..Default::default()
+        })
+        .on_conflict(
+            OnConflict::column(login_challenge::Column::SessionId)
+                .update_columns([
+                    login_challenge::Column::CodeHash,
+                    login_challenge::Column::CreatedAt,
+                    login_challenge::Column::ExpiresAt,
+                    login_challenge::Column::Attempts,
+                    login_challenge::Column::MaxAttempts,
+                    login_challenge::Column::LastSentAt,
+                    login_challenge::Column::ConsumedAt,
+                ])
+                .to_owned(),
+        )
+        .exec(&self.db)
+        .await?;
+        Ok(())
+    }
+
+    /// The pending challenge for a session, if one exists.
+    pub async fn login_challenge_by_session(
+        &self,
+        session_id: i32,
+    ) -> Result<Option<login_challenge::Model>, StoreError> {
+        Ok(login_challenge::Entity::find()
+            .filter(login_challenge::Column::SessionId.eq(session_id))
+            .one(&self.db)
+            .await?)
+    }
+
+    /// Records one wrong entry against a challenge.
+    pub async fn login_challenge_record_attempt(
+        &self,
+        id: i32,
+        attempts: i32,
+    ) -> Result<(), StoreError> {
+        login_challenge::Entity::update_many()
+            .col_expr(login_challenge::Column::Attempts, Expr::value(attempts))
+            .filter(login_challenge::Column::Id.eq(id))
+            .exec(&self.db)
+            .await?;
+        Ok(())
+    }
+
+    /// Marks a challenge satisfied, atomically. Returns whether it was live.
+    pub async fn login_challenge_consume(&self, id: i32, now: i64) -> Result<bool, StoreError> {
+        let result = login_challenge::Entity::update_many()
+            .col_expr(login_challenge::Column::ConsumedAt, Expr::value(Some(now)))
+            .filter(login_challenge::Column::Id.eq(id))
+            .filter(login_challenge::Column::ConsumedAt.is_null())
+            .exec(&self.db)
+            .await?;
+        Ok(result.rows_affected == 1)
+    }
+
+    /// Deletes challenges that expired before `cutoff`; returns the count.
+    pub async fn login_challenge_sweep(&self, cutoff: i64) -> Result<u64, StoreError> {
+        let result = login_challenge::Entity::delete_many()
+            .filter(login_challenge::Column::ExpiresAt.lt(cutoff))
+            .exec(&self.db)
+            .await?;
+        Ok(result.rows_affected)
+    }
+
     /// Deletes verification tokens that expired unconsumed before `cutoff`.
     ///
     /// Consumed/revoked rows are deliberately kept: the verification history
@@ -822,17 +1019,11 @@ impl Store {
         let account_ids: Vec<i32> = accounts.iter().map(|a| a.id).collect();
 
         let newest_usage = self.newest_usage_day_by_account(Some(&account_ids)).await?;
-        let live_sessions: HashSet<i32> = browser_session::Entity::find()
-            .filter(browser_session::Column::AccountId.is_in(account_ids.clone()))
-            .filter(browser_session::Column::InvalidatedAt.is_null())
-            .filter(browser_session::Column::ExpiresAt.gt(now))
-            .select_only()
-            .column(browser_session::Column::AccountId)
-            .into_tuple::<i32>()
-            .all(&self.db)
-            .await?
-            .into_iter()
-            .collect();
+        // Only a session that reached the second factor counts as activity
+        // (WVR-167). A session that only proved the password has not "used" the
+        // account, so it must not keep a dormant account alive; the derivation
+        // lives in `strong_session_accounts`.
+        let live_sessions = self.strong_session_accounts(now).await?;
         let emails: HashMap<i32, String> = email_identity::Entity::find()
             .filter(email_identity::Column::AccountId.is_in(account_ids))
             .all(&self.db)

@@ -10,6 +10,7 @@
 	import { setPasswordSchema } from '#lib/account/schemas';
 	import { flow } from '#lib/account/state';
 	import VerifiedEmail from '#lib/account/VerifiedEmail.svelte';
+	import { climb } from '#lib/app/upgrade';
 	import Keycap from '#lib/ui/Keycap.svelte';
 	import Page from '#lib/ui/Page.svelte';
 	import { goto } from '$app/navigation';
@@ -18,10 +19,15 @@
 	const { completion_token, email = '' } = flow.load();
 
 	const sf = jsonForm(setPasswordSchema, { password: '' }, async ({ password }) => {
-		const res = await api<{ outcome: 'activated' | 'existing_account' }>('/api/account/complete', {
-			completion_token,
-			password
-		});
+		const res = await api<{ outcome: 'activated' | 'existing_account' }>(
+			'POST',
+			'/api/account/complete',
+			{
+				completion_token,
+				password
+			},
+			climb
+		);
 		if (!res.ok || !res.data) {
 			return res.error ?? 'We could not set your password. Please try again.';
 		}

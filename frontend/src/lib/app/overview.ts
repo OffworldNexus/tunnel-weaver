@@ -43,5 +43,5 @@ export const OVERVIEW_ROWS = 10;
 
 /** `GET /api/account/overview` — the signed-in account's rollup. */
 export function getOverview() {
-	return api<OverviewStats>(OVERVIEW_URL);
+	return api<OverviewStats>('GET', OVERVIEW_URL);
 }

@@ -42,7 +42,7 @@ pub enum OtpError {
 }
 
 /// Generates a zero-padded numeric code from the process CSPRNG.
-fn generate_code() -> String {
+pub(crate) fn generate_code() -> String {
     let mut rng = rand::rng();
     (0..OTP_DIGITS)
         .map(|_| {
@@ -53,7 +53,7 @@ fn generate_code() -> String {
 }
 
 /// Hashes a code so the persisted challenge never stores it in the clear.
-fn hash_code(code: &str) -> String {
+pub(crate) fn hash_code(code: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(code.as_bytes());
     base64::engine::general_purpose::STANDARD.encode(hasher.finalize())

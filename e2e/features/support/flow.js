@@ -4,9 +4,12 @@
  */
 
 import * as assert from './assertions.js';
-import { latestMailLink } from './harness.js';
+import { latestMailCode, latestMailLink } from './harness.js';
 
 const VERIFY_LINK = /https:\/\/localhost:\d+\/verify\?token=[0-9a-f]+/g;
+
+/** Subject of the emailed second-factor code (WVR-167). */
+export const SIGN_IN_CODE_SUBJECT = 'Your Tunnel Weaver sign-in code';
 
 /**
  * Presses a button by its exact name. A submit gated by the proof-of-work
@@ -50,10 +53,26 @@ export async function registerAccount(world, name, password) {
   await setPassword(world, password);
 }
 
-/** Submits the sign-in form; the caller asserts the outcome. */
+/**
+ * Submits the sign-in form — the password, the first factor. The caller asserts
+ * the outcome: a refusal stays here with an error, a success lands on the code
+ * step (`/verify-code`).
+ */
 export async function signIn(world, password) {
   await ensureOn(world, '/sign-in', 'Sign in');
   await world.page.getByLabel('Email', { exact: true }).fill(world.email);
   await world.page.getByLabel('Password', { exact: true }).fill(password);
   await press(world, 'Sign in');
+}
+
+/**
+ * Enters the emailed second-factor code, completing the sign-in (WVR-167). The
+ * caller asserts the destination: the console, or `/pair` on a pairing detour.
+ */
+export async function enterSignInCode(world) {
+  await assert.seeHeading(world.page, 'Enter your code');
+  await world.page
+    .getByLabel('Code', { exact: true })
+    .fill(await latestMailCode(SIGN_IN_CODE_SUBJECT));
+  await press(world, 'Continue');
 }

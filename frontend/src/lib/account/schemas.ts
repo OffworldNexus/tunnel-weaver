@@ -30,6 +30,19 @@ const newPassword = v.pipe(
 
 export const signInSchema = v.object({ email, password: required('Enter your password.') });
 
+/**
+ * The emailed second-factor code (WVR-167): exactly six digits, the shape the
+ * relay issues. Trimmed so a pasted code with a stray space still validates.
+ */
+export const verifyCodeSchema = v.object({
+	code: v.pipe(
+		v.string(),
+		v.trim(),
+		v.nonEmpty('Enter the code from your email.'),
+		v.regex(/^\d{6}$/, 'The code is six digits.')
+	)
+});
+
 export const signUpSchema = v.object({
 	name: v.pipe(
 		v.string(),

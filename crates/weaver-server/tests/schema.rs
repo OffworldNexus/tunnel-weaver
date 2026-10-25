@@ -62,6 +62,11 @@ async fn references_point_where_the_model_says() {
             vec!["account", "email_identity", "verification_token"],
         ),
         ("machine_key_log", vec![]),
+        // WVR-167: the authentication trail cascades with its account but has no
+        // session foreign key (it outlives the session sweep); the pending
+        // challenge cascades with its session.
+        ("auth_event", vec!["account"]),
+        ("login_challenge", vec!["browser_session"]),
     ] {
         let mut found: Vec<String> = rows(
             &store,

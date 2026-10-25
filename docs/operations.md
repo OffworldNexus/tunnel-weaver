@@ -302,17 +302,17 @@ fails fast when they are missing.
 
 ## Transactional email
 
-Email is opt-in. With no `email` block in the config, the relay boots normally
-and any caller that needs to send gets `email is not configured`; the daemon
-itself sends nothing in this milestone.
+Email is required (WVR-167). Every sign-in sends a one-time code to the
+account's address, so the relay refuses to boot without a working `email` block
+rather than running with the second factor unavailable.
 
 - List the provider catalog with `weaver-server providers email`. `providers`
   alone still shows the ACME/SSL table.
-- `setup` asks whether to enable email after the ACME step, shows the chosen
-  provider's guidance, gathers the verified sender and credentials (offering
-  ambient env values such as `RESEND_API_KEY` when present), then **sends and
-  verifies a numeric OTP** to the admin address. Setup cannot complete until the
-  code is accepted.
+- `setup` requires email after the ACME step (it is a prerequisite, not a
+  choice), shows the chosen provider's guidance, gathers the verified sender and
+  credentials (offering ambient env values such as `RESEND_API_KEY` when
+  present), then **sends and verifies a numeric OTP** to the admin address.
+  Setup cannot complete until the code is accepted.
 - `configure` is headless and two-step. The first run with email flags sends the
   OTP and exits non-zero:
   `configure --email-provider resend --email-from relay@example.com --email-api-key-file /root/resend.key …`
@@ -320,8 +320,12 @@ itself sends nothing in this milestone.
   `configure --email-otp 123456 …` (or `WEAVER_EMAIL_OTP`).
 - Use `--email-api-key-file` rather than `--email-api-key` so keys stay out of
   shell history. `--email-endpoint` overrides the provider base URL (regional
-  hosts, Mailgun EU, or a CI mock). `--no-email` clears the block and conflicts
-  with `--email-provider`.
+  hosts, Mailgun EU, or a CI mock).
+- Email is **required**, not optional (WVR-167): every sign-in sends a one-time
+  code to the account's address, so a relay with no working provider cannot sign
+  anyone in. There is no `--no-email`: a `configure` or `setup` that would leave
+  the block empty is refused, and a config without one fails validation at load,
+  so the daemon will not start in a state where the second factor is unavailable.
 - Credentials live in the 0600 SQLite file, like the certificate keys. `status`
   reports the configured provider and sender but never a credential, `doctor`
   prints none either, and provider error output is redacted.

@@ -654,7 +654,7 @@ mod tests {
             usage_retention_secs: 31_536_000,
             relay_ips,
             setup_complete: false,
-            email: None,
+            email: Some(crate::config::test_email_config()),
             abuse: None,
             account: Default::default(),
         };

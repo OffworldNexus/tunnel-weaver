@@ -113,6 +113,25 @@ export const latestMailBySubject = (subject) =>
     async () => `No message with subject ${JSON.stringify(subject)}: ${await describeMailbox()}`
   );
 
+/** How many captured messages carry `subject` exactly. */
+export const mailCount = async (subject) =>
+  (await call('GET', '/messages')).filter((message) => message.subject === subject).length;
+
+/**
+ * The six-digit code in the newest captured message with `subject`, polling
+ * until one arrives (WVR-167). The plain-text twin carries the code alone on a
+ * line, which is what makes the match unambiguous.
+ */
+export const latestMailCode = (subject) =>
+  poll(
+    async () => {
+      const message = (await call('GET', '/messages')).findLast((m) => m.subject === subject);
+      return message?.text.match(/^\s*(\d{6})\s*$/m)?.[1];
+    },
+    async () =>
+      `No six-digit code in a ${JSON.stringify(subject)} message: ${await describeMailbox()}`
+  );
+
 // ----- pairing ---------------------------------------------------------------
 
 /** A fresh key per seed, as a real pairing mints a new key each time. */

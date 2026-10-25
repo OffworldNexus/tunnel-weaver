@@ -3,7 +3,8 @@
 	import { api } from '#lib/account/api';
 	import { notify } from '#lib/account/notices';
 	import { flow } from '#lib/account/state';
-	import { useSession } from '#lib/app/session.svelte';
+	import { atLeast, useSession } from '#lib/app/session.svelte';
+	import { climb } from '#lib/app/upgrade';
 	import { setMeta } from '#lib/console/meta.svelte';
 	import ConfirmDeleteDialog from '#lib/ui/ConfirmDeleteDialog.svelte';
 	import Icon from '#lib/ui/Icon.svelte';
@@ -28,12 +29,60 @@
 	 */
 	const expected = $derived(session.user?.email || session.user?.name || '');
 
-	async function deleteAccount(address: string) {
+	/**
+	 * Deleting needs `certain` — the password proven moments ago — so the inline
+	 * escalation asks for it first, and the confirmation that follows is the last
+	 * word. A session that still holds `certain` (someone who has just signed in)
+	 * goes straight to the confirmation.
+	 */
+	async function beginDelete() {
+		if (await climb('certain')) {
+			confirming = true;
+		}
+	}
+
+	/**
+	 * The confirmation does not outlive the proof behind it.
+	 *
+	 * `certain` holds only for the step-up window, and the session stream reports
+	 * the drop the moment it happens — so a confirmation left open while the
+	 * window runs out hands the flow straight back to the escalation instead of
+	 * leaving the person holding a confirmation that cannot be submitted. This
+	 * fires as many times as the level lapses.
+	 */
+	$effect(() => {
+		if (confirming && !atLeast(session.level, 'certain')) {
+			confirming = false;
+			void beginDelete();
+		}
+	});
+
+	async function deleteAccount(address: string, escalated = false) {
 		busy = true;
-		const res = await api('/api/account/delete', { address });
+		// Success ends every session; do not let the guard see it before we leave.
+		session.detach();
+		const res = await api('POST', '/api/account/delete', { address }, async (required, options) => {
+			// The proof aged out between the escalation and this submit — the race
+			// the effect above almost always wins first. Prove it again and finish
+			// what the person confirmed. Once only: a refusal that is *not* about
+			// the level must not loop.
+			if (escalated || !(await climb(required, options))) {
+				return;
+			}
+			await deleteAccount(address, true);
+		});
 		busy = false;
 		confirming = false;
 		if (!res.ok) {
+			session.restart();
+			if (res.refused) {
+				// A second refusal is not about the level: rather than swallow the
+				// click, ask for the password again and leave the confirmation be.
+				if (escalated) {
+					void beginDelete();
+				}
+				return;
+			}
 			notify('error', res.error ?? 'We could not delete your account. Please try again.');
 			return;
 		}
@@ -62,6 +111,18 @@
 	{/if}
 </Panel>
 
+<Panel
+	title="Two-factor authentication"
+	subtitle="A second factor protects your account even if your password leaks. It is always on."
+>
+	<p class="state"><Icon name="check" size={16} /> Enabled · email codes</p>
+	<p class="state__note">
+		Every sign-in sends a one-time code to
+		<strong>{session.user?.email || 'your address'}</strong>. The relay's email provider is
+		therefore required, and there is no way to turn the second factor off.
+	</p>
+</Panel>
+
 <Panel danger title="Danger zone" subtitle="Irreversible actions. There is no way back.">
 	<div class="danger">
 		<div class="danger__copy">
@@ -71,7 +132,7 @@
 				history. This cannot be undone.
 			</p>
 		</div>
-		<Keycap type="button" variant="danger" disabled={busy} onclick={() => (confirming = true)}>
+		<Keycap type="button" variant="danger" disabled={busy} onclick={beginDelete}>
 			<Icon name="trash" size={14} /> Delete account
 		</Keycap>
 	</div>
@@ -103,6 +164,14 @@
 
 	.state :global(svg) {
 		color: var(--tw-online);
+	}
+
+	.state__note {
+		margin: 8px 0 0;
+		color: var(--tw-muted);
+		font-size: 14px;
+		line-height: 1.5;
+		max-width: 60ch;
 	}
 
 	.danger {

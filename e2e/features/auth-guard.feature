@@ -31,6 +31,8 @@ Feature: A signed-in person is kept out of the account-entry pages
     Then I land on my console
     When I open the "existing-account" page
     Then I land on my console
+    When I open the "verify-code" page
+    Then I land on my console
 
   Scenario: A signed-out visitor still sees each account-entry page
     When I open the "sign-in" page

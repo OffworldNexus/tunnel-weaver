@@ -19,6 +19,7 @@
 	import { setPasswordSchema } from '#lib/account/schemas';
 	import { flow } from '#lib/account/state';
 	import VerifiedEmail from '#lib/account/VerifiedEmail.svelte';
+	import { climb } from '#lib/app/upgrade';
 	import Keycap from '#lib/ui/Keycap.svelte';
 	import Page from '#lib/ui/Page.svelte';
 	import { goto } from '$app/navigation';
@@ -35,9 +36,14 @@
 			return;
 		}
 		void goto(resolve('/(auth)/reset'), { replace: true, shallow: true });
-		const res = await api<{ valid: boolean; email?: string }>('/api/account/reset/check', {
-			token
-		});
+		const res = await api<{ valid: boolean; email?: string }>(
+			'POST',
+			'/api/account/reset/check',
+			{
+				token
+			},
+			climb
+		);
 		if (res.data?.valid && res.data.email) {
 			email = res.data.email;
 			phase = 'form';
@@ -53,7 +59,7 @@
 	});
 
 	const sf = jsonForm(setPasswordSchema, { password: '' }, async ({ password }) => {
-		const res = await api('/api/account/reset/complete', { token, password });
+		const res = await api('POST', '/api/account/reset/complete', { token, password }, climb);
 		if (!res.ok) {
 			return res.error ?? 'We could not reset your password. Request a new link and try again.';
 		}

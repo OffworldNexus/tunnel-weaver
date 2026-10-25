@@ -244,7 +244,7 @@ async fn test_pebble_e2e_issuance_and_lazy_ensure() {
         usage_retention_secs: 31_536_000,
         relay_ips: vec!["127.0.0.1".parse().unwrap()],
         setup_complete: true,
-        email: None,
+        email: Some(weaver_server::config::test_email_config()),
         abuse: None,
         account: Default::default(),
     });
@@ -397,7 +397,7 @@ async fn test_pebble_e2e_tunnel_registration_and_proxying() {
         usage_retention_secs: 31_536_000,
         relay_ips: vec!["127.0.0.1".parse().unwrap()],
         setup_complete: true,
-        email: None,
+        email: Some(weaver_server::config::test_email_config()),
         abuse: None,
         account: Default::default(),
     });

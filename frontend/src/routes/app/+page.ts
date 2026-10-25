@@ -13,8 +13,8 @@ import { getOverview, OVERVIEW_ROWS } from '#lib/app/overview';
 import type { PageLoad } from './$types';
 
 export const load: PageLoad = async ({ depends, parent }) => {
-	// Wait for the root layout's session load first, so `GET /api/account/me`
-	// is issued before this page's own requests.
+	// Wait for the root and console layouts: the session stream has spoken and
+	// the level is enough before this page issues a request of its own.
 	await parent();
 	depends('app:machines');
 

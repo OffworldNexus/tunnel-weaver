@@ -538,19 +538,19 @@ fn set_credential(cfg: &mut EmailConfig, field: CredentialField, value: String) 
     }
 }
 
-/// Asks whether to enable email and, if so, gathers a complete [`EmailConfig`].
+/// Gathers a complete [`EmailConfig`] for the relay.
 ///
 /// Ambient credentials offered by the environment win by default but the
 /// operator may still type a value. The returned block is validated; the OTP
 /// proof is performed by the caller after the plan is confirmed.
-pub fn prompt_email_config() -> std::io::Result<Option<EmailConfig>> {
-    let enable = Confirm::new("Enable email-based accounts?")
-        .with_default(false)
-        .prompt()
-        .map_err(inquire_err)?;
-    if !enable {
-        return Ok(None);
-    }
+pub fn prompt_email_config() -> std::io::Result<EmailConfig> {
+    // Email is a prerequisite, not a choice (WVR-167): it delivers the second
+    // factor, so there is nothing to decline.
+    println!(
+        "{}",
+        "Email is required: your sign-in sends a one-time code to the account's address."
+            .dark_grey()
+    );
 
     let options: Vec<EmailProviderOption> = PROVIDERS
         .iter()
@@ -634,7 +634,7 @@ pub fn prompt_email_config() -> std::io::Result<Option<EmailConfig>> {
     if !issues.is_empty() {
         return Err(std::io::Error::other(issues.join("; ")));
     }
-    Ok(Some(cfg))
+    Ok(cfg)
 }
 
 #[cfg(test)]

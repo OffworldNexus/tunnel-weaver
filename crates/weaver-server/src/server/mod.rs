@@ -191,25 +191,21 @@ pub async fn run_server(
         ServerError::Activation(format!("Failed to provision the ALTCHA demo client: {e}"))
     })?;
 
-    // The account plane. It is always served on the admin host. The
-    // mailer is optional: when email is not configured, signup still records the
-    // pending registration and the user can resend once mail is set up.
+    // The account plane. It is always served on the admin host. Email is a hard
+    // requirement (WVR-167): the second factor is an emailed code, so
+    // `Config::load` has already guaranteed a block and a mailer that will not
+    // build is a boot failure, never a silent "off".
     let support_url = format!("https://{}", config.admin_domain);
-    let mailer = match crate::email::mailer_from_config(config.email.as_ref(), &support_url) {
-        Ok(mailer) => Some(mailer),
-        Err(crate::email::MailerError::NotConfigured) => None,
-        Err(err) => {
-            return Err(ServerError::Activation(format!(
-                "Failed to initialize the account mailer: {err}"
-            )));
-        }
-    };
+    let mailer =
+        crate::email::mailer_from_config(config.email.as_ref(), &support_url).map_err(|err| {
+            ServerError::Activation(format!("Failed to initialize the account mailer: {err}"))
+        })?;
     let account = crate::account::AccountRuntime::from_config(
         &config.account,
         &config.admin_domain,
         store.clone(),
         altcha.clone(),
-        mailer,
+        Some(mailer),
         live,
     )
     .map_err(|e| ServerError::Activation(format!("Failed to initialize the account plane: {e}")))?;

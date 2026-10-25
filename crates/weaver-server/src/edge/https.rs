@@ -116,6 +116,7 @@ async fn collect_body(req: Request<hyper::body::Incoming>) -> Option<Bytes> {
 async fn serve_account(
     account: &Arc<crate::account::AccountRuntime>,
     tunnel: Option<Arc<TunnelRegistry>>,
+    remote_addr: SocketAddr,
     req: Request<hyper::body::Incoming>,
     include_hsts: bool,
 ) -> Response<BoxBody> {
@@ -123,7 +124,12 @@ async fn serve_account(
 
     let router = crate::account::router::router(account.clone(), tunnel);
     let (parts, body) = req.into_parts();
-    let request = Request::from_parts(parts, axum::body::Body::new(body));
+    let mut request = Request::from_parts(parts, axum::body::Body::new(body));
+    // The raw edge is the only layer that knows the socket address; the account
+    // plane records it on its authentication trail (WVR-167).
+    request
+        .extensions_mut()
+        .insert(crate::account::auth::ClientAddr(remote_addr));
     let response = match router.oneshot(request).await {
         Ok(response) => response,
         Err(never) => match never {},
@@ -384,6 +390,14 @@ pub async fn handle_https_request(
             ViewId::ACCOUNT_SIGNUP
         } else if surface.host == Host::Admin && path == "/api/account/login" {
             ViewId::ACCOUNT_LOGIN
+        } else if surface.host == Host::Admin && path == "/api/account/login/verify" {
+            // Checking an emailed code guesses digits behind the same password
+            // guess that opened the session, so it shares the login budget
+            // rather than minting a new one (WVR-167).
+            ViewId::ACCOUNT_LOGIN
+        } else if surface.host == Host::Admin && path == "/api/account/login/resend" {
+            // A re-sent code is an email-keyed send like a verification resend.
+            ViewId::ACCOUNT_RESEND
         } else if surface.host == Host::Admin && path == "/api/account/password" {
             // A password change verifies a guessed credential behind a session, so
             // it is the same guessing surface as a login attempt and shares that
@@ -529,9 +543,14 @@ pub async fn handle_https_request(
         // plane — the landing page at `/`, the auth routes, the account API and
         // the vendored ALTCHA widget.
         if let Some(account) = &config.account {
-            return Ok(
-                serve_account(account, config.tunnel_registry.clone(), req, include_hsts).await,
-            );
+            return Ok(serve_account(
+                account,
+                config.tunnel_registry.clone(),
+                remote_addr,
+                req,
+                include_hsts,
+            )
+            .await);
         }
         return Ok(static_host_response(&req, include_hsts));
     }

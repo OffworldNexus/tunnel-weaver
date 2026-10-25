@@ -8,6 +8,7 @@
 	import EmailField from '#lib/account/EmailField.svelte';
 	import { jsonForm } from '#lib/account/form';
 	import { resetRequestSchema } from '#lib/account/schemas';
+	import { climb } from '#lib/app/upgrade';
 	import Keycap from '#lib/ui/Keycap.svelte';
 	import Page from '#lib/ui/Page.svelte';
 	import { resolve } from '$app/paths';
@@ -17,7 +18,7 @@
 	let sent = $state(false);
 
 	const sf = jsonForm(resetRequestSchema, { email: '' }, async (data) => {
-		const res = await api('/api/account/reset/request', { ...data, altcha: proof });
+		const res = await api('POST', '/api/account/reset/request', { ...data, altcha: proof }, climb);
 		altcha?.reset();
 		if (!res.ok) {
 			return res.error ?? 'We could not send the reset link. Please try again.';

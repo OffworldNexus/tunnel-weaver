@@ -19,8 +19,8 @@ import type { PageLoad } from './$types';
 const SIZE = 60;
 
 export const load: PageLoad = async ({ url, depends, parent }) => {
-	// Wait for the root layout's session load first, so `GET /api/account/me`
-	// is issued before this page's own requests.
+	// Wait for the root and console layouts: the session stream has spoken and
+	// the level is enough before this page issues a request of its own.
 	await parent();
 	depends('app:machines');
 
