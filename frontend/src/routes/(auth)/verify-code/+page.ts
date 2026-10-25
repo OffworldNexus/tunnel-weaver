@@ -14,7 +14,7 @@
  */
 import { api } from '#lib/account/api';
 import { session } from '#lib/app/session.svelte';
-import { stepUp } from '#lib/app/upgrade';
+import { climb } from '#lib/app/upgrade';
 
 import type { PageLoad } from './$types';
 
@@ -23,7 +23,7 @@ export const load: PageLoad = async ({ parent }) => {
 	if (session.level !== 'basic') {
 		return { codeSent: false };
 	}
-	const res = await api<{ status: string }>('POST', '/api/account/login/resend', {}, stepUp);
+	const res = await api<{ status: string }>('POST', '/api/account/login/resend', {}, climb);
 	// `cooldown` means a code was just sent, so nothing went out now; anything
 	// else is a real send (or a failure, which the page reports).
 	return { codeSent: res.ok && res.data?.status === 'second_factor' };

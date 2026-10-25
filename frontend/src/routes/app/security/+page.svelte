@@ -4,10 +4,9 @@
 	import { notify } from '#lib/account/notices';
 	import { flow } from '#lib/account/state';
 	import { atLeast, useSession } from '#lib/app/session.svelte';
-	import { climb, stepUp } from '#lib/app/upgrade';
+	import { climb } from '#lib/app/upgrade';
 	import { setMeta } from '#lib/console/meta.svelte';
 	import ConfirmDeleteDialog from '#lib/ui/ConfirmDeleteDialog.svelte';
-	import ConfirmPasswordDialog from '#lib/ui/ConfirmPasswordDialog.svelte';
 	import Icon from '#lib/ui/Icon.svelte';
 	import Keycap from '#lib/ui/Keycap.svelte';
 	import Panel from '#lib/ui/Panel.svelte';
@@ -20,14 +19,7 @@
 	});
 
 	let confirming = $state(false);
-	let confirmingPassword = $state(false);
-	let passwordError = $state('');
 	let busy = $state(false);
-	/**
-	 * The address the person already typed back, kept while the password step
-	 * runs so the delete resumes where it left off instead of asking again.
-	 */
-	let pendingAddress = $state('');
 
 	const session = useSession();
 
@@ -38,71 +30,57 @@
 	const expected = $derived(session.user?.email || session.user?.name || '');
 
 	/**
-	 * Deleting needs `Certain` — the password proven moments ago — so the
-	 * password step opens first, and the confirmation that follows it is the
-	 * last word. A session that is already `Certain` (someone who has just
-	 * signed in) goes straight to the confirmation.
+	 * Deleting needs `certain` — the password proven moments ago — so the inline
+	 * escalation asks for it first, and the confirmation that follows is the last
+	 * word. A session that still holds `certain` (someone who has just signed in)
+	 * goes straight to the confirmation.
 	 */
-	function beginDelete() {
-		if (atLeast(session.level, 'certain')) {
+	async function beginDelete() {
+		if (await climb('certain')) {
 			confirming = true;
-			return;
 		}
-		pendingAddress = '';
-		passwordError = '';
-		confirmingPassword = true;
 	}
 
-	/** The step-up itself: ask the relay to prove the password again. */
-	async function confirmPassword(password: string) {
-		passwordError = '';
-		busy = true;
-		const res = await api('POST', '/api/account/confirm-password', { password }, stepUp);
-		busy = false;
-		if (res.refused) {
-			return;
+	/**
+	 * The confirmation does not outlive the proof behind it.
+	 *
+	 * `certain` holds only for the step-up window, and the session stream reports
+	 * the drop the moment it happens — so a confirmation left open while the
+	 * window runs out hands the flow straight back to the escalation instead of
+	 * leaving the person holding a confirmation that cannot be submitted. This
+	 * fires as many times as the level lapses.
+	 */
+	$effect(() => {
+		if (confirming && !atLeast(session.level, 'certain')) {
+			confirming = false;
+			void beginDelete();
 		}
-		if (!res.ok) {
-			passwordError = res.error ?? 'That is not your password.';
-			return;
-		}
-		// The relay records the proof; wait for the session stream to report the
-		// new level, so the retry is not refused for a frame.
-		await session.reached('certain');
-		confirmingPassword = false;
-		passwordError = '';
-		if (pendingAddress) {
-			// The person had already confirmed the deletion; finish it.
-			const address = pendingAddress;
-			pendingAddress = '';
-			await deleteAccount(address);
-			return;
-		}
-		confirming = true;
-	}
+	});
 
-	async function deleteAccount(address: string) {
+	async function deleteAccount(address: string, escalated = false) {
 		busy = true;
 		// Success ends every session; do not let the guard see it before we leave.
 		session.detach();
-		const res = await api('POST', '/api/account/delete', { address }, async (required, paths) => {
-			// The proof aged out while the confirmation was open, or the level was
-			// never enough: whatever the way up names, take it and come back to the
-			// confirmation the person already gave.
-			if (paths[0]?.[0]?.step !== 'confirm_password') {
-				await climb(required, paths);
+		const res = await api('POST', '/api/account/delete', { address }, async (required, options) => {
+			// The proof aged out between the escalation and this submit — the race
+			// the effect above almost always wins first. Prove it again and finish
+			// what the person confirmed. Once only: a refusal that is *not* about
+			// the level must not loop.
+			if (escalated || !(await climb(required, options))) {
 				return;
 			}
-			pendingAddress = address;
-			confirming = false;
-			passwordError = '';
-			confirmingPassword = true;
+			await deleteAccount(address, true);
 		});
 		busy = false;
 		confirming = false;
 		if (!res.ok) {
 			session.restart();
 			if (res.refused) {
+				// A second refusal is not about the level: rather than swallow the
+				// click, ask for the password again and leave the confirmation be.
+				if (escalated) {
+					void beginDelete();
+				}
 				return;
 			}
 			notify('error', res.error ?? 'We could not delete your account. Please try again.');
@@ -159,18 +137,6 @@
 		</Keycap>
 	</div>
 </Panel>
-
-<ConfirmPasswordDialog
-	bind:open={confirmingPassword}
-	error={passwordError}
-	{busy}
-	onConfirm={confirmPassword}
->
-	<p>
-		Deleting your account asks for your password first: it means the console has not simply been
-		left open and signed in. We keep it for a few minutes, then ask again.
-	</p>
-</ConfirmPasswordDialog>
 
 <ConfirmDeleteDialog
 	bind:open={confirming}

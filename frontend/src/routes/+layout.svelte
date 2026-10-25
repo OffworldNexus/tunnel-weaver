@@ -3,6 +3,8 @@
 
 	import { ensureConfig } from '#lib/account/config.svelte';
 	import { provideSession } from '#lib/app/session.svelte';
+	import { stepUp } from '#lib/app/stepup.svelte';
+	import ConfirmPasswordDialog from '#lib/ui/ConfirmPasswordDialog.svelte';
 	import Keycap from '#lib/ui/Keycap.svelte';
 	import Page from '#lib/ui/Page.svelte';
 	import Toaster from '#lib/ui/Toaster.svelte';
@@ -21,6 +23,19 @@
 
 <a class="skip-link" href="#main">Skip to content</a>
 <Toaster />
+
+<!--
+	The inline escalation popin lives here, once, so any action on any
+	signed-in page can have a level re-proven without owning a form of its
+	own — and so the page it happened on is still there afterwards.
+-->
+<ConfirmPasswordDialog
+	bind:open={stepUp.open}
+	error={stepUp.error}
+	busy={stepUp.busy}
+	onConfirm={(password: string) => stepUp.submit(password)}
+	onClose={() => stepUp.cancel()}
+/>
 
 {#if session.ready}
 	{@render children()}

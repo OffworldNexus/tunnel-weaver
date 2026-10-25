@@ -14,7 +14,7 @@
 	 */
 	import { notify } from '#lib/account/notices';
 	import { disconnectMachine, type Machine, renameMachine, revokeMachine } from '#lib/app/machines';
-	import { stepUp } from '#lib/app/upgrade';
+	import { climb } from '#lib/app/upgrade';
 	import ConfirmDeleteDialog from '#lib/ui/ConfirmDeleteDialog.svelte';
 	import Dialog from '#lib/ui/Dialog.svelte';
 	import Icon from '#lib/ui/Icon.svelte';
@@ -39,7 +39,7 @@
 			return;
 		}
 		busy = true;
-		const res = await renameMachine(machine.id, renameValue, stepUp);
+		const res = await renameMachine(machine.id, renameValue, climb);
 		busy = false;
 		if (res.refused) {
 			return;
@@ -55,7 +55,7 @@
 
 	async function confirmKick() {
 		busy = true;
-		const res = await disconnectMachine(machine.id, stepUp);
+		const res = await disconnectMachine(machine.id, climb);
 		busy = false;
 		if (res.refused) {
 			return;
@@ -76,7 +76,7 @@
 
 	async function confirmRevoke() {
 		busy = true;
-		const res = await revokeMachine(machine.id, stepUp);
+		const res = await revokeMachine(machine.id, climb);
 		busy = false;
 		if (res.refused) {
 			return;

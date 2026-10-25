@@ -1,17 +1,16 @@
 <script lang="ts">
 	/**
-	 * The password step-up modal: asks for the account's password again before a
-	 * sensitive action.
+	 * The password step-up popin, asking the account's password again.
 	 *
-	 * It is the console's form of the `confirm_password` step (WVR-165): the
-	 * relay answers a destructive action with `403` and
-	 * `x-weaver-required-level: certain`, whose upgrade path names this step, and
-	 * this is how a `strong` session gets back to `certain` without leaving the
-	 * page. It stays open until the caller says the check passed, so a wrong
-	 * password is answered on the field rather than by a dialog that closed.
+	 * It is the console's form of the `confirm_password` step (WVR-165) and it is
+	 * global: one instance serves every action that needs a level re-proven
+	 * (`lib/app/stepup.svelte.ts` drives it, the root layout mounts it), so a
+	 * sensitive action never grows a password form of its own, and the person
+	 * never loses the page it happened on.
+	 *
+	 * It stays open until whoever asked says the check passed, so a wrong
+	 * password is answered on the field rather than by a popin that closed.
 	 */
-	import type { Snippet } from 'svelte';
-
 	import Dialog from '#lib/ui/Dialog.svelte';
 	import Icon from '#lib/ui/Icon.svelte';
 	import Keycap from '#lib/ui/Keycap.svelte';
@@ -26,8 +25,6 @@
 		/** Receives the typed password; the caller checks it. */
 		onConfirm?: (password: string) => void;
 		onClose?: () => void;
-		/** Why the password is being asked for. */
-		children?: Snippet;
 	}
 
 	let {
@@ -36,8 +33,7 @@
 		error = '',
 		busy = false,
 		onConfirm = () => {},
-		onClose = undefined,
-		children
+		onClose = undefined
 	}: Props = $props();
 
 	let password = $state('');
@@ -83,7 +79,10 @@
 		<div class="confirm-password__lead">
 			<Icon name="lock" size={18} />
 			<div class="confirm-password__copy">
-				{@render children?.()}
+				<p>
+					Your password is what says it is you. It is only taken at its word for a few minutes at a
+					time, so an action that matters asks for it again.
+				</p>
 			</div>
 		</div>
 

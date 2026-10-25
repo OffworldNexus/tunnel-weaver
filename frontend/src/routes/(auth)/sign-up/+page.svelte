@@ -9,7 +9,7 @@
 	import { jsonForm } from '#lib/account/form';
 	import { signUpSchema } from '#lib/account/schemas';
 	import { flow } from '#lib/account/state';
-	import { stepUp } from '#lib/app/upgrade';
+	import { climb } from '#lib/app/upgrade';
 	import Keycap from '#lib/ui/Keycap.svelte';
 	import Page from '#lib/ui/Page.svelte';
 	import { goto } from '$app/navigation';
@@ -23,7 +23,7 @@
 			'POST',
 			'/api/account/signup',
 			{ ...data, altcha: proof },
-			stepUp
+			climb
 		);
 		altcha?.reset();
 		if (!res.ok || !res.data) {

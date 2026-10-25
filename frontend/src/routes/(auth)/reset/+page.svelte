@@ -19,7 +19,7 @@
 	import { setPasswordSchema } from '#lib/account/schemas';
 	import { flow } from '#lib/account/state';
 	import VerifiedEmail from '#lib/account/VerifiedEmail.svelte';
-	import { stepUp } from '#lib/app/upgrade';
+	import { climb } from '#lib/app/upgrade';
 	import Keycap from '#lib/ui/Keycap.svelte';
 	import Page from '#lib/ui/Page.svelte';
 	import { goto } from '$app/navigation';
@@ -42,7 +42,7 @@
 			{
 				token
 			},
-			stepUp
+			climb
 		);
 		if (res.data?.valid && res.data.email) {
 			email = res.data.email;
@@ -59,7 +59,7 @@
 	});
 
 	const sf = jsonForm(setPasswordSchema, { password: '' }, async ({ password }) => {
-		const res = await api('POST', '/api/account/reset/complete', { token, password }, stepUp);
+		const res = await api('POST', '/api/account/reset/complete', { token, password }, climb);
 		if (!res.ok) {
 			return res.error ?? 'We could not reset your password. Request a new link and try again.';
 		}

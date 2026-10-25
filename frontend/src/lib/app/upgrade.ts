@@ -1,83 +1,84 @@
 /**
- * Taking a person up to the level an action needs (WVR-167).
+ * Ways up (WVR-167/165).
  *
- * The console knows which level each of its actions requires; the relay says
- * how this account gets there — on the session stream ahead of time, and on a
- * refusal after the fact. Either way that is a list of options, each an ordered
- * list of steps, and each step says where it will leave the session. This is
- * where a step becomes a page, and where a climb that cannot finish what it
- * started says so rather than dropping the person back into a refusal.
+ * A level is not a permission the console decides: the relay reports it on the
+ * session stream and, for the account it is talking to, names the steps that
+ * reach each higher level — because they depend on how that account
+ * authenticates. The console's job is to *perform* a step, and there are two
+ * answers:
+ *
+ * * the nominal flow's pages (signing in, the emailed code), which the `(auth)`
+ *   guard owns — reached by leaving the page the action was on;
+ * * the inline escalation popin (`stepUp`), for a session that is already
+ *   signed in and only needs a level re-proven in place.
+ *
+ * `climb` is the one entry point, for both kinds of caller: an action that knows
+ * which level it needs, and a refusal handler answering the level the relay
+ * asked for. It is also a write's refusal handler as-is — `api` takes
+ * `(required, options)` and so does this — but nothing is retried for you: a
+ * caller that wants the action finished after climbing re-issues it itself.
  */
-import type { RefusalHandler } from '#lib/account/api';
 import { notify } from '#lib/account/notices';
 import { goto } from '$app/navigation';
 import { resolve } from '$app/paths';
 
 import { atLeast, type AuthLevel, session, type Step, type UpgradePath } from './session.svelte';
+import { stepUp } from './stepup.svelte';
 
-/** The page that performs `step`, or empty when no page does yet. */
-export function stepRoute(step: Step): string {
+/**
+ * The route that performs `step`, or `null` when the console performs it in
+ * place (the inline popin). The nominal flow is pages; a signed-in session is
+ * only ever a popin away from a level its own authentication can reach.
+ *
+ * The route *id* rather than a URL, so both callers `resolve` it themselves and
+ * nothing here has to know what a URL looks like.
+ */
+export function stepPage(step: Step): '/(auth)/sign-in' | '/(auth)/verify-code' | null {
 	switch (step) {
 		case 'login':
-			return resolve('/(auth)/sign-in');
+			return '/(auth)/sign-in';
 		case 'verify_email_otp':
-			return resolve('/(auth)/verify-code');
-		// Re-typing the password has no page until a sensitive action needs
-		// `certain` (WVR-165).
+			return '/(auth)/verify-code';
 		case 'confirm_password':
-			return '';
+			return null;
 	}
 }
 
 /**
- * Sends the person to the first step of the preferred way to reach `required`,
- * asking the relay for that way when the caller has none to hand. Returns
- * whether the console could take them all the way.
+ * Takes the session up to `required` and reports whether it got there.
+ *
+ * The way up comes from the caller when it has one (a refusal names it in
+ * `x-weaver-upgrade-paths`); otherwise it is read from the session itself. A
+ * step the console performs in place is performed. A step that is a page hands
+ * the person to the nominal flow: the guard takes over, the action is **not**
+ * resumed — the console has left the page it was on — and this returns `false`.
  */
 export async function climb(
 	required: AuthLevel,
 	options: UpgradePath[] = session.pathsTo(required)
 ): Promise<boolean> {
-	const path = options[0] ?? [];
-	// Only the steps this console can actually perform; a path may end in one
-	// it has no page for (re-typing the password, WVR-165).
-	const performable = path.filter((set) => stepRoute(set.step) !== '');
-	const first = performable[0];
-	if (!first) {
+	if (atLeast(session.level, required)) {
+		return true;
+	}
+	for (const step of options[0] ?? []) {
+		const page = stepPage(step.step);
+		if (page) {
+			if (step.step === 'login') {
+				// The session is gone: forget it, so the guards stop reading a
+				// stale one.
+				session.stop();
+				notify('error', 'Your session has expired. Please sign in again.');
+			}
+			await goto(resolve(page), { replace: true });
+			return false;
+		}
+		if (!(await stepUp.ask(required))) {
+			return false;
+		}
+	}
+	if (!atLeast(session.level, required)) {
 		notify('error', `This needs a ${required} sign-in, which this console cannot ask for yet.`);
 		return false;
 	}
-	// Say so when the climb cannot reach the level the action wanted, or the
-	// person is walked up only to be refused again.
-	const reaches = performable.at(-1)?.reaches ?? 'none';
-	if (!atLeast(reaches, required)) {
-		notify(
-			'error',
-			`This needs a ${required} sign-in; this console can take you to ${reaches} for now.`
-		);
-	}
-	switch (first.step) {
-		case 'login':
-			// The session is gone: forget it, so the guards stop reading a stale
-			// one.
-			session.stop();
-			notify('error', 'Your session has expired. Please sign in again.');
-			await goto(resolve('/(auth)/sign-in'), { replace: true });
-			return true;
-		case 'verify_email_otp':
-			await goto(resolve('/(auth)/verify-code'), { replace: true });
-			return true;
-		// Filtered out by `performable`; kept for exhaustiveness.
-		case 'confirm_password':
-			return false;
-	}
+	return true;
 }
-
-/**
- * The refusal handler for an action whose only answer to "not enough" is to
- * take the person up: the action is not retried — they start it again once
- * they are back.
- */
-export const stepUp: RefusalHandler = async (required, options) => {
-	await climb(required, options);
-};

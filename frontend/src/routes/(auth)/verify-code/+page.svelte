@@ -16,7 +16,7 @@
 	import { verifyCodeSchema } from '#lib/account/schemas';
 	import { pairing } from '#lib/account/state';
 	import { useSession } from '#lib/app/session.svelte';
-	import { stepUp } from '#lib/app/upgrade';
+	import { climb } from '#lib/app/upgrade';
 	import Keycap from '#lib/ui/Keycap.svelte';
 	import Page from '#lib/ui/Page.svelte';
 	import { goto } from '$app/navigation';
@@ -41,7 +41,7 @@
 	});
 
 	const sf = jsonForm(verifyCodeSchema, { code: '' }, async (values) => {
-		const res = await api('POST', '/api/account/login/verify', values, stepUp);
+		const res = await api('POST', '/api/account/login/verify', values, climb);
 		if (res.refused) {
 			return;
 		}
@@ -60,7 +60,7 @@
 	async function resend(): Promise<void> {
 		resending = true;
 		resent = '';
-		const res = await api<{ status: string }>('POST', '/api/account/login/resend', {}, stepUp);
+		const res = await api<{ status: string }>('POST', '/api/account/login/resend', {}, climb);
 		resending = false;
 		if (res.refused) {
 			return;

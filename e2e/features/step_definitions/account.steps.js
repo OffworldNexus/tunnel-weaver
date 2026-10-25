@@ -298,8 +298,9 @@ When('I confirm the deletion', async function () {
   await confirmButton(this.page).click();
 });
 
-// WVR-167: a submit refused for want of `certain` takes the confirmation away
-// with it, and the password step-up takes its place.
+// WVR-167: the confirmation does not outlive the proof behind it — the open
+// confirmation is handed back to the step-up the moment `certain` lapses, so
+// this asserts it is gone by the time the password is asked for again.
 Then('the delete confirmation is closed', async function () {
   await deleteDialog(this.page).waitFor({ state: 'hidden' });
 });

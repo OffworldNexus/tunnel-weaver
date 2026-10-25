@@ -28,7 +28,7 @@
 		revokeMachine
 	} from '#lib/app/machines';
 	import { timeAgo } from '#lib/app/time';
-	import { stepUp } from '#lib/app/upgrade';
+	import { climb } from '#lib/app/upgrade';
 	import { setMeta } from '#lib/console/meta.svelte';
 	import PairMachineDialog from '#lib/console/PairMachineDialog.svelte';
 	import { search } from '#lib/console/search.svelte';
@@ -197,7 +197,7 @@
 		}
 		const target = renaming;
 		busy = true;
-		const res = await renameMachine(target.id, renameValue, stepUp);
+		const res = await renameMachine(target.id, renameValue, climb);
 		busy = false;
 		if (res.refused) {
 			return;
@@ -217,7 +217,7 @@
 		}
 		const target = disconnecting;
 		busy = true;
-		const res = await disconnectMachine(target.id, stepUp);
+		const res = await disconnectMachine(target.id, climb);
 		busy = false;
 		if (res.refused) {
 			return;
@@ -242,7 +242,7 @@
 		}
 		const target = revoking;
 		busy = true;
-		const res = await revokeMachine(target.id, stepUp);
+		const res = await revokeMachine(target.id, climb);
 		busy = false;
 		if (res.refused) {
 			return;

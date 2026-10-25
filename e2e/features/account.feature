@@ -111,9 +111,9 @@ Feature: Account lifecycle
   # confirmation, so this journey carries the step-up's refusals (a wrong
   # password, both ways of leaving it) and the renewal of `certain` that lets the
   # delete through. It lands its deletion the way the harness makes
-  # deterministic: the proof ages out at the filled-in confirmation, the submit
-  # is refused, the password returns, and the delete resumes on its own with the
-  # address never typed a second time.
+  # deterministic: the open confirmation is handed back to the step-up by itself
+  # the moment the proof lapses — no click, no refused submit — and the delete
+  # then lands from the empty confirmation the password reopens.
   Scenario: Deleting my account from the Danger zone leaves nothing behind
     Given an account exists for "Ada Lovelace" with the password "correct-horse-battery-staple"
     When I sign in with the password "correct-horse-battery-staple"
@@ -151,14 +151,19 @@ Feature: Account lifecycle
     Then the delete confirmation is locked
     When I type my email into the confirmation
     Then the delete confirmation is unlocked
-    # WVR-167: let the renewed proof age out with the confirmation already filled
-    # in. The submit is refused for want of `certain`, the password step-up comes
-    # back, and the delete then resumes on its own — the address is never retyped.
+    # WVR-167: the confirmation does not outlive the proof behind it. The moment
+    # `certain` lapses, the open confirmation is handed back to the step-up by
+    # itself — no click, no refused submit — and the confirmation the password
+    # reopens starts empty, so the address is typed again and the delete lands
+    # inside the fresh window.
     When my password proof has aged out
-    And I confirm the deletion
     Then I am asked for my password first
     And the delete confirmation is closed
     When I confirm the password "correct-horse-battery-staple"
+    Then the delete confirmation is locked
+    When I type my email into the confirmation
+    Then the delete confirmation is unlocked
+    When I confirm the deletion
     Then the deletion lands me signed out on the sign-in page
     And I see "Your account and all its data have been deleted."
     And the old session no longer authenticates

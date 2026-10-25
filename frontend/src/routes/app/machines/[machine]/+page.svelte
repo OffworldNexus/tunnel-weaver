@@ -21,7 +21,7 @@
 		revokeMachine
 	} from '#lib/app/machines';
 	import { date, timeAgo } from '#lib/app/time';
-	import { stepUp } from '#lib/app/upgrade';
+	import { climb } from '#lib/app/upgrade';
 	import { setMeta } from '#lib/console/meta.svelte';
 	import Badge from '#lib/ui/Badge.svelte';
 	import ConfirmDeleteDialog from '#lib/ui/ConfirmDeleteDialog.svelte';
@@ -81,7 +81,7 @@
 			return;
 		}
 		busy = true;
-		const res = await renameMachine(machine.id, renameValue, stepUp);
+		const res = await renameMachine(machine.id, renameValue, climb);
 		busy = false;
 		if (res.refused) {
 			return;
@@ -98,7 +98,7 @@
 	async function confirmDisconnect() {
 		const target = machine;
 		busy = true;
-		const res = await disconnectMachine(target.id, stepUp);
+		const res = await disconnectMachine(target.id, climb);
 		busy = false;
 		if (res.refused) {
 			return;
@@ -120,7 +120,7 @@
 	async function confirmRevoke() {
 		const target = machine;
 		busy = true;
-		const res = await revokeMachine(target.id, stepUp);
+		const res = await revokeMachine(target.id, climb);
 		busy = false;
 		if (res.refused) {
 			return;

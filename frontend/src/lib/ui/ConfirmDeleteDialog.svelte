@@ -50,7 +50,22 @@
 				: typed.trim() === wanted)
 	);
 
-	/** Closes the dialog and clears the confirmation field for the next open. */
+	/**
+	 * The field is emptied whenever the dialog opens.
+	 *
+	 * The caller drives `open` — it can close this confirmation to hand the flow
+	 * on to a step-up, which closes it from the outside — so `close()` alone
+	 * cannot be the only place that forgets what was typed: reopening would
+	 * otherwise arrive with the target already typed back and the danger keycap
+	 * already unlocked.
+	 */
+	$effect(() => {
+		if (open) {
+			typed = '';
+		}
+	});
+
+	/** Closes, and forgets the confirmation. */
 	function close() {
 		typed = '';
 		open = false;

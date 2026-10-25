@@ -10,7 +10,7 @@
 	import { api } from '#lib/account/api';
 	import { ensureConfig } from '#lib/account/config.svelte';
 	import { flow } from '#lib/account/state';
-	import { stepUp } from '#lib/app/upgrade';
+	import { climb } from '#lib/app/upgrade';
 	import Keycap from '#lib/ui/Keycap.svelte';
 	import Page from '#lib/ui/Page.svelte';
 	import { goto } from '$app/navigation';
@@ -43,7 +43,7 @@
 		busy = true;
 		info = '';
 		error = '';
-		const res = await api('POST', '/api/account/resend', { flow: carried.flow }, stepUp);
+		const res = await api('POST', '/api/account/resend', { flow: carried.flow }, climb);
 		busy = false;
 		if (!res.ok) {
 			error = res.error ?? 'We could not resend the link. Please try again.';

@@ -11,13 +11,21 @@
 import { redirect } from '@sveltejs/kit';
 
 import { session } from '#lib/app/session.svelte';
-import { stepRoute } from '#lib/app/upgrade';
+import { stepPage } from '#lib/app/upgrade';
+import { resolve } from '$app/paths';
 
 import type { LayoutLoad } from './$types';
 
 export const load: LayoutLoad = async ({ parent }) => {
 	await parent();
+	// The console needs `strong`. A session that only proved the password is sent
+	// up the way the relay names — in practice the emailed-code page, the one
+	// step the nominal flow still owes it. A step the console could do in place
+	// has no page to redirect to and is left to the layout's own guard.
 	if (session.level === 'basic') {
-		redirect(307, stepRoute(session.pathsTo('strong')[0]?.[0]?.step ?? 'verify_email_otp'));
+		const page = stepPage(session.pathsTo('strong')[0]?.[0]?.step ?? 'verify_email_otp');
+		if (page) {
+			redirect(307, resolve(page));
+		}
 	}
 };

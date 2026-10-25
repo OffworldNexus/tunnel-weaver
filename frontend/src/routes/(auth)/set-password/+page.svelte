@@ -10,7 +10,7 @@
 	import { setPasswordSchema } from '#lib/account/schemas';
 	import { flow } from '#lib/account/state';
 	import VerifiedEmail from '#lib/account/VerifiedEmail.svelte';
-	import { stepUp } from '#lib/app/upgrade';
+	import { climb } from '#lib/app/upgrade';
 	import Keycap from '#lib/ui/Keycap.svelte';
 	import Page from '#lib/ui/Page.svelte';
 	import { goto } from '$app/navigation';
@@ -26,7 +26,7 @@
 				completion_token,
 				password
 			},
-			stepUp
+			climb
 		);
 		if (!res.ok || !res.data) {
 			return res.error ?? 'We could not set your password. Please try again.';

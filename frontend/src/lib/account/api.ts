@@ -30,11 +30,14 @@ export type Method = 'GET' | WriteMethod;
  * What to do when the session is too weak for a call: `requiredLevel` is what
  * the route needs, `upgradePaths` the ways there (each an ordered list of
  * steps), the preferred first.
+ *
+ * The wrapper awaits the handler and ignores what it gives back, so a handler
+ * that reports whether it got there — `climb` does — passes as-is.
  */
 export type RefusalHandler = (
 	requiredLevel: AuthLevel,
 	upgradePaths: UpgradePath[]
-) => void | Promise<void>;
+) => void | Promise<unknown>;
 
 export interface ApiResult<T> {
 	ok: boolean;

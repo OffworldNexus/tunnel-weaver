@@ -7,7 +7,7 @@
 	import { signInSchema } from '#lib/account/schemas';
 	import { flow } from '#lib/account/state';
 	import { session } from '#lib/app/session.svelte';
-	import { stepUp } from '#lib/app/upgrade';
+	import { climb } from '#lib/app/upgrade';
 	import Keycap from '#lib/ui/Keycap.svelte';
 	import Page from '#lib/ui/Page.svelte';
 	import { goto } from '$app/navigation';
@@ -24,7 +24,7 @@
 	let showPassword = $state(false);
 
 	const sf = jsonForm(signInSchema, { email: carried.email ?? '', password: '' }, async (data) => {
-		const res = await api('POST', '/api/account/login', { ...data, altcha: proof }, stepUp);
+		const res = await api('POST', '/api/account/login', { ...data, altcha: proof }, climb);
 		altcha?.reset();
 		if (!res.ok) {
 			return res.error ?? 'That email and password did not match.';
