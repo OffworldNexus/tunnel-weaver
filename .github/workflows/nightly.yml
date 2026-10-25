@@ -395,7 +395,19 @@ jobs:
             exit 1
           fi
 
+      # Email is a hard requirement (WVR-167): the second factor is an emailed
+      # code, so a relay with no working provider cannot sign anyone in and
+      # `setup` refuses to install one. The provider is proven the way an
+      # operator proves it — the first run mails a six-digit code to the
+      # receiving mailbox and exits non-zero, the code is read back through
+      # Resend's Receiving API (never from the database), and the second run
+      # proves it and installs. The code is addressed to the receiving mailbox
+      # because that is the one address this workflow can read.
       - name: Deploy weaver-server and run headless setup
+        env:
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          WEAVER_E2E_EMAIL: ${{ secrets.WEAVER_E2E_EMAIL }}
+          WEAVER_E2E_FROM: ${{ secrets.WEAVER_E2E_FROM }}
         run: |
           IP="${{ steps.droplet.outputs.ip }}"
           TARGET_DOMAIN="${{ steps.domain.outputs.full_domain }}"
@@ -405,12 +417,67 @@ jobs:
             target/release/weaver-server root@"$IP":/tmp/weaver-server
 
           ssh -o StrictHostKeyChecking=no -i ~/.ssh/id_nightly root@"$IP" \
-            "install -m 755 /tmp/weaver-server /usr/local/bin/weaver-server && \
-             /usr/local/bin/weaver-server setup --headless \
-               --tunnel-domain $TARGET_DOMAIN \
-               --admin-domain $ADMIN_DOMAIN \
-               --email admin@$TARGET_DOMAIN \
-               --acme-provider letsencrypt-staging"
+            "install -m 755 /tmp/weaver-server /usr/local/bin/weaver-server"
+
+          SETUP="/usr/local/bin/weaver-server setup --headless \
+            --tunnel-domain $TARGET_DOMAIN \
+            --admin-domain $ADMIN_DOMAIN \
+            --email $WEAVER_E2E_EMAIL \
+            --acme-provider letsencrypt-staging \
+            --email-provider resend \
+            --email-from $WEAVER_E2E_FROM \
+            --email-api-key $RESEND_API_KEY"
+
+          # Snapshot already-received ids first, so a stale code from an earlier
+          # run (same subject) cannot be mistaken for this run's.
+          BEFORE=$(curl -s -H "Authorization: Bearer $RESEND_API_KEY" \
+            "https://api.resend.com/emails/receiving?limit=20" | jq -r '.data[].id' | tr '\n' ' ')
+
+          # First run issues the OTP and exits non-zero.
+          set +e
+          FIRST=$(ssh -o StrictHostKeyChecking=no -i ~/.ssh/id_nightly root@"$IP" "$SETUP" 2>&1)
+          FIRST_RC=$?
+          set -e
+          echo "$FIRST"
+          if [ "$FIRST_RC" -eq 0 ]; then
+            echo "::error::the first setup run should have required the OTP"
+            exit 1
+          fi
+          echo "$FIRST" | grep -q "OTP was sent" || { echo "::error::no setup OTP was sent"; exit 1; }
+
+          # Read the code back through Resend's Receiving API, accepting only an
+          # email that arrived after the snapshot above.
+          OTP=""
+          for _ in $(seq 1 30); do
+            RESP=$(curl -s -H "Authorization: Bearer $RESEND_API_KEY" \
+              "https://api.resend.com/emails/receiving?limit=20")
+            ID=$(echo "$RESP" | jq -r --arg to "$WEAVER_E2E_EMAIL" --arg before "$BEFORE" '
+              ($before | split(" ")) as $seen
+              | .data[]
+              | select((.to | index($to)) and (.subject | test("verification code"; "i")))
+              | .id as $id
+              | select(($seen | index($id)) == null)
+              | $id' | head -n 1)
+            if [ -n "$ID" ] && [ "$ID" != "null" ]; then
+              TEXT=$(curl -s -H "Authorization: Bearer $RESEND_API_KEY" \
+                "https://api.resend.com/emails/receiving/$ID" | jq -r '.text // .html // ""')
+              OTP=$(printf '%s' "$TEXT" | grep -oE '[0-9]{6}' | head -n 1 || true)
+              if [ -n "$OTP" ]; then
+                break
+              fi
+            fi
+            sleep 2
+          done
+          if [ -z "$OTP" ]; then
+            echo "::error::did not receive the setup OTP email at $WEAVER_E2E_EMAIL"
+            exit 1
+          fi
+          echo "received the setup OTP email (code redacted)"
+
+          # Second run proves the code and installs, so the relay is configured
+          # before it ever starts.
+          ssh -o StrictHostKeyChecking=no -i ~/.ssh/id_nightly root@"$IP" \
+            "$SETUP --email-otp $OTP"
 
       - name: Wait for the relay to serve the admin and tunnel hostnames
         run: |
@@ -457,99 +524,6 @@ jobs:
 
           curl -s -v --fail --max-time 15 --cacert /tmp/certs/staging-ca.pem "https://$TARGET_DOMAIN/" > /dev/null
           curl -s -v --fail --max-time 15 --cacert /tmp/certs/staging-ca.pem "https://$ADMIN_DOMAIN/" > /dev/null
-
-      # The provider is configured through the real two-step OTP flow: the relay
-      # mails a six-digit code through Resend, and it is read back through
-      # Resend's Receiving API — never from the database.
-      - name: Configure the mail provider (real Resend)
-        env:
-          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
-          WEAVER_E2E_EMAIL: ${{ secrets.WEAVER_E2E_EMAIL }}
-          WEAVER_E2E_FROM: ${{ secrets.WEAVER_E2E_FROM }}
-        run: |
-          IP="${{ steps.droplet.outputs.ip }}"
-          TARGET_DOMAIN="${{ steps.domain.outputs.full_domain }}"
-          ADMIN_DOMAIN="${{ steps.domain.outputs.admin_domain }}"
-          DB=/var/lib/weaver/weaver.db
-
-          # `configure` writes through the store, so run it as the service user:
-          # SQLite's -wal/-shm files must never end up root-owned under a running
-          # relay. The OTP is addressed to the receiving mailbox.
-          CONFIGURE="runuser -u weaver -- /usr/local/bin/weaver-server configure \
-            --db $DB --tunnel-domain $TARGET_DOMAIN --admin-domain $ADMIN_DOMAIN \
-            --email $WEAVER_E2E_EMAIL --headless \
-            --email-provider resend --email-from $WEAVER_E2E_FROM \
-            --email-api-key $RESEND_API_KEY"
-
-          # Snapshot already-received ids first, so a stale code from an earlier
-          # run (same subject) cannot be mistaken for this run's.
-          BEFORE=$(curl -s -H "Authorization: Bearer $RESEND_API_KEY" \
-            "https://api.resend.com/emails/receiving?limit=20" | jq -r '.data[].id' | tr '\n' ' ')
-
-          # First run issues the OTP and exits non-zero.
-          set +e
-          FIRST=$(ssh -o StrictHostKeyChecking=no -i ~/.ssh/id_nightly root@"$IP" "$CONFIGURE" 2>&1)
-          FIRST_RC=$?
-          set -e
-          echo "$FIRST"
-          if [ "$FIRST_RC" -eq 0 ]; then
-            echo "::error::the first configure run should have required the OTP"
-            exit 1
-          fi
-          echo "$FIRST" | grep -q "OTP was sent" || { echo "::error::no OTP was sent"; exit 1; }
-
-          # Read the code back through Resend's Receiving API, accepting only an
-          # email that arrived after the snapshot above.
-          OTP=""
-          for _ in $(seq 1 30); do
-            RESP=$(curl -s -H "Authorization: Bearer $RESEND_API_KEY" \
-              "https://api.resend.com/emails/receiving?limit=20")
-            ID=$(echo "$RESP" | jq -r --arg to "$WEAVER_E2E_EMAIL" --arg before "$BEFORE" '
-              ($before | split(" ")) as $seen
-              | .data[]
-              | select((.to | index($to)) and (.subject | test("verification code"; "i")))
-              | .id as $id
-              | select(($seen | index($id)) == null)
-              | $id' | head -n 1)
-            if [ -n "$ID" ] && [ "$ID" != "null" ]; then
-              TEXT=$(curl -s -H "Authorization: Bearer $RESEND_API_KEY" \
-                "https://api.resend.com/emails/receiving/$ID" | jq -r '.text // .html // ""')
-              OTP=$(printf '%s' "$TEXT" | grep -oE '[0-9]{6}' | head -n 1 || true)
-              if [ -n "$OTP" ]; then
-                break
-              fi
-            fi
-            sleep 2
-          done
-          if [ -z "$OTP" ]; then
-            echo "::error::did not receive the configure OTP email at $WEAVER_E2E_EMAIL"
-            exit 1
-          fi
-          echo "received the configure OTP email (code redacted)"
-
-          # Second run proves the code and persists the email block.
-          ssh -o StrictHostKeyChecking=no -i ~/.ssh/id_nightly root@"$IP" \
-            "$CONFIGURE --email-otp $OTP"
-
-          # The account runtime reads the mail configuration at startup, so the
-          # relay picks the provider up on a restart.
-          ssh -o StrictHostKeyChecking=no -i ~/.ssh/id_nightly root@"$IP" \
-            "systemctl restart weaver-server.service"
-          healthy=""
-          for _ in $(seq 1 30); do
-            if curl -s -o /dev/null --fail --max-time 10 --cacert /tmp/certs/staging-ca.pem "https://$ADMIN_DOMAIN/"; then
-              echo "relay is back up with email configured"
-              healthy=1
-              break
-            fi
-            sleep 2
-          done
-          if [ -z "$healthy" ]; then
-            echo "::error::the relay did not come back after the email configuration"
-            ssh -o StrictHostKeyChecking=no -i ~/.ssh/id_nightly root@"$IP" \
-              "systemctl status weaver-server.service --no-pager || true"
-            exit 1
-          fi
 
       # The real sign-up journey in a browser: create the account, then — once
       # the emailed verification link is known — verify, set a password, sign in.
