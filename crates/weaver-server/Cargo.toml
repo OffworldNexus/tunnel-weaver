@@ -53,6 +53,7 @@ lettre = { workspace = true }
 libc = { workspace = true }
 libsqlite3-sys = { workspace = true }
 mrml = { workspace = true }
+openssl = { workspace = true }
 p256 = { workspace = true }
 rand = { workspace = true }
 rcgen = { workspace = true }

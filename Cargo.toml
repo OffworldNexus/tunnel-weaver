@@ -110,12 +110,19 @@ argon2 = "0.6"
 sha1 = "0.11"
 # WebAuthn passkeys (WVR-163): the registration and assertion ceremonies, with
 # the RP-ID/origin binding and the CBOR/COSE validation we must not hand-roll.
-# `attestation` stays off — the policy is "accept none", and leaving it on would
-# pull the openssl/der attestation graph into a `ring`-based build.
+# `attestation` stays off — the policy is "accept none" — though that alone does
+# *not* keep OpenSSL out: `webauthn-rs-core` parses X.509 through it whatever we
+# ask for, which is why OpenSSL is vendored below.
 # `conditional-ui` is what exposes the discoverable/autofill ceremony
 # (`start_discoverable_authentication`), which is how the sign-in page offers a
 # passkey in the email field.
 webauthn-rs = { version = "0.5", default-features = false, features = ["conditional-ui"] }
+# The X.509 half of `webauthn-rs` is built on OpenSSL, and depends on it
+# unconditionally. Vendored, so the relay carries its own libcrypto: no target
+# needs a system libssl to build or to run it, which is what lets the aarch64
+# artifacts cross-compile and then execute under QEMU in CI. It lives here rather
+# than in the code because it is a feature choice for a crate we never call.
+openssl = { version = "0.10", features = ["vendored"] }
 # The passkey feature (WVR-163) needs a *derived* per-account WebAuthn user
 # handle (v5, name-based) — it comes back on every discoverable assertion, so it
 # must be the same value every time and must never be random.
