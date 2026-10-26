@@ -748,7 +748,10 @@ impl Store {
 
     // ----- machines: listing, presence and rename -----
 
-    /// Lists a person's machines, ordered by name for a stable list view.
+    /// Lists a person's machines, ordered by name.
+    ///
+    /// The order is only the stable base: the machine view re-orders by reverse
+    /// last use, which it can only do once presence (a metrics read) is in hand.
     pub async fn list_machines(&self, person_id: i32) -> Result<Vec<machine::Model>, StoreError> {
         Ok(machine::Entity::find()
             .filter(machine::Column::PersonId.eq(person_id))

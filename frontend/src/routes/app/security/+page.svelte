@@ -78,25 +78,20 @@
 	/** One of the account's machines, as the relay lists them. */
 	interface MachineView {
 		name: string;
-		/** When it was last seen; `null` when it never was. */
-		last_seen_at: number | null;
 	}
 
 	/**
 	 * What to call a new passkey before the person says otherwise.
 	 *
 	 * A passkey belongs to a *device*, and the account already knows which devices
-	 * it has: the one that was most recently alive is the one this is almost
-	 * certainly being added on, so its name is the default. Failing that (an
+	 * it has: the relay lists them most recently used first, so the first named
+	 * one is the device this is almost certainly being added on. Failing that (an
 	 * account with no machines yet), the browser and the system are a truer name
 	 * than either alone — and better than an invented one.
 	 */
 	async function suggestedName(): Promise<string> {
-		const res = await api<{ machines: MachineView[] }>('GET', '/api/account/machines?per_page=200');
-		const newest = (res.data?.machines ?? [])
-			.filter((machine) => machine.name !== '')
-			.sort((left, right) => (right.last_seen_at ?? 0) - (left.last_seen_at ?? 0))[0];
-		return newest?.name ?? browserAndSystem();
+		const res = await api<{ machines: MachineView[] }>('GET', '/api/account/machines');
+		return res.data?.machines.find((machine) => machine.name !== '')?.name ?? browserAndSystem();
 	}
 
 	/** "Chrome on Linux": what this browser is, as plainly as the UA allows. */

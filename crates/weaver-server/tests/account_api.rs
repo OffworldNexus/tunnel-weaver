@@ -3049,6 +3049,78 @@ async fn machines_report_their_metered_usage() {
     assert_eq!(list.body["machines"][0]["usage_30d"]["bytes_out"], 1000);
 }
 
+/// The machine list reads most recently used first: the order the console shows,
+/// and the one that makes the first machine the right default name for something
+/// that belongs to a device — a passkey (WVR-163).
+#[tokio::test]
+async fn the_machine_list_reads_most_recently_used_first() {
+    use sea_orm::ConnectionTrait as _;
+    use weaver_server::metrics::encode_blob;
+
+    let fixture = setup().await;
+    // The fixture's own machine is named "laptop" and is never metered.
+    let (browser, person_id, _) = machines_fixture(&fixture).await;
+    let store = &fixture.account.store;
+    // Two more machines, named so that ordering by name would answer differently
+    // than ordering by recency: "aardvark" is used earliest, "zebra" latest, so
+    // the never-metered "laptop" belongs last.
+    let aardvark = store
+        .create_machine(person_id, "aardvark", &KeyId::P256([8; 33]))
+        .await
+        .unwrap();
+    let zebra = store
+        .create_machine(person_id, "zebra", &KeyId::P256([9; 33]))
+        .await
+        .unwrap();
+
+    let day = (std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        / 86_400) as i64;
+    // One open minute each, at different minutes of the day: presence is the
+    // metrics store's business, so the rows are written in its own shape (the
+    // blobs must be real frames — an empty `open_ms_minutes` is corrupt).
+    for (machine_id, minute) in [(aardvark.id, 5_usize), (zebra.id, 400_usize)] {
+        let service = store
+            .get_or_create_service(machine_id, "web")
+            .await
+            .unwrap();
+        let mut open_minutes = vec![0_i64; 1440];
+        open_minutes[minute] = 60_000;
+        let open_minutes_blob = hex(&encode_blob(&open_minutes));
+        let mut open_hours = vec![0_i64; 24];
+        open_hours[minute / 60] = 60_000;
+        let open_hours_blob = hex(&encode_blob(&open_hours));
+        store
+            .db()
+            .execute_unprepared(&format!(
+                "INSERT INTO usage_daily (service_id, day, bytes_in, bytes_in_hours, bytes_in_minutes, \
+                    bytes_out, bytes_out_hours, bytes_out_minutes, tunnel_in, tunnel_in_hours, tunnel_in_minutes, \
+                    tunnel_out, tunnel_out_hours, tunnel_out_minutes, requests, requests_hours, requests_minutes, \
+                    open_ms, open_ms_hours, open_ms_minutes) VALUES \
+                 ({}, {}, 0, X'', X'', 0, X'', X'', 0, X'', X'', 0, X'', X'', 0, X'', X'', 60000, X'{open_hours_blob}', X'{open_minutes_blob}')",
+                service.id, day
+            ))
+            .await
+            .unwrap();
+    }
+
+    let list = browser.get(&fixture, "/api/account/machines").await;
+    assert_eq!(list.status, StatusCode::OK, "{:?}", list.body);
+    let names: Vec<&str> = list.body["machines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|machine| machine["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        names,
+        ["zebra", "aardvark", "laptop"],
+        "most recently used first, never seen last"
+    );
+}
+
 #[tokio::test]
 async fn metrics_endpoint_returns_a_self_scoped_series() {
     use sea_orm::ConnectionTrait as _;
