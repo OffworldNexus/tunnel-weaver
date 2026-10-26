@@ -121,6 +121,47 @@ systemd owns the binds; the service runs with an empty `CapabilityBoundingSet=`.
 Without socket activation (containers), DNS self-bind on 53 needs
 `CAP_NET_BIND_SERVICE` or a privileged port mapping.
 
+## Signing in with a passkey
+
+An account that holds `Certain` can register a passkey from the console's
+security page. The browser creates a **discoverable** credential (the
+authenticator stores it, so the sign-in field can offer it with no address
+typed) and the relay keeps the public half in `passkey_credential`, named after
+the most recently active machine unless the person edits it. A credential id
+belongs to one account for good — the table's unique index enforces it — so the
+same passkey cannot be enrolled twice or re-homed.
+
+A passkey signs in two ways, both on the sign-in page:
+
+- **The field.** The page starts one discoverable ceremony on load and leaves
+  the assertion pending against a field marked `autocomplete="username
+  webauthn"`, so the browser offers the passkey inline in autofill. Whether a
+  given password manager appears there is that manager's conditional-UI support,
+  not the relay's.
+- **The button.** "Sign in with a passkey" asks for the picker
+  (`mediation: 'optional'`) and signs in with what comes back. It stands the
+  field's pending request down first, because a page may have only one
+  credential request in flight.
+
+What an operator should expect:
+
+- **An assertion is `Certain` at once and falls to `Strong`** after
+  `account.confirm_window_secs` (default 300): the possession half lasts as long
+  as the session, the user-verification half only as long as the confirmation
+  window. The same gesture also answers a step-up in place of the password,
+  which makes the account `Certain` again.
+- **Ceremonies are memory only.** Single-use handles, five minutes, swept when
+  the next one starts: a restart ends the ones in flight and nothing is left in
+  the store.
+- **They have their own budget.** `account.passkey` (default: a 300-request
+  burst refilling 300 per minute). An assertion cannot be guessed, so this
+  bounds unauthenticated work rather than a guessing surface, and unlike the
+  credential budgets it **serves** the request when the budget store cannot
+  answer, logging loudly, instead of failing closed.
+- **The journal says what happened**: `Passkey registered`, `Passkey removed`,
+  `Signed in with a passkey`, and `passkey_failed` on the account's auth trail.
+  A `503` now names the policy that refused it.
+
 ## Machine pairing
 
 A machine is enrolled by a person in a browser, never implicitly. The client

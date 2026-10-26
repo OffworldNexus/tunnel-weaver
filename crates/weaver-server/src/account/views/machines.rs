@@ -1,4 +1,5 @@
-//! `GET /api/account/machines` — a page of the signed-in person's machines.
+//! `GET /api/account/machines` — a page of the signed-in person's machines,
+//! most recently used first.
 
 use std::collections::{BTreeSet, HashMap};
 
@@ -10,6 +11,7 @@ use serde_json::{Value, json};
 
 use crate::live::{Entity, Interest, Viewer};
 use crate::store::entity::{machine, person};
+use crate::wall_clock::unix_secs;
 
 use super::{
     ServiceView, View, ViewContext, load_error, machine_view, parse_query, person_of,
@@ -90,6 +92,11 @@ fn empty_page() -> Value {
 /// applied in memory (health is derived from the live registry, which the store
 /// cannot filter on), and only the requested page's services and usage are then
 /// read — the expensive per-machine lookups never touch the rows being skipped.
+///
+/// The list reads **most recently used first**, which is also what makes the
+/// first machine the right default name for something that belongs to a device
+/// (a passkey). Presence decides it: a machine alive right now sorts first, then
+/// the metered minutes, and a machine never seen sorts last.
 async fn page_of(
     ctx: &ViewContext<'_>,
     person: &person::Model,
@@ -99,7 +106,21 @@ async fn page_of(
     let needle = query.q.as_deref().unwrap_or("").trim().to_ascii_lowercase();
     let health = query.health.as_deref().unwrap_or("all");
 
-    let matched: Vec<machine::Model> = ctx
+    // Presence is what orders the list, so the metered minutes are read before
+    // anything is filtered or paged.
+    let last_seen = last_seen_by_machine(&ctx.runtime.store, person)
+        .await
+        .map_err(load_error)?;
+    let now = unix_secs();
+    let used_at = |machine: &machine::Model| -> Option<i64> {
+        if super::online(machine, ctx.tunnel) {
+            Some(now)
+        } else {
+            last_seen.get(&machine.id).copied()
+        }
+    };
+
+    let mut matched: Vec<machine::Model> = ctx
         .runtime
         .store
         .list_machines(person.id)
@@ -113,6 +134,14 @@ async fn page_of(
             _ => true,
         })
         .collect();
+    // Reverse last use: the machine in play is the one worth reading first, and
+    // one that has never been seen sorts last. The name breaks ties, so two live
+    // machines never swap places between refreshes.
+    matched.sort_by(|left, right| {
+        used_at(right)
+            .cmp(&used_at(left))
+            .then_with(|| left.name.cmp(&right.name))
+    });
 
     let total = matched.len();
     let page_count = total.div_ceil(per_page).max(1);
@@ -146,10 +175,6 @@ async fn page_of(
             service_usage,
         ));
     }
-    let last_seen = last_seen_by_machine(&ctx.runtime.store, person)
-        .await
-        .map_err(load_error)?;
-
     let listed: BTreeSet<i32> = slice.iter().map(|machine| machine.id).collect();
     let machines: Vec<Value> = slice
         .into_iter()

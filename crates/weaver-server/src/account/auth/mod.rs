@@ -8,10 +8,11 @@
 //! - [`level`]: the ordered [`AuthLevel`] enum. `Basic` is "one factor, the
 //!   password", `Strong` is "the second factor is alive".
 //! - [`proof`]: the [`ProofKind`] set and each kind's lifetime. WVR-167 uses
-//!   `password` and `email_otp`; WVR-164/165/166 add kinds, never a redesign.
+//!   `password` and `email_otp`; WVR-163 adds the two a passkey assertion
+//!   writes. WVR-164/165/166 add kinds, never a redesign.
 //! - [`paths`]: the [`AuthPath`] trait — *how* one authenticates, the level it
-//!   currently grants and the steps it offers to climb. Only the password +
-//!   emailed-code path exists today; the trait is the extension seam.
+//!   currently grants and the steps it offers to climb. Two concrete paths
+//!   exist: password + emailed code, and passkeys (WVR-163).
 //! - [`manager`]: the per-request [`AuthManager`], sole owner of the audit
 //!   trail (the `auth_event` rows that are also the level's source) and the
 //!   session plumbing.
@@ -43,9 +44,10 @@ pub use proof::ProofKind;
 /// The kind of an `auth_event` row.
 ///
 /// The rows are simultaneously the audit trail and the raw material the level
-/// is derived from: the `password` and `email_otp` kinds are proofs (see
-/// [`ProofKind`]), the rest are recorded for the record's sake. Adding a kind is
-/// a value, not a migration.
+/// is derived from: the `password`, `email_otp`, `passkey` and
+/// `passkey_user_verification` kinds are proofs (see [`ProofKind`]), the rest
+/// are recorded for the record's sake. Adding a kind is a value, not a
+/// migration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EventKind {
     /// The password was checked and a session opened (first factor).
@@ -61,6 +63,17 @@ pub enum EventKind {
     EmailOtp,
     /// An emailed code was refused (wrong, expired or attempt-capped).
     EmailOtpFailed,
+    /// A passkey assertion was accepted, and the credential it named is the
+    /// session's now (WVR-163) — the possession factor.
+    Passkey,
+    /// A passkey assertion was accepted *with user verification*: the
+    /// authenticator checked the person (biometric or PIN) as it signed
+    /// (WVR-163). Recorded alongside [`EventKind::Passkey`], never instead of
+    /// it, so the trail says whether the assertion really was a full one.
+    PasskeyUserVerification,
+    /// A passkey assertion was refused (unknown credential, wrong account,
+    /// failed verification, or a replay). The session keeps whatever it had.
+    PasskeyFailed,
     /// A password check failed, before any session existed.
     LoginFailed,
     /// The session was closed; proofs before it cannot be revived.
@@ -69,13 +82,16 @@ pub enum EventKind {
 
 impl EventKind {
     /// Every kind, for parsing a stored row.
-    pub const ALL: [EventKind; 8] = [
+    pub const ALL: [EventKind; 11] = [
         EventKind::Password,
         EventKind::PasswordConfirmed,
         EventKind::PasswordConfirmFailed,
         EventKind::EmailOtpIssued,
         EventKind::EmailOtp,
         EventKind::EmailOtpFailed,
+        EventKind::Passkey,
+        EventKind::PasskeyUserVerification,
+        EventKind::PasskeyFailed,
         EventKind::LoginFailed,
         EventKind::Logout,
     ];
@@ -89,6 +105,9 @@ impl EventKind {
             EventKind::EmailOtpIssued => "email_otp_issued",
             EventKind::EmailOtp => "email_otp",
             EventKind::EmailOtpFailed => "email_otp_failed",
+            EventKind::Passkey => "passkey",
+            EventKind::PasskeyUserVerification => "passkey_user_verification",
+            EventKind::PasskeyFailed => "passkey_failed",
             EventKind::LoginFailed => "login_failed",
             EventKind::Logout => "logout",
         }
@@ -107,9 +126,12 @@ impl EventKind {
         match self {
             EventKind::Password | EventKind::PasswordConfirmed => Some(ProofKind::Password),
             EventKind::EmailOtp => Some(ProofKind::EmailOtp),
+            EventKind::Passkey => Some(ProofKind::Passkey),
+            EventKind::PasskeyUserVerification => Some(ProofKind::PasskeyUserVerification),
             EventKind::PasswordConfirmFailed
             | EventKind::EmailOtpIssued
             | EventKind::EmailOtpFailed
+            | EventKind::PasskeyFailed
             | EventKind::LoginFailed
             | EventKind::Logout => None,
         }

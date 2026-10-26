@@ -334,3 +334,103 @@ Then('the browser holds no account cookie', async function () {
     );
   }
 });
+
+// ----- passkeys (WVR-163) ----------------------------------------------------
+//
+// A passkey is a whole way in: one gesture, no password and no emailed code.
+// Every ceremony here needs the scenario's virtual authenticator to be present
+// (`World#present`), and stands presence down again the moment the screen the
+// ceremony ends on is reached: the sign-in page starts a *conditional* ceremony
+// of its own on load, and a present authenticator would complete that one for
+// whoever asked next.
+
+/** The Passkeys panel on the Security page. */
+function passkeyPanel(page) {
+  return page.getByRole('region', { name: 'Passkeys', exact: true });
+}
+
+/** One passkey's row, told apart from its siblings by its name. */
+function passkeyRow(page, name) {
+  return passkeyPanel(page).getByRole('listitem').filter({ hasText: name });
+}
+
+When('I add a passkey named {string}', async function (name) {
+  await passkeyPanel(this.page).getByRole('button', { name: /Add a passkey/ }).click();
+  const dialog = this.page.getByRole('dialog', { name: 'Add a passkey' });
+  await dialog.getByLabel(/Name/).fill(name);
+  await this.present(true);
+  await this.page.getByRole('button', { name: /Create passkey/ }).click();
+  // The dialog closing is the ceremony's own success signal — the toast and the
+  // reloaded list both follow it, and either is what the feature asserts on.
+  await this.page.getByRole('dialog', { name: 'Add a passkey' }).waitFor({ state: 'hidden' });
+  await this.present(false);
+});
+
+Then('I see the passkey {string}', async function (name) {
+  await passkeyRow(this.page, name).waitFor({ state: 'visible' });
+});
+
+// WVR-163: the named button — the way in for a browser that did not offer the
+// passkey in the field's autofill. The page's own autofill ceremony is pending
+// from load; the click stands it down and issues a modal one of its own.
+// Presence is turned on *after* the click, never before: with an authenticator
+// already present, the field's own ceremony would answer first and sign the
+// person in before the button could be pressed at all.
+When('I sign in with the passkey from the button', async function () {
+  await assert.seeHeading(this.page, 'Sign in');
+  await this.page.getByRole('button', { name: /Sign in with a passkey/ }).click();
+  await this.present(true);
+  await assert.seeHeading(this.page, 'Overview');
+  await this.present(false);
+});
+
+// WVR-163: the conditional-UI half. The field carries `username webauthn`, the
+// ceremony starts on page load, and a field nobody has typed into is the whole
+// point: the passkey is picked out of autofill, not typed for.
+Then('the sign-in field is ready to offer a passkey, and holds nothing', async function () {
+  await assert.seeHeading(this.page, 'Sign in');
+  const field = this.page.getByLabel('Email', { exact: true });
+  if ((await field.inputValue()) !== '') {
+    throw new Error('The email field is not empty: autofill must sign in with nothing typed.');
+  }
+  const autocomplete = await field.getAttribute('autocomplete');
+  if (autocomplete !== 'username webauthn') {
+    throw new Error(`Expected an autofill-ready email field, but its autocomplete is "${autocomplete}".`);
+  }
+  await assert.seeText(this.page, 'No password, no emailed code');
+});
+
+When('the passkey signs me in without a click', async function () {
+  // Headless Chrome has no autofill UI to click, so an authenticator that is
+  // present answers the page's own ceremony the moment the page loads: nothing
+  // typed, nothing clicked, and the person lands signed in.
+  await this.present(true);
+  await this.open('/sign-in');
+  await assert.seeHeading(this.page, 'Overview');
+  await this.present(false);
+});
+
+When('I remove the passkey {string}', async function (name) {
+  await passkeyRow(this.page, name).getByRole('button', { name: /Remove/ }).click();
+  const dialog = this.page.getByRole('dialog', { name: 'Remove this passkey?' });
+  await dialog.getByLabel(/Type/).fill(name);
+  await dialog.getByRole('button', { name: /Remove passkey/ }).click();
+});
+
+// WVR-163: the popin offers the assertion beside the password form. The relay
+// names `assert_passkey` among the ways up exactly when the account holds a
+// passkey, so the offer being there at all is the server's answer, not the
+// console's guess.
+Then('the password step-up offers the passkey as well', async function () {
+  const dialog = passwordDialog(this.page);
+  await dialog.getByRole('button', { name: 'Confirm', exact: true }).waitFor({ state: 'visible' });
+  await dialog.getByRole('button', { name: 'use a passkey' }).waitFor({ state: 'visible' });
+});
+
+When('I take the passkey in place of the password', async function () {
+  const dialog = passwordDialog(this.page);
+  await dialog.getByRole('button', { name: 'use a passkey' }).click();
+  await this.present(true);
+  await this.page.getByRole('dialog', { name: 'Delete your account?' }).waitFor({ state: 'visible' });
+  await this.present(false);
+});

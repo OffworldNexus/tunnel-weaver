@@ -10,6 +10,7 @@ mod m0001_init;
 mod m0002_usage_daily;
 mod m0003_inactivity;
 mod m0004_auth_levels;
+mod m0005_passkeys;
 
 /// The ordered list of every migration known to this binary.
 pub struct Migrator;
@@ -22,6 +23,7 @@ impl MigratorTrait for Migrator {
             Box::new(m0002_usage_daily::Migration),
             Box::new(m0003_inactivity::Migration),
             Box::new(m0004_auth_levels::Migration),
+            Box::new(m0005_passkeys::Migration),
         ]
     }
 }

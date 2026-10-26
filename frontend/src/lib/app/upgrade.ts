@@ -40,6 +40,8 @@ export function stepPage(step: Step): '/(auth)/sign-in' | '/(auth)/verify-code' 
 		case 'verify_email_otp':
 			return '/(auth)/verify-code';
 		case 'confirm_password':
+		case 'assert_passkey':
+			// Both are performed in place, by the step-up popin.
 			return null;
 	}
 }

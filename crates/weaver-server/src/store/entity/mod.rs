@@ -21,6 +21,7 @@ pub mod email_verification;
 pub mod login_challenge;
 pub mod machine;
 pub mod machine_key_log;
+pub mod passkey_credential;
 pub mod password_credential;
 pub mod password_reset_token;
 pub mod pending_registration;

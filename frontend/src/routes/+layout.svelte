@@ -33,7 +33,9 @@
 	bind:open={stepUp.open}
 	error={stepUp.error}
 	busy={stepUp.busy}
+	passkeyAvailable={stepUp.passkeyAvailable}
 	onConfirm={(password: string) => stepUp.submit(password)}
+	onPasskey={() => stepUp.submitPasskey()}
 	onClose={() => stepUp.cancel()}
 />
 

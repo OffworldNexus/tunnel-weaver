@@ -5,45 +5,64 @@
 //! feeds the derived [`AuthLevel`](super::AuthLevel). Nothing level-related is
 //! cached on the session itself.
 //!
-//! WVR-167 defines two kinds. WVR-164/165/166 (backup codes, "turn email OTP
-//! off", authenticator app) add kinds here and a `StepKind` to reach them —
-//! they never re-architect the level derivation.
+//! WVR-167 defines the password and emailed-code kinds; WVR-163 adds the two a
+//! passkey assertion writes — the credential's possession, and the
+//! user-verification it performed moments ago. WVR-164/165/166 (backup codes,
+//! "turn email OTP off", authenticator app) add kinds here and a `StepKind` to
+//! reach them — they never re-architect the level derivation.
 
 /// Something the person demonstrated on this session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ProofKind {
     /// The password was checked. Granting `Basic` is the session's existence;
-    /// this proof exists so the (currently unused) `Certain` level has a second
-    /// input — a password typed moments ago.
+    /// this proof exists so the `Certain` level has a second input — a password
+    /// typed moments ago.
     Password,
     /// An emailed one-time code was accepted — the second factor.
     EmailOtp,
+    /// A passkey assertion was accepted (WVR-163): the *possession* half, "this
+    /// person holds the credential". It is the same thing the emailed code
+    /// proves, so it lives as long as the session too.
+    Passkey,
+    /// The same assertion performed user verification — Face ID, Touch ID,
+    /// Windows Hello, a key's PIN (WVR-163). It is the *presence-of-person*
+    /// half, the same thing a password typed moments ago proves, so it lives
+    /// only for the confirmation window: a passkey sign-in is `Certain` at
+    /// once and falls to `Strong` when this expires.
+    PasskeyUserVerification,
 }
 
 impl ProofKind {
     /// Every kind the level derivation knows about.
-    pub const ALL: [ProofKind; 2] = [ProofKind::Password, ProofKind::EmailOtp];
+    pub const ALL: [ProofKind; 4] = [
+        ProofKind::Password,
+        ProofKind::EmailOtp,
+        ProofKind::Passkey,
+        ProofKind::PasskeyUserVerification,
+    ];
 
     /// The stable string stored in `auth_event.kind`.
     pub const fn as_str(self) -> &'static str {
         match self {
             ProofKind::Password => "password",
             ProofKind::EmailOtp => "email_otp",
+            ProofKind::Passkey => "passkey",
+            ProofKind::PasskeyUserVerification => "passkey_user_verification",
         }
     }
 
     /// How long an occurrence of this kind stays alive, in seconds.
     ///
-    /// The password proof is short (the reference's five minutes, and the
-    /// `account.confirm_window_secs` policy): it only distinguishes `Certain`
-    /// from `Strong`, and it is the window a step-up is good for. The
-    /// emailed-code proof lives as long as the session it was given on, so a
-    /// completed second factor holds for the whole session rather than
-    /// demanding a mid-session re-step-up.
+    /// The short kinds (the password, and a passkey's user verification) only
+    /// distinguish `Certain` from `Strong`, and they are the window a step-up is
+    /// good for (`account.confirm_window_secs`). The long kinds (the emailed
+    /// code, and a passkey's possession) live as long as the session they were
+    /// given on, so a completed second factor holds for the whole session
+    /// rather than demanding a mid-session re-step-up.
     pub const fn max_age_secs(self, session_ttl_secs: i64, confirm_window_secs: i64) -> i64 {
         match self {
-            ProofKind::Password => confirm_window_secs,
-            ProofKind::EmailOtp => session_ttl_secs,
+            ProofKind::Password | ProofKind::PasskeyUserVerification => confirm_window_secs,
+            ProofKind::EmailOtp | ProofKind::Passkey => session_ttl_secs,
         }
     }
 }
@@ -54,7 +73,8 @@ mod tests {
 
     #[test]
     fn the_sign_in_proof_names_are_the_stored_ones() {
-        // `manager` holds the other half: every proof has an event writing it.
+        // `manager` holds the other half: every proof has an event writing it,
+        // under the very same name.
         for kind in ProofKind::ALL {
             assert!(!kind.as_str().is_empty());
         }
@@ -64,5 +84,16 @@ mod tests {
     fn otp_lifetime_tracks_the_session() {
         assert_eq!(ProofKind::EmailOtp.max_age_secs(86_400, 300), 86_400);
         assert_eq!(ProofKind::Password.max_age_secs(86_400, 300), 300);
+    }
+
+    #[test]
+    fn a_passkey_is_strong_for_the_session_and_certain_only_for_the_window() {
+        // The possession half holds for the session, the user-verification half
+        // for the confirmation window: `Certain` now, `Strong` afterwards.
+        assert_eq!(ProofKind::Passkey.max_age_secs(86_400, 300), 86_400);
+        assert_eq!(
+            ProofKind::PasskeyUserVerification.max_age_secs(86_400, 300),
+            300
+        );
     }
 }

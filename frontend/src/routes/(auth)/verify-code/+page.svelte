@@ -7,6 +7,13 @@
 	 * accepted, and this page's only route onwards is
 	 * `POST /api/account/login/verify`.
 	 *
+	 * The code it asks for is the one the password step already sent: the page
+	 * does **not** ask the relay for another on arrival. A `basic` session always
+	 * had one issued for it, so arriving here is not a reason to send a second
+	 * email nobody asked for — and the relay's own re-send cooldown would refuse
+	 * most of those anyway. Someone whose code is old or lost has the button
+	 * below; pressing it is what sends another.
+	 *
 	 * Once accepted, the session is finished and the person continues to the
 	 * console — or back to a pending `/pair` detour, which is why the detour flag
 	 * is read here rather than at the password step.
@@ -22,23 +29,11 @@
 	import { goto } from '$app/navigation';
 	import { resolve } from '$app/paths';
 
-	import type { PageProps } from './$types';
-
-	let { data }: PageProps = $props();
-
 	const session = useSession();
 
 	let resending = $state(false);
 	let startingOver = $state(false);
 	let resent = $state('');
-
-	// The load asks for a code when this session had none in flight; say so, or
-	// the person would be left wondering which of their emails is the live one.
-	$effect(() => {
-		if (data.codeSent) {
-			resent = 'A new code is on its way.';
-		}
-	});
 
 	const sf = jsonForm(verifyCodeSchema, { code: '' }, async (values) => {
 		const res = await api('POST', '/api/account/login/verify', values, climb);

@@ -38,7 +38,7 @@ export function atLeast(level: AuthLevel, required: AuthLevel): boolean {
  * One thing a person can do to climb, as the relay names it: sign in, enter the
  * emailed code, re-type the password. More arrive with more factors.
  */
-export type Step = 'login' | 'verify_email_otp' | 'confirm_password';
+export type Step = 'login' | 'verify_email_otp' | 'confirm_password' | 'assert_passkey';
 
 /**
  * One step of a way up, with the level taking it would leave the session at.

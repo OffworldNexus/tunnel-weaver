@@ -115,19 +115,21 @@ async fn test_store_open_runs_migrations_and_is_idempotent() {
         let store = Store::open(&db_path).await.expect("open failed");
         let count: i64 = scalar(
             &store,
-            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN ('config', 'acme_account', 'domains', 'certificates', 'cert_events', 'seaql_migrations', 'person', 'machine', 'machine_key_log', 'service', 'usage_daily', 'usage_live', 'challenge', 'abuse_bucket', 'auth_event', 'login_challenge')",
+            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN ('config', 'acme_account', 'domains', 'certificates', 'cert_events', 'seaql_migrations', 'person', 'machine', 'machine_key_log', 'service', 'usage_daily', 'usage_live', 'challenge', 'abuse_bucket', 'auth_event', 'login_challenge', 'passkey_credential')",
         )
         .await;
-        assert_eq!(count, 16);
-        assert_eq!(store.schema_version().await.expect("schema_version"), 4);
+        assert_eq!(count, 17);
+        // Five migrations: `m0001_init`, `m0002_usage_daily`,
+        // `m0003_inactivity`, `m0004_auth_levels` and `m0005_passkeys`.
+        assert_eq!(store.schema_version().await.expect("schema_version"), 5);
     }
 
     // Re-open existing database: should succeed and not re-apply migrations
     {
         let store = Store::open(&db_path).await.expect("re-open failed");
         let migration_count: i64 = scalar(&store, "SELECT count(*) FROM seaql_migrations").await;
-        assert_eq!(migration_count, 4);
-        assert_eq!(store.schema_version().await.expect("schema_version"), 4);
+        assert_eq!(migration_count, 5);
+        assert_eq!(store.schema_version().await.expect("schema_version"), 5);
     }
 }
 

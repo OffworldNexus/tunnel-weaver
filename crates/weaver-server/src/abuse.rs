@@ -184,6 +184,30 @@ pub fn build(config: &Config, store: Store) -> Arc<Pipeline> {
         routes.push((view, policy));
     }
 
+    // the passkey ceremonies are always served too, but they get a budget of
+    // their own: a passkey assertion is cryptographic, so there is nothing to
+    // guess and the allowance only has to bound unauthenticated work (one
+    // sign-in is a handful of requests, and it never shares a bucket with the
+    // password login, whose 30-per-10-minutes allowance a page load could
+    // spend). It also favours availability where the credentials above fail
+    // closed: a budget store that cannot answer serves the ceremony and logs
+    // loudly, because what it would have protected is a resource, not a secret.
+    policies.push(Policy {
+        id: PolicyId::ACCOUNT_PASSKEY,
+        budgets: vec![
+            Budget {
+                key: KeyKind::PeerHost,
+                quota: quota(&config.account.passkey),
+            },
+            Budget {
+                key: KeyKind::PeerNetwork,
+                quota: quota(&config.account.passkey),
+            },
+        ],
+        on_store_error: StoreErrorPolicy::Degraded,
+    });
+    routes.push((ViewId::ACCOUNT_PASSKEY, PolicyId::ACCOUNT_PASSKEY));
+
     let retry_cap_secs = config
         .abuse
         .as_ref()
