@@ -403,6 +403,12 @@ pub async fn handle_https_request(
             // it is the same guessing surface as a login attempt and shares that
             // budget rather than minting a new one.
             ViewId::ACCOUNT_LOGIN
+        } else if surface.host == Host::Admin && path.starts_with("/api/account/passkey/") {
+            // A passkey assertion guesses a credential the way a password sign-in
+            // guesses a password, and its step-up does so from behind a session —
+            // both are the same guessing surface, and both are cheap, so they
+            // share the login budget rather than minting a new one (WVR-163).
+            ViewId::ACCOUNT_LOGIN
         } else if surface.host == Host::Admin && path == "/api/account/resend" {
             ViewId::ACCOUNT_RESEND
         } else if surface.host == Host::Admin && path == weaver_proto::pair::PAIR_CHANNEL_PATH {

@@ -172,3 +172,71 @@ Feature: Account lifecycle
     And the browser holds no account cookie
     When I sign in with the wrong password "correct-horse-battery-staple"
     Then I see the error "invalid email or password"
+
+  # WVR-163: a passkey is a whole way in. This journey registers one from the
+  # Security tab — which lands while the sign-in's own `certain` is still fresh,
+  # the proof registering asks for — takes both ways the sign-in page offers it
+  # (the named button, then the field's autofill with nothing typed), then spends
+  # the credential: removing it, and deleting the account while the passkey
+  # sign-in's `certain` still holds, so that gate asks for no proof at all.
+  Scenario: A passkey signs me in, and the account it protects deletes while that proof is fresh
+    Given an account exists for "Ada Lovelace" with the password "correct-horse-battery-staple"
+    When I sign in with the password "correct-horse-battery-staple"
+    Then I see the signed-in identity for "Ada Lovelace"
+    When I follow the "Security" link
+    Then I see the "Security" heading
+    When I add a passkey named "MacBook Pro"
+    Then I see "Passkey added. It can sign you in on its own."
+    And I see the passkey "MacBook Pro"
+    And I see "never used"
+    When I sign out
+    Then I see the "Sign in" heading
+    When I sign in with the passkey from the button
+    Then I see the signed-in identity for "Ada Lovelace"
+    When I sign out
+    Then I see the "Sign in" heading
+    And the sign-in field is ready to offer a passkey, and holds nothing
+    When the passkey signs me in without a click
+    Then I see the signed-in identity for "Ada Lovelace"
+    # WVR-163: the passkey sign-in carries user verification, so the session it
+    # opens is `certain` — which is why the deletion below meets no step-up. Read
+    # while it is still held, as the level falls to `strong` on its own.
+    And the console holds my session as "certain"
+    When I follow the "Security" link
+    Then I see the passkey "MacBook Pro"
+    When I remove the passkey "MacBook Pro"
+    Then I see "Passkey removed."
+    And I see "No passkey yet"
+    When I open the delete confirmation
+    Then I see the "Delete your account?" heading
+    And the delete confirmation is locked
+    When I type my email into the confirmation
+    Then the delete confirmation is unlocked
+    When I confirm the deletion
+    Then the deletion lands me signed out on the sign-in page
+    And I see "Your account and all its data have been deleted."
+
+  # WVR-163: the other half of the same step-up. The password's way through this
+  # gate is the Danger-zone journey's; here the passkey answers it instead, on a
+  # session that has lapsed to `strong` — the assertion is offered in the popin
+  # beside the password form, and taking it renews `certain` in place.
+  Scenario: A passkey answers the step-up in place of the password
+    Given an account exists for "Ada Lovelace" with the password "correct-horse-battery-staple"
+    When I sign in with the password "correct-horse-battery-staple"
+    Then I see the signed-in identity for "Ada Lovelace"
+    When I follow the "Security" link
+    Then I see the "Security" heading
+    When I add a passkey named "MacBook Pro"
+    Then I see the passkey "MacBook Pro"
+    Then the console holds my session as "strong"
+    When I open the delete confirmation
+    Then I am asked for my password first
+    And the password step-up offers the passkey as well
+    When I take the passkey in place of the password
+    Then I see the "Delete your account?" heading
+    And the delete confirmation is locked
+    When I type my email into the confirmation
+    Then the delete confirmation is unlocked
+    When I confirm the deletion
+    Then the deletion lands me signed out on the sign-in page
+    And I see "Your account and all its data have been deleted."

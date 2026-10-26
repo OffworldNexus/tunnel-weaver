@@ -3468,3 +3468,683 @@ async fn inactivity_sweep_deletes_without_a_mailer() {
     assert_eq!(report.deleted, 1);
     assert!(store.account_by_id(account.id).await.unwrap().is_none());
 }
+
+// ----- passkeys (WVR-163) ---------------------------------------------------
+
+/// Seeds a passkey row the way a verified registration would.
+///
+/// The ceremony itself is what the browser BDD drives (a real page and a real
+/// virtual authenticator); these tests are about everything *around* it — the
+/// level machinery, the ways up, the account scoping — for which a row in the
+/// table is the whole fixture. The stored `credential` is opaque to all of it,
+/// so a placeholder is honest here and keeps the tests about the relay.
+async fn seed_passkey(fixture: &Fixture, account_id: i32, name: &str) -> i32 {
+    use weaver_server::store::account::NewPasskey;
+    fixture
+        .account
+        .store
+        .passkey_create(NewPasskey {
+            account_id,
+            credential_id: format!("credential-{account_id}-{name}"),
+            credential: "{}".to_string(),
+            user_unique_id: "00000000-0000-0000-0000-000000000000".to_string(),
+            transports: "internal".to_string(),
+            name: name.to_string(),
+            created_at: weaver_server::wall_clock::unix_secs(),
+        })
+        .await
+        .unwrap()
+        .id
+}
+
+/// The signed-in account behind a session cookie.
+async fn account_of(fixture: &Fixture, session: &str) -> i32 {
+    let raw = session.to_string();
+    fixture
+        .account
+        .sessions
+        .account(&raw, weaver_server::wall_clock::unix_secs())
+        .await
+        .unwrap()
+        .expect("a live session")
+        .id
+}
+
+/// A well-formed assertion no authenticator ever produced.
+///
+/// Every field parses as the shape `PublicKeyCredential.toJSON()` sends, so the
+/// handler's own refusal is what is under test rather than axum's deserializer.
+fn bogus_assertion() -> serde_json::Value {
+    serde_json::json!({
+        "id": "AAAA",
+        "rawId": "AAAA",
+        "type": "public-key",
+        "response": {
+            "authenticatorData": "AAAA",
+            "clientDataJSON": "AAAA",
+            "signature": "AAAA",
+        },
+    })
+}
+
+/// A passkey added or removed reaches the console without a reload: the relay
+/// announces it on the session bus, and every open stream of the account
+/// re-reads what the session can do.
+#[tokio::test]
+async fn a_passkey_removal_reaches_an_open_stream() {
+    use sea_orm::ConnectionTrait as _;
+
+    let fixture = setup().await;
+    register(
+        &fixture,
+        "Rémy",
+        "live@example.com",
+        "correct horse battery",
+    )
+    .await;
+    let (session, csrf) = sign_in(&fixture, "live@example.com", "correct horse battery").await;
+    let account_id = account_of(&fixture, &session).await;
+    let passkey = seed_passkey(&fixture, account_id, "MacBook").await;
+
+    // Ten minutes on, so `certain` has lapsed and the ways up are worth reading.
+    fixture
+        .account
+        .store
+        .db()
+        .execute_unprepared(
+            "UPDATE auth_event SET occurred_at = occurred_at - 600 WHERE kind = 'password'",
+        )
+        .await
+        .unwrap();
+
+    let request = Request::builder()
+        .method("GET")
+        .uri("/api/account/me")
+        .header("cookie", format!("__Host-weaver_session={session}"))
+        .body(Body::empty())
+        .unwrap();
+    let response = fixture.router.clone().oneshot(request).await.unwrap();
+    let mut events = Events::new(response.into_body());
+
+    let before = events.state().await;
+    assert_eq!(before["level"], "strong");
+    assert_eq!(
+        before["paths"][0]["options"],
+        serde_json::json!([
+            [{ "step": "confirm_password", "reaches": "certain" }],
+            [{ "step": "assert_passkey", "reaches": "certain" }],
+        ])
+    );
+
+    // Removing it takes the assertion away, on the stream that is already open.
+    let removed = call(
+        &fixture.router,
+        "POST",
+        &format!("/api/account/passkeys/{passkey}/remove"),
+        &[
+            (
+                "cookie",
+                format!("__Host-weaver_session={session}; __Host-weaver_csrf={csrf}"),
+            ),
+            ("x-csrf-token", csrf.to_string()),
+        ],
+        None,
+    )
+    .await;
+    assert_eq!(removed.status, StatusCode::OK, "{:?}", removed.body);
+
+    let after = events.state().await;
+    assert_eq!(
+        after["level"], "strong",
+        "the level is untouched by a removal"
+    );
+    assert_eq!(
+        after["paths"][0]["options"],
+        serde_json::json!([[{ "step": "confirm_password", "reaches": "certain" }]]),
+        "the assertion is no longer offered"
+    );
+}
+
+/// The assertion's refusals are the password sign-in's, word for word: an
+/// address nobody holds and an account with no passkey are one answer, so
+/// probing can only learn what the login budget already lets anyone ask.
+#[tokio::test]
+async fn a_passkey_sign_in_refuses_an_unknown_address_indistinguishably() {
+    let fixture = setup().await;
+    register(
+        &fixture,
+        "Rémy",
+        "no-passkey@example.com",
+        "correct horse battery",
+    )
+    .await;
+
+    let unknown = call(
+        &fixture.router,
+        "POST",
+        "/api/account/passkey/begin",
+        &[],
+        Some(serde_json::json!({ "email": "who@example.com" })),
+    )
+    .await;
+    let known_without_one = call(
+        &fixture.router,
+        "POST",
+        "/api/account/passkey/begin",
+        &[],
+        Some(serde_json::json!({ "email": "no-passkey@example.com" })),
+    )
+    .await;
+
+    assert_eq!(unknown.status, StatusCode::UNAUTHORIZED);
+    assert_eq!(known_without_one.status, StatusCode::UNAUTHORIZED);
+    assert_eq!(unknown.body, known_without_one.body);
+    assert_eq!(unknown.body["error"], "invalid email or password");
+}
+
+/// The discoverable ceremony needs no address at all, and the options it hands
+/// the browser are the conditional-UI ones: that is what puts the passkey in the
+/// sign-in field's autofill rather than behind a separate modal.
+#[tokio::test]
+async fn the_discoverable_ceremony_asks_the_browser_to_autofill() {
+    let fixture = setup().await;
+    let reply = call(
+        &fixture.router,
+        "POST",
+        "/api/account/passkey/begin",
+        &[],
+        Some(serde_json::json!({ "email": "" })),
+    )
+    .await;
+
+    assert_eq!(reply.status, StatusCode::OK, "{:?}", reply.body);
+    assert_eq!(reply.body["options"]["mediation"], "conditional");
+    assert_eq!(reply.body["options"]["publicKey"]["rpId"], "admin.test");
+    assert_eq!(
+        reply.body["options"]["publicKey"]["allowCredentials"],
+        serde_json::json!([])
+    );
+    // The handle is opaque, single use, and the only thing that ties `finish` to
+    // this challenge.
+    let handle = reply.body["handle"].as_str().expect("a handle");
+    assert!(!handle.is_empty());
+
+    // An assertion for a challenge nobody started is refused, and refused the
+    // same way for a handle that was never issued.
+    let forged = call(
+        &fixture.router,
+        "POST",
+        "/api/account/passkey/finish",
+        &[],
+        Some(serde_json::json!({
+            "handle": "not-a-handle",
+            "credential": bogus_assertion(),
+        })),
+    )
+    .await;
+    assert_eq!(forged.status, StatusCode::UNAUTHORIZED);
+    assert_eq!(forged.body["error"], "invalid email or password");
+}
+
+/// Registering a passkey is a `certain` action, and the options it asks the
+/// browser for are the ones that make the credential *discoverable* — without
+/// which the passkey could never be offered in the sign-in field. The library
+/// asks for `discouraged` by default, so this test is what keeps the override
+/// honest.
+#[tokio::test]
+async fn registering_asks_for_a_discoverable_credential() {
+    let fixture = setup().await;
+    register(
+        &fixture,
+        "Rémy",
+        "enrol@example.com",
+        "correct horse battery",
+    )
+    .await;
+    let (session, csrf) = sign_in(&fixture, "enrol@example.com", "correct horse battery").await;
+
+    let started = call(
+        &fixture.router,
+        "POST",
+        "/api/account/passkeys/begin",
+        &[
+            (
+                "cookie",
+                format!("__Host-weaver_session={session}; __Host-weaver_csrf={csrf}"),
+            ),
+            ("x-csrf-token", csrf.to_string()),
+        ],
+        None,
+    )
+    .await;
+    assert_eq!(started.status, StatusCode::OK, "{:?}", started.body);
+
+    let options = &started.body["options"];
+    assert_eq!(options["publicKey"]["rp"]["id"], "admin.test");
+    assert_eq!(
+        options["publicKey"]["authenticatorSelection"]["residentKey"], "required",
+        "a discoverable credential is what the sign-in field's autofill can offer"
+    );
+    assert_eq!(
+        options["publicKey"]["authenticatorSelection"]["requireResidentKey"], true,
+        "the legacy spelling of the same thing"
+    );
+    // A fresh session signing in with the password is immediately `certain`, so
+    // the ceremony is served without a step-up.
+    let user_id = options["publicKey"]["user"]["id"]
+        .as_str()
+        .expect("a user id");
+    let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(user_id)
+        .expect("the user id is base64url");
+    assert_eq!(decoded.len(), 16, "the user handle is a UUID");
+
+    // The handle is consumed by the first attempt, even when the credential is
+    // nonsense: a challenge is answered once or not at all.
+    let bogus = serde_json::json!({
+        "id": "AAAA",
+        "rawId": "AAAA",
+        "type": "public-key",
+        "response": {
+            "attestationObject": "AAAA",
+            "clientDataJSON": "AAAA",
+        },
+    });
+    let refused = call(
+        &fixture.router,
+        "POST",
+        "/api/account/passkeys/finish",
+        &[
+            (
+                "cookie",
+                format!("__Host-weaver_session={session}; __Host-weaver_csrf={csrf}"),
+            ),
+            ("x-csrf-token", csrf.to_string()),
+        ],
+        Some(serde_json::json!({
+            "handle": started.body["handle"],
+            "label": "",
+            "credential": bogus,
+        })),
+    )
+    .await;
+    assert_eq!(
+        refused.status,
+        StatusCode::BAD_REQUEST,
+        "{:?}",
+        refused.body
+    );
+    assert_eq!(
+        refused.body["error"],
+        "That passkey was not accepted. Try again."
+    );
+
+    let again = call(
+        &fixture.router,
+        "POST",
+        "/api/account/passkeys/finish",
+        &[
+            (
+                "cookie",
+                format!("__Host-weaver_session={session}; __Host-weaver_csrf={csrf}"),
+            ),
+            ("x-csrf-token", csrf.to_string()),
+        ],
+        Some(serde_json::json!({
+            "handle": started.body["handle"],
+            "label": "",
+            "credential": bogus,
+        })),
+    )
+    .await;
+    assert_eq!(again.status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        again.body["error"], "That passkey request has expired. Start again.",
+        "a spent handle is gone"
+    );
+}
+
+/// A passkey changes what a session can do: the assertion becomes one of the
+/// ways up to `certain`, beside re-typing the password, and the console is told
+/// so by the stream it already listens to.
+#[tokio::test]
+async fn a_registered_passkey_becomes_a_way_up() {
+    use sea_orm::ConnectionTrait as _;
+
+    let fixture = setup().await;
+    register(
+        &fixture,
+        "Rémy",
+        "way-up@example.com",
+        "correct horse battery",
+    )
+    .await;
+    let (session, _) = sign_in(&fixture, "way-up@example.com", "correct horse battery").await;
+    let account_id = account_of(&fixture, &session).await;
+
+    // No passkey yet: the password is the only way back to `certain`.
+    fixture
+        .account
+        .store
+        .db()
+        .execute_unprepared(
+            "UPDATE auth_event SET occurred_at = occurred_at - 600 WHERE kind = 'password'",
+        )
+        .await
+        .unwrap();
+    assert_eq!(me(&fixture, &session).await.body["level"], "strong");
+    assert_eq!(
+        me(&fixture, &session).await.body["paths"],
+        serde_json::json!([{
+            "to": "certain",
+            "options": [[{ "step": "confirm_password", "reaches": "certain" }]],
+        }])
+    );
+
+    // Enrolling one adds the assertion, after the password — the password path
+    // is the one this session was opened through, so its step is preferred.
+    seed_passkey(&fixture, account_id, "MacBook").await;
+    assert_eq!(
+        me(&fixture, &session).await.body["paths"],
+        serde_json::json!([{
+            "to": "certain",
+            "options": [
+                [{ "step": "confirm_password", "reaches": "certain" }],
+                [{ "step": "assert_passkey", "reaches": "certain" }],
+            ],
+        }])
+    );
+
+    // And the same two options are what a refusal names, so an action that needs
+    // `certain` tells the console how to get there.
+    let refused = call(
+        &fixture.router,
+        "POST",
+        "/api/account/delete",
+        &[("cookie", format!("__Host-weaver_session={session}"))],
+        Some(serde_json::json!({ "address": "way-up@example.com" })),
+    )
+    .await;
+    assert_eq!(refused.status, StatusCode::FORBIDDEN);
+    let options: serde_json::Value = serde_json::from_str(
+        refused
+            .headers
+            .get("x-weaver-upgrade-paths")
+            .expect("the ways up")
+            .to_str()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        options,
+        serde_json::json!([
+            [{ "step": "confirm_password", "reaches": "certain" }],
+            [{ "step": "assert_passkey", "reaches": "certain" }],
+        ])
+    );
+}
+
+/// The step-up ceremony is served only where a step-up is expected, exactly like
+/// the password's, so a client cannot spend challenges at will.
+#[tokio::test]
+async fn the_passkey_step_up_is_only_served_when_expected() {
+    use sea_orm::ConnectionTrait as _;
+
+    let fixture = setup().await;
+    register(
+        &fixture,
+        "Rémy",
+        "stepup@example.com",
+        "correct horse battery",
+    )
+    .await;
+    let (session, csrf) = sign_in(&fixture, "stepup@example.com", "correct horse battery").await;
+    let account_id = account_of(&fixture, &session).await;
+    seed_passkey(&fixture, account_id, "YubiKey").await;
+
+    // Freshly signed in, the session holds `certain` — there is nothing to step
+    // up to.
+    assert_eq!(me(&fixture, &session).await.body["level"], "certain");
+    let early = call(
+        &fixture.router,
+        "POST",
+        "/api/account/passkey/step-up/begin",
+        &[
+            (
+                "cookie",
+                format!("__Host-weaver_session={session}; __Host-weaver_csrf={csrf}"),
+            ),
+            ("x-csrf-token", csrf.to_string()),
+        ],
+        None,
+    )
+    .await;
+    assert_eq!(early.status, StatusCode::CONFLICT, "{:?}", early.body);
+
+    // Once the confirmation window has passed, the guard lets it through: what
+    // stands between the two answers is only whether a step-up is expected. The
+    // ceremony itself from there needs a real credential, which is what the
+    // browser BDD drives.
+    fixture
+        .account
+        .store
+        .db()
+        .execute_unprepared(
+            "UPDATE auth_event SET occurred_at = occurred_at - 600 \
+             WHERE kind IN ('password', 'password_confirmed')",
+        )
+        .await
+        .unwrap();
+    assert_eq!(me(&fixture, &session).await.body["level"], "strong");
+    let started = call(
+        &fixture.router,
+        "POST",
+        "/api/account/passkey/step-up/begin",
+        &[
+            (
+                "cookie",
+                format!("__Host-weaver_session={session}; __Host-weaver_csrf={csrf}"),
+            ),
+            ("x-csrf-token", csrf.to_string()),
+        ],
+        None,
+    )
+    .await;
+    assert_ne!(
+        started.status,
+        StatusCode::CONFLICT,
+        "an expected step-up is not refused as unexpected: {:?}",
+        started.body
+    );
+}
+
+/// Listing and removing are the account's own business: the id comes from the
+/// console, so a guessed one must reach nothing but its owner's rows.
+#[tokio::test]
+async fn passkeys_are_listed_and_removed_within_the_account() {
+    let fixture = setup().await;
+    register(
+        &fixture,
+        "Rémy",
+        "list@example.com",
+        "correct horse battery",
+    )
+    .await;
+    register(
+        &fixture,
+        "Someone",
+        "other@example.com",
+        "correct horse battery",
+    )
+    .await;
+    let (session, csrf) = sign_in(&fixture, "list@example.com", "correct horse battery").await;
+    let (other_session, _other_csrf) =
+        sign_in(&fixture, "other@example.com", "correct horse battery").await;
+    let mine = account_of(&fixture, &session).await;
+    let theirs = account_of(&fixture, &other_session).await;
+
+    let first = seed_passkey(&fixture, mine, "MacBook").await;
+    let theirs_id = seed_passkey(&fixture, theirs, "Their laptop").await;
+
+    let listed = call(
+        &fixture.router,
+        "GET",
+        "/api/account/passkeys",
+        &[("cookie", format!("__Host-weaver_session={session}"))],
+        None,
+    )
+    .await;
+    assert_eq!(listed.status, StatusCode::OK);
+    let passkeys = listed.body["passkeys"].as_array().expect("a list").clone();
+    assert_eq!(passkeys.len(), 1, "only my own: {:?}", listed.body);
+    assert_eq!(passkeys[0]["id"], first);
+    assert_eq!(passkeys[0]["name"], "MacBook");
+    assert_eq!(passkeys[0]["transports"], serde_json::json!(["internal"]));
+    // Never used: absent, not zero, so the console can tell the two apart.
+    assert_eq!(passkeys[0]["last_used_at"], serde_json::Value::Null);
+
+    // Their passkey is not mine to remove: it exists, it is not mine, and the
+    // answer says nothing about it.
+    let not_mine = call(
+        &fixture.router,
+        "POST",
+        &format!("/api/account/passkeys/{theirs_id}/remove"),
+        &[
+            (
+                "cookie",
+                format!("__Host-weaver_session={session}; __Host-weaver_csrf={csrf}"),
+            ),
+            ("x-csrf-token", csrf.to_string()),
+        ],
+        None,
+    )
+    .await;
+    assert_eq!(
+        not_mine.status,
+        StatusCode::NOT_FOUND,
+        "{:?}",
+        not_mine.body
+    );
+    // …and it is still there, for its owner.
+    let theirs_list = call(
+        &fixture.router,
+        "GET",
+        "/api/account/passkeys",
+        &[("cookie", format!("__Host-weaver_session={other_session}"))],
+        None,
+    )
+    .await;
+    assert_eq!(
+        theirs_list.body["passkeys"].as_array().map(Vec::len),
+        Some(1)
+    );
+
+    let removed = call(
+        &fixture.router,
+        "POST",
+        &format!("/api/account/passkeys/{first}/remove"),
+        &[
+            (
+                "cookie",
+                format!("__Host-weaver_session={session}; __Host-weaver_csrf={csrf}"),
+            ),
+            ("x-csrf-token", csrf.to_string()),
+        ],
+        None,
+    )
+    .await;
+    assert_eq!(removed.status, StatusCode::OK, "{:?}", removed.body);
+
+    let after = call(
+        &fixture.router,
+        "GET",
+        "/api/account/passkeys",
+        &[("cookie", format!("__Host-weaver_session={session}"))],
+        None,
+    )
+    .await;
+    assert_eq!(
+        after.body["passkeys"],
+        serde_json::json!([]),
+        "removal is immediate"
+    );
+
+    // Removal is not a `certain` action: it takes a way in away, and the
+    // password still works. It is `strong`, and it is CSRF-protected.
+    let without_csrf = call(
+        &fixture.router,
+        "POST",
+        &format!("/api/account/passkeys/{first}/remove"),
+        &[("cookie", format!("__Host-weaver_session={session}"))],
+        None,
+    )
+    .await;
+    assert_eq!(without_csrf.status, StatusCode::FORBIDDEN);
+}
+
+/// A session that proved a passkey is as strong as one that entered an emailed
+/// code, so the inactivity sweep must count it as live activity — otherwise a
+/// passkey-only sign-in would let a dormant account be deleted under it.
+#[tokio::test]
+async fn a_passkey_session_counts_as_a_live_strong_session() {
+    use sea_orm::ConnectionTrait as _;
+    use weaver_server::store::account::NewAuthEvent;
+
+    let fixture = setup().await;
+    let store = fixture.account.store.clone();
+    let account = store.create_account_without_login("Passkey").await.unwrap();
+    let raw = fixture
+        .account
+        .sessions
+        .create(account.id, weaver_server::wall_clock::unix_secs())
+        .await
+        .unwrap();
+    let session = store
+        .session_live(
+            &weaver_server::account::session::token_hash(&raw),
+            weaver_server::wall_clock::unix_secs(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+    for kind in ["password", "passkey"] {
+        store
+            .auth_event_insert(NewAuthEvent {
+                account_id: Some(account.id),
+                session_id: Some(session.id),
+                kind: kind.to_string(),
+                occurred_at: weaver_server::wall_clock::unix_secs(),
+                ip_address: String::new(),
+                user_agent: String::new(),
+                attempted: String::new(),
+            })
+            .await
+            .unwrap();
+    }
+
+    let strong = store
+        .strong_session_accounts(weaver_server::wall_clock::unix_secs())
+        .await
+        .unwrap();
+    assert!(
+        strong.contains(&account.id),
+        "a passkey assertion is a second factor"
+    );
+
+    // The password alone is not: the same session without the passkey row — or
+    // an emailed code — must not keep a dormant account alive.
+    store
+        .db()
+        .execute_unprepared(&format!(
+            "DELETE FROM auth_event WHERE kind = 'passkey' AND session_id = {}",
+            session.id
+        ))
+        .await
+        .unwrap();
+    let strong = store
+        .strong_session_accounts(weaver_server::wall_clock::unix_secs())
+        .await
+        .unwrap();
+    assert!(!strong.contains(&account.id));
+}

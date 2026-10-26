@@ -52,6 +52,13 @@ struct Inner {
     user_agent: String,
     /// The derived proofs, memoised after the first load of the request.
     proofs: Mutex<Option<BTreeMap<ProofKind, i64>>>,
+    /// Whether the account holds passkeys, memoised alongside the proofs.
+    ///
+    /// Only the *ways up* need it (the assertion is an option only when there
+    /// is a credential to assert with); the level derivation never reads it, so
+    /// the anonymous case costs nothing and an authenticated request pays one
+    /// indexed count.
+    has_passkeys: Mutex<Option<bool>>,
 }
 
 impl AuthManager {
@@ -78,6 +85,7 @@ impl AuthManager {
             ip_address,
             user_agent,
             proofs: Mutex::new(None),
+            has_passkeys: Mutex::new(None),
         }))
     }
 
@@ -93,11 +101,12 @@ impl AuthManager {
 
     // --- ask ---------------------------------------------------------------
 
-    /// The subject and the live proofs on this session — one indexed query,
-    /// memoised for the request.
+    /// The subject and the live proofs on this session — one indexed query per
+    /// part, memoised for the request.
     pub async fn situation(&self) -> Situation {
         Situation {
             account_id: self.account_id(),
+            has_passkeys: self.has_passkeys().await,
             proofs: self.proofs().await,
             now: self.0.now,
             session_ttl_secs: self.0.session_ttl_secs,
@@ -228,6 +237,54 @@ impl AuthManager {
         .await
     }
 
+    /// A passkey assertion was accepted (WVR-163): the credential is this
+    /// session's now, and — when `user_verified` — the authenticator verified
+    /// the person as it signed.
+    ///
+    /// Two rows when both hold, not one, because the two halves expire
+    /// differently: possession holds for the session, user verification for the
+    /// confirmation window. Together they are `Certain` at once and `Strong`
+    /// afterwards — one ceremony, the strength of a password *and* an emailed
+    /// code. A policy-compliant authenticator always verifies, so `false` means
+    /// either a client that ignored the request or a credential registered
+    /// without it: the session is then `Strong` and nothing more.
+    pub async fn passkey_asserted(
+        &self,
+        session: SessionContext,
+        user_verified: bool,
+    ) -> Result<(), StoreError> {
+        let mut kinds = vec![EventKind::Passkey];
+        if user_verified {
+            kinds.push(EventKind::PasskeyUserVerification);
+        } else {
+            tracing::warn!(
+                account_id = session.account_id,
+                "passkey assertion was accepted without user verification"
+            );
+        }
+        for kind in kinds {
+            self.record(kind, Some(session.account_id), Some(session.session_id), "")
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// A passkey assertion was refused (WVR-163).
+    ///
+    /// Recorded with or without a session, because the anonymous sign-in path
+    /// has none to attach it to and a refused credential is exactly what an
+    /// operator wants in the trail. `attempted` is the address the sign-in
+    /// named, or empty on the discoverable path, where none was given.
+    pub async fn passkey_failed(
+        &self,
+        account_id: Option<i32>,
+        session_id: Option<i32>,
+        attempted: &str,
+    ) -> Result<(), StoreError> {
+        self.record(EventKind::PasskeyFailed, account_id, session_id, attempted)
+            .await
+    }
+
     /// The session was closed; proofs before it cannot be revived.
     pub async fn logged_out(&self, session: SessionContext) -> Result<(), StoreError> {
         self.record(
@@ -300,6 +357,30 @@ impl AuthManager {
         let loaded = self.load_proofs().await.unwrap_or_default();
         *self.0.proofs.lock().expect("proofs mutex poisoned") = Some(loaded.clone());
         loaded
+    }
+
+    /// Whether this session's account holds passkeys, memoised for the request.
+    ///
+    /// A read failure reads as "none": the worst it can do is leave the
+    /// assertion out of a list of ways up, which is a step the person can still
+    /// take from the Security page. It must never be the reason a request is
+    /// refused.
+    async fn has_passkeys(&self) -> bool {
+        if let Some(cached) = *self.0.has_passkeys.lock().expect("passkeys mutex poisoned") {
+            return cached;
+        }
+        let has = match self.0.session {
+            Some(session) => self
+                .0
+                .store
+                .passkey_count_for(session.account_id)
+                .await
+                .map(|count| count > 0)
+                .unwrap_or(false),
+            None => false,
+        };
+        *self.0.has_passkeys.lock().expect("passkeys mutex poisoned") = Some(has);
+        has
     }
 
     async fn load_proofs(&self) -> Result<BTreeMap<ProofKind, i64>, StoreError> {
@@ -463,6 +544,22 @@ mod tests {
         // The recorded event kind and the proof kind it feeds must be one string.
         assert_eq!(EventKind::Password.as_str(), ProofKind::Password.as_str());
         assert_eq!(EventKind::EmailOtp.as_str(), ProofKind::EmailOtp.as_str());
+        assert_eq!(EventKind::Passkey.as_str(), ProofKind::Passkey.as_str());
+        assert_eq!(
+            EventKind::PasskeyUserVerification.as_str(),
+            ProofKind::PasskeyUserVerification.as_str()
+        );
+        // Every proof is written by an event carrying the very same name; the
+        // `*_confirmed` events are additional ways to prove one of them, never
+        // the only way to a proof of their own.
+        for proof in ProofKind::ALL {
+            assert!(
+                EventKind::ALL
+                    .into_iter()
+                    .any(|kind| kind.as_str() == proof.as_str()),
+                "{proof:?} has no event named after it"
+            );
+        }
     }
 
     #[test]
@@ -478,6 +575,7 @@ mod tests {
             Some(ProofKind::Password)
         );
         assert_eq!(EventKind::Logout.proof(), None);
+        assert_eq!(EventKind::PasskeyFailed.proof(), None);
         // Every proof the levels read is written by some event.
         for proof in ProofKind::ALL {
             assert!(
@@ -492,11 +590,42 @@ mod tests {
     fn situation(proofs: &[(ProofKind, i64)], now: i64, ttl: i64) -> Situation {
         Situation {
             account_id: Some(1),
+            has_passkeys: false,
             proofs: proofs.iter().copied().collect(),
             now,
             session_ttl_secs: ttl,
             confirm_window_secs: 300,
         }
+    }
+
+    #[test]
+    fn a_passkey_sign_in_falls_from_certain_to_strong_and_then_to_nothing() {
+        // One ceremony, two proofs: `Certain` while the user verification is
+        // fresh, `Strong` for as long as the credential is the session's, and
+        // nothing once it goes.
+        let fresh = situation(
+            &[
+                (ProofKind::Passkey, 100),
+                (ProofKind::PasskeyUserVerification, 100),
+            ],
+            120,
+            1_000,
+        );
+        assert_eq!(level_of(&fresh), AuthLevel::Certain);
+        assert_eq!(next_drop(&fresh, 2_000), Some((400, AuthLevel::Strong)));
+
+        // Past the confirmation window, and never used again: the possession
+        // proof is the next thing to go.
+        let strong = situation(
+            &[
+                (ProofKind::Passkey, 100),
+                (ProofKind::PasskeyUserVerification, 100),
+            ],
+            500,
+            1_000,
+        );
+        assert_eq!(level_of(&strong), AuthLevel::Strong);
+        assert_eq!(next_drop(&strong, 2_000), Some((1_100, AuthLevel::None)));
     }
 
     #[test]

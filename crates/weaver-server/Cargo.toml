@@ -74,6 +74,8 @@ tokio-util = { workspace = true }
 tower = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+uuid = { workspace = true }
+webauthn-rs = { workspace = true }
 weaver-abuse = { workspace = true }
 weaver-assets = { workspace = true, features = ["account-spa"] }
 weaver-mux = { workspace = true }

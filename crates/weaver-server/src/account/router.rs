@@ -20,12 +20,13 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Extension, Json, Router, middleware};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use weaver_abuse::AltchaError;
 
 use crate::account::auth::{AuthManager, SessionContext, watch};
+use crate::account::passkey;
 use crate::account::session::{self, CSRF_COOKIE, CSRF_HEADER, SESSION_COOKIE};
 use crate::account::views::{
     USAGE_WINDOW_SECS, key_of, load_error, owned_machine, person_of, person_services, signed_in,
@@ -46,6 +47,7 @@ use crate::tunnel::TunnelRegistry;
 use crate::wall_clock::unix_secs;
 use weaver_mux::CloseCode;
 use weaver_proto::pair;
+use webauthn_rs::prelude::{PublicKeyCredential, RegisterPublicKeyCredential};
 
 /// Purpose bound into an email-ownership verification token.
 const PURPOSE_EMAIL_VERIFICATION: &str = "email-verification";
@@ -87,6 +89,26 @@ pub fn router(runtime: Arc<AccountRuntime>, tunnel: Option<Arc<TunnelRegistry>>)
         .route("/api/account/delete", post(delete_account))
         .route("/api/account/password", post(change_password))
         .route("/api/account/confirm-password", post(confirm_password))
+        // Passkeys (WVR-163). The singular names the *ceremony* — signing in,
+        // and stepping a session up to `Certain` without a password — while the
+        // plural names the credentials themselves.
+        .route("/api/account/passkey/begin", post(passkey_signin_begin))
+        .route("/api/account/passkey/finish", post(passkey_signin_finish))
+        .route(
+            "/api/account/passkey/step-up/begin",
+            post(passkey_stepup_begin),
+        )
+        .route(
+            "/api/account/passkey/step-up/finish",
+            post(passkey_stepup_finish),
+        )
+        .route("/api/account/passkeys", get(passkeys_list))
+        .route("/api/account/passkeys/begin", post(passkey_register_begin))
+        .route(
+            "/api/account/passkeys/finish",
+            post(passkey_register_finish),
+        )
+        .route("/api/account/passkeys/{id}/remove", post(passkey_remove))
         .route("/api/account/machines", get(machines_list))
         .route("/api/account/overview", get(overview))
         .route("/api/account/metrics", get(metrics))
@@ -1186,6 +1208,431 @@ async fn delete_account(
             rt.sessions.clear_csrf_cookie(),
         ),
         Err(e) => load_error(e),
+    }
+}
+
+// ----- passkeys (WVR-163) ---------------------------------------------------
+
+/// What a passkey sign-in refused with says, whatever the reason.
+///
+/// The message is deliberately the password sign-in's, and so is the status: a
+/// caller learns that signing in did not happen, and nothing about whether the
+/// address exists — the difference between "no such account" and "that account
+/// has no passkey" is not theirs to see.
+const PASSKEY_SIGNIN_REFUSED: &str = "invalid email or password";
+
+/// Body of a `POST /api/account/passkey/begin`.
+#[derive(Deserialize)]
+struct PasskeySigninBeginRequest {
+    /// The address to sign in as. Empty means "offer me whatever this browser
+    /// holds for you" — the discoverable, autofill ceremony.
+    #[serde(default)]
+    email: String,
+}
+
+/// Body of a `POST /api/account/passkey/finish`.
+#[derive(Deserialize)]
+struct PasskeyAssertionRequest {
+    /// The single-use handle `begin` answered with.
+    handle: String,
+    /// The browser's assertion, as `PublicKeyCredential.toJSON()` spells it.
+    credential: PublicKeyCredential,
+}
+
+/// Body of a `POST /api/account/passkeys/finish`.
+#[derive(Deserialize)]
+struct PasskeyRegistrationRequest {
+    handle: String,
+    /// What to call it; empty means the person did not name it.
+    #[serde(default)]
+    label: String,
+    /// The browser's registration, as `PublicKeyCredential.toJSON()` spells it.
+    credential: RegisterPublicKeyCredential,
+}
+
+/// The body every `begin` answers with: the handle to finish under, and the
+/// options the browser needs.
+fn passkey_started<T: Serialize>(started: passkey::Started<T>) -> Response {
+    let options = serde_json::to_value(started.options).unwrap_or(Value::Null);
+    json_ok(json!({ "handle": started.handle, "options": options }))
+}
+
+/// How a ceremony's failure is answered.
+///
+/// A store that could not be read is a `503`; everything else is the caller's to
+/// decide, because "no such ceremony" and "that assertion did not verify" are
+/// the same refusal to a person and different answers to a log.
+fn passkey_problem(
+    error: passkey::PasskeyError,
+    refused: StatusCode,
+    refused_message: &str,
+) -> Response {
+    match error {
+        passkey::PasskeyError::Unavailable => {
+            err(StatusCode::SERVICE_UNAVAILABLE, "temporarily unavailable")
+        }
+        _ => err(refused, refused_message),
+    }
+}
+
+/// `POST /api/account/passkey/begin` — start a passkey sign-in (public).
+///
+/// With an address, the assertion is against that account's own credentials.
+/// Without one, the browser is invited to offer a discoverable passkey in the
+/// sign-in field's autofill, and the account is resolved from whichever
+/// credential comes back.
+///
+/// Cheap: no password is hashed and no email is sent, so it is bounded by the
+/// edge's login budget (and shares that budget with the password sign-in, whose
+/// guessing surface this is) rather than by a proof of work.
+async fn passkey_signin_begin(
+    State(rt): State<Arc<AccountRuntime>>,
+    headers: HeaderMap,
+    Json(req): Json<PasskeySigninBeginRequest>,
+) -> Response {
+    if !origin_ok(&headers, &rt.base_url) {
+        return err(StatusCode::FORBIDDEN, "request refused");
+    }
+    let now = unix_secs();
+    let lookup = normalize_email(&req.email);
+    if lookup.is_empty() {
+        return match passkey::begin_discover(&rt, now) {
+            Ok(started) => passkey_started(started),
+            Err(error) => passkey_problem(
+                error,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "temporarily unavailable",
+            ),
+        };
+    }
+    let account = match rt.store.email_identity_find(&lookup).await.ok().flatten() {
+        Some(identity) => rt
+            .store
+            .account_by_id(identity.account_id)
+            .await
+            .ok()
+            .flatten(),
+        None => None,
+    };
+    // An address nothing matches and an account with no passkey are answered
+    // identically, message and status, so probing can only learn whether *some*
+    // account behind that address holds a passkey — no more than the login
+    // budget already allows anyone to ask.
+    let Some(account) = account else {
+        return err(StatusCode::UNAUTHORIZED, PASSKEY_SIGNIN_REFUSED);
+    };
+    match passkey::begin_assert(&rt, account.id, now).await {
+        Ok(started) => passkey_started(started),
+        Err(error) => passkey_problem(error, StatusCode::UNAUTHORIZED, PASSKEY_SIGNIN_REFUSED),
+    }
+}
+
+/// `POST /api/account/passkey/finish` — accept a passkey assertion and sign in
+/// (public).
+///
+/// The one place a session opens with no password at all, and the one way an
+/// anonymous request reaches `Strong` in a single step: the assertion carries
+/// user verification, so the new session is `Certain` and falls to `Strong` when
+/// the confirmation window ends.
+async fn passkey_signin_finish(
+    State(rt): State<Arc<AccountRuntime>>,
+    Extension(manager): Extension<AuthManager>,
+    headers: HeaderMap,
+    Json(req): Json<PasskeyAssertionRequest>,
+) -> Response {
+    if !origin_ok(&headers, &rt.base_url) {
+        return err(StatusCode::FORBIDDEN, "request refused");
+    }
+    let now = unix_secs();
+    let Ok(asserted) = passkey::finish_signin(&rt, &req.handle, &req.credential, now).await else {
+        // No session exists yet, so the trail gets the attempt and nothing else.
+        let _ = manager.passkey_failed(None, None, "").await;
+        return err(StatusCode::UNAUTHORIZED, PASSKEY_SIGNIN_REFUSED);
+    };
+
+    // The second factor travels by email, so an account without an address
+    // cannot sign in; only test-only fixtures lack one, and it is never a
+    // bypass.
+    let Some(identity) = rt
+        .store
+        .email_identity_for_account(asserted.account_id)
+        .await
+        .ok()
+        .flatten()
+    else {
+        tracing::warn!(
+            account_id = asserted.account_id,
+            "passkey sign-in blocked: account has no email address"
+        );
+        return err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "sign-in is temporarily unavailable",
+        );
+    };
+    let _ = identity;
+
+    let raw = match rt.sessions.create(asserted.account_id, now).await {
+        Ok(raw) => raw,
+        Err(_) => return err(StatusCode::SERVICE_UNAVAILABLE, "temporarily unavailable"),
+    };
+    let Some(session) = rt
+        .store
+        .session_live(&session::token_hash(&raw), now)
+        .await
+        .ok()
+        .flatten()
+    else {
+        let _ = rt.sessions.invalidate(&raw, now).await;
+        return err(StatusCode::SERVICE_UNAVAILABLE, "temporarily unavailable");
+    };
+    let context = SessionContext {
+        session_id: session.id,
+        account_id: asserted.account_id,
+    };
+    if manager
+        .passkey_asserted(context, asserted.user_verified)
+        .await
+        .is_err()
+        || rt
+            .store
+            .account_record_login(asserted.account_id, now)
+            .await
+            .is_err()
+    {
+        let _ = rt.sessions.invalidate(&raw, now).await;
+        return err(StatusCode::SERVICE_UNAVAILABLE, "temporarily unavailable");
+    }
+    tracing::info!(account_id = asserted.account_id, "Signed in with a passkey");
+
+    let csrf = session::new_token();
+    let response = json_ok(json!({ "status": "signed_in" }));
+    let response = with_cookie(response, rt.sessions.session_cookie(&raw));
+    with_cookie(response, rt.sessions.csrf_cookie(&csrf))
+}
+
+/// `GET /api/account/passkeys` — the account's own passkeys.
+async fn passkeys_list(
+    State(rt): State<Arc<AccountRuntime>>,
+    Extension(manager): Extension<AuthManager>,
+) -> Response {
+    let Some(session) = manager.session() else {
+        return err(StatusCode::UNAUTHORIZED, "not signed in");
+    };
+    match rt.store.passkeys_for_account(session.account_id).await {
+        Ok(rows) => {
+            let passkeys: Vec<passkey::PasskeyView> = rows.iter().map(passkey::view).collect();
+            json_ok(json!({ "passkeys": passkeys }))
+        }
+        Err(error) => load_error(error),
+    }
+}
+
+/// `POST /api/account/passkeys/begin` — start registering a passkey.
+///
+/// Reachable at `Certain` (the gate's business, not this handler's): a passkey
+/// outlives every password, so planting one must take a proof of presence.
+async fn passkey_register_begin(
+    State(rt): State<Arc<AccountRuntime>>,
+    Extension(manager): Extension<AuthManager>,
+    headers: HeaderMap,
+) -> Response {
+    if !origin_ok(&headers, &rt.base_url) || !csrf_ok(&headers) {
+        return err(StatusCode::FORBIDDEN, "request refused");
+    }
+    let Some(session) = manager.session() else {
+        return err(StatusCode::UNAUTHORIZED, "not signed in");
+    };
+    let now = unix_secs();
+    let Some(account) = rt
+        .store
+        .account_by_id(session.account_id)
+        .await
+        .ok()
+        .flatten()
+    else {
+        return err(StatusCode::SERVICE_UNAVAILABLE, "temporarily unavailable");
+    };
+    // Both are what the authenticator stores alongside the credential, so the
+    // browser can show a person which account and which passkey they are
+    // creating. Neither is a key.
+    let email = rt
+        .store
+        .email_identity_for_account(session.account_id)
+        .await
+        .ok()
+        .flatten()
+        .map(|identity| identity.email)
+        .unwrap_or_else(|| account.name.clone());
+    match passkey::begin_register(&rt, session.account_id, &account.name, &email, now).await {
+        Ok(started) => passkey_started(started),
+        Err(error) => passkey_problem(error, StatusCode::BAD_REQUEST, error.message()),
+    }
+}
+
+/// `POST /api/account/passkeys/finish` — store the registered credential.
+async fn passkey_register_finish(
+    State(rt): State<Arc<AccountRuntime>>,
+    Extension(manager): Extension<AuthManager>,
+    headers: HeaderMap,
+    Json(req): Json<PasskeyRegistrationRequest>,
+) -> Response {
+    if !origin_ok(&headers, &rt.base_url) || !csrf_ok(&headers) {
+        return err(StatusCode::FORBIDDEN, "request refused");
+    }
+    let Some(session) = manager.session() else {
+        return err(StatusCode::UNAUTHORIZED, "not signed in");
+    };
+    let now = unix_secs();
+    match passkey::finish_register(&rt, &req.handle, &req.credential, &req.label, now).await {
+        // The ceremony carries the account it was started for; a credential that
+        // came back for another account is a refusal, not a filing.
+        Ok(row) if row.account_id == session.account_id => {
+            // The ways up changed for every session of this account: the
+            // assertion is now one of them, and the console learns it from its
+            // own stream rather than by asking.
+            watch::sessions_changed(&rt.live, session.account_id);
+            json_ok(json!({ "passkey": passkey::view(&row) }))
+        }
+        Ok(_) => {
+            tracing::warn!(
+                account_id = session.account_id,
+                "passkey registration answered for another account"
+            );
+            err(
+                StatusCode::BAD_REQUEST,
+                passkey::PasskeyError::Refused.message(),
+            )
+        }
+        Err(error) => passkey_problem(error, StatusCode::BAD_REQUEST, error.message()),
+    }
+}
+
+/// `POST /api/account/passkeys/{id}/remove` — remove one of the account's own
+/// passkeys (CSRF-protected).
+///
+/// Not a `Certain` action: removing a credential takes a way in away, and the
+/// other way in — the password — still works, so it loses nothing an unattended
+/// browser could be tricked into losing.
+async fn passkey_remove(
+    State(rt): State<Arc<AccountRuntime>>,
+    Extension(manager): Extension<AuthManager>,
+    Path(id): Path<i32>,
+    headers: HeaderMap,
+) -> Response {
+    if !origin_ok(&headers, &rt.base_url) || !csrf_ok(&headers) {
+        return err(StatusCode::FORBIDDEN, "request refused");
+    }
+    let Some(session) = manager.session() else {
+        return err(StatusCode::UNAUTHORIZED, "not signed in");
+    };
+    match rt.store.passkey_remove(id, session.account_id).await {
+        Ok(true) => {
+            watch::sessions_changed(&rt.live, session.account_id);
+            tracing::info!(
+                account_id = session.account_id,
+                passkey_id = id,
+                "Passkey removed"
+            );
+            json_ok(json!({ "ok": true }))
+        }
+        Ok(false) => err(StatusCode::NOT_FOUND, "no such passkey"),
+        Err(error) => load_error(error),
+    }
+}
+
+/// `POST /api/account/passkey/step-up/begin` — start an assertion that lifts
+/// this session back to `Certain` (CSRF-protected).
+///
+/// The passkey twin of `confirm-password`, including its guard: it is only
+/// served where a step-up is *expected*, so a client cannot spend challenges at
+/// will, and it deliberately does not require `Certain` — it is the way there.
+async fn passkey_stepup_begin(
+    State(rt): State<Arc<AccountRuntime>>,
+    Extension(manager): Extension<AuthManager>,
+    headers: HeaderMap,
+) -> Response {
+    if !origin_ok(&headers, &rt.base_url) || !csrf_ok(&headers) {
+        return err(StatusCode::FORBIDDEN, "request refused");
+    }
+    if manager.session().is_none() {
+        return err(StatusCode::UNAUTHORIZED, "not signed in");
+    }
+    let now = unix_secs();
+    let Some(raw) = session::cookie(&headers, SESSION_COOKIE) else {
+        return err(StatusCode::UNAUTHORIZED, "not signed in");
+    };
+    let Some((row, _)) = rt.sessions.live(&raw, now).await.ok().flatten() else {
+        return err(StatusCode::UNAUTHORIZED, "not signed in");
+    };
+    if !manager.step_up_expected(row.expires_at).await {
+        return err(StatusCode::CONFLICT, "this sign-in is already confirmed");
+    }
+    // Discoverable, not named: the ceremony is the same one an anonymous sign-in
+    // uses, and it is the only shape some password managers answer at all — they
+    // stay silent when a request names a credential. The account it resolves to
+    // is checked below, against this very session.
+    match passkey::begin_discover(&rt, now) {
+        Ok(started) => passkey_started(started),
+        Err(error) => passkey_problem(error, StatusCode::BAD_REQUEST, error.message()),
+    }
+}
+
+/// `POST /api/account/passkey/step-up/finish` — accept the assertion (already
+/// `Strong`, and only where a step-up is expected).
+async fn passkey_stepup_finish(
+    State(rt): State<Arc<AccountRuntime>>,
+    Extension(manager): Extension<AuthManager>,
+    headers: HeaderMap,
+    Json(req): Json<PasskeyAssertionRequest>,
+) -> Response {
+    if !origin_ok(&headers, &rt.base_url) || !csrf_ok(&headers) {
+        return err(StatusCode::FORBIDDEN, "request refused");
+    }
+    let Some(session) = manager.session() else {
+        return err(StatusCode::UNAUTHORIZED, "not signed in");
+    };
+    let now = unix_secs();
+    let Some(raw) = session::cookie(&headers, SESSION_COOKIE) else {
+        return err(StatusCode::UNAUTHORIZED, "not signed in");
+    };
+    let Some((row, _)) = rt.sessions.live(&raw, now).await.ok().flatten() else {
+        return err(StatusCode::UNAUTHORIZED, "not signed in");
+    };
+    if !manager.step_up_expected(row.expires_at).await {
+        return err(StatusCode::CONFLICT, "this sign-in is already confirmed");
+    }
+    match passkey::finish_step_up(&rt, &req.handle, &req.credential, now).await {
+        // The assertion has to be this session's own account's, or a ceremony
+        // started elsewhere could lift this one.
+        Ok(asserted) if asserted.account_id == session.account_id => {
+            if manager
+                .passkey_asserted(session, asserted.user_verified)
+                .await
+                .is_err()
+            {
+                return err(StatusCode::SERVICE_UNAVAILABLE, "temporarily unavailable");
+            }
+            tracing::info!(
+                account_id = session.account_id,
+                "Passkey confirmed for a step-up"
+            );
+            json_ok(json!({ "ok": true }))
+        }
+        Ok(_) => {
+            let _ = manager
+                .passkey_failed(Some(session.account_id), Some(session.session_id), "")
+                .await;
+            err(
+                StatusCode::BAD_REQUEST,
+                passkey::PasskeyError::Refused.message(),
+            )
+        }
+        Err(error) => {
+            let _ = manager
+                .passkey_failed(Some(session.account_id), Some(session.session_id), "")
+                .await;
+            passkey_problem(error, StatusCode::BAD_REQUEST, error.message())
+        }
     }
 }
 

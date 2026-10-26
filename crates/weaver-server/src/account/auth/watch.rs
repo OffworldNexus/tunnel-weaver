@@ -61,8 +61,10 @@ pub fn session_changed(live: &LiveHub, session: SessionContext) {
     );
 }
 
-/// Announces that every session of an account may be gone (a password change
-/// or reset retires them all; so does a deletion).
+/// Announces that every session of an account must re-read the account's own
+/// state: a password change or reset retires them all, a deletion takes them
+/// with it, and enrolling or removing a passkey changes which ways up they have
+/// (WVR-167, WVR-163).
 pub fn sessions_changed(live: &LiveHub, account_id: i32) {
     live.publish(Change::visible_to(Viewer::Account(account_id)).entity(Entity::Session));
 }
@@ -86,6 +88,9 @@ struct Watched {
     /// The two lifetimes the proofs are measured against (see [`Situation`]).
     session_ttl_secs: i64,
     confirm_window_secs: i64,
+    /// Whether the account holds passkeys: what decides whether the
+    /// `assert_passkey` step is part of the ways up it is told about.
+    has_passkeys: bool,
     me: Value,
 }
 
@@ -94,6 +99,7 @@ impl Watched {
     fn situation(&self, now: i64) -> Situation {
         Situation {
             account_id: Some(self.session.account_id),
+            has_passkeys: self.has_passkeys,
             proofs: self.proofs.clone(),
             now,
             session_ttl_secs: self.session_ttl_secs,
@@ -128,8 +134,8 @@ async fn load(
         .map(|identity| identity.email)
         .unwrap_or_default();
     // Drives the Security page's "Password is set" state: a live credential
-    // exists for every email/password account today, but the flag keeps the
-    // panel honest once passkeys or SSO arrive.
+    // exists for every email/password account today, because a password stays
+    // the recovery anchor even for an account that signs in with passkeys.
     let has_password = rt.store.password_current_for(account.id).await?.is_some();
     Ok(Some(Watched {
         session,
@@ -137,6 +143,10 @@ async fn load(
         proofs: situation.proofs,
         session_ttl_secs: situation.session_ttl_secs,
         confirm_window_secs: situation.confirm_window_secs,
+        // Read with the proofs (the situation already counted them), so a
+        // registration or a removal reaches the stream through the same
+        // session change that reloads everything else.
+        has_passkeys: situation.has_passkeys,
         me: json!({
             "id": account.id,
             "name": account.name,
@@ -161,6 +171,7 @@ fn state(watched: Option<&Watched>, now: i64) -> (Value, Option<i64>) {
         // so the stream ends here.
         let situation = Situation {
             account_id: None,
+            has_passkeys: false,
             proofs: BTreeMap::new(),
             now,
             session_ttl_secs: 0,

@@ -22,8 +22,12 @@
 		error?: string;
 		/** Whether a check is in flight. */
 		busy?: boolean;
+		/** Whether the account can answer with a passkey instead (WVR-163). */
+		passkeyAvailable?: boolean;
 		/** Receives the typed password; the caller checks it. */
 		onConfirm?: (password: string) => void;
+		/** The person chose the passkey instead; the caller runs the ceremony. */
+		onPasskey?: () => void;
 		onClose?: () => void;
 	}
 
@@ -32,7 +36,9 @@
 		title = 'Confirm your password',
 		error = '',
 		busy = false,
+		passkeyAvailable = false,
 		onConfirm = () => {},
+		onPasskey = () => {},
 		onClose = undefined
 	}: Props = $props();
 
@@ -110,6 +116,15 @@
 				{/if}
 			</div>
 		</form>
+
+		{#if passkeyAvailable}
+			<p class="confirm-password__alternative">
+				Or, if it is handier, prove it with the passkey itself —
+				<button type="button" class="linklike" onclick={onPasskey} disabled={busy}>
+					use a passkey
+				</button>.
+			</p>
+		{/if}
 	</div>
 </Dialog>
 
@@ -154,5 +169,15 @@
 		height: 38px;
 		padding: 0 10px;
 		font-size: 14px;
+	}
+
+	// The passkey alternative is a second way to answer, not a third button in
+	// the footer: it reads as the sentence it is, so the footer stays the
+	// confirm/cancel pair the sibling dialogs have.
+	.confirm-password__alternative {
+		margin: 0;
+		color: var(--tw-muted);
+		font-size: 14px;
+		line-height: 1.55;
 	}
 </style>

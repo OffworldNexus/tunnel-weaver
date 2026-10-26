@@ -141,7 +141,8 @@ fn required_level(method: &Method, path: &str) -> AuthLevel {
 }
 
 /// The front door: everything reachable before any factor is proven, including
-/// the password step of sign-in (which mints a `Basic` session).
+/// the two ways a sign-in starts — the password step (which mints a `Basic`
+/// session) and the passkey ceremony (which mints a `Strong` one outright).
 fn is_public(method: &Method, path: &str) -> bool {
     match path {
         // `me` answers anyone: an anonymous visitor is told `none` on the stream
@@ -156,7 +157,13 @@ fn is_public(method: &Method, path: &str) -> bool {
         | "/api/account/reset/request"
         | "/api/account/reset/check"
         | "/api/account/reset/complete"
-        | "/api/account/login" => *method == Method::POST,
+        | "/api/account/login"
+        // The anonymous passkey ceremony (WVR-163): `begin` issues the challenge,
+        // `finish` accepts the assertion and opens the session. Named in the
+        // singular to keep them visibly apart from the authenticated
+        // `/api/account/passkeys` routes below, which manage credentials.
+        | "/api/account/passkey/begin"
+        | "/api/account/passkey/finish" => *method == Method::POST,
         _ => false,
     }
 }
@@ -179,8 +186,16 @@ fn is_basic(method: &Method, path: &str) -> bool {
 /// unlocked browser must not be able to delete the account in one click. The
 /// console answers the refusal with the `confirm_password` step, and the same
 /// gate refuses again if the proof has aged out by the time it is submitted.
+/// Registering a passkey joins them (WVR-163): it plants a credential that
+/// signs in on its own, which is at least as lasting as a deletion, and the
+/// nominal way to arrive here is a sign-in that already holds `Certain`.
 fn is_certain(method: &Method, path: &str) -> bool {
-    matches!((method, path), (&Method::POST, "/api/account/delete"))
+    matches!(
+        (method, path),
+        (&Method::POST, "/api/account/delete")
+            | (&Method::POST, "/api/account/passkeys/begin")
+            | (&Method::POST, "/api/account/passkeys/finish")
+    )
 }
 
 #[cfg(test)]
@@ -200,6 +215,15 @@ mod tests {
         // The session stream tells an anonymous visitor so itself.
         assert_eq!(
             required_level(&Method::GET, "/api/account/me"),
+            AuthLevel::None
+        );
+        // The anonymous passkey ceremony is the other way a sign-in starts.
+        assert_eq!(
+            required_level(&Method::POST, "/api/account/passkey/begin"),
+            AuthLevel::None
+        );
+        assert_eq!(
+            required_level(&Method::POST, "/api/account/passkey/finish"),
             AuthLevel::None
         );
     }
@@ -235,6 +259,28 @@ mod tests {
     }
 
     #[test]
+    fn registering_a_passkey_asks_for_certain_and_managing_it_does_not() {
+        // Planting a credential is as lasting as a deletion.
+        assert_eq!(
+            required_level(&Method::POST, "/api/account/passkeys/begin"),
+            AuthLevel::Certain
+        );
+        assert_eq!(
+            required_level(&Method::POST, "/api/account/passkeys/finish"),
+            AuthLevel::Certain
+        );
+        // Listing, removing and asserting are ordinary authenticated work.
+        for (method, path) in [
+            (Method::GET, "/api/account/passkeys"),
+            (Method::POST, "/api/account/passkeys/7/remove"),
+            (Method::POST, "/api/account/passkey/step-up/begin"),
+            (Method::POST, "/api/account/passkey/step-up/finish"),
+        ] {
+            assert_eq!(required_level(&method, path), AuthLevel::Strong, "{path}");
+        }
+    }
+
+    #[test]
     fn everything_else_on_the_api_is_strong() {
         for (method, path) in [
             (Method::GET, "/api/account/machines"),
@@ -260,6 +306,16 @@ mod tests {
             required_level(&Method::GET, "/api/account/config/leak"),
             AuthLevel::Strong
         );
+        // Including a lookalike of the passkey ceremony: `passkeys/…` manages
+        // credentials and is emphatically not the public front door.
+        assert_eq!(
+            required_level(&Method::POST, "/api/account/passkey/beginish"),
+            AuthLevel::Strong
+        );
+        assert_eq!(
+            required_level(&Method::POST, "/api/account/passkeys/begin"),
+            AuthLevel::Certain
+        );
     }
 
     #[test]
@@ -275,6 +331,15 @@ mod tests {
     fn a_public_route_with_the_wrong_method_stays_strong() {
         assert_eq!(
             required_level(&Method::GET, "/api/account/login"),
+            AuthLevel::Strong
+        );
+        // The ceremony is a POST: a GET of it is nobody's business.
+        assert_eq!(
+            required_level(&Method::GET, "/api/account/passkey/begin"),
+            AuthLevel::Strong
+        );
+        assert_eq!(
+            required_level(&Method::GET, "/api/account/passkey/finish"),
             AuthLevel::Strong
         );
     }

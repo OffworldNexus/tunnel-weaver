@@ -108,3 +108,15 @@ tower = { version = "0.5", default-features = false, features = ["util"] }
 # only for the Have I Been Pwned k-anonymity range query, never for storage.
 argon2 = "0.6"
 sha1 = "0.11"
+# WebAuthn passkeys (WVR-163): the registration and assertion ceremonies, with
+# the RP-ID/origin binding and the CBOR/COSE validation we must not hand-roll.
+# `attestation` stays off — the policy is "accept none", and leaving it on would
+# pull the openssl/der attestation graph into a `ring`-based build.
+# `conditional-ui` is what exposes the discoverable/autofill ceremony
+# (`start_discoverable_authentication`), which is how the sign-in page offers a
+# passkey in the email field.
+webauthn-rs = { version = "0.5", default-features = false, features = ["conditional-ui"] }
+# The passkey feature (WVR-163) needs a *derived* per-account WebAuthn user
+# handle (v5, name-based) — it comes back on every discoverable assertion, so it
+# must be the same value every time and must never be random.
+uuid = { version = "1.19", features = ["v5"] }

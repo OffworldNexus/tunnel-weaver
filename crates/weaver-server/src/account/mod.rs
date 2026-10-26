@@ -11,6 +11,7 @@
 pub mod auth;
 pub mod inactivity;
 pub mod pairing;
+pub mod passkey;
 pub mod password;
 pub mod router;
 pub mod second_factor;
@@ -18,6 +19,9 @@ pub mod session;
 pub mod views;
 
 use std::sync::Arc;
+
+use webauthn_rs::WebauthnBuilder;
+use webauthn_rs::prelude::{Url, Webauthn};
 
 use crate::altcha::AltchaRuntime;
 use crate::config::AccountConfig;
@@ -41,6 +45,10 @@ pub struct AccountRuntime {
     /// The in-memory registry of pending pairings. Not persisted: a
     /// pending pairing lives only as long as the CLI's channel.
     pub pairings: pairing::Pairings,
+    /// The WebAuthn relying party — this admin domain, at this origin — and the
+    /// in-memory registry of started passkey ceremonies (WVR-163).
+    pub webauthn: Arc<Webauthn>,
+    pub ceremonies: passkey::Ceremonies,
     /// The console's real-time change bus: presence transitions, membership
     /// writes and metered minutes announce the affected person here, and every
     /// open SSE stream of that person recomputes (WVR-25).
@@ -115,6 +123,7 @@ impl AccountRuntime {
             config.session_ttl_secs as i64,
             config.cookie_secure,
         );
+        let webauthn = Arc::new(webauthn_relying_party(&base_url, admin_domain)?);
         // Prefer an explicit support address; otherwise reuse the mailer's sender
         // so the footer can link somewhere real rather than a dead placeholder.
         let support_email = config.support_email.clone().or_else(|| {
@@ -130,6 +139,8 @@ impl AccountRuntime {
             sessions,
             config: config.clone(),
             pairings: pairing::Pairings::default(),
+            webauthn,
+            ceremonies: passkey::Ceremonies::default(),
             live,
             base_url,
             dummy_hash,
@@ -237,4 +248,28 @@ impl AccountRuntime {
     pub fn password_recovery_url(&self) -> String {
         format!("{}/forgot-password", self.base_url.trim_end_matches('/'))
     }
+}
+
+/// Builds the WebAuthn relying party: this admin domain, reachable at this
+/// origin (WVR-163).
+///
+/// The relying party is the account plane's own host and the origin is the
+/// console's own, so a ceremony can only ever be completed by a page we served:
+/// there is no third-party identity service here and no client secret to leak.
+/// `webauthn-rs` matches the origin literally, which is why the e2e harness —
+/// whose admin domain is the single label `localhost` behind a random port —
+/// gets a working relying party out of the same derivation.
+fn webauthn_relying_party(base_url: &str, admin_domain: &str) -> Result<Webauthn, String> {
+    let origin = Url::parse(base_url)
+        .map_err(|error| format!("account.base_url ({base_url}) is not a URL: {error}"))?;
+    WebauthnBuilder::new(admin_domain, &origin)
+        .map_err(|error| {
+            format!(
+                "the admin domain ({admin_domain}) and the console origin ({base_url}) \
+                 cannot be a WebAuthn relying party: {error}"
+            )
+        })?
+        .rp_name("Tunnel Weaver")
+        .build()
+        .map_err(|error| format!("the WebAuthn relying party could not be built: {error}"))
 }

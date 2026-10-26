@@ -12,16 +12,17 @@
 
 use sea_orm::sea_query::{Expr, OnConflict};
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, Condition, EntityTrait, QueryFilter, QueryOrder, QuerySelect,
-    Set, TransactionTrait,
+    ActiveModelTrait, ColumnTrait, Condition, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder,
+    QuerySelect, Set, TransactionTrait,
 };
 
 use std::collections::{HashMap, HashSet};
 
 use super::entity::{
     account, auth_event, browser_session, domain, email_identity, email_verification,
-    login_challenge, machine, machine_key_log, password_credential, password_reset_token,
-    pending_registration, person, service, usage_daily, usage_live, verification_token,
+    login_challenge, machine, machine_key_log, passkey_credential, password_credential,
+    password_reset_token, pending_registration, person, service, usage_daily, usage_live,
+    verification_token,
 };
 use super::{Store, StoreError};
 
@@ -31,6 +32,14 @@ use super::{Store, StoreError};
 /// layer keeps knowing nothing about the account plane's types. The value must
 /// match `account::auth::EventKind::EmailOtp`; a test there asserts the pair.
 const PROOF_EMAIL_OTP: &str = "email_otp";
+
+/// `auth_event.kind` for the passkey (possession) proof (WVR-163).
+///
+/// Same rule as [`PROOF_EMAIL_OTP`]: the literal is duplicated on purpose, and
+/// `account::auth` asserts the pair. A session that proved a passkey is as
+/// `Strong` as one that entered an emailed code, so the inactivity sweep reads
+/// both (`strong_session_accounts`).
+const PROOF_PASSKEY: &str = "passkey";
 
 /// Caller-supplied fields for a new in-flight signup.
 #[derive(Debug, Clone)]
@@ -87,6 +96,23 @@ pub struct NewLoginChallenge {
     pub expires_at: i64,
     pub max_attempts: i32,
     pub last_sent_at: i64,
+}
+
+/// Caller-supplied fields for a freshly registered passkey (WVR-163).
+///
+/// Everything here comes from the verified registration ceremony, except
+/// `name`, which is the person's own label and may be empty.
+#[derive(Debug, Clone)]
+pub struct NewPasskey {
+    pub account_id: i32,
+    pub credential_id: String,
+    /// The serialised `webauthn-rs` `Passkey`.
+    pub credential: String,
+    pub user_unique_id: String,
+    /// The announced transports, comma-joined; empty when none were announced.
+    pub transports: String,
+    pub name: String,
+    pub created_at: i64,
 }
 
 /// Everything the atomic activation needs. The token and pending registration
@@ -732,6 +758,114 @@ impl Store {
             .await?)
     }
 
+    // ----- passkeys (WVR-163) -----
+
+    /// Stores a freshly registered passkey.
+    ///
+    /// `credential_id` is unique across the whole table, so a credential that
+    /// somehow reappeared is refused here rather than made a way into a second
+    /// account.
+    pub async fn passkey_create(
+        &self,
+        passkey: NewPasskey,
+    ) -> Result<passkey_credential::Model, StoreError> {
+        Ok(passkey_credential::ActiveModel {
+            account_id: Set(passkey.account_id),
+            credential_id: Set(passkey.credential_id),
+            credential: Set(passkey.credential),
+            user_unique_id: Set(passkey.user_unique_id),
+            transports: Set(passkey.transports),
+            name: Set(passkey.name),
+            created_at: Set(passkey.created_at),
+            last_used_at: Set(None),
+            ..Default::default()
+        }
+        .insert(&self.db)
+        .await?)
+    }
+
+    /// Every passkey of an account, oldest first.
+    pub async fn passkeys_for_account(
+        &self,
+        account_id: i32,
+    ) -> Result<Vec<passkey_credential::Model>, StoreError> {
+        Ok(passkey_credential::Entity::find()
+            .filter(passkey_credential::Column::AccountId.eq(account_id))
+            .order_by_asc(passkey_credential::Column::CreatedAt)
+            .order_by_asc(passkey_credential::Column::Id)
+            .all(&self.db)
+            .await?)
+    }
+
+    /// How many passkeys an account holds.
+    ///
+    /// This is what the situation reads to decide whether *asserting with a
+    /// passkey* can be offered as a way up (both in the `me` stream and in a
+    /// refusal's headers), so it is one indexed count on a hot path.
+    pub async fn passkey_count_for(&self, account_id: i32) -> Result<u64, StoreError> {
+        Ok(passkey_credential::Entity::find()
+            .filter(passkey_credential::Column::AccountId.eq(account_id))
+            .count(&self.db)
+            .await?)
+    }
+
+    /// The passkey with this credential id, whoever owns it.
+    ///
+    /// The anonymous discovery path resolves an assertion by credential id
+    /// alone, so callers must take the account from the returned row and never
+    /// from the request.
+    pub async fn passkey_by_credential_id(
+        &self,
+        credential_id: &str,
+    ) -> Result<Option<passkey_credential::Model>, StoreError> {
+        Ok(passkey_credential::Entity::find()
+            .filter(passkey_credential::Column::CredentialId.eq(credential_id))
+            .one(&self.db)
+            .await?)
+    }
+
+    /// Removes one passkey of an account. Returns whether a row was removed.
+    ///
+    /// Scoped by account deliberately: the row id comes from the console, so a
+    /// guessed id must not reach another account's credential.
+    pub async fn passkey_remove(&self, id: i32, account_id: i32) -> Result<bool, StoreError> {
+        let result = passkey_credential::Entity::delete_many()
+            .filter(passkey_credential::Column::Id.eq(id))
+            .filter(passkey_credential::Column::AccountId.eq(account_id))
+            .exec(&self.db)
+            .await?;
+        Ok(result.rows_affected > 0)
+    }
+
+    /// Records that a passkey has just been used: when, and — when the
+    /// authenticator moved on — the refreshed credential.
+    ///
+    /// The counter lives inside the credential, and it is what the next
+    /// assertion's clone detection compares against, so the stored copy is
+    /// re-serialised whenever `webauthn-rs` says it changed. The instant is what
+    /// the Security panel shows as "last used".
+    pub async fn passkey_record_use(
+        &self,
+        id: i32,
+        credential: Option<&str>,
+        used_at: i64,
+    ) -> Result<(), StoreError> {
+        let mut update = passkey_credential::Entity::update_many()
+            .col_expr(
+                passkey_credential::Column::LastUsedAt,
+                Expr::value(Some(used_at)),
+            )
+            .filter(passkey_credential::Column::Id.eq(id));
+        if let Some(credential) = credential {
+            update = update.col_expr(
+                passkey_credential::Column::Credential,
+                Expr::value(credential.to_string()),
+            );
+        }
+        update.exec(&self.db).await?;
+        Ok(())
+    }
+
     // ----- browser sessions -----
 
     /// Records a new server-side session for an account.
@@ -835,7 +969,9 @@ impl Store {
     /// This is what the inactivity sweep must read: a session that only proved
     /// the password (or one that never reached `Strong`) must not keep a dormant
     /// account alive. Because the emailed-code proof lives as long as its
-    /// session, a live session with an `email_otp` row is a `Strong` one.
+    /// session, a live session with an `email_otp` row is a `Strong` one — and
+    /// so is one with a `passkey` row, which is the same thing proven by a
+    /// passkey assertion instead of a code (WVR-163).
     pub async fn strong_session_accounts(&self, now: i64) -> Result<HashSet<i32>, StoreError> {
         let live: Vec<(i32, i32)> = browser_session::Entity::find()
             .filter(browser_session::Column::InvalidatedAt.is_null())
@@ -852,7 +988,10 @@ impl Store {
         let session_ids: Vec<i32> = live.iter().map(|(_, session_id)| *session_id).collect();
         let proven: HashSet<i32> = auth_event::Entity::find()
             .filter(auth_event::Column::SessionId.is_in(session_ids))
-            .filter(auth_event::Column::Kind.eq(PROOF_EMAIL_OTP))
+            .filter(
+                auth_event::Column::Kind
+                    .is_in([PROOF_EMAIL_OTP.to_string(), PROOF_PASSKEY.to_string()]),
+            )
             .select_only()
             .column(auth_event::Column::SessionId)
             .into_tuple::<i32>()
