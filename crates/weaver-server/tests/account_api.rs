@@ -22,7 +22,7 @@ use weaver_server::account::inactivity;
 use weaver_server::account::password::BreachCheck;
 use weaver_server::account::router::router;
 use weaver_server::altcha::AltchaRuntime;
-use weaver_server::config::{AccountConfig, Config};
+use weaver_server::config::{AbuseConfig, AccountConfig, AltchaConfig, Config};
 use weaver_server::email::{Email, Mailbox, Mailer, MailerError, MailerIdentity, SendReceipt};
 use weaver_server::store::Store;
 
@@ -138,7 +138,22 @@ async fn setup_full(adjust: impl FnOnce(&mut AccountConfig), with_mailer: bool) 
     }
 }
 
+/// The relay config every test in this file runs against.
+///
+/// The proof of work is *real* work, and these tests solve it by brute force
+/// in-process: at the production cost each pairing ceremony spends tens of
+/// seconds in a CPU loop, and a whole test binary's worth of that on a contended
+/// CI runner outlives the pairing channel's 60 s wait for `Begin` — which is how
+/// the pairing tests came to fail with a broken pipe rather than a refusal. One
+/// iteration exercises the protocol perfectly well; `tests/altcha_api.rs` covers
+/// the real cost.
 fn base_config() -> Config {
+    let mut altcha: AltchaConfig = serde_json::from_str("{}").expect("altcha defaults");
+    altcha.default_cost = 1;
+    let mut abuse: AbuseConfig = serde_json::from_str("{}").expect("abuse defaults");
+    abuse.enabled = false;
+    abuse.altcha = Some(altcha);
+
     Config {
         tunnel_domain: "weaver.test".into(),
         admin_domain: "admin.test".into(),
@@ -157,7 +172,7 @@ fn base_config() -> Config {
         relay_ips: Vec::new(),
         setup_complete: false,
         email: Some(weaver_server::config::test_email_config()),
-        abuse: None,
+        abuse: Some(abuse),
         account: AccountConfig::default(),
     }
 }
