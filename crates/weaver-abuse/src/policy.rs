@@ -28,6 +28,13 @@ impl PolicyId {
     /// A credential login attempt (admin host account plane).
     pub const ACCOUNT_LOGIN: PolicyId = PolicyId("account-login");
 
+    /// A passkey ceremony (admin host account plane).
+    ///
+    /// Deliberately apart from the login budget: a passkey assertion is
+    /// cryptographic, so there is nothing to guess and this budget bounds
+    /// unauthenticated *work* rather than a guessing surface.
+    pub const ACCOUNT_PASSKEY: PolicyId = PolicyId("account-passkey");
+
     /// Resending a verification link (admin host account plane).
     pub const ACCOUNT_RESEND: PolicyId = PolicyId("account-resend");
 
@@ -66,6 +73,9 @@ impl ViewId {
     pub const ACCOUNT_SIGNUP: ViewId = ViewId("account-signup");
     /// A credential login attempt (admin host account plane).
     pub const ACCOUNT_LOGIN: ViewId = ViewId("account-login");
+    /// A passkey ceremony: signing in, stepping up, or managing credentials
+    /// (admin host account plane).
+    pub const ACCOUNT_PASSKEY: ViewId = ViewId("account-passkey");
     /// Resending a verification link (admin host account plane).
     pub const ACCOUNT_RESEND: ViewId = ViewId("account-resend");
     /// The pairing channel and its browser API (admin host).

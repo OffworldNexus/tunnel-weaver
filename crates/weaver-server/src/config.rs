@@ -335,6 +335,13 @@ pub struct AccountConfig {
     /// Per-network budget for login attempts.
     #[serde(default = "default_account_login_budget")]
     pub login: BudgetConfig,
+    /// Per-network budget for passkey ceremonies.
+    ///
+    /// A passkey is cryptographic — there is nothing to guess — so this budget
+    /// bounds unauthenticated work rather than a guessing surface, and it is far
+    /// looser than the login budget it once shared.
+    #[serde(default = "default_account_passkey_budget")]
+    pub passkey: BudgetConfig,
     /// Per-network budget for verification resends.
     #[serde(default = "default_account_resend_budget")]
     pub resend: BudgetConfig,
@@ -395,6 +402,7 @@ impl Default for AccountConfig {
             hibp_url: default_account_hibp_url(),
             signup: default_account_signup_budget(),
             login: default_account_login_budget(),
+            passkey: default_account_passkey_budget(),
             resend: default_account_resend_budget(),
             pair: default_account_pair_budget(),
             key_log_retention_days: default_account_key_log_retention_days(),
@@ -487,6 +495,20 @@ fn default_account_login_budget() -> BudgetConfig {
         burst: 30,
         refill_units: 30,
         refill_per_secs: 600,
+    }
+}
+
+/// Default passkey budget: a 300-request burst refilling at 300 per minute.
+///
+/// One passkey sign-in is a handful of requests — the field's offer, the
+/// ceremony, the finish — so a person cannot come near this; only a flood can.
+/// That is the point: an assertion cannot be guessed, so what is bounded here is
+/// work, not a secret.
+fn default_account_passkey_budget() -> BudgetConfig {
+    BudgetConfig {
+        burst: 300,
+        refill_units: 300,
+        refill_per_secs: 60,
     }
 }
 
@@ -912,6 +934,28 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The passkey budget bounds unauthenticated work, not a secret: an
+    /// assertion cannot be guessed, so it must be far looser than the login
+    /// budget that password attempts share with a person's own sign-ins
+    /// (WVR-163).
+    #[test]
+    fn the_passkey_budget_is_laxer_than_the_login_budget() {
+        let account = AccountConfig::default();
+        assert!(account.passkey.burst > account.login.burst);
+        let login_per_sec =
+            account.login.refill_units as f64 / account.login.refill_per_secs as f64;
+        let passkey_per_sec =
+            account.passkey.refill_units as f64 / account.passkey.refill_per_secs as f64;
+        assert!(
+            passkey_per_sec > login_per_sec * 10.0,
+            "the passkey budget must be a lot looser, not merely different"
+        );
+        // An absent key falls back to the same default, so a config written
+        // before WVR-163 gets the loose budget rather than the login's.
+        let absent: AccountConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(absent.passkey, account.passkey);
+    }
 
     #[test]
     fn key_log_retention_defaults_to_a_year() {

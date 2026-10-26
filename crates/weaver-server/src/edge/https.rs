@@ -276,6 +276,54 @@ where
     resp
 }
 
+/// The budgeted view a request targets.
+///
+/// Views are named here, at the edge, because this is the single routing
+/// boundary every host passes through: no handler can forget to declare what it
+/// is. The budgets themselves live in [`crate::abuse`] and the operator's
+/// config; only routes with one of their own are named, and everything else on
+/// the relay's web surface is [`ViewId::RELAY_WEB`] (budgeted only when the
+/// operator arms `abuse`).
+fn view_for(surface: Surface, path: &str) -> ViewId {
+    let admin = surface.host == Host::Admin;
+    match surface.host {
+        Host::Tunneled => ViewId::TUNNEL,
+        Host::TunnelRoot if path == "/altcha/challenge" => ViewId::ALTCHA_CHALLENGE,
+        Host::TunnelRoot if path == "/altcha/verify" => ViewId::ALTCHA_VERIFY,
+        _ if admin && path == "/api/account/signup" => ViewId::ACCOUNT_SIGNUP,
+        _ if admin && path == "/api/account/login" => ViewId::ACCOUNT_LOGIN,
+        // Checking an emailed code guesses digits behind the same password guess
+        // that opened the session, so it shares the login budget rather than
+        // minting a new one (WVR-167).
+        _ if admin && path == "/api/account/login/verify" => ViewId::ACCOUNT_LOGIN,
+        // A re-sent code is an email-keyed send like a verification resend.
+        _ if admin && path == "/api/account/login/resend" => ViewId::ACCOUNT_RESEND,
+        // A password change verifies a guessed credential behind a session, so it
+        // is the same guessing surface as a login attempt and shares that budget
+        // rather than minting a new one.
+        _ if admin && path == "/api/account/password" => ViewId::ACCOUNT_LOGIN,
+        // Every passkey endpoint: the anonymous ceremony the sign-in field offers
+        // and the button presses, the step-up, and the account's own credential
+        // management. A passkey is cryptographic — there is nothing to guess — so
+        // these get their own, far looser budget rather than the login's, and one
+        // that serves instead of refusing when the budget store hiccups: what it
+        // bounds is work, not a secret (WVR-163).
+        _ if admin && path.starts_with("/api/account/passkey") => ViewId::ACCOUNT_PASSKEY,
+        _ if admin && path == "/api/account/resend" => ViewId::ACCOUNT_RESEND,
+        // The pairing channel charges the pairing budget itself, once the proof of
+        // work is in: a throttled machine is told so on the channel rather than by
+        // a bare 429 on the upgrade.
+        _ if admin && path == weaver_proto::pair::PAIR_CHANNEL_PATH => ViewId::RELAY_WEB,
+        // The pairing browser API, behind its own fail-closed budget.
+        _ if admin && path.starts_with("/api/account/pair/") => ViewId::ACCOUNT_PAIR,
+        // The reset request is an unauthenticated, email-keyed, enumeration-safe
+        // action: exactly the same situation as a verification resend, so it
+        // shares that budget rather than minting a new one.
+        _ if admin && path == "/api/account/reset/request" => ViewId::ACCOUNT_RESEND,
+        _ => ViewId::RELAY_WEB,
+    }
+}
+
 /// Dispatches an HTTPS request based on SNI and Host header validation.
 ///
 /// `conn_bytes` is the socket-level counter for this visitor connection; when
@@ -377,56 +425,9 @@ pub async fn handle_https_request(
     };
 
     if let Some(surface) = surface {
-        // The ALTCHA API routes on the apex carry their own budgets, so the
-        // view is chosen before the guard runs.
-        let path = req.uri().path();
-        let view = if surface.host == Host::Tunneled {
-            ViewId::TUNNEL
-        } else if surface.host == Host::TunnelRoot && path == "/altcha/challenge" {
-            ViewId::ALTCHA_CHALLENGE
-        } else if surface.host == Host::TunnelRoot && path == "/altcha/verify" {
-            ViewId::ALTCHA_VERIFY
-        } else if surface.host == Host::Admin && path == "/api/account/signup" {
-            ViewId::ACCOUNT_SIGNUP
-        } else if surface.host == Host::Admin && path == "/api/account/login" {
-            ViewId::ACCOUNT_LOGIN
-        } else if surface.host == Host::Admin && path == "/api/account/login/verify" {
-            // Checking an emailed code guesses digits behind the same password
-            // guess that opened the session, so it shares the login budget
-            // rather than minting a new one (WVR-167).
-            ViewId::ACCOUNT_LOGIN
-        } else if surface.host == Host::Admin && path == "/api/account/login/resend" {
-            // A re-sent code is an email-keyed send like a verification resend.
-            ViewId::ACCOUNT_RESEND
-        } else if surface.host == Host::Admin && path == "/api/account/password" {
-            // A password change verifies a guessed credential behind a session, so
-            // it is the same guessing surface as a login attempt and shares that
-            // budget rather than minting a new one.
-            ViewId::ACCOUNT_LOGIN
-        } else if surface.host == Host::Admin && path.starts_with("/api/account/passkey/") {
-            // A passkey assertion guesses a credential the way a password sign-in
-            // guesses a password, and its step-up does so from behind a session —
-            // both are the same guessing surface, and both are cheap, so they
-            // share the login budget rather than minting a new one (WVR-163).
-            ViewId::ACCOUNT_LOGIN
-        } else if surface.host == Host::Admin && path == "/api/account/resend" {
-            ViewId::ACCOUNT_RESEND
-        } else if surface.host == Host::Admin && path == weaver_proto::pair::PAIR_CHANNEL_PATH {
-            // The pairing channel charges the pairing budget itself, once the
-            // proof of work is in: a throttled machine is told so on the
-            // channel rather than by a bare 429 on the upgrade.
-            ViewId::RELAY_WEB
-        } else if surface.host == Host::Admin && path.starts_with("/api/account/pair/") {
-            // The pairing browser API, behind its own fail-closed budget.
-            ViewId::ACCOUNT_PAIR
-        } else if surface.host == Host::Admin && path == "/api/account/reset/request" {
-            // The reset request is an unauthenticated, email-keyed, enumeration-safe
-            // action: exactly the same situation as a verification resend, so it
-            // shares that budget rather than minting a new one.
-            ViewId::ACCOUNT_RESEND
-        } else {
-            ViewId::RELAY_WEB
-        };
+        // The view is what selects the budget, so it is chosen before the guard
+        // runs.
+        let view = view_for(surface, req.uri().path());
         let ctx = crate::abuse::context(
             surface,
             &req,
@@ -461,7 +462,18 @@ pub async fn handle_https_request(
                 policy = policy.as_str(),
                 "safety pipeline budget store unavailable; serving degraded"
             ),
-            Decision::Allow | Decision::Unavailable { .. } => {}
+            // Fail-closed: the request is refused with a 503, so it must say so
+            // here — an unexplained 503 on a budgeted route is otherwise
+            // invisible in the journal, which is how a passkey sign-in was
+            // mistaken for a hang.
+            Decision::Unavailable { policy } => warn!(
+                hostname = %host_lower,
+                visitor = %remote_addr.ip(),
+                path = %bounded_path(req.uri().path()),
+                policy = policy.as_str(),
+                "safety pipeline budget store unavailable; refusing"
+            ),
+            Decision::Allow => {}
         }
         if let Some(refusal) = Refusal::from_decision(decision) {
             return Ok(refusal_response(refusal, include_hsts));
@@ -906,4 +918,76 @@ pub async fn run_https_server_full(
 
     tracker.close();
     tracker.wait().await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every route with a budget of its own is named by the edge; anything else
+    /// on the relay's web surface falls to `relay-web`.
+    #[test]
+    fn views_name_their_own_budgets() {
+        let admin = Surface::https(Host::Admin);
+        for (path, view) in [
+            ("/api/account/signup", ViewId::ACCOUNT_SIGNUP),
+            ("/api/account/login", ViewId::ACCOUNT_LOGIN),
+            ("/api/account/login/verify", ViewId::ACCOUNT_LOGIN),
+            ("/api/account/password", ViewId::ACCOUNT_LOGIN),
+            ("/api/account/login/resend", ViewId::ACCOUNT_RESEND),
+            ("/api/account/resend", ViewId::ACCOUNT_RESEND),
+            ("/api/account/reset/request", ViewId::ACCOUNT_RESEND),
+            ("/api/account/pair/begin", ViewId::ACCOUNT_PAIR),
+            ("/app", ViewId::RELAY_WEB),
+        ] {
+            assert_eq!(view_for(admin, path), view, "{path}");
+        }
+        // The pairing channel charges its budget itself, once the proof is in.
+        assert_eq!(
+            view_for(admin, weaver_proto::pair::PAIR_CHANNEL_PATH),
+            ViewId::RELAY_WEB
+        );
+    }
+
+    /// A passkey ceremony must not be charged to the password login's budget:
+    /// it is cryptographic, so what it bounds is work rather than a guessing
+    /// surface, and the two must never share a bucket (WVR-163).
+    #[test]
+    fn every_passkey_endpoint_has_its_own_budget() {
+        let admin = Surface::https(Host::Admin);
+        for path in [
+            "/api/account/passkey/begin",
+            "/api/account/passkey/finish",
+            "/api/account/passkey/step-up/begin",
+            "/api/account/passkey/step-up/finish",
+            "/api/account/passkeys",
+            "/api/account/passkeys/begin",
+            "/api/account/passkeys/finish",
+            "/api/account/passkeys/7/remove",
+        ] {
+            assert_eq!(view_for(admin, path), ViewId::ACCOUNT_PASSKEY, "{path}");
+        }
+    }
+
+    /// The other surfaces keep their views: proxied traffic is unbudgeted, the
+    /// apex's ALTCHA API has its own budget, and the admin plane's budgets are
+    /// never reached from another host.
+    #[test]
+    fn other_surfaces_keep_their_views() {
+        let apex = Surface::https(Host::TunnelRoot);
+        assert_eq!(
+            view_for(apex, "/altcha/challenge"),
+            ViewId::ALTCHA_CHALLENGE
+        );
+        assert_eq!(view_for(apex, "/altcha/verify"), ViewId::ALTCHA_VERIFY);
+        assert_eq!(view_for(apex, "/api/account/login"), ViewId::RELAY_WEB);
+        assert_eq!(
+            view_for(Surface::https(Host::Tunneled), "/api/account/login"),
+            ViewId::TUNNEL
+        );
+        assert_eq!(
+            view_for(Surface::cleartext(), "/api/account/login"),
+            ViewId::RELAY_WEB
+        );
+    }
 }
