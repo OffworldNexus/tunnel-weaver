@@ -21,8 +21,8 @@ use std::collections::{HashMap, HashSet};
 use super::entity::{
     account, auth_event, browser_session, domain, email_identity, email_verification,
     login_challenge, machine, machine_key_log, passkey_credential, password_credential,
-    password_reset_token, pending_registration, person, service, usage_daily, usage_live,
-    verification_token,
+    password_reset_token, pending_registration, person, service, totp_credential, usage_daily,
+    usage_live, verification_token,
 };
 use super::{Store, StoreError};
 
@@ -40,6 +40,14 @@ const PROOF_EMAIL_OTP: &str = "email_otp";
 /// `Strong` as one that entered an emailed code, so the inactivity sweep reads
 /// both (`strong_session_accounts`).
 const PROOF_PASSKEY: &str = "passkey";
+
+/// `auth_event.kind` for the authenticator-app proof (WVR-166).
+///
+/// Same rule as [`PROOF_EMAIL_OTP`]: the literal is duplicated on purpose, and
+/// `account::auth` asserts the pair. A code from an authenticator app proves the
+/// same thing an emailed code does — possession of the second factor — so the
+/// inactivity sweep reads it too (`strong_session_accounts`).
+const PROOF_TOTP: &str = "totp";
 
 /// Caller-supplied fields for a new in-flight signup.
 #[derive(Debug, Clone)]
@@ -112,6 +120,22 @@ pub struct NewPasskey {
     /// The announced transports, comma-joined; empty when none were announced.
     pub transports: String,
     pub name: String,
+    pub created_at: i64,
+}
+
+/// Caller-supplied fields for a freshly begun authenticator-app enrolment
+/// (WVR-166).
+///
+/// `secret` is already sealed: the store never handles a plaintext shared
+/// secret, and cannot tell a sealed one from any other string. `name` is the
+/// person's own label — it is what the app displays beside the issuer and what
+/// the console lists the app under — and may be empty.
+#[derive(Debug, Clone)]
+pub struct NewTotpCredential {
+    pub account_id: i32,
+    pub name: String,
+    /// The sealed shared secret (`nonce ‖ ciphertext`, hex).
+    pub secret: String,
     pub created_at: i64,
 }
 
@@ -866,6 +890,184 @@ impl Store {
         Ok(())
     }
 
+    // ----- authenticator apps (WVR-166) -----
+
+    /// Stores a freshly begun authenticator-app enrolment.
+    ///
+    /// Always an insert: an account may hold as many apps as it likes, and there
+    /// is nothing to collide on — the secret is random and is never looked up by
+    /// value. The row starts unconfirmed, so it is neither a way in nor a second
+    /// factor until a code it generated has been verified.
+    pub async fn totp_credential_create(
+        &self,
+        credential: NewTotpCredential,
+    ) -> Result<totp_credential::Model, StoreError> {
+        Ok(totp_credential::ActiveModel {
+            account_id: Set(credential.account_id),
+            name: Set(credential.name),
+            secret: Set(credential.secret),
+            created_at: Set(credential.created_at),
+            confirmed_at: Set(None),
+            last_used_at: Set(None),
+            last_used_step: Set(None),
+            ..Default::default()
+        }
+        .insert(&self.db)
+        .await?)
+    }
+
+    /// One app of an account, by id. `None` when the id is not theirs.
+    ///
+    /// Scoped by account like every other single-row read here: the id comes
+    /// from the console, so a guessed one must not reach another account's app.
+    pub async fn totp_credential(
+        &self,
+        id: i32,
+        account_id: i32,
+    ) -> Result<Option<totp_credential::Model>, StoreError> {
+        Ok(totp_credential::Entity::find()
+            .filter(totp_credential::Column::Id.eq(id))
+            .filter(totp_credential::Column::AccountId.eq(account_id))
+            .one(&self.db)
+            .await?)
+    }
+
+    /// Every *confirmed* app of an account, oldest first.
+    ///
+    /// Pending enrolments are deliberately absent: an app that has never proved
+    /// itself is not something the console shows, and it is not something a code
+    /// can be verified against either. What lists them is the account sweep,
+    /// which deletes the old ones ([`Store::totp_pending_sweep`]).
+    pub async fn totp_confirmed_for_account(
+        &self,
+        account_id: i32,
+    ) -> Result<Vec<totp_credential::Model>, StoreError> {
+        Ok(totp_credential::Entity::find()
+            .filter(totp_credential::Column::AccountId.eq(account_id))
+            .filter(totp_credential::Column::ConfirmedAt.is_not_null())
+            .order_by_asc(totp_credential::Column::CreatedAt)
+            .order_by_asc(totp_credential::Column::Id)
+            .all(&self.db)
+            .await?)
+    }
+
+    /// How many *confirmed* apps an account holds.
+    ///
+    /// This is what the situation reads to decide whether *entering a code from
+    /// an authenticator app* can be offered as a way up (both in the `me` stream
+    /// and in a refusal's headers), so it is one indexed count on a hot path. A
+    /// pending enrolment must not count: it is not a factor yet.
+    pub async fn totp_confirmed_count_for(&self, account_id: i32) -> Result<u64, StoreError> {
+        Ok(totp_credential::Entity::find()
+            .filter(totp_credential::Column::AccountId.eq(account_id))
+            .filter(totp_credential::Column::ConfirmedAt.is_not_null())
+            .count(&self.db)
+            .await?)
+    }
+
+    /// Confirms a pending enrolment, atomically. Returns whether it was pending.
+    ///
+    /// Conditional on `confirmed_at IS NULL`, so the same row cannot be confirmed
+    /// twice (which would also let one code enrol and then sign in). The step
+    /// that proved the app is recorded as used in the same write: a code that
+    /// enrolled an app has been accepted, and must not be accepted again.
+    pub async fn totp_confirm(
+        &self,
+        id: i32,
+        account_id: i32,
+        now: i64,
+        step: i64,
+    ) -> Result<bool, StoreError> {
+        let result = totp_credential::Entity::update_many()
+            .col_expr(totp_credential::Column::ConfirmedAt, Expr::value(Some(now)))
+            .col_expr(totp_credential::Column::LastUsedAt, Expr::value(Some(now)))
+            .col_expr(
+                totp_credential::Column::LastUsedStep,
+                Expr::value(Some(step)),
+            )
+            .filter(totp_credential::Column::Id.eq(id))
+            .filter(totp_credential::Column::AccountId.eq(account_id))
+            .filter(totp_credential::Column::ConfirmedAt.is_null())
+            .exec(&self.db)
+            .await?;
+        Ok(result.rows_affected == 1)
+    }
+
+    /// Records the accepted code of an app, atomically. Returns whether this
+    /// step was still fresh.
+    ///
+    /// The whole replay guard: the update only applies when the stored step is
+    /// absent or behind the one being accepted, so two concurrent submissions of
+    /// the same code cannot both succeed, and a code an attacker observed is
+    /// refused — across a restart, because the step is a column and not memory.
+    pub async fn totp_record_use(&self, id: i32, step: i64, now: i64) -> Result<bool, StoreError> {
+        let result = totp_credential::Entity::update_many()
+            .col_expr(
+                totp_credential::Column::LastUsedStep,
+                Expr::value(Some(step)),
+            )
+            .col_expr(totp_credential::Column::LastUsedAt, Expr::value(Some(now)))
+            .filter(totp_credential::Column::Id.eq(id))
+            .filter(
+                Condition::any()
+                    .add(totp_credential::Column::LastUsedStep.is_null())
+                    .add(totp_credential::Column::LastUsedStep.lt(step)),
+            )
+            .exec(&self.db)
+            .await?;
+        Ok(result.rows_affected == 1)
+    }
+
+    /// Removes one app of an account. Returns whether a row was removed.
+    ///
+    /// Scoped by account deliberately, exactly like `passkey_remove`: the row id
+    /// comes from the console, so a guessed id must not reach another account.
+    pub async fn totp_remove(&self, id: i32, account_id: i32) -> Result<bool, StoreError> {
+        let result = totp_credential::Entity::delete_many()
+            .filter(totp_credential::Column::Id.eq(id))
+            .filter(totp_credential::Column::AccountId.eq(account_id))
+            .exec(&self.db)
+            .await?;
+        Ok(result.rows_affected > 0)
+    }
+
+    /// Deletes enrolments that were begun before `cutoff` and never confirmed;
+    /// returns the count.
+    ///
+    /// A pending row is what an abandoned dialog leaves behind: it is not a
+    /// factor, it is not listed, and nothing can be verified against it, so the
+    /// only thing it can still do is sit there holding a sealed secret. Only
+    /// *unconfirmed* rows are dropped — a confirmed app's secret is live, and
+    /// deleting it would be revoking a second factor nobody asked to revoke.
+    pub async fn totp_pending_sweep(&self, cutoff: i64) -> Result<u64, StoreError> {
+        let result = totp_credential::Entity::delete_many()
+            .filter(totp_credential::Column::ConfirmedAt.is_null())
+            .filter(totp_credential::Column::CreatedAt.lt(cutoff))
+            .exec(&self.db)
+            .await?;
+        Ok(result.rows_affected)
+    }
+
+    /// How many `auth_event` rows of one kind a session has accumulated since
+    /// `since`.
+    ///
+    /// One indexed count (`idx_auth_event_session_kind`), and the wrong-code cap
+    /// on the authenticator-app step reads it scoped to the session — never to
+    /// the account — so a guesser cannot lock the owner out.
+    pub async fn auth_event_count_since(
+        &self,
+        session_id: i32,
+        kind: &str,
+        since: i64,
+    ) -> Result<u64, StoreError> {
+        Ok(auth_event::Entity::find()
+            .filter(auth_event::Column::SessionId.eq(session_id))
+            .filter(auth_event::Column::Kind.eq(kind))
+            .filter(auth_event::Column::OccurredAt.gte(since))
+            .count(&self.db)
+            .await?)
+    }
+
     // ----- browser sessions -----
 
     /// Records a new server-side session for an account.
@@ -971,7 +1173,8 @@ impl Store {
     /// account alive. Because the emailed-code proof lives as long as its
     /// session, a live session with an `email_otp` row is a `Strong` one — and
     /// so is one with a `passkey` row, which is the same thing proven by a
-    /// passkey assertion instead of a code (WVR-163).
+    /// passkey assertion instead of a code (WVR-163), or a `totp` row, the same
+    /// thing proven by a code from an authenticator app (WVR-166).
     pub async fn strong_session_accounts(&self, now: i64) -> Result<HashSet<i32>, StoreError> {
         let live: Vec<(i32, i32)> = browser_session::Entity::find()
             .filter(browser_session::Column::InvalidatedAt.is_null())
@@ -988,10 +1191,11 @@ impl Store {
         let session_ids: Vec<i32> = live.iter().map(|(_, session_id)| *session_id).collect();
         let proven: HashSet<i32> = auth_event::Entity::find()
             .filter(auth_event::Column::SessionId.is_in(session_ids))
-            .filter(
-                auth_event::Column::Kind
-                    .is_in([PROOF_EMAIL_OTP.to_string(), PROOF_PASSKEY.to_string()]),
-            )
+            .filter(auth_event::Column::Kind.is_in([
+                PROOF_EMAIL_OTP.to_string(),
+                PROOF_PASSKEY.to_string(),
+                PROOF_TOTP.to_string(),
+            ]))
             .select_only()
             .column(auth_event::Column::SessionId)
             .into_tuple::<i32>()

@@ -7,9 +7,11 @@
 //!
 //! WVR-167 defines the password and emailed-code kinds; WVR-163 adds the two a
 //! passkey assertion writes — the credential's possession, and the
-//! user-verification it performed moments ago. WVR-164/165/166 (backup codes,
-//! "turn email OTP off", authenticator app) add kinds here and a `StepKind` to
-//! reach them — they never re-architect the level derivation.
+//! user-verification it performed moments ago. WVR-166 adds the authenticator
+//! app's code, which is the emailed code's twin: the same thing proven — that
+//! the person holds the second factor — reached without the mailbox.
+//! WVR-164/165 (backup codes, "turn email OTP off") add kinds here and a
+//! `StepKind` to reach them — they never re-architect the level derivation.
 
 /// Something the person demonstrated on this session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -20,6 +22,12 @@ pub enum ProofKind {
     Password,
     /// An emailed one-time code was accepted — the second factor.
     EmailOtp,
+    /// A code from an authenticator app was accepted (WVR-166) — the second
+    /// factor again, reached through a shared secret instead of the mailbox.
+    /// The two are interchangeable inputs to the same level: a session that
+    /// entered an app's code right after signing in is `Certain`, exactly as one
+    /// that entered an emailed code, and falls to `Strong` on the same clock.
+    Totp,
     /// A passkey assertion was accepted (WVR-163): the *possession* half, "this
     /// person holds the credential". It is the same thing the emailed code
     /// proves, so it lives as long as the session too.
@@ -34,9 +42,10 @@ pub enum ProofKind {
 
 impl ProofKind {
     /// Every kind the level derivation knows about.
-    pub const ALL: [ProofKind; 4] = [
+    pub const ALL: [ProofKind; 5] = [
         ProofKind::Password,
         ProofKind::EmailOtp,
+        ProofKind::Totp,
         ProofKind::Passkey,
         ProofKind::PasskeyUserVerification,
     ];
@@ -46,6 +55,7 @@ impl ProofKind {
         match self {
             ProofKind::Password => "password",
             ProofKind::EmailOtp => "email_otp",
+            ProofKind::Totp => "totp",
             ProofKind::Passkey => "passkey",
             ProofKind::PasskeyUserVerification => "passkey_user_verification",
         }
@@ -56,13 +66,14 @@ impl ProofKind {
     /// The short kinds (the password, and a passkey's user verification) only
     /// distinguish `Certain` from `Strong`, and they are the window a step-up is
     /// good for (`account.confirm_window_secs`). The long kinds (the emailed
-    /// code, and a passkey's possession) live as long as the session they were
-    /// given on, so a completed second factor holds for the whole session
-    /// rather than demanding a mid-session re-step-up.
+    /// code, a code from an authenticator app, and a passkey's possession) live
+    /// as long as the session they were given on, so a completed second factor
+    /// holds for the whole session rather than demanding a mid-session
+    /// re-step-up.
     pub const fn max_age_secs(self, session_ttl_secs: i64, confirm_window_secs: i64) -> i64 {
         match self {
             ProofKind::Password | ProofKind::PasskeyUserVerification => confirm_window_secs,
-            ProofKind::EmailOtp | ProofKind::Passkey => session_ttl_secs,
+            ProofKind::EmailOtp | ProofKind::Totp | ProofKind::Passkey => session_ttl_secs,
         }
     }
 }
@@ -94,6 +105,17 @@ mod tests {
         assert_eq!(
             ProofKind::PasskeyUserVerification.max_age_secs(86_400, 300),
             300
+        );
+    }
+
+    #[test]
+    fn an_authenticator_code_lives_as_long_as_an_emailed_one() {
+        // The whole point of the twin: entering one after signing in is
+        // `Certain` and decays to `Strong` on the same clock as the other.
+        assert_eq!(ProofKind::Totp.max_age_secs(86_400, 300), 86_400);
+        assert_eq!(
+            ProofKind::Totp.max_age_secs(86_400, 300),
+            ProofKind::EmailOtp.max_age_secs(86_400, 300)
         );
     }
 }

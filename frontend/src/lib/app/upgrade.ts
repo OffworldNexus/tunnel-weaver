@@ -38,6 +38,9 @@ export function stepPage(step: Step): '/(auth)/sign-in' | '/(auth)/verify-code' 
 		case 'login':
 			return '/(auth)/sign-in';
 		case 'verify_email_otp':
+		case 'verify_totp':
+			// One page, two fields: the code page asks for whichever factor the
+			// relay is offering, and offers the other one (WVR-166).
 			return '/(auth)/verify-code';
 		case 'confirm_password':
 		case 'assert_passkey':

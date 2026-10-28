@@ -743,6 +743,18 @@ async fn main() {
                 .as_ref()
                 .map(|cfg| cfg.usage_retention_secs)
                 .unwrap_or_else(weaver_server::config::default_usage_retention);
+            // The account block is operator-owned, and it holds the key that
+            // seals authenticator-app secrets (WVR-166). Rebuilding it from the
+            // defaults here — as this used to — would make every enrolled app
+            // unreadable, so it is carried forward, and the key is generated
+            // when the install predates it.
+            let mut account = existing_config
+                .as_ref()
+                .map(|cfg| cfg.account.clone())
+                .unwrap_or_default();
+            if account.totp_key.is_empty() {
+                account.totp_key = weaver_server::config::TotpKey::generate();
+            }
 
             let root_ca_pem = match acme_root_ca {
                 Some(path) => match std::fs::read_to_string(&path) {
@@ -787,7 +799,7 @@ async fn main() {
                 setup_complete: true,
                 email: None,
                 abuse: None,
-                account: Default::default(),
+                account,
             };
 
             match email_decision {

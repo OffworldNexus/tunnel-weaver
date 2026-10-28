@@ -6,7 +6,7 @@
 //! ```json
 //! { "level": "basic",
 //!   "paths": [{ "to": "strong", "options": [[{ "step": "verify_email_otp", "reaches": "strong" }]] }],
-//!   "me": { "id": 1, "name": "…", "email": "…", "has_password": true } }
+//!   "me": { "id": 1, "name": "…", "email": "…" } }
 //! ```
 //!
 //! The console is told a *level*, never a policy: `paths` names, for every level
@@ -63,8 +63,8 @@ pub fn session_changed(live: &LiveHub, session: SessionContext) {
 
 /// Announces that every session of an account must re-read the account's own
 /// state: a password change or reset retires them all, a deletion takes them
-/// with it, and enrolling or removing a passkey changes which ways up they have
-/// (WVR-167, WVR-163).
+/// with it, and enrolling or removing a passkey (WVR-163) or an authenticator
+/// app (WVR-166) changes which ways up they have.
 pub fn sessions_changed(live: &LiveHub, account_id: i32) {
     live.publish(Change::visible_to(Viewer::Account(account_id)).entity(Entity::Session));
 }
@@ -91,6 +91,9 @@ struct Watched {
     /// Whether the account holds passkeys: what decides whether the
     /// `assert_passkey` step is part of the ways up it is told about.
     has_passkeys: bool,
+    /// Whether the account holds a confirmed authenticator app (WVR-166), which
+    /// decides whether `verify_totp` is part of those ways up.
+    has_totp: bool,
     me: Value,
 }
 
@@ -100,6 +103,7 @@ impl Watched {
         Situation {
             account_id: Some(self.session.account_id),
             has_passkeys: self.has_passkeys,
+            has_totp: self.has_totp,
             proofs: self.proofs.clone(),
             now,
             session_ttl_secs: self.session_ttl_secs,
@@ -133,10 +137,6 @@ async fn load(
         .await?
         .map(|identity| identity.email)
         .unwrap_or_default();
-    // Drives the Security page's "Password is set" state: a live credential
-    // exists for every email/password account today, because a password stays
-    // the recovery anchor even for an account that signs in with passkeys.
-    let has_password = rt.store.password_current_for(account.id).await?.is_some();
     Ok(Some(Watched {
         session,
         ends_at: row.expires_at,
@@ -147,11 +147,11 @@ async fn load(
         // registration or a removal reaches the stream through the same
         // session change that reloads everything else.
         has_passkeys: situation.has_passkeys,
+        has_totp: situation.has_totp,
         me: json!({
             "id": account.id,
             "name": account.name,
             "email": email,
-            "has_password": has_password,
         }),
     }))
 }
@@ -172,6 +172,7 @@ fn state(watched: Option<&Watched>, now: i64) -> (Value, Option<i64>) {
         let situation = Situation {
             account_id: None,
             has_passkeys: false,
+            has_totp: false,
             proofs: BTreeMap::new(),
             now,
             session_ttl_secs: 0,

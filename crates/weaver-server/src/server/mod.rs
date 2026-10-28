@@ -84,7 +84,7 @@ pub async fn run_server(
     let store = Store::open(&db_path).await?;
 
     // 3. Load and validate configuration
-    let config = match Config::load(&store).await {
+    let mut config = match Config::load(&store).await {
         Ok(cfg) => cfg,
         Err(ConfigError::MissingKeys(keys)) => return Err(ServerError::MissingConfig(keys)),
         Err(ConfigError::ValidationFailed(issues)) => {
@@ -97,6 +97,25 @@ pub async fn run_server(
             return Err(ServerError::Store(StoreError::InvalidPath(msg)));
         }
     };
+
+    // An install upgraded from before WVR-166 has no key to seal authenticator
+    // app secrets with. Generating one here — rather than refusing to serve, or
+    // leaving enrolment unavailable — is what keeps the feature working on a
+    // deployment nobody re-ran `setup` on; the warning is the operator's only
+    // cue to keep it with the rest of the deployment's state, because losing it
+    // makes every enrolled app unreadable.
+    match config.ensure_totp_key(&store).await {
+        Ok(true) => warn!(
+            "generated a new account.totp_key for authenticator apps; keep it with the \
+             deployment's state, or enrolled apps will stop working"
+        ),
+        Ok(false) => {}
+        Err(error) => warn!(
+            %error,
+            "the generated account.totp_key could not be persisted; authenticator apps \
+             enrolled before the next restart will stop working"
+        ),
+    }
 
     info!(
         tunnel_domain = %config.tunnel_domain,

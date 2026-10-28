@@ -67,6 +67,9 @@ async fn references_point_where_the_model_says() {
         // challenge cascades with its session.
         ("auth_event", vec!["account"]),
         ("login_challenge", vec!["browser_session"]),
+        // WVR-166: an account may hold as many authenticator apps as it likes,
+        // and they go when it goes.
+        ("totp_credential", vec!["account"]),
     ] {
         let mut found: Vec<String> = rows(
             &store,
@@ -92,6 +95,7 @@ async fn references_point_where_the_model_says() {
         "idx_service_machine_id_name",
         "idx_machine_key_log_retired_at",
         "idx_altcha_proof_public_key_nonce",
+        "idx_totp_credential_account_id",
     ] {
         assert_eq!(
             rows(

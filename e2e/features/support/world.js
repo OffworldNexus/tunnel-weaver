@@ -18,6 +18,8 @@ class WeaverWorld extends World {
   paired = {};
   /** Every request URL the page issued, so a handle leak can be disproved. */
   requestUrls = [];
+  /** The base32 setup keys read from the enrolment dialog, by app name (WVR-166). */
+  appSecrets = {};
   /** The CDP session driving this scenario's virtual authenticator (WVR-163). */
   cdp;
   /** That authenticator's id, for the presence toggle below. */

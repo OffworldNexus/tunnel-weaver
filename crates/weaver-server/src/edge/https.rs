@@ -296,6 +296,11 @@ fn view_for(surface: Surface, path: &str) -> ViewId {
         // that opened the session, so it shares the login budget rather than
         // minting a new one (WVR-167).
         _ if admin && path == "/api/account/login/verify" => ViewId::ACCOUNT_LOGIN,
+        // An authenticator app's code is the same guess, one factor over: same
+        // budget, and it additionally carries the wrong-code cap of its own
+        // (WVR-166). Enrolling and managing apps is authenticated work with
+        // nothing to guess, so it stays on the relay-web budget.
+        _ if admin && path == "/api/account/login/totp" => ViewId::ACCOUNT_LOGIN,
         // A re-sent code is an email-keyed send like a verification resend.
         _ if admin && path == "/api/account/login/resend" => ViewId::ACCOUNT_RESEND,
         // A password change verifies a guessed credential behind a session, so it
@@ -933,6 +938,7 @@ mod tests {
             ("/api/account/signup", ViewId::ACCOUNT_SIGNUP),
             ("/api/account/login", ViewId::ACCOUNT_LOGIN),
             ("/api/account/login/verify", ViewId::ACCOUNT_LOGIN),
+            ("/api/account/login/totp", ViewId::ACCOUNT_LOGIN),
             ("/api/account/password", ViewId::ACCOUNT_LOGIN),
             ("/api/account/login/resend", ViewId::ACCOUNT_RESEND),
             ("/api/account/resend", ViewId::ACCOUNT_RESEND),

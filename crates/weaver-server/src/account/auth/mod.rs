@@ -9,10 +9,12 @@
 //!   password", `Strong` is "the second factor is alive".
 //! - [`proof`]: the [`ProofKind`] set and each kind's lifetime. WVR-167 uses
 //!   `password` and `email_otp`; WVR-163 adds the two a passkey assertion
-//!   writes. WVR-164/165/166 add kinds, never a redesign.
+//!   writes; WVR-166 adds `totp`, the authenticator app's code. WVR-164/165 add
+//!   kinds, never a redesign.
 //! - [`paths`]: the [`AuthPath`] trait — *how* one authenticates, the level it
-//!   currently grants and the steps it offers to climb. Two concrete paths
-//!   exist: password + emailed code, and passkeys (WVR-163).
+//!   currently grants and the steps it offers to climb. Three concrete paths
+//!   exist: password + second factor (an emailed code, or one from an
+//!   authenticator app), and passkeys (WVR-163).
 //! - [`manager`]: the per-request [`AuthManager`], sole owner of the audit
 //!   trail (the `auth_event` rows that are also the level's source) and the
 //!   session plumbing.
@@ -44,7 +46,7 @@ pub use proof::ProofKind;
 /// The kind of an `auth_event` row.
 ///
 /// The rows are simultaneously the audit trail and the raw material the level
-/// is derived from: the `password`, `email_otp`, `passkey` and
+/// is derived from: the `password`, `email_otp`, `totp`, `passkey` and
 /// `passkey_user_verification` kinds are proofs (see [`ProofKind`]), the rest
 /// are recorded for the record's sake. Adding a kind is a value, not a
 /// migration.
@@ -63,6 +65,12 @@ pub enum EventKind {
     EmailOtp,
     /// An emailed code was refused (wrong, expired or attempt-capped).
     EmailOtpFailed,
+    /// A code from an authenticator app was accepted (WVR-166) — the same
+    /// second factor as an emailed code, reached through a shared secret.
+    Totp,
+    /// A code from an authenticator app was refused (wrong, replayed, capped, or
+    /// the app's secret could not be read). The session keeps whatever it had.
+    TotpFailed,
     /// A passkey assertion was accepted, and the credential it named is the
     /// session's now (WVR-163) — the possession factor.
     Passkey,
@@ -82,13 +90,15 @@ pub enum EventKind {
 
 impl EventKind {
     /// Every kind, for parsing a stored row.
-    pub const ALL: [EventKind; 11] = [
+    pub const ALL: [EventKind; 13] = [
         EventKind::Password,
         EventKind::PasswordConfirmed,
         EventKind::PasswordConfirmFailed,
         EventKind::EmailOtpIssued,
         EventKind::EmailOtp,
         EventKind::EmailOtpFailed,
+        EventKind::Totp,
+        EventKind::TotpFailed,
         EventKind::Passkey,
         EventKind::PasskeyUserVerification,
         EventKind::PasskeyFailed,
@@ -105,6 +115,8 @@ impl EventKind {
             EventKind::EmailOtpIssued => "email_otp_issued",
             EventKind::EmailOtp => "email_otp",
             EventKind::EmailOtpFailed => "email_otp_failed",
+            EventKind::Totp => "totp",
+            EventKind::TotpFailed => "totp_failed",
             EventKind::Passkey => "passkey",
             EventKind::PasskeyUserVerification => "passkey_user_verification",
             EventKind::PasskeyFailed => "passkey_failed",
@@ -126,11 +138,13 @@ impl EventKind {
         match self {
             EventKind::Password | EventKind::PasswordConfirmed => Some(ProofKind::Password),
             EventKind::EmailOtp => Some(ProofKind::EmailOtp),
+            EventKind::Totp => Some(ProofKind::Totp),
             EventKind::Passkey => Some(ProofKind::Passkey),
             EventKind::PasskeyUserVerification => Some(ProofKind::PasskeyUserVerification),
             EventKind::PasswordConfirmFailed
             | EventKind::EmailOtpIssued
             | EventKind::EmailOtpFailed
+            | EventKind::TotpFailed
             | EventKind::PasskeyFailed
             | EventKind::LoginFailed
             | EventKind::Logout => None,
