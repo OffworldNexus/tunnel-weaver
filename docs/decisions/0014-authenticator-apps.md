@@ -135,17 +135,21 @@ cannot lock the owner out, and the emailed code is a way through for both.
 
 When a confirmed app exists, `POST /api/account/login` issues nothing and sends
 nothing. The code step asks for the first *code* the relay offers — the app's
-code — and deliberately never defaults to a passkey: a passkey is a way *in*,
-offered on the sign-in page, and someone who has typed a password and landed on
-this step is finishing what they started.
+code — says plainly where that code comes from (icon, the source's name, and the
+sentence the field is described by), and deliberately never defaults to a passkey:
+someone who has typed a password and landed on this step is finishing what they
+started.
 
 Everything else the account can do is behind **"Try another way"**, a page of its
 own built from the relay's own `paths` for the session — one row per way up, in
 the relay's preference order. Choosing the emailed code is what *sends* it, so the
-page the person lands on has a code waiting; a factor the console has never heard
-of is still listed (its label is the relay's step name, tidied) and handed to the
-same machinery that performs every other way up, so a later factor is usable
-before anyone writes copy for it.
+page the person lands on has a code waiting; a passkey appears there too, because
+an assertion is a way *in* as much as a step-up — the relay lists it from `Basic`
+for exactly that reason, and an assertion taken at that level *is* the sign-in, so
+the inactivity clock is advanced as the anonymous ceremony advances it. A factor
+the console has never heard of is still listed (its label is the relay's step
+name, tidied) and handed to the same machinery that performs every other way up,
+so a later factor is usable before anyone writes copy for it.
 
 This is the difference from a single "email me instead" button: the ways up are
 the relay's answer rather than a hand-written list of two, and the console's job
