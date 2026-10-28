@@ -1,10 +1,11 @@
 //! Ways of authenticating: what level a session currently holds, and what a
 //! person can do to climb.
 //!
-//! A [`AuthPath`] is one way in (password then emailed code, a passkey…). It
+//! A [`AuthPath`] is one way in (password then second factor, a passkey…). It
 //! *describes* steps; how a step is presented — a SvelteKit route for the
 //! console, a JSON `403` for the API — is the caller's business. The trait is
-//! the seam WVR-166 plugs into for the next factor kind.
+//! what each new factor kind plugs into: WVR-166 adds the authenticator app by
+//! adding a path, not by touching the level derivation.
 
 use std::collections::BTreeMap;
 
@@ -20,6 +21,11 @@ pub struct Situation {
     /// Whether the account has at least one registered passkey, which is what
     /// decides whether *asserting with a passkey* can be offered as a way up.
     pub has_passkeys: bool,
+    /// Whether the account has at least one *confirmed* authenticator app
+    /// (WVR-166), which is what decides whether *entering a code from an
+    /// authenticator app* can be offered as a way up. A pending enrolment does
+    /// not count: it is not a factor yet.
+    pub has_totp: bool,
     /// The latest occurrence (Unix seconds) of each proof on the session.
     pub proofs: BTreeMap<ProofKind, i64>,
     /// The request's instant, so lifetimes are evaluated consistently.
@@ -57,6 +63,11 @@ pub enum StepKind {
     Login,
     /// Enter the emailed second-factor code.
     VerifyEmailOtp,
+    /// Enter the code an authenticator app produces (WVR-166). The same level as
+    /// the emailed code, and offered before it when the account has an app:
+    /// both are the second factor, and the app is the one the person set up on
+    /// purpose.
+    VerifyTotp,
     /// Re-type the password: what `Certain` asks for once the sign-in's own
     /// password proof has aged out (WVR-165).
     ConfirmPassword,
@@ -73,6 +84,7 @@ impl StepKind {
         match self {
             StepKind::Login => "login",
             StepKind::VerifyEmailOtp => "verify_email_otp",
+            StepKind::VerifyTotp => "verify_totp",
             StepKind::ConfirmPassword => "confirm_password",
             StepKind::AssertPasskey => "assert_passkey",
         }
@@ -91,6 +103,7 @@ impl StepKind {
             // exists is what `levels_after` adds on top.
             StepKind::Login | StepKind::ConfirmPassword => &[ProofKind::Password],
             StepKind::VerifyEmailOtp => &[ProofKind::EmailOtp],
+            StepKind::VerifyTotp => &[ProofKind::Totp],
             StepKind::AssertPasskey => &[ProofKind::Passkey, ProofKind::PasskeyUserVerification],
         }
     }
@@ -220,8 +233,80 @@ impl AuthPath for PasskeyPath {
     }
 }
 
+/// An authenticator app: the emailed code's twin (WVR-166).
+///
+/// A code from an app proves exactly what an emailed code proves — this person
+/// holds the second factor — so this path is the emailed one with the mailbox
+/// swapped for a shared secret, and its `current_level` is that path's body with
+/// `EmailOtp` replaced by `Totp`. The two are *not* merged into one path because
+/// they are offered differently: the app is the factor shown first when the
+/// account has one, and the emailed code is the alternative behind it.
+///
+/// It is listed first in [`PATHS`], which is what makes an app's code the
+/// preferred way up among the equal-length options (see
+/// [`upgrade_paths`](super::manager::upgrade_paths)).
+pub struct AuthenticatorPath;
+
+impl AuthPath for AuthenticatorPath {
+    fn proofs(&self) -> &'static [ProofKind] {
+        &[ProofKind::Password, ProofKind::Totp]
+    }
+
+    fn current_level(&self, situation: &Situation) -> AuthLevel {
+        if situation.account_id.is_none() {
+            return AuthLevel::None;
+        }
+        // A session opened by another path holds neither of this path's proofs,
+        // and this path can do nothing for it: there is no password check here
+        // to repeat and no code pending to enter. `None` keeps the ways up
+        // honest — the same rule the emailed path follows.
+        if !situation.was_used(ProofKind::Password) && !situation.was_used(ProofKind::Totp) {
+            return AuthLevel::None;
+        }
+        if !situation.has_valid(ProofKind::Totp) {
+            return AuthLevel::Basic;
+        }
+        if situation.has_valid(ProofKind::Password) {
+            return AuthLevel::Certain;
+        }
+        AuthLevel::Strong
+    }
+
+    fn steps_to(&self, situation: &Situation, target: AuthLevel) -> Vec<Vec<Step>> {
+        // No session at all: the way in is the sign-in form, which is the
+        // emailed path's step to name. This path starts from a signed-in
+        // session, and its endpoint is `Basic`-gated like the emailed code's, so
+        // it offers nothing before that.
+        if situation.account_id.is_none() || !situation.has_totp {
+            return Vec::new();
+        }
+        let current = self.current_level(situation);
+        if current == AuthLevel::None {
+            return Vec::new();
+        }
+        let mut steps = Vec::new();
+        if current < AuthLevel::Strong && target >= AuthLevel::Strong {
+            steps.push(Step(StepKind::VerifyTotp));
+        }
+        // A password typed moments ago (at sign-in, say) already counts.
+        if target >= AuthLevel::Certain && !situation.has_valid(ProofKind::Password) {
+            steps.push(Step(StepKind::ConfirmPassword));
+        }
+        if steps.is_empty() {
+            Vec::new()
+        } else {
+            vec![steps]
+        }
+    }
+}
+
 /// Every path, in preference order.
-pub static PATHS: &[&dyn AuthPath] = &[&PasswordEmailOtpPath, &PasskeyPath];
+///
+/// Order is what "the strongest configured second factor" means: among the
+/// options that reach the same level in the same number of steps, the first path
+/// to propose one wins, so an authenticator app is offered before the emailed
+/// code (WVR-166) and a passkey's single gesture before either.
+pub static PATHS: &[&dyn AuthPath] = &[&AuthenticatorPath, &PasswordEmailOtpPath, &PasskeyPath];
 
 /// The best level any path grants `situation`.
 pub fn level_of(situation: &Situation) -> AuthLevel {
@@ -261,19 +346,21 @@ mod tests {
     use super::*;
 
     fn situation(account: bool, proofs: &[(ProofKind, i64)], now: i64) -> Situation {
-        situation_with(account, false, proofs, now)
+        situation_with(account, false, false, proofs, now)
     }
 
-    /// The same, with passkeys registered on the account.
+    /// The same, with the given factors configured on the account.
     fn situation_with(
         account: bool,
         has_passkeys: bool,
+        has_totp: bool,
         proofs: &[(ProofKind, i64)],
         now: i64,
     ) -> Situation {
         Situation {
             account_id: account.then_some(1),
             has_passkeys,
+            has_totp,
             proofs: proofs.iter().copied().collect(),
             now,
             session_ttl_secs: 86_400,
@@ -449,6 +536,7 @@ mod tests {
         let strong = situation_with(
             true,
             true,
+            false,
             &[(ProofKind::Password, 1_000), (ProofKind::EmailOtp, 1_000)],
             2_000,
         );
@@ -467,6 +555,7 @@ mod tests {
         let strong = situation_with(
             true,
             false,
+            false,
             &[(ProofKind::Password, 1_000), (ProofKind::EmailOtp, 1_000)],
             2_000,
         );
@@ -477,7 +566,7 @@ mod tests {
     fn a_basic_session_is_not_offered_an_assertion() {
         // The password was just checked: the only way up is the emailed code
         // that was just sent, because that is what the gate will serve.
-        let basic = situation_with(true, true, &[(ProofKind::Password, 1_000)], 1_000);
+        let basic = situation_with(true, true, false, &[(ProofKind::Password, 1_000)], 1_000);
         assert_eq!(level_of(&basic), AuthLevel::Basic);
         assert!(PasskeyPath.steps_to(&basic, AuthLevel::Strong).is_empty());
         assert!(PasskeyPath.steps_to(&basic, AuthLevel::Certain).is_empty());
@@ -490,6 +579,7 @@ mod tests {
         let lapsed = situation_with(
             true,
             true,
+            false,
             &[
                 (ProofKind::Passkey, 1_000),
                 (ProofKind::PasskeyUserVerification, 1_000),
@@ -511,6 +601,7 @@ mod tests {
         let certain = situation_with(
             true,
             true,
+            false,
             &[
                 (ProofKind::Passkey, 1_301),
                 (ProofKind::PasskeyUserVerification, 1_301),
@@ -524,5 +615,116 @@ mod tests {
                 .is_empty()
         );
         assert!(PasskeyPath.steps_to(&certain, AuthLevel::Strong).is_empty());
+    }
+
+    #[test]
+    fn an_authenticator_code_is_certain_then_strong() {
+        // The emailed code's twin in full: entered seconds after the password it
+        // is `Certain`; once the confirmation window has passed, the code alone
+        // holds `Strong` for the rest of the session.
+        let fresh = situation_with(
+            true,
+            false,
+            true,
+            &[(ProofKind::Password, 2_000), (ProofKind::Totp, 2_000)],
+            2_100,
+        );
+        assert_eq!(AuthenticatorPath.current_level(&fresh), AuthLevel::Certain);
+        assert_eq!(level_of(&fresh), AuthLevel::Certain);
+
+        let later = situation_with(
+            true,
+            false,
+            true,
+            &[(ProofKind::Password, 2_000), (ProofKind::Totp, 2_000)],
+            2_301,
+        );
+        assert_eq!(AuthenticatorPath.current_level(&later), AuthLevel::Strong);
+        assert_eq!(level_of(&later), AuthLevel::Strong);
+    }
+
+    #[test]
+    fn an_authenticator_session_is_the_emailed_paths_business_only_up_to_basic() {
+        // Each path knows its own kind: for a session that entered an app's
+        // code, the emailed path sees the password proof and stops at `Basic`,
+        // while the level (`level_of`, the best any path grants) is `Strong`.
+        let s = situation_with(
+            true,
+            false,
+            true,
+            &[(ProofKind::Password, 1_000), (ProofKind::Totp, 1_000)],
+            1_301,
+        );
+        assert_eq!(PasswordEmailOtpPath.current_level(&s), AuthLevel::Basic);
+        assert_eq!(AuthenticatorPath.current_level(&s), AuthLevel::Strong);
+        assert_eq!(level_of(&s), AuthLevel::Strong);
+    }
+
+    #[test]
+    fn the_app_is_a_way_up_only_when_one_is_confirmed() {
+        // A code cannot be entered before something can produce it: with no
+        // confirmed app the path names no step, exactly as the passkey path does
+        // with no credential. A pending enrolment counts as none — `has_totp` is
+        // the *confirmed* count.
+        let with_app = situation_with(true, false, true, &[(ProofKind::Password, 1_000)], 1_000);
+        assert_eq!(
+            AuthenticatorPath.steps_to(&with_app, AuthLevel::Strong),
+            vec![vec![Step(StepKind::VerifyTotp)]]
+        );
+
+        let without = situation_with(true, false, false, &[(ProofKind::Password, 1_000)], 1_000);
+        assert!(
+            AuthenticatorPath
+                .steps_to(&without, AuthLevel::Strong)
+                .is_empty()
+        );
+        assert!(
+            AuthenticatorPath
+                .steps_to(&without, AuthLevel::Certain)
+                .is_empty()
+        );
+        // And it never grants a level on its own without a code: the password
+        // proof alone is the emailed path's `Basic`, not this path's.
+        assert_eq!(AuthenticatorPath.current_level(&without), AuthLevel::Basic);
+    }
+
+    #[test]
+    fn the_app_is_not_a_way_to_reach_certain_on_its_own() {
+        // Signed in with the password and an app's code, ten minutes ago:
+        // `Strong`. The way back to `Certain` is the password — the code is
+        // already in hand, and entering a fresh one proves nothing newer.
+        let strong = situation_with(
+            true,
+            false,
+            true,
+            &[(ProofKind::Password, 1_000), (ProofKind::Totp, 1_000)],
+            2_000,
+        );
+        assert_eq!(AuthenticatorPath.current_level(&strong), AuthLevel::Strong);
+        assert_eq!(
+            AuthenticatorPath.steps_to(&strong, AuthLevel::Certain),
+            vec![vec![Step(StepKind::ConfirmPassword)]]
+        );
+        assert!(
+            AuthenticatorPath
+                .steps_to(&strong, AuthLevel::Strong)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_signed_out_visitor_is_not_offered_a_code_by_the_app_path() {
+        // The way in is the sign-in form, which the emailed path names. This
+        // path starts from a signed-in session, so it adds no second copy of it.
+        let anon = situation(false, &[], 1_000);
+        assert!(
+            AuthenticatorPath
+                .steps_to(&anon, AuthLevel::Strong)
+                .is_empty()
+        );
+        assert_eq!(
+            PasswordEmailOtpPath.steps_to(&anon, AuthLevel::Strong),
+            vec![vec![Step(StepKind::Login)]]
+        );
     }
 }

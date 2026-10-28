@@ -76,15 +76,10 @@ When('I change my password from {string} to {string}', async function (current, 
   await press(this, 'Change password');
 });
 
-Then('the Password panel shows {string}', async function (state) {
-  const panel = this.page.getByRole('region', { name: 'Password', exact: true });
-  await panel.getByText(state).waitFor();
-});
-
-// WVR-167: the second factor is fixed, not a setting — the panel reports it as
-// enabled for email codes and offers no control that could turn it off.
-Then('the Two-factor authentication panel shows {string}', async function (state) {
-  const panel = this.page.getByRole('region', { name: 'Two-factor authentication', exact: true });
+// One step for any of the Security page's panels: each is an accessible region
+// named by its title, so the assertion is the same wherever it is pointed.
+Then('the {string} panel shows {string}', async function (panel_name, state) {
+  const panel = this.page.getByRole('region', { name: panel_name, exact: true });
   await panel.getByText(state).waitFor();
 });
 

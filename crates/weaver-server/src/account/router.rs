@@ -25,13 +25,13 @@ use serde_json::{Value, json};
 
 use weaver_abuse::AltchaError;
 
-use crate::account::auth::{AuthManager, SessionContext, watch};
+use crate::account::auth::{AuthManager, EventKind, SessionContext, watch};
 use crate::account::passkey;
 use crate::account::session::{self, CSRF_COOKIE, CSRF_HEADER, SESSION_COOKIE};
 use crate::account::views::{
     USAGE_WINDOW_SECS, key_of, load_error, owned_machine, person_of, person_services, signed_in,
 };
-use crate::account::{AccountRuntime, pairing, second_factor, views};
+use crate::account::{AccountRuntime, pairing, second_factor, totp, views};
 use crate::email::{Mailbox, PasswordChanged, Reset, SignInCode, Verification, Welcome};
 use crate::live::{Change, Entity, Viewer};
 use crate::metrics::{Function, Metric, MetricsQuery, MetricsStore};
@@ -83,6 +83,7 @@ pub fn router(runtime: Arc<AccountRuntime>, tunnel: Option<Arc<TunnelRegistry>>)
         .route("/api/account/login", post(login))
         .route("/api/account/login/verify", post(login_verify))
         .route("/api/account/login/resend", post(login_resend))
+        .route("/api/account/login/totp", post(login_totp))
         .route("/api/account/me", get(me))
         .route("/api/account/avatar", get(avatar))
         .route("/api/account/logout", post(logout))
@@ -102,13 +103,24 @@ pub fn router(runtime: Arc<AccountRuntime>, tunnel: Option<Arc<TunnelRegistry>>)
             "/api/account/passkey/step-up/finish",
             post(passkey_stepup_finish),
         )
-        .route("/api/account/passkeys", get(passkeys_list))
         .route("/api/account/passkeys/begin", post(passkey_register_begin))
         .route(
             "/api/account/passkeys/finish",
             post(passkey_register_finish),
         )
         .route("/api/account/passkeys/{id}/remove", post(passkey_remove))
+        // Authenticator apps (WVR-166). `begin` and `confirm` are `Certain`
+        // (the gate's business): an app is a second factor that works without
+        // the mailbox, so planting one must take a proof of presence. Removing
+        // one is ordinary authenticated work, like removing a passkey.
+        .route("/api/account/totp/begin", post(totp_begin))
+        .route("/api/account/totp/confirm", post(totp_confirm))
+        .route("/api/account/totp/{id}/remove", post(totp_remove))
+        // What the Security page shows, in one request (WVR-166): whether a
+        // password is set, the passkeys, and the authenticator apps. It is a
+        // page's data, refreshed by the page's own actions, rather than three
+        // endpoints each arriving when it feels like it.
+        .route("/api/account/security", get(security))
         .route("/api/account/machines", get(machines_list))
         .route("/api/account/overview", get(overview))
         .route("/api/account/metrics", get(metrics))
@@ -183,6 +195,24 @@ struct LoginRequest {
     password: String,
     #[serde(default)]
     altcha: String,
+}
+
+/// Body of a `POST /api/account/totp/begin` (WVR-166).
+#[derive(Deserialize)]
+struct TotpBeginRequest {
+    /// What the person calls this app; empty when they did not name it. It is the
+    /// label the authenticator displays beside the issuer, and it is what tells
+    /// two enrolled apps apart in the console.
+    #[serde(default)]
+    name: String,
+}
+
+/// Body of a `POST /api/account/totp/confirm` (WVR-166).
+#[derive(Deserialize)]
+struct TotpConfirmRequest {
+    /// The pending enrolment's row id, from `totp/begin`.
+    id: i32,
+    code: String,
 }
 
 #[derive(Deserialize)]
@@ -743,10 +773,13 @@ async fn reset_complete(
 /// `POST /api/account/login` — verify the password and start the second factor.
 ///
 /// Success opens a `Basic` session (the password factor is proven) and emails a
-/// one-time code. It does **not** sign anyone in: the session can reach nothing
-/// but the climb until `POST /api/account/login/verify` accepts the code. If the
-/// code cannot be sent the session is rolled back, rather than leaving a page
-/// that can never be satisfied.
+/// one-time code — unless the account has a confirmed authenticator app, in
+/// which case nothing is issued and nothing is sent (WVR-166): the app is the
+/// factor offered, and the emailed code is behind the console's "email me a code
+/// instead" (which is `POST /api/account/login/resend`). It does **not** sign
+/// anyone in: the session can reach nothing but the climb until one of the two
+/// codes is accepted. If the code cannot be sent the session is rolled back,
+/// rather than leaving a page that can never be satisfied.
 ///
 /// The sign-in is recorded on the inactivity clock (WVR-160) only once the code
 /// is accepted, so an abandoned second step is never mistaken for activity.
@@ -834,25 +867,40 @@ async fn login(
         account_id: account.id,
     };
 
-    let Ok(code) = second_factor::issue(&rt.store, session.id, now).await else {
+    if manager.password_checked(context).await.is_err() {
         let _ = rt.sessions.invalidate(&raw, now).await;
         return err(StatusCode::SERVICE_UNAVAILABLE, "temporarily unavailable");
-    };
-    if manager.password_checked(context).await.is_err()
-        || manager.email_otp_issued(context).await.is_err()
-    {
-        let _ = rt.sessions.invalidate(&raw, now).await;
-        return err(StatusCode::SERVICE_UNAVAILABLE, "temporarily unavailable");
-    }
-    if let Err(error) = send_signin_code(&rt, &account.name, &identity.email, &code).await {
-        tracing::warn!(account_id = account.id, error = %error, "sign-in code email was not sent");
-        let _ = rt.sessions.invalidate(&raw, now).await;
-        return err(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "we could not send your code; try again",
-        );
     }
 
+    // The factor offered is the strongest the account configured, and the one it
+    // configured on purpose is the authenticator app: with a confirmed one there
+    // is no code to issue and no email to send (WVR-166). Nothing is taken from
+    // anyone — the emailed code is one click away, `POST /login/resend` being
+    // what the console's "email me a code instead" calls.
+    let has_app = rt
+        .store
+        .totp_confirmed_count_for(account.id)
+        .await
+        .map(|count| count > 0)
+        .unwrap_or(false);
+    if !has_app {
+        let Ok(code) = second_factor::issue(&rt.store, session.id, now).await else {
+            let _ = rt.sessions.invalidate(&raw, now).await;
+            return err(StatusCode::SERVICE_UNAVAILABLE, "temporarily unavailable");
+        };
+        if manager.email_otp_issued(context).await.is_err() {
+            let _ = rt.sessions.invalidate(&raw, now).await;
+            return err(StatusCode::SERVICE_UNAVAILABLE, "temporarily unavailable");
+        }
+        if let Err(error) = send_signin_code(&rt, &account.name, &identity.email, &code).await {
+            tracing::warn!(account_id = account.id, error = %error, "sign-in code email was not sent");
+            let _ = rt.sessions.invalidate(&raw, now).await;
+            return err(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "we could not send your code; try again",
+            );
+        }
+    }
     let csrf = session::new_token();
     let response = json_ok(json!({ "status": "second_factor" }));
     let response = with_cookie(response, rt.sessions.session_cookie(&raw));
@@ -868,9 +916,10 @@ struct LoginVerifyRequest {
 /// `POST /api/account/login/verify` — accept the emailed code and finish signing
 /// in (CSRF-protected).
 ///
-/// This is the only place a session becomes `Strong`, and the only place the
-/// inactivity clock advances. A refusal is a `400` (never a `401`, which the SPA
-/// would read as "session expired") and invites a re-send.
+/// One of the two places a session becomes `Strong` — its twin is
+/// `/login/totp` (WVR-166) — and, with it, the only places the inactivity clock
+/// advances. A refusal is a `400` (never a `401`, which the SPA would read as
+/// "session expired") and invites a re-send.
 async fn login_verify(
     State(rt): State<Arc<AccountRuntime>>,
     Extension(manager): Extension<AuthManager>,
@@ -909,6 +958,77 @@ async fn login_verify(
                 "Second factor refused"
             );
             err(StatusCode::BAD_REQUEST, error.message())
+        }
+    }
+}
+
+/// `POST /api/account/login/totp` — accept a code from an authenticator app and
+/// finish signing in (CSRF-protected) (WVR-166).
+///
+/// The app's twin of `/login/verify`, with the same contract: it is a way out of
+/// a `Basic` session, a refusal is a `400` and never a `401`, and taking it is
+/// what records the sign-in on the inactivity clock. What differs is what it
+/// verifies against — every confirmed app of the account, each with its own
+/// one-step drift window and its own replay guard — and that wrong codes are
+/// counted: six digits behind a stolen password are guessable in a way a code
+/// sitting in a mailbox is not.
+async fn login_totp(
+    State(rt): State<Arc<AccountRuntime>>,
+    Extension(manager): Extension<AuthManager>,
+    headers: HeaderMap,
+    Json(req): Json<LoginVerifyRequest>,
+) -> Response {
+    if !origin_ok(&headers, &rt.base_url) || !csrf_ok(&headers) {
+        return err(StatusCode::FORBIDDEN, "request refused");
+    }
+    let Some(session) = manager.session() else {
+        return err(StatusCode::UNAUTHORIZED, "not signed in");
+    };
+    let now = unix_secs();
+    // The allowance is counted over this session's own window and from its own
+    // rows, so it can only ever stop the session that spent it: a guesser
+    // exhausts their session, never the owner's, and the emailed code stays a
+    // way through for both.
+    let since = now - rt.config.session_ttl_secs as i64;
+    let wrong = rt
+        .store
+        .auth_event_count_since(session.session_id, EventKind::TotpFailed.as_str(), since)
+        .await
+        .unwrap_or(0);
+    match totp::verify(
+        &rt.store,
+        &rt.config.totp_key,
+        session.account_id,
+        &req.code,
+        wrong,
+        now,
+    )
+    .await
+    {
+        Ok(()) => {
+            if manager.totp_verified(session).await.is_err()
+                || rt
+                    .store
+                    .account_record_login(session.account_id, now)
+                    .await
+                    .is_err()
+            {
+                return err(StatusCode::SERVICE_UNAVAILABLE, "temporarily unavailable");
+            }
+            tracing::info!(
+                account_id = session.account_id,
+                "Second factor verified with an authenticator app"
+            );
+            json_ok(json!({ "ok": true }))
+        }
+        Err(error) => {
+            let _ = manager.totp_failed(session).await;
+            tracing::warn!(
+                account_id = session.account_id,
+                reason = ?error,
+                "Authenticator code refused"
+            );
+            authenticator_problem(error, StatusCode::BAD_REQUEST, error.message())
         }
     }
 }
@@ -1410,21 +1530,41 @@ async fn passkey_signin_finish(
     with_cookie(response, rt.sessions.csrf_cookie(&csrf))
 }
 
-/// `GET /api/account/passkeys` — the account's own passkeys.
-async fn passkeys_list(
+/// `GET /api/account/security` — everything the Security page shows (WVR-166).
+///
+/// One request for one page. What an account signs in with — whether a password
+/// is set, its passkeys, its authenticator apps — is one screen of the console,
+/// and three endpoints meant three lists arriving in their own time and three
+/// ways to refresh them. The page loads this through its data loader and its
+/// actions invalidate that load, so there is one source and one refresh.
+///
+/// Authenticator apps are listed only once they are *confirmed*: an enrolment
+/// that was begun and never proved is not a factor, is not shown, and is dropped
+/// by the account sweep when it goes stale.
+async fn security(
     State(rt): State<Arc<AccountRuntime>>,
     Extension(manager): Extension<AuthManager>,
 ) -> Response {
     let Some(session) = manager.session() else {
         return err(StatusCode::UNAUTHORIZED, "not signed in");
     };
-    match rt.store.passkeys_for_account(session.account_id).await {
-        Ok(rows) => {
-            let passkeys: Vec<passkey::PasskeyView> = rows.iter().map(passkey::view).collect();
-            json_ok(json!({ "passkeys": passkeys }))
-        }
-        Err(error) => load_error(error),
-    }
+    let account_id = session.account_id;
+    let Ok(passkeys) = rt.store.passkeys_for_account(account_id).await else {
+        return err(StatusCode::SERVICE_UNAVAILABLE, "temporarily unavailable");
+    };
+    let Ok(apps) = rt.store.totp_confirmed_for_account(account_id).await else {
+        return err(StatusCode::SERVICE_UNAVAILABLE, "temporarily unavailable");
+    };
+    let Ok(credential) = rt.store.password_current_for(account_id).await else {
+        return err(StatusCode::SERVICE_UNAVAILABLE, "temporarily unavailable");
+    };
+    let passkeys: Vec<passkey::PasskeyView> = passkeys.iter().map(passkey::view).collect();
+    let apps: Vec<totp::AuthenticatorView> = apps.iter().map(totp::view).collect();
+    json_ok(json!({
+        "has_password": credential.is_some(),
+        "passkeys": passkeys,
+        "authenticator_apps": apps,
+    }))
 }
 
 /// `POST /api/account/passkeys/begin` — start registering a passkey.
@@ -1540,8 +1680,180 @@ async fn passkey_remove(
     }
 }
 
-/// `POST /api/account/passkey/step-up/begin` — start an assertion that lifts
-/// this session back to `Certain` (CSRF-protected).
+/// `POST /api/account/totp/begin` — start enrolling an authenticator app
+/// (CSRF-protected) (WVR-166).
+///
+/// Reachable at `Certain` (the gate's business, not this handler's): an app is a
+/// second factor that works without the mailbox, so planting one takes a proof
+/// of presence — the same rule as planting a passkey. An account may hold as
+/// many apps as it likes, so this never replaces one.
+///
+/// The name is collected *here* rather than at confirmation because it is the
+/// label the authenticator app displays: the URI an app is set up from is built
+/// once, and cannot be relabelled afterwards.
+async fn totp_begin(
+    State(rt): State<Arc<AccountRuntime>>,
+    Extension(manager): Extension<AuthManager>,
+    headers: HeaderMap,
+    Json(req): Json<TotpBeginRequest>,
+) -> Response {
+    if !origin_ok(&headers, &rt.base_url) || !csrf_ok(&headers) {
+        return err(StatusCode::FORBIDDEN, "request refused");
+    }
+    let Some(session) = manager.session() else {
+        return err(StatusCode::UNAUTHORIZED, "not signed in");
+    };
+    let now = unix_secs();
+    let Some(account) = rt
+        .store
+        .account_by_id(session.account_id)
+        .await
+        .ok()
+        .flatten()
+    else {
+        return err(StatusCode::SERVICE_UNAVAILABLE, "temporarily unavailable");
+    };
+    // The account's address, which the URI falls back to when the app is not
+    // named. The name is the fallback for the test-only accounts with no
+    // address — nothing but an opaque handler needs that.
+    let address = rt
+        .store
+        .email_identity_for_account(session.account_id)
+        .await
+        .ok()
+        .flatten()
+        .map(|identity| identity.email)
+        .unwrap_or_else(|| account.name.clone());
+    match totp::begin(
+        &rt.store,
+        &rt.config.totp_key,
+        session.account_id,
+        &address,
+        &req.name,
+        now,
+    )
+    .await
+    {
+        // The secret is in the body, so nothing may store the response. No
+        // session change is announced: an unconfirmed enrolment is not a way up.
+        Ok(begun) => json_no_store(json!({
+            "id": begun.id,
+            "secret": begun.secret,
+            "uri": begun.uri,
+        })),
+        Err(error) => authenticator_problem(error, StatusCode::BAD_REQUEST, error.message()),
+    }
+}
+
+/// `POST /api/account/totp/confirm` — confirm a pending app with a code it
+/// produced (CSRF-protected) (WVR-166).
+///
+/// Confirming is what makes the app a factor, so the ways up of every session of
+/// the account change here — that is what the announcement is for. Entering a
+/// valid code also proves the app's possession on *this* session, which is
+/// recorded like any other proof.
+async fn totp_confirm(
+    State(rt): State<Arc<AccountRuntime>>,
+    Extension(manager): Extension<AuthManager>,
+    headers: HeaderMap,
+    Json(req): Json<TotpConfirmRequest>,
+) -> Response {
+    if !origin_ok(&headers, &rt.base_url) || !csrf_ok(&headers) {
+        return err(StatusCode::FORBIDDEN, "request refused");
+    }
+    let Some(session) = manager.session() else {
+        return err(StatusCode::UNAUTHORIZED, "not signed in");
+    };
+    let now = unix_secs();
+    match totp::confirm(
+        &rt.store,
+        &rt.config.totp_key,
+        session.account_id,
+        req.id,
+        &req.code,
+        now,
+    )
+    .await
+    {
+        Ok(row) => {
+            let _ = manager.totp_verified(session).await;
+            watch::sessions_changed(&rt.live, session.account_id);
+            tracing::info!(
+                account_id = session.account_id,
+                app_id = row.id,
+                "Authenticator app enrolled"
+            );
+            json_ok(json!({ "app": totp::view(&row) }))
+        }
+        Err(error) => {
+            let _ = manager.totp_failed(session).await;
+            tracing::warn!(
+                account_id = session.account_id,
+                app_id = req.id,
+                reason = ?error,
+                "Authenticator code refused while enrolling"
+            );
+            authenticator_problem(error, StatusCode::BAD_REQUEST, error.message())
+        }
+    }
+}
+
+/// `POST /api/account/totp/{id}/remove` — remove one of the account's apps
+/// (CSRF-protected) (WVR-166).
+///
+/// Not a `Certain` action, for the same reason removing a passkey is not: the
+/// account keeps its other factors and the emailed code still signs it in, so
+/// nothing is lost that an unattended browser could be tricked into losing. A
+/// pending enrolment is removable here too — that is how it is abandoned.
+async fn totp_remove(
+    State(rt): State<Arc<AccountRuntime>>,
+    Extension(manager): Extension<AuthManager>,
+    Path(id): Path<i32>,
+    headers: HeaderMap,
+) -> Response {
+    if !origin_ok(&headers, &rt.base_url) || !csrf_ok(&headers) {
+        return err(StatusCode::FORBIDDEN, "request refused");
+    }
+    let Some(session) = manager.session() else {
+        return err(StatusCode::UNAUTHORIZED, "not signed in");
+    };
+    match rt.store.totp_remove(id, session.account_id).await {
+        Ok(true) => {
+            // The ways up changed: `verify_totp` leaves every session of the
+            // account the moment its last confirmed app goes.
+            watch::sessions_changed(&rt.live, session.account_id);
+            tracing::info!(
+                account_id = session.account_id,
+                app_id = id,
+                "Authenticator app removed"
+            );
+            json_ok(json!({ "ok": true }))
+        }
+        Ok(false) => err(StatusCode::NOT_FOUND, "no such authenticator app"),
+        Err(error) => load_error(error),
+    }
+}
+
+/// How an authenticator-app refusal is answered.
+///
+/// A key that cannot seal anything, or a store that could not be read, is a
+/// `503`: neither is something the person can act on. Everything else is the
+/// caller's to decide, because "no such app" and "that code is not right" are
+/// different answers to a log and the same shrug to a person.
+fn authenticator_problem(
+    error: totp::AuthenticatorError,
+    refused: StatusCode,
+    refused_message: &str,
+) -> Response {
+    match error {
+        totp::AuthenticatorError::NoKey | totp::AuthenticatorError::Unavailable => {
+            err(StatusCode::SERVICE_UNAVAILABLE, "temporarily unavailable")
+        }
+        _ => err(refused, refused_message),
+    }
+}
+
+/// `POST /api/account/passkey/step-up/begin` — start an assertion that lifts/// this session back to `Certain` (CSRF-protected).
 ///
 /// The passkey twin of `confirm-password`, including its guard: it is only
 /// served where a step-up is *expected*, so a client cannot spend challenges at
@@ -2673,6 +2985,16 @@ fn redirect(location: &str) -> Response {
 /// A successful JSON response.
 pub(crate) fn json_ok(value: Value) -> Response {
     (StatusCode::OK, Json(value)).into_response()
+}
+
+/// [`json_ok`] for a body that must never be cached: a secret travels in it.
+fn json_no_store(value: Value) -> Response {
+    let mut response = json_ok(value);
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static(CACHE_NO_STORE),
+    );
+    response
 }
 
 /// A JSON error response.

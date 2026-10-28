@@ -5,8 +5,9 @@ use sea_orm::{ConnectionTrait, DbBackend, Statement};
 use tempfile::TempDir;
 use weaver_server::store::account::{
     ActivationOutcome, ActivationRequest, NewAuthEvent, NewPasswordResetToken,
-    NewPendingRegistration, NewVerificationToken, ResetRequest,
+    NewPendingRegistration, NewTotpCredential, NewVerificationToken, ResetRequest,
 };
+use weaver_server::store::entity::totp_credential;
 use weaver_server::{Config, ConfigError, Store, StoreError};
 
 /// Runs a scalar query and returns the first column of the first row.
@@ -115,21 +116,22 @@ async fn test_store_open_runs_migrations_and_is_idempotent() {
         let store = Store::open(&db_path).await.expect("open failed");
         let count: i64 = scalar(
             &store,
-            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN ('config', 'acme_account', 'domains', 'certificates', 'cert_events', 'seaql_migrations', 'person', 'machine', 'machine_key_log', 'service', 'usage_daily', 'usage_live', 'challenge', 'abuse_bucket', 'auth_event', 'login_challenge', 'passkey_credential')",
+            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN ('config', 'acme_account', 'domains', 'certificates', 'cert_events', 'seaql_migrations', 'person', 'machine', 'machine_key_log', 'service', 'usage_daily', 'usage_live', 'challenge', 'abuse_bucket', 'auth_event', 'login_challenge', 'passkey_credential', 'totp_credential')",
         )
         .await;
-        assert_eq!(count, 17);
-        // Five migrations: `m0001_init`, `m0002_usage_daily`,
-        // `m0003_inactivity`, `m0004_auth_levels` and `m0005_passkeys`.
-        assert_eq!(store.schema_version().await.expect("schema_version"), 5);
+        assert_eq!(count, 18);
+        // Six migrations: `m0001_init`, `m0002_usage_daily`,
+        // `m0003_inactivity`, `m0004_auth_levels`, `m0005_passkeys` and
+        // `m0006_totp`.
+        assert_eq!(store.schema_version().await.expect("schema_version"), 6);
     }
 
     // Re-open existing database: should succeed and not re-apply migrations
     {
         let store = Store::open(&db_path).await.expect("re-open failed");
         let migration_count: i64 = scalar(&store, "SELECT count(*) FROM seaql_migrations").await;
-        assert_eq!(migration_count, 5);
-        assert_eq!(store.schema_version().await.expect("schema_version"), 5);
+        assert_eq!(migration_count, 6);
+        assert_eq!(store.schema_version().await.expect("schema_version"), 6);
     }
 }
 
@@ -2886,4 +2888,275 @@ async fn test_account_login_and_warning_timestamps_round_trip() {
     let updated = store.account_by_id(account.id).await.unwrap().unwrap();
     assert_eq!(updated.last_login_at, Some(1_800_001_000));
     assert_eq!(updated.inactivity_warning_at, Some(1_800_000_600));
+}
+
+// ----- authenticator apps (WVR-166) -----------------------------------------
+
+/// Begins an enrolment the way `POST /api/account/totp/begin` does: one
+/// unconfirmed row. The secret is already sealed by the time it reaches the
+/// store, which cannot tell a sealed one from any other string.
+async fn pending_totp(
+    store: &Store,
+    account_id: i32,
+    name: &str,
+    at: i64,
+) -> totp_credential::Model {
+    store
+        .totp_credential_create(NewTotpCredential {
+            account_id,
+            name: name.to_string(),
+            secret: "0f0f0f0f".to_string(),
+            created_at: at,
+        })
+        .await
+        .expect("a pending enrolment is inserted")
+}
+
+#[tokio::test]
+async fn test_totp_confirm_is_single_use_and_account_scoped() {
+    let store = Store::connect("sqlite::memory:").await.unwrap();
+    let mine = activate_account(&store, "totp@example.com", 1_000).await;
+    let theirs = activate_account(&store, "totp-other@example.com", 1_000).await;
+    let row = pending_totp(&store, mine, "Phone", 1_000).await;
+
+    // Another account's id cannot confirm it: the id comes from a console.
+    assert!(!store.totp_confirm(row.id, theirs, 1_000, 7).await.unwrap());
+    assert!(store.totp_confirm(row.id, mine, 1_000, 7).await.unwrap());
+    // Nor can the same row be confirmed twice — that is what would let one code
+    // enrol an app and then sign in with it as well.
+    assert!(!store.totp_confirm(row.id, mine, 1_010, 8).await.unwrap());
+
+    let row = store.totp_credential(row.id, mine).await.unwrap().unwrap();
+    assert_eq!(row.confirmed_at, Some(1_000));
+    assert_eq!(row.last_used_at, Some(1_000));
+    assert_eq!(row.last_used_step, Some(7));
+    // A pending row is not a factor, so a confirmed count is what the ways up
+    // are read from. An account with only pending rows has none.
+    assert_eq!(store.totp_confirmed_count_for(mine).await.unwrap(), 1);
+}
+
+#[tokio::test]
+async fn test_totp_replay_guard_only_ever_advances() {
+    let store = Store::connect("sqlite::memory:").await.unwrap();
+    let account = activate_account(&store, "replay@example.com", 1_000).await;
+    let row = pending_totp(&store, account, "Phone", 1_000).await;
+    store
+        .totp_confirm(row.id, account, 1_000, 100)
+        .await
+        .unwrap();
+
+    // The confirming code's own step is spent...
+    assert!(!store.totp_record_use(row.id, 100, 1_030).await.unwrap());
+    // ...and so is an older one: a code observed a step ago is inside the drift
+    // window but already accepted, which is exactly what must not work twice.
+    assert!(!store.totp_record_use(row.id, 99, 1_030).await.unwrap());
+    // Only a step ahead is accepted, and only once.
+    assert!(store.totp_record_use(row.id, 101, 1_060).await.unwrap());
+    assert!(!store.totp_record_use(row.id, 101, 1_060).await.unwrap());
+
+    let row = store
+        .totp_credential(row.id, account)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.last_used_step, Some(101));
+    assert_eq!(row.last_used_at, Some(1_060));
+}
+
+#[tokio::test]
+async fn test_totp_counting_listing_and_removal_are_per_account() {
+    let store = Store::connect("sqlite::memory:").await.unwrap();
+    let mine = activate_account(&store, "count@example.com", 1_000).await;
+    let theirs = activate_account(&store, "count-other@example.com", 1_000).await;
+    let first = pending_totp(&store, mine, "Phone", 1_000).await;
+    let second = pending_totp(&store, mine, "", 1_001).await;
+    pending_totp(&store, theirs, "Their laptop", 1_000).await;
+
+    // Nothing is confirmed, so nothing is a factor *and* nothing is listed: an
+    // enrolment that was begun and never proved is not something the console
+    // shows (the account sweep deletes it instead).
+    assert_eq!(store.totp_confirmed_count_for(mine).await.unwrap(), 0);
+    assert!(
+        store
+            .totp_confirmed_for_account(mine)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    store.totp_confirm(first.id, mine, 1_002, 5).await.unwrap();
+    store.totp_confirm(second.id, mine, 1_002, 6).await.unwrap();
+    // As many apps as the person likes, each with its own secret — and its own
+    // name, which is what tells them apart.
+    assert_eq!(store.totp_confirmed_count_for(mine).await.unwrap(), 2);
+    let listed = store.totp_confirmed_for_account(mine).await.unwrap();
+    assert_eq!(listed.len(), 2);
+    assert_eq!(listed[0].name, "Phone");
+    assert_eq!(listed[1].name, "", "unnamed is an empty string, never null");
+    // The other account's rows are still pending, so they are no factor of
+    // theirs either — the count never crosses accounts.
+    assert_eq!(store.totp_confirmed_count_for(theirs).await.unwrap(), 0);
+
+    // Removal is scoped: another account's id removes nothing.
+    assert!(!store.totp_remove(first.id, theirs).await.unwrap());
+    assert!(store.totp_remove(first.id, mine).await.unwrap());
+    assert!(!store.totp_remove(first.id, mine).await.unwrap());
+    assert_eq!(
+        store.totp_confirmed_for_account(mine).await.unwrap().len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn test_totp_pending_sweep_drops_only_abandoned_enrolments() {
+    let store = Store::connect("sqlite::memory:").await.unwrap();
+    let account = activate_account(&store, "sweep@example.com", 1_000).await;
+    let abandoned = pending_totp(&store, account, "", 1_000).await;
+    let long_ago_but_confirmed = pending_totp(&store, account, "Phone", 1_000).await;
+    store
+        .totp_confirm(long_ago_but_confirmed.id, account, 1_000, 7)
+        .await
+        .unwrap();
+    let recent = pending_totp(&store, account, "", 9_000).await;
+
+    // Past the cutoff, the abandoned enrolment goes...
+    assert_eq!(store.totp_pending_sweep(8_000).await.unwrap(), 1);
+    assert!(
+        store
+            .totp_credential(abandoned.id, account)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    // ...a recent one stays (its dialog may still be open)...
+    assert!(
+        store
+            .totp_credential(recent.id, account)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    // ...and a confirmed app is a live second factor, however old it is.
+    assert!(
+        store
+            .totp_credential(long_ago_but_confirmed.id, account)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(
+        store
+            .totp_confirmed_for_account(account)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn test_totp_rows_go_with_the_account() {
+    let store = Store::connect("sqlite::memory:").await.unwrap();
+    let account = activate_account(&store, "cascade@example.com", 1_000).await;
+    let row = pending_totp(&store, account, "Phone", 1_000).await;
+    store.totp_confirm(row.id, account, 1_000, 7).await.unwrap();
+
+    store.delete_account(account).await.unwrap();
+    assert!(
+        store
+            .totp_confirmed_for_account(account)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        store
+            .totp_credential(row.id, account)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn test_auth_event_count_since_is_one_kind_on_one_session() {
+    let store = Store::connect("sqlite::memory:").await.unwrap();
+    let account = activate_account(&store, "cap@example.com", 1_000).await;
+    async fn insert(store: &Store, account: i32, session_id: i32, kind: &str, at: i64) {
+        store
+            .auth_event_insert(NewAuthEvent {
+                account_id: Some(account),
+                session_id: Some(session_id),
+                kind: kind.to_string(),
+                occurred_at: at,
+                ip_address: String::new(),
+                user_agent: String::new(),
+                attempted: String::new(),
+            })
+            .await
+            .unwrap();
+    }
+    for at in [1_000_i64, 1_010, 1_020] {
+        insert(&store, account, 7, "totp_failed", at).await;
+    }
+    // Another kind on the same session, and the same kind on another session,
+    // are not part of the count: the cap is one session's own wrong codes.
+    insert(&store, account, 7, "email_otp_failed", 1_030).await;
+    insert(&store, account, 8, "totp_failed", 1_030).await;
+
+    assert_eq!(
+        store
+            .auth_event_count_since(7, "totp_failed", 0)
+            .await
+            .unwrap(),
+        3
+    );
+    assert_eq!(
+        store
+            .auth_event_count_since(7, "totp_failed", 1_015)
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        store
+            .auth_event_count_since(8, "totp_failed", 0)
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        store
+            .auth_event_count_since(7, "passkey_failed", 0)
+            .await
+            .unwrap(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn test_ensure_totp_key_is_generated_once_and_persisted() {
+    let temp = TempDir::new().expect("tempdir");
+    let store = Store::open(temp.path().join("totp-key.db"))
+        .await
+        .expect("open failed");
+    store.save_config(&sample_config()).await.expect("save");
+
+    let mut config = sample_config();
+    assert!(config.account.totp_key.is_empty());
+    assert!(config.ensure_totp_key(&store).await.expect("generates"));
+    let key = config.account.totp_key.as_str().to_string();
+    assert_eq!(key.len(), 64, "32 bytes of hex");
+    assert!(config.account.totp_key.bytes().is_some());
+
+    // A second call leaves it alone: replacing the key would make every enrolled
+    // app unreadable, which is the one thing it must never do.
+    assert!(!config.ensure_totp_key(&store).await.expect("no-op"));
+    assert_eq!(config.account.totp_key.as_str(), key);
+
+    // And what it generated is on disk, which is what keeps enrolments alive
+    // across a restart.
+    let persisted: Config =
+        serde_json::from_str(&store.load_config_json().await.unwrap().unwrap()).unwrap();
+    assert_eq!(persisted.account.totp_key.as_str(), key);
 }

@@ -170,11 +170,16 @@ fn is_public(method: &Method, path: &str) -> bool {
 
 /// The minimum to climb from `Basic` to `Strong`, plus leaving: verify and
 /// re-send the code, and sign out.
+///
+/// Both second factors are named here: the emailed code and the code an
+/// authenticator app produces (WVR-166) — entering either is a way out of a
+/// `Basic` session, which is the only reason a route is on this list.
 fn is_basic(method: &Method, path: &str) -> bool {
     match path {
-        "/api/account/login/verify" | "/api/account/login/resend" | "/api/account/logout" => {
-            *method == Method::POST
-        }
+        "/api/account/login/verify"
+        | "/api/account/login/resend"
+        | "/api/account/login/totp"
+        | "/api/account/logout" => *method == Method::POST,
         _ => false,
     }
 }
@@ -189,12 +194,18 @@ fn is_basic(method: &Method, path: &str) -> bool {
 /// Registering a passkey joins them (WVR-163): it plants a credential that
 /// signs in on its own, which is at least as lasting as a deletion, and the
 /// nominal way to arrive here is a sign-in that already holds `Certain`.
+/// Enrolling an authenticator app joins them too (WVR-166): it plants a second
+/// factor that works without the mailbox. Removing one does *not* — the account
+/// keeps its other factors and the emailed code, so it is ordinary authenticated
+/// work, exactly as removing a passkey is.
 fn is_certain(method: &Method, path: &str) -> bool {
     matches!(
         (method, path),
         (&Method::POST, "/api/account/delete")
             | (&Method::POST, "/api/account/passkeys/begin")
             | (&Method::POST, "/api/account/passkeys/finish")
+            | (&Method::POST, "/api/account/totp/begin")
+            | (&Method::POST, "/api/account/totp/confirm")
     )
 }
 
@@ -234,6 +245,11 @@ mod tests {
             required_level(&Method::POST, "/api/account/login/verify"),
             AuthLevel::Basic
         );
+        // An app's code is the other side of the same climb (WVR-166).
+        assert_eq!(
+            required_level(&Method::POST, "/api/account/login/totp"),
+            AuthLevel::Basic
+        );
     }
 
     #[test]
@@ -271,10 +287,31 @@ mod tests {
         );
         // Listing, removing and asserting are ordinary authenticated work.
         for (method, path) in [
-            (Method::GET, "/api/account/passkeys"),
+            (Method::GET, "/api/account/security"),
             (Method::POST, "/api/account/passkeys/7/remove"),
             (Method::POST, "/api/account/passkey/step-up/begin"),
             (Method::POST, "/api/account/passkey/step-up/finish"),
+        ] {
+            assert_eq!(required_level(&method, path), AuthLevel::Strong, "{path}");
+        }
+    }
+
+    #[test]
+    fn enrolling_an_authenticator_app_asks_for_certain_and_managing_it_does_not() {
+        // Planting a second factor that works without the mailbox is as lasting
+        // as planting a passkey.
+        assert_eq!(
+            required_level(&Method::POST, "/api/account/totp/begin"),
+            AuthLevel::Certain
+        );
+        assert_eq!(
+            required_level(&Method::POST, "/api/account/totp/confirm"),
+            AuthLevel::Certain
+        );
+        // Listing and removing are ordinary authenticated work.
+        for (method, path) in [
+            (Method::GET, "/api/account/security"),
+            (Method::POST, "/api/account/totp/7/remove"),
         ] {
             assert_eq!(required_level(&method, path), AuthLevel::Strong, "{path}");
         }

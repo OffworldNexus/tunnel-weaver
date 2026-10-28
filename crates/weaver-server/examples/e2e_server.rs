@@ -125,6 +125,10 @@ fn account_config(base_url: String) -> AccountConfig {
         // for, after the relay has already reported the fall (its lead is five),
         // which is the whole point of the lead.
         confirm_window_secs: 12,
+        // The daemon repairs a missing TOTP key at boot (WVR-166); the harness
+        // builds the runtime directly, so it has to supply one itself. A fresh
+        // store per run means a fresh key is exactly right.
+        totp_key: weaver_server::config::TotpKey::generate(),
         signup: generous(),
         login: generous(),
         resend: generous(),

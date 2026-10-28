@@ -91,11 +91,21 @@ impl Task for AltchaSweepTask {
 }
 
 /// Prunes the account plane's expiry-scoped rows: verification tokens, reset
-/// tokens, expired sessions, and retired machine key-log rows.
+/// tokens, expired sessions, retired machine key-log rows, and enrolments that
+/// were begun and never confirmed.
 pub struct AccountSweepTask {
     store: Store,
     config: AccountConfig,
 }
+
+/// How long an unconfirmed authenticator-app enrolment may sit before the sweep
+/// drops it (WVR-166).
+///
+/// A pending row lives only as long as the dialog that began it: confirming it
+/// takes a code, which takes a minute. Anything still unconfirmed a day later is
+/// an abandoned dialog, and a day is far more slack than an enrolment needs —
+/// while still being short enough that a sealed secret does not linger.
+const PENDING_TOTP_TTL_SECS: i64 = 86_400;
 
 impl AccountSweepTask {
     pub fn new(store: Store, config: AccountConfig) -> Self {
@@ -127,6 +137,13 @@ impl Task for AccountSweepTask {
         let key_log_cutoff = self.config.key_log_cutoff(tick);
         if let Err(err) = self.store.sweep_machine_key_log(key_log_cutoff).await {
             warn!(error = %err, "machine key log sweep failed");
+        }
+        if let Err(err) = self
+            .store
+            .totp_pending_sweep(tick.saturating_sub(PENDING_TOTP_TTL_SECS))
+            .await
+        {
+            warn!(error = %err, "pending authenticator enrolment sweep failed");
         }
     }
 }

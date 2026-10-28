@@ -264,10 +264,16 @@ pub async fn execute_install(
         .as_ref()
         .and_then(|existing| existing.abuse.clone());
     // Account tuning is likewise operator-owned; carry it forward too.
-    let previous_account = existing_config
+    let mut previous_account = existing_config
         .as_ref()
         .map(|existing| existing.account.clone())
         .unwrap_or_default();
+    // Setup owns the key that seals authenticator-app secrets (WVR-166) when
+    // there is none, and never replaces one that exists: a new key would make
+    // every enrolled app unreadable.
+    if previous_account.totp_key.is_empty() {
+        previous_account.totp_key = crate::config::TotpKey::generate();
+    }
 
     let root_ca_pem = match &gathered.acme_root_ca_path {
         Some(path) => match fs::read_to_string(path) {

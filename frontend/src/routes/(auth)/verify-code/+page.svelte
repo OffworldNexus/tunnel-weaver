@@ -1,18 +1,19 @@
 <script lang="ts">
 	/**
-	 * The second-factor step of a sign-in (WVR-167).
+	 * The second-factor step of a sign-in (WVR-167, WVR-166).
 	 *
 	 * The password step opens a session that can do nothing but be here: the
-	 * relay refuses every other account endpoint until the emailed code is
-	 * accepted, and this page's only route onwards is
-	 * `POST /api/account/login/verify`.
+	 * relay refuses every other account endpoint until a second factor is
+	 * accepted, and this page's only route onwards is `login/verify` (the emailed
+	 * code) or `login/totp` (the code an authenticator app shows).
 	 *
-	 * The code it asks for is the one the password step already sent: the page
-	 * does **not** ask the relay for another on arrival. A `basic` session always
-	 * had one issued for it, so arriving here is not a reason to send a second
-	 * email nobody asked for — and the relay's own re-send cooldown would refuse
-	 * most of those anyway. Someone whose code is old or lost has the button
-	 * below; pressing it is what sends another.
+	 * Which one it asks for is not decided here: the relay names the ways up from
+	 * the session's level on the stream, strongest first, and this page performs
+	 * the first. An account with a confirmed authenticator app is therefore asked
+	 * for the app's code, with the emailed code behind the button below. The page
+	 * asks the relay for nothing on arrival — in particular, no second email is
+	 * sent: an account with an app gets no code mailed at sign-in at all, and the
+	 * button below is what asks for one.
 	 *
 	 * Once accepted, the session is finished and the person continues to the
 	 * console — or back to a pending `/pair` detour, which is why the detour flag
@@ -31,12 +32,32 @@
 
 	const session = useSession();
 
+	/** Which second factor this page is asking for. */
+	type Factor = 'app' | 'email';
+
+	/**
+	 * What the relay is offering: the first way up to `strong` names it, and it is
+	 * the relay's own answer, so it holds on a reload as well.
+	 */
+	const offered = $derived<Factor>(
+		session.pathsTo('strong')[0]?.[0]?.step === 'verify_totp' ? 'app' : 'email'
+	);
+
+	/** The factor the person has switched to, if they have. */
+	let switched = $state<Factor | null>(null);
+	const asking = $derived<Factor>(switched ?? offered);
+
 	let resending = $state(false);
 	let startingOver = $state(false);
 	let resent = $state('');
 
 	const sf = jsonForm(verifyCodeSchema, { code: '' }, async (values) => {
-		const res = await api('POST', '/api/account/login/verify', values, climb);
+		const res = await api(
+			'POST',
+			asking === 'app' ? '/api/account/login/totp' : '/api/account/login/verify',
+			values,
+			climb
+		);
 		if (res.refused) {
 			return;
 		}
@@ -51,7 +72,16 @@
 
 	const { form, errors, message, submitting, enhance } = sf;
 
-	/** Sends a fresh code; the relay enforces its own re-send cooldown. */
+	/**
+	 * Asks the relay to email a code.
+	 *
+	 * On a session whose offered factor is the app this is how the alternative is
+	 * chosen — nothing was mailed at sign-in, so there is nothing to re-send — and
+	 * on one without an app it is the ordinary re-send. Either way the page asks
+	 * for the emailed code from here on, including when the relay answers
+	 * `cooldown`: that means a code was issued moments ago, which is exactly the
+	 * case where the one the person already has is the one to type.
+	 */
 	async function resend(): Promise<void> {
 		resending = true;
 		resent = '';
@@ -60,13 +90,14 @@
 		if (res.refused) {
 			return;
 		}
+		switched = 'email';
 		if (!res.ok) {
 			resent = res.error ?? 'We could not send a new code. Try again.';
 			return;
 		}
 		resent =
 			res.data?.status === 'cooldown'
-				? 'A code was just sent. Wait a moment before asking again.'
+				? 'A code was just sent. Enter the last one you received.'
 				: 'A new code is on its way.';
 	}
 
@@ -94,10 +125,17 @@
 {#if session.level === 'basic'}
 	<Page labelledby="verify-code-title">
 		<h1 id="verify-code-title">Enter your code</h1>
-		<p class="lede">
-			We emailed a six-digit code to
-			<strong>{session.user?.email || 'your address'}</strong>.
-		</p>
+		{#if asking === 'app'}
+			<p class="lede">
+				Enter the six-digit code your authenticator app shows for
+				<strong>{session.user?.email || 'your account'}</strong>.
+			</p>
+		{:else}
+			<p class="lede">
+				We emailed a six-digit code to
+				<strong>{session.user?.email || 'your address'}</strong>.
+			</p>
+		{/if}
 
 		<form class="form" method="POST" use:enhance novalidate>
 			<div class="field">
@@ -133,7 +171,7 @@
 
 		<div class="secondary">
 			<Keycap type="button" variant="ghost" onclick={resend} loading={resending}>
-				Send a new code
+				{asking === 'app' ? 'Email me a code instead' : 'Send a new code'}
 			</Keycap>
 			<Keycap type="button" variant="ghost" onclick={startOver} loading={startingOver}>
 				Start over

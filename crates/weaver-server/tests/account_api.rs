@@ -108,6 +108,9 @@ async fn setup_full(adjust: impl FnOnce(&mut AccountConfig), with_mailer: bool) 
         argon2_memory_kib: 8,
         argon2_iterations: 1,
         argon2_parallelism: 1,
+        // The daemon generates this at boot when an install has none (WVR-166);
+        // a fixture builds the runtime directly, so it supplies one here.
+        totp_key: weaver_server::config::TotpKey::generate(),
         ..Default::default()
     };
     adjust(&mut account_config);
@@ -494,11 +497,9 @@ async fn full_lifecycle_signup_verify_login_logout() {
     assert_eq!(state.body["level"], "certain");
     assert_eq!(state.body["paths"], serde_json::json!([]));
     assert!(state.body.get("drop").is_none(), "{:?}", state.body);
-    // The Security page's "Password is set" state is driven by this flag.
-    assert_eq!(
-        state.body["me"]["has_password"], true,
-        "a password account reports a live credential"
-    );
+    // The Security page's "Password is set" state moved to its own endpoint
+    // (`GET /api/account/security`), so this stream no longer carries it.
+    assert!(state.body["me"].get("has_password").is_none());
 
     // Logout requires the CSRF token.
     let no_csrf = call(
@@ -4073,14 +4074,7 @@ async fn passkeys_are_listed_and_removed_within_the_account() {
     let first = seed_passkey(&fixture, mine, "MacBook").await;
     let theirs_id = seed_passkey(&fixture, theirs, "Their laptop").await;
 
-    let listed = call(
-        &fixture.router,
-        "GET",
-        "/api/account/passkeys",
-        &[("cookie", format!("__Host-weaver_session={session}"))],
-        None,
-    )
-    .await;
+    let listed = security(&fixture, &session).await;
     assert_eq!(listed.status, StatusCode::OK);
     let passkeys = listed.body["passkeys"].as_array().expect("a list").clone();
     assert_eq!(passkeys.len(), 1, "only my own: {:?}", listed.body);
@@ -4113,14 +4107,7 @@ async fn passkeys_are_listed_and_removed_within_the_account() {
         not_mine.body
     );
     // …and it is still there, for its owner.
-    let theirs_list = call(
-        &fixture.router,
-        "GET",
-        "/api/account/passkeys",
-        &[("cookie", format!("__Host-weaver_session={other_session}"))],
-        None,
-    )
-    .await;
+    let theirs_list = security(&fixture, &other_session).await;
     assert_eq!(
         theirs_list.body["passkeys"].as_array().map(Vec::len),
         Some(1)
@@ -4142,14 +4129,7 @@ async fn passkeys_are_listed_and_removed_within_the_account() {
     .await;
     assert_eq!(removed.status, StatusCode::OK, "{:?}", removed.body);
 
-    let after = call(
-        &fixture.router,
-        "GET",
-        "/api/account/passkeys",
-        &[("cookie", format!("__Host-weaver_session={session}"))],
-        None,
-    )
-    .await;
+    let after = security(&fixture, &session).await;
     assert_eq!(
         after.body["passkeys"],
         serde_json::json!([]),
@@ -4234,4 +4214,528 @@ async fn a_passkey_session_counts_as_a_live_strong_session() {
         .await
         .unwrap();
     assert!(!strong.contains(&account.id));
+}
+
+// ----- authenticator apps (WVR-166) -----------------------------------------
+
+/// A known secret, so the tests can produce the codes a real app would from it.
+const APP_SECRET: &[u8] = b"12345678901234567890";
+
+/// The code an app holding `secret` shows right now.
+///
+/// The relay accepts the step either side of its own, so a test that computes
+/// this just before a step boundary and has it checked just after still passes —
+/// the drift tolerance is what makes it unambiguous, not luck.
+fn app_code(secret: &[u8]) -> String {
+    let now = weaver_server::wall_clock::unix_secs();
+    weaver_server::account::totp::code_for_step(secret, weaver_server::account::totp::step_at(now))
+}
+
+/// Decodes the base32 secret `totp/begin` hands out, so a test can produce the
+/// codes a real authenticator app would from what the person scanned.
+///
+/// Production never decodes one — the relay generates its own secrets and only
+/// ever spells them out — so this exists for the tests alone.
+fn base32_decode(encoded: &str) -> Vec<u8> {
+    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+    let mut bits = 0u64;
+    let mut held = 0u32;
+    let mut out = Vec::new();
+    for byte in encoded.bytes() {
+        let value = ALPHABET
+            .iter()
+            .position(|candidate| *candidate == byte)
+            .expect("only the base32 alphabet") as u64;
+        bits = (bits << 5) | value;
+        held += 5;
+        if held >= 8 {
+            held -= 8;
+            out.push(((bits >> held) & 0xff) as u8);
+        }
+    }
+    out
+}
+
+/// Seeds a *confirmed* app with a known secret, sealed exactly as `totp/begin`
+/// seals one.
+///
+/// The ceremony itself is driven over HTTP below; this is for the tests about
+/// everything around it — the level machinery, signing in, the replay guard,
+/// the account scoping — for which a row is the whole fixture.
+async fn seed_app(fixture: &Fixture, account_id: i32, name: &str, secret: &[u8]) -> i32 {
+    use weaver_server::store::account::NewTotpCredential;
+
+    let now = weaver_server::wall_clock::unix_secs();
+    let sealed =
+        weaver_server::account::totp::seal(&fixture.account.config.totp_key, account_id, secret)
+            .expect("the fixture's key seals");
+    let row = fixture
+        .account
+        .store
+        .totp_credential_create(NewTotpCredential {
+            account_id,
+            name: name.to_string(),
+            secret: sealed,
+            created_at: now,
+        })
+        .await
+        .unwrap();
+    fixture
+        .account
+        .store
+        .totp_confirm(
+            row.id,
+            account_id,
+            now,
+            // One step behind now: the step that confirms an app is spent (a code
+            // that enrolled an app must not also sign in), and this leaves the
+            // step the tests then use still fresh.
+            weaver_server::account::totp::step_at(now) - 1,
+        )
+        .await
+        .unwrap();
+    row.id
+}
+
+/// The authenticator-app endpoints, with the double-submit CSRF pair attached.
+async fn app_begin(fixture: &Fixture, session: &str, csrf: &str, name: &str) -> Reply {
+    call(
+        &fixture.router,
+        "POST",
+        "/api/account/totp/begin",
+        &[
+            (
+                "cookie",
+                format!("__Host-weaver_session={session}; __Host-weaver_csrf={csrf}"),
+            ),
+            ("x-csrf-token", csrf.to_string()),
+        ],
+        Some(serde_json::json!({ "name": name })),
+    )
+    .await
+}
+
+async fn app_confirm(fixture: &Fixture, session: &str, csrf: &str, id: i32, code: &str) -> Reply {
+    call(
+        &fixture.router,
+        "POST",
+        "/api/account/totp/confirm",
+        &[
+            (
+                "cookie",
+                format!("__Host-weaver_session={session}; __Host-weaver_csrf={csrf}"),
+            ),
+            ("x-csrf-token", csrf.to_string()),
+        ],
+        Some(serde_json::json!({ "id": id, "code": code })),
+    )
+    .await
+}
+
+async fn app_remove(fixture: &Fixture, session: &str, csrf: &str, id: i32) -> Reply {
+    call(
+        &fixture.router,
+        "POST",
+        &format!("/api/account/totp/{id}/remove"),
+        &[
+            (
+                "cookie",
+                format!("__Host-weaver_session={session}; __Host-weaver_csrf={csrf}"),
+            ),
+            ("x-csrf-token", csrf.to_string()),
+        ],
+        None,
+    )
+    .await
+}
+
+/// What the Security page loads: the one request that carries the password
+/// state, the passkeys and the authenticator apps (WVR-166).
+async fn security(fixture: &Fixture, session: &str) -> Reply {
+    call(
+        &fixture.router,
+        "GET",
+        "/api/account/security",
+        &[("cookie", format!("__Host-weaver_session={session}"))],
+        None,
+    )
+    .await
+}
+
+/// The app's side of the second-factor step, with the CSRF pair attached.
+async fn login_with_app(fixture: &Fixture, session: &str, csrf: &str, code: &str) -> Reply {
+    call(
+        &fixture.router,
+        "POST",
+        "/api/account/login/totp",
+        &[
+            (
+                "cookie",
+                format!("__Host-weaver_session={session}; __Host-weaver_csrf={csrf}"),
+            ),
+            ("x-csrf-token", csrf.to_string()),
+        ],
+        Some(serde_json::json!({ "code": code })),
+    )
+    .await
+}
+
+/// The "email me a code instead" action, with the CSRF pair attached.
+async fn resend_signin_code(fixture: &Fixture, session: &str, csrf: &str) -> Reply {
+    call(
+        &fixture.router,
+        "POST",
+        "/api/account/login/resend",
+        &[
+            (
+                "cookie",
+                format!("__Host-weaver_session={session}; __Host-weaver_csrf={csrf}"),
+            ),
+            ("x-csrf-token", csrf.to_string()),
+        ],
+        None,
+    )
+    .await
+}
+
+/// Enrolling is planting a second factor that works without the mailbox, so it
+/// takes a proof of presence — and until a code the app itself produced is
+/// verified, the app is not a factor at all: not listed, not a way up, and never
+/// a secret the relay holds in the clear.
+#[tokio::test]
+async fn enrolling_an_app_is_a_certain_action_and_takes_a_code_it_produced() {
+    use sea_orm::ConnectionTrait as _;
+
+    let fixture = setup().await;
+    register(
+        &fixture,
+        "Rémy",
+        "enrol@example.com",
+        "correct horse battery",
+    )
+    .await;
+    let (session, csrf) = sign_in(&fixture, "enrol@example.com", "correct horse battery").await;
+    let account_id = account_of(&fixture, &session).await;
+
+    // Ten minutes on, `certain` has lapsed: the gate refuses the enrolment and
+    // names what would have been enough.
+    fixture
+        .account
+        .store
+        .db()
+        .execute_unprepared(
+            "UPDATE auth_event SET occurred_at = occurred_at - 600 WHERE kind = 'password'",
+        )
+        .await
+        .unwrap();
+    let refused = app_begin(&fixture, &session, &csrf, "Phone").await;
+    assert_eq!(refused.status, StatusCode::FORBIDDEN, "{:?}", refused.body);
+    assert_eq!(
+        refused.headers.get("x-weaver-required-level").unwrap(),
+        "certain"
+    );
+    assert_eq!(
+        refused.headers.get("x-weaver-upgrade-paths").unwrap(),
+        r#"[[{"step":"confirm_password","reaches":"certain"}]]"#
+    );
+
+    // With the password confirmed the enrolment starts: a 20-byte secret, as
+    // base32, and the URI an app scans. Nothing may cache the response.
+    let confirmed = confirm_password(&fixture, &session, &csrf, "correct horse battery").await;
+    assert_eq!(confirmed.status, StatusCode::OK, "{:?}", confirmed.body);
+    let begun = app_begin(&fixture, &session, &csrf, "Phone").await;
+    assert_eq!(begun.status, StatusCode::OK, "{:?}", begun.body);
+    assert_eq!(begun.headers.get("cache-control").unwrap(), "no-store");
+    let id = begun.body["id"].as_i64().expect("an id") as i32;
+    let secret = begun.body["secret"].as_str().expect("a secret").to_string();
+    assert_eq!(base32_decode(&secret).len(), 20, "{secret}");
+    let uri = begun.body["uri"].as_str().expect("a uri");
+    // The label the authenticator displays is the name the person gave, so two
+    // apps enrolled on one account are told apart in the app itself, not only in
+    // the console.
+    assert!(
+        uri.starts_with("otpauth://totp/Tunnel%20Weaver:Phone?"),
+        "{uri}"
+    );
+    assert!(uri.contains(&format!("secret={secret}")), "{uri}");
+    assert!(uri.contains("issuer=Tunnel%20Weaver"), "{uri}");
+    assert!(uri.contains("digits=6"), "{uri}");
+    assert!(uri.contains("period=30"), "{uri}");
+
+    // Pending is not a factor, and it is not listed either — the page shows what
+    // the account can actually sign in with, and nothing about the abandoned
+    // dialog's row survives into it.
+    let listed = security(&fixture, &session).await;
+    assert_eq!(listed.status, StatusCode::OK);
+    assert_eq!(listed.body["has_password"], true);
+    assert_eq!(listed.body["authenticator_apps"], serde_json::json!([]));
+    assert_eq!(listed.body["passkeys"], serde_json::json!([]));
+    assert_eq!(
+        fixture
+            .account
+            .store
+            .totp_confirmed_count_for(account_id)
+            .await
+            .unwrap(),
+        0
+    );
+
+    // A code the app did not produce confirms nothing.
+    let wrong = app_confirm(&fixture, &session, &csrf, id, "000000").await;
+    assert_eq!(wrong.status, StatusCode::BAD_REQUEST, "{:?}", wrong.body);
+    assert_eq!(
+        wrong.body["error"],
+        "That code is not right. Check it and try again."
+    );
+    assert_eq!(
+        fixture
+            .account
+            .store
+            .totp_confirmed_count_for(account_id)
+            .await
+            .unwrap(),
+        0
+    );
+
+    // The app's own code does, and the step it used is spent: the same code
+    // cannot then be used to sign in.
+    let code = app_code(&base32_decode(&secret));
+    let accepted = app_confirm(&fixture, &session, &csrf, id, &code).await;
+    assert_eq!(accepted.status, StatusCode::OK, "{:?}", accepted.body);
+    assert_eq!(accepted.body["app"]["name"], "Phone");
+    assert_eq!(
+        fixture
+            .account
+            .store
+            .totp_confirmed_count_for(account_id)
+            .await
+            .unwrap(),
+        1
+    );
+    // And it is now what the page lists.
+    let listed = security(&fixture, &session).await;
+    assert_eq!(
+        listed.body["authenticator_apps"].as_array().map(Vec::len),
+        Some(1)
+    );
+    assert_eq!(listed.body["authenticator_apps"][0]["name"], "Phone");
+
+    // What the store holds is a sealed value, never the secret the person
+    // scanned, and the listing never carries it either.
+    let row = fixture
+        .account
+        .store
+        .totp_credential(id, account_id)
+        .await
+        .unwrap()
+        .expect("the row");
+    assert_ne!(row.secret, secret);
+    assert!(!row.secret.contains(&secret));
+    let listing = security(&fixture, &session).await.body.to_string();
+    assert!(!listing.contains(&secret), "{listing}");
+}
+
+/// The app is what an account with one is offered, and the emailed code stays
+/// one click away: a fresh sign-in sends no email at all, the code from the app
+/// finishes it, and it cannot be replayed.
+#[tokio::test]
+async fn the_app_is_the_factor_offered_and_the_email_is_the_alternative() {
+    let fixture = setup().await;
+    register(
+        &fixture,
+        "Rémy",
+        "offered@example.com",
+        "correct horse battery",
+    )
+    .await;
+    let (session, _) = sign_in(&fixture, "offered@example.com", "correct horse battery").await;
+    let account_id = account_of(&fixture, &session).await;
+    seed_app(&fixture, account_id, "Phone", APP_SECRET).await;
+
+    // No email is sent: the account configured an app, so there is no code to
+    // issue. The console reads the ways up from the stream, and the app's code
+    // is the first of the two options — both reach `certain` on a fresh sign-in.
+    let before = fixture.sent.lock().unwrap().len();
+    let (basic, csrf) = login_step(&fixture, "offered@example.com", "correct horse battery").await;
+    assert_eq!(
+        fixture.sent.lock().unwrap().len(),
+        before,
+        "no sign-in code is emailed when an app is enrolled"
+    );
+    let state = me(&fixture, &basic).await;
+    assert_eq!(state.body["level"], "basic");
+    assert_eq!(
+        state.body["paths"],
+        serde_json::json!([
+            {
+                "to": "strong",
+                "options": [
+                    [{ "step": "verify_totp", "reaches": "certain" }],
+                    [{ "step": "verify_email_otp", "reaches": "certain" }],
+                ],
+            },
+            {
+                "to": "certain",
+                "options": [
+                    [{ "step": "verify_totp", "reaches": "certain" }],
+                    [{ "step": "verify_email_otp", "reaches": "certain" }],
+                ],
+            },
+        ])
+    );
+
+    // The app's code finishes the sign-in ...
+    let code = app_code(APP_SECRET);
+    let done = login_with_app(&fixture, &basic, &csrf, &code).await;
+    assert_eq!(done.status, StatusCode::OK, "{:?}", done.body);
+    assert_eq!(me(&fixture, &basic).await.body["level"], "certain");
+
+    // ... and cannot be replayed, although it is still inside the drift window.
+    let replay = login_with_app(&fixture, &basic, &csrf, &code).await;
+    assert_eq!(replay.status, StatusCode::BAD_REQUEST, "{:?}", replay.body);
+    assert_eq!(
+        replay.body["error"],
+        "That code has already been used. Wait for the next one."
+    );
+
+    // The emailed code is still a way through: asking mails one, and it finishes
+    // the same sign-in.
+    let (second, second_csrf) =
+        login_step(&fixture, "offered@example.com", "correct horse battery").await;
+    let mailed = resend_signin_code(&fixture, &second, &second_csrf).await;
+    assert_eq!(mailed.status, StatusCode::OK, "{:?}", mailed.body);
+    let verified = verify_code(
+        &fixture,
+        &second,
+        &second_csrf,
+        &latest_signin_code(&fixture.sent),
+    )
+    .await;
+    assert_eq!(verified.status, StatusCode::OK, "{:?}", verified.body);
+}
+
+/// An account may hold as many apps as it likes, each with its own secret: any
+/// of them finishes a sign-in, and removing one stops that one alone.
+#[tokio::test]
+async fn every_app_works_on_its_own_and_each_is_removable_on_its_own() {
+    let fixture = setup().await;
+    register(
+        &fixture,
+        "Rémy",
+        "two-apps@example.com",
+        "correct horse battery",
+    )
+    .await;
+    let (session, csrf) = sign_in(&fixture, "two-apps@example.com", "correct horse battery").await;
+    let account_id = account_of(&fixture, &session).await;
+    let mac = b"11111111111111111111";
+    let phone = b"22222222222222222222";
+    let mac_id = seed_app(&fixture, account_id, "MacBook", mac).await;
+    let phone_id = seed_app(&fixture, account_id, "Phone", phone).await;
+
+    // Either app finishes a sign-in: every confirmed one is tried.
+    let (basic, basic_csrf) =
+        login_step(&fixture, "two-apps@example.com", "correct horse battery").await;
+    let done = login_with_app(&fixture, &basic, &basic_csrf, &app_code(phone)).await;
+    assert_eq!(done.status, StatusCode::OK, "{:?}", done.body);
+
+    // Removing the phone stops the phone, and nothing else.
+    let removed = app_remove(&fixture, &session, &csrf, phone_id).await;
+    assert_eq!(removed.status, StatusCode::OK, "{:?}", removed.body);
+    let (basic, basic_csrf) =
+        login_step(&fixture, "two-apps@example.com", "correct horse battery").await;
+    let gone = login_with_app(&fixture, &basic, &basic_csrf, &app_code(phone)).await;
+    assert_eq!(gone.status, StatusCode::BAD_REQUEST, "{:?}", gone.body);
+    let (basic, basic_csrf) =
+        login_step(&fixture, "two-apps@example.com", "correct horse battery").await;
+    let kept = login_with_app(&fixture, &basic, &basic_csrf, &app_code(mac)).await;
+    assert_eq!(kept.status, StatusCode::OK, "{:?}", kept.body);
+
+    // Another account's app is not mine to remove.
+    register(
+        &fixture,
+        "Someone",
+        "their-apps@example.com",
+        "correct horse battery",
+    )
+    .await;
+    let (other, other_csrf) =
+        sign_in(&fixture, "their-apps@example.com", "correct horse battery").await;
+    let not_mine = app_remove(&fixture, &other, &other_csrf, mac_id).await;
+    assert_eq!(
+        not_mine.status,
+        StatusCode::NOT_FOUND,
+        "{:?}",
+        not_mine.body
+    );
+    assert_eq!(
+        app_remove(&fixture, &session, &csrf, mac_id).await.status,
+        StatusCode::OK
+    );
+
+    // With the last app gone the emailed code is the factor again — the sign-in
+    // mails one, and the app's code is not offered.
+    let before = fixture.sent.lock().unwrap().len();
+    let (basic, _) = login_step(&fixture, "two-apps@example.com", "correct horse battery").await;
+    assert_eq!(
+        fixture.sent.lock().unwrap().len(),
+        before + 1,
+        "the emailed code comes back when the last app goes"
+    );
+    let state = me(&fixture, &basic).await;
+    let options = state.body["paths"][0]["options"].clone();
+    assert_eq!(
+        options,
+        serde_json::json!([[{ "step": "verify_email_otp", "reaches": "certain" }]])
+    );
+}
+
+/// Six digits behind a stolen password are guessable, so a session gets five
+/// tries. The allowance is the session's own: a guesser exhausts theirs, and the
+/// owner is never locked out of the emailed code or of their next sign-in.
+#[tokio::test]
+async fn the_wrong_code_allowance_closes_a_session_not_the_account() {
+    let fixture = setup().await;
+    register(
+        &fixture,
+        "Rémy",
+        "capped@example.com",
+        "correct horse battery",
+    )
+    .await;
+    let (session, _) = sign_in(&fixture, "capped@example.com", "correct horse battery").await;
+    let account_id = account_of(&fixture, &session).await;
+    seed_app(&fixture, account_id, "Phone", APP_SECRET).await;
+
+    let (basic, csrf) = login_step(&fixture, "capped@example.com", "correct horse battery").await;
+    for attempt in 1..=weaver_server::account::totp::MAX_WRONG_CODES {
+        let refused = login_with_app(&fixture, &basic, &csrf, "000000").await;
+        assert_eq!(refused.status, StatusCode::BAD_REQUEST, "attempt {attempt}");
+        assert_eq!(
+            refused.body["error"], "That code is not right. Check it and try again.",
+            "attempt {attempt}"
+        );
+    }
+    // The allowance is spent: the next attempt is refused without being tried,
+    // and the code that would have worked is refused with it.
+    for code in ["000000", &app_code(APP_SECRET)] {
+        let capped = login_with_app(&fixture, &basic, &csrf, code).await;
+        assert_eq!(capped.status, StatusCode::BAD_REQUEST, "{:?}", capped.body);
+        assert_eq!(
+            capped.body["error"], "Too many tries. Use your emailed code instead.",
+            "{:?}",
+            capped.body
+        );
+    }
+
+    // The account is not locked: a fresh sign-in has its own allowance, and the
+    // capped session still has the emailed code.
+    let (fresh, fresh_csrf) =
+        login_step(&fixture, "capped@example.com", "correct horse battery").await;
+    let worked = login_with_app(&fixture, &fresh, &fresh_csrf, &app_code(APP_SECRET)).await;
+    assert_eq!(worked.status, StatusCode::OK, "{:?}", worked.body);
+    let mailed = resend_signin_code(&fixture, &basic, &csrf).await;
+    assert_eq!(mailed.status, StatusCode::OK, "{:?}", mailed.body);
+    let verified = verify_code(&fixture, &basic, &csrf, &latest_signin_code(&fixture.sent)).await;
+    assert_eq!(verified.status, StatusCode::OK, "{:?}", verified.body);
 }

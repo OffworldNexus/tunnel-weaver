@@ -16,6 +16,7 @@ pub mod password;
 pub mod router;
 pub mod second_factor;
 pub mod session;
+pub mod totp;
 pub mod views;
 
 use std::sync::Arc;

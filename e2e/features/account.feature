@@ -35,8 +35,12 @@ Feature: Account lifecycle
     Then I see the signed-in identity for "Ada Lovelace"
     When I follow the "Security" link
     Then I see the "Security" heading
-    And the Password panel shows "Password is set"
-    And the Two-factor authentication panel shows "Enabled · email codes"
+    And the "Password" panel shows "Password is set"
+    # WVR-167/WVR-166: the second factor is not a setting — the email block says
+    # it is always on and offers no control that could turn it off, and the
+    # authenticator apps have a block of their own.
+    And the "Email codes" panel shows "Enabled · always on"
+    And the "Authenticator apps" panel shows "No authenticator app yet"
     When I follow the "Change password" link
     Then I see the "Change your password" heading
     When I change my password from "correct-horse-battery-staple" to "correct-horse-battery-staple-2"

@@ -59,6 +59,10 @@ struct Inner {
     /// the anonymous case costs nothing and an authenticated request pays one
     /// indexed count.
     has_passkeys: Mutex<Option<bool>>,
+    /// Whether the account holds a *confirmed* authenticator app (WVR-166), on
+    /// the same terms: only the ways up need it, and a pending enrolment must
+    /// not count.
+    has_totp: Mutex<Option<bool>>,
 }
 
 impl AuthManager {
@@ -86,6 +90,7 @@ impl AuthManager {
             user_agent,
             proofs: Mutex::new(None),
             has_passkeys: Mutex::new(None),
+            has_totp: Mutex::new(None),
         }))
     }
 
@@ -107,6 +112,7 @@ impl AuthManager {
         Situation {
             account_id: self.account_id(),
             has_passkeys: self.has_passkeys().await,
+            has_totp: self.has_totp().await,
             proofs: self.proofs().await,
             now: self.0.now,
             session_ttl_secs: self.0.session_ttl_secs,
@@ -230,6 +236,37 @@ impl AuthManager {
     pub async fn email_otp_failed(&self, session: SessionContext) -> Result<(), StoreError> {
         self.record(
             EventKind::EmailOtpFailed,
+            Some(session.account_id),
+            Some(session.session_id),
+            "",
+        )
+        .await
+    }
+
+    /// A code from an authenticator app was accepted (WVR-166).
+    ///
+    /// One row, like the emailed code: a code proves one thing, and it is the
+    /// same thing. Writing it is what makes the app's code an alternative to the
+    /// email rather than a stronger factor — the level it reaches is the level
+    /// the session's other proofs already allow.
+    pub async fn totp_verified(&self, session: SessionContext) -> Result<(), StoreError> {
+        self.record(
+            EventKind::Totp,
+            Some(session.account_id),
+            Some(session.session_id),
+            "",
+        )
+        .await
+    }
+
+    /// A code from an authenticator app was refused.
+    ///
+    /// Recorded on the session, never on the account: the wrong-code cap counts
+    /// these rows per session (`Store::auth_event_count_since`), so a guesser
+    /// exhausts their own session and cannot lock the owner out of theirs.
+    pub async fn totp_failed(&self, session: SessionContext) -> Result<(), StoreError> {
+        self.record(
+            EventKind::TotpFailed,
             Some(session.account_id),
             Some(session.session_id),
             "",
@@ -383,6 +420,31 @@ impl AuthManager {
         has
     }
 
+    /// Whether this session's account holds a *confirmed* authenticator app
+    /// (WVR-166), memoised for the request.
+    ///
+    /// Same posture as [`AuthManager::has_passkeys`]: only the ways up read it,
+    /// a read failure reads as "none", and it must never be the reason a request
+    /// is refused. A pending enrolment does not count — the count is of
+    /// confirmed rows — so a half-finished enrolment names no step.
+    async fn has_totp(&self) -> bool {
+        if let Some(cached) = *self.0.has_totp.lock().expect("totp mutex poisoned") {
+            return cached;
+        }
+        let has = match self.0.session {
+            Some(session) => self
+                .0
+                .store
+                .totp_confirmed_count_for(session.account_id)
+                .await
+                .map(|count| count > 0)
+                .unwrap_or(false),
+            None => false,
+        };
+        *self.0.has_totp.lock().expect("totp mutex poisoned") = Some(has);
+        has
+    }
+
     async fn load_proofs(&self) -> Result<BTreeMap<ProofKind, i64>, StoreError> {
         let Some(session) = self.0.session else {
             return Ok(BTreeMap::new());
@@ -418,7 +480,12 @@ impl AuthManager {
 }
 
 /// Every path's options to reach `target`: the path the session was opened
-/// with first, then shortest first.
+/// with first, then shortest first, and each distinct run of steps once.
+///
+/// Paths are independent — an app's code and an emailed one are different paths
+/// proposing the same climb when a session somehow proved both — so the same run
+/// of steps can arrive twice. It is one option for the person either way, and
+/// the gate would serve it once.
 pub fn steps_to(situation: &Situation, target: AuthLevel) -> Vec<Vec<Step>> {
     let mut options = Vec::new();
     for path in PATHS {
@@ -428,7 +495,13 @@ pub fn steps_to(situation: &Situation, target: AuthLevel) -> Vec<Vec<Step>> {
         }
     }
     options.sort_by_key(|(inactive, length, _)| (*inactive, *length));
-    options.into_iter().map(|(_, _, option)| option).collect()
+    let mut seen: Vec<Vec<Step>> = Vec::new();
+    for (_, _, option) in options {
+        if !seen.contains(&option) {
+            seen.push(option);
+        }
+    }
+    seen
 }
 
 /// How long before a level actually falls the console is told it has.
@@ -538,6 +611,7 @@ fn truncate(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::account::auth::StepKind;
 
     #[test]
     fn proof_and_event_names_agree() {
@@ -591,11 +665,96 @@ mod tests {
         Situation {
             account_id: Some(1),
             has_passkeys: false,
+            has_totp: false,
             proofs: proofs.iter().copied().collect(),
             now,
             session_ttl_secs: ttl,
             confirm_window_secs: 300,
         }
+    }
+
+    /// The same, with the given factors configured on the account.
+    fn with_factors(
+        has_passkeys: bool,
+        has_totp: bool,
+        proofs: &[(ProofKind, i64)],
+        now: i64,
+    ) -> Situation {
+        Situation {
+            account_id: Some(1),
+            has_passkeys,
+            has_totp,
+            proofs: proofs.iter().copied().collect(),
+            now,
+            session_ttl_secs: 86_400,
+            confirm_window_secs: 300,
+        }
+    }
+
+    #[test]
+    fn the_authenticator_app_is_offered_before_the_emailed_code() {
+        // Both reach `Strong` in one step from `Basic`, and both count as the
+        // path the session was opened with (the password was just checked), so
+        // the tie is broken by `PATHS`' order: the app first, the emailed code
+        // as the alternative behind it.
+        let basic = with_factors(false, true, &[(ProofKind::Password, 100)], 401);
+        assert_eq!(
+            upgrade_paths(&basic, AuthLevel::Strong),
+            vec![
+                vec![WireStep {
+                    step: "verify_totp",
+                    reaches: "strong",
+                }],
+                vec![WireStep {
+                    step: "verify_email_otp",
+                    reaches: "strong",
+                }],
+            ]
+        );
+    }
+
+    #[test]
+    fn without_an_app_the_only_way_up_is_the_emailed_code() {
+        // The app's path names no step when nothing is enrolled, so an account
+        // that never set one up is offered exactly what it was before WVR-166.
+        let basic = with_factors(false, false, &[(ProofKind::Password, 100)], 401);
+        assert_eq!(
+            steps_to(&basic, AuthLevel::Strong),
+            vec![vec![Step(StepKind::VerifyEmailOtp)]]
+        );
+    }
+
+    #[test]
+    fn a_run_of_steps_two_paths_both_name_is_one_option() {
+        // A session that proved an emailed code *and* an app's code is the
+        // business of both paths, and they agree that the way back to `Certain`
+        // is the password. The person is offered it once.
+        let both = with_factors(
+            false,
+            true,
+            &[
+                (ProofKind::Password, 100),
+                (ProofKind::EmailOtp, 100),
+                (ProofKind::Totp, 100),
+            ],
+            401,
+        );
+        assert_eq!(
+            steps_to(&both, AuthLevel::Certain),
+            vec![vec![Step(StepKind::ConfirmPassword)]]
+        );
+    }
+
+    #[test]
+    fn a_signed_in_session_is_not_offered_a_sign_in_twice() {
+        // The app's path deliberately names no `login` step (that is the emailed
+        // path's), so an anonymous visitor still sees exactly one way in.
+        let mut anonymous = situation(&[], 100, 86_400);
+        anonymous.account_id = None;
+        assert_eq!(
+            steps_to(&anonymous, AuthLevel::Strong),
+            vec![vec![Step(StepKind::Login)]]
+        );
     }
 
     #[test]
