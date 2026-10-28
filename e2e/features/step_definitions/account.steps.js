@@ -2,8 +2,22 @@
 
 import { Then, When } from '@cucumber/cucumber';
 import * as assert from '../support/assertions.js';
-import { latestMailBySubject, latestMailLink, mailCount, mailLinks, poll } from '../support/harness.js';
-import { createAccount, openVerificationLink, press, setPassword } from '../support/flow.js';
+import {
+  clearMail,
+  latestMailBySubject,
+  latestMailLink,
+  mailCount,
+  mailLinks,
+  poll
+} from '../support/harness.js';
+import {
+  SIGN_IN_CODE_SUBJECT,
+  createAccount,
+  openVerificationLink,
+  press,
+  setPassword
+} from '../support/flow.js';
+import { totpCode } from '../support/totp.js';
 
 const RESET_LINK = /https:\/\/localhost:\d+\/reset#token=[0-9a-f]+/g;
 
@@ -428,4 +442,238 @@ When('I take the passkey in place of the password', async function () {
   await this.present(true);
   await this.page.getByRole('dialog', { name: 'Delete your account?' }).waitFor({ state: 'visible' });
   await this.present(false);
+});
+
+// ----- authenticator apps (WVR-166) ------------------------------------------
+//
+// An app is a second factor that works without the mailbox: enrolling one is a
+// `certain` action (so the password step-up comes first, exactly as it does for
+// a passkey or a deletion), sign-in then offers the app instead of emailing a
+// code, and removing one is ordinary authenticated work confirmed by naming it.
+// The code an app would show is computed locally (`support/totp.js`), from the
+// Setup key the relay spelled out — the scenario is the app. Everything else the
+// session can do lives behind "Try another way", and is the relay's own answer
+// (the ways up it reports) rather than the console's guess.
+
+/** The Authenticator apps panel on the Security page. */
+function appPanel(page) {
+  return page.getByRole('region', { name: 'Authenticator apps', exact: true });
+}
+
+/**
+ * One app's row. Its accessible name is `label + ' ' + meta`, and the meta
+ * carries a live relative time ("last used just now" → "19s ago"), so only the
+ * name's stable prefix is matched.
+ */
+function appRow(page, name) {
+  const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return appPanel(page).getByRole('listitem', { name: new RegExp(`^${escaped} `) });
+}
+
+/** The enrolment dialog — never the password step-up, never a removal. */
+function appDialog(page) {
+  return page.getByRole('dialog', { name: 'Add an authenticator app' });
+}
+
+/** The removal confirmation for an app. */
+function removeAppDialog(page) {
+  return page.getByRole('dialog', { name: 'Remove this authenticator app?' });
+}
+
+/** Its confirm keycap, locked until the app's name is typed back. */
+function removeAppButton(page) {
+  return removeAppDialog(page).getByRole('button', { name: 'Remove app', exact: true });
+}
+
+/** Opens the enrolment: on a fresh `certain` the dialog follows with no step-up. */
+When('I open the add an authenticator app dialog', async function () {
+  await this.page.getByRole('button', { name: 'Add an authenticator app' }).click();
+});
+
+Then('the add an authenticator app dialog is open', async function () {
+  await appDialog(this.page).waitFor({ state: 'visible' });
+});
+
+// WVR-166: the confirmation must not appear before the proof it needs is held,
+// so while the step-up asks for the password the dialog is not open at all.
+Then('the add an authenticator app dialog is not open', async function () {
+  if (await appDialog(this.page).isVisible()) {
+    throw new Error('The app dialog must not be open while the step-up asks for the password.');
+  }
+});
+
+// The name is the label the authenticator app displays, and the URI the QR
+// carries is built once — so it is collected before the key is shown, not after.
+When('I name the authenticator app {string} and continue', async function (name) {
+  const dialog = appDialog(this.page);
+  await dialog.getByLabel('Name', { exact: true }).fill(name);
+  await dialog.getByRole('button', { name: 'Continue', exact: true }).click();
+  // The key only exists once the relay has begun the enrolment, and reading it
+  // here is what lets the code be computed from what the person was shown.
+  const key = dialog.getByLabel('Setup key');
+  await key.waitFor({ state: 'visible' });
+  const secret = (await key.innerText()).trim();
+  if (!secret) throw new Error('The enrolment dialog showed no setup key.');
+  this.appSecrets[name] = secret;
+});
+
+Then('the add an authenticator app dialog shows a setup key in text', async function () {
+  const key = appDialog(this.page).getByLabel('Setup key');
+  await key.waitFor({ state: 'visible' });
+  const secret = (await key.innerText()).trim();
+  if (secret.length < 8) {
+    throw new Error(`Expected a setup key in the dialog, but it read ${JSON.stringify(secret)}.`);
+  }
+});
+
+// Confirmations use the *current* step: the code is the one an app would show
+// now. Sign-ins use the next one (see below), because this is where the step is
+// spent — the relay remembers it, and the same code is then refused.
+When('I confirm the authenticator app {string} with a code it produced', async function (name) {
+  const secret = this.appSecrets[name];
+  if (!secret) throw new Error(`No setup key was read for the authenticator app ${JSON.stringify(name)}.`);
+  const dialog = appDialog(this.page);
+  await dialog.getByLabel('Code from the app').fill(totpCode(secret));
+  await dialog.getByRole('button', { name: 'Confirm', exact: true }).click();
+  // The dialog closing is the enrolment's own success signal; the toast and the
+  // reloaded list both follow it, and either is what the feature asserts on.
+  await dialog.waitFor({ state: 'hidden' });
+});
+
+Then('I see the authenticator app {string}', async function (name) {
+  await appRow(this.page, name).waitFor({ state: 'visible' });
+});
+
+Then('I do not see the authenticator app {string}', async function (name) {
+  // The list is re-read from the relay after a removal, so its going is polled
+  // rather than assumed.
+  await poll(
+    async () => ((await appRow(this.page, name).count()) === 0 ? true : undefined),
+    () => `The authenticator app ${JSON.stringify(name)} is still listed.`
+  );
+});
+
+// ----- the app is the factor offered, and nothing is emailed (WVR-166) -------
+
+Then('the code page asks for the code from my authenticator app', async function () {
+  await assert.seeHeading(this.page, 'Enter your code');
+  await assert.seeText(this.page, 'Enter the six-digit code your authenticator app shows for');
+});
+
+// One keycap whose name depends on the state: the code step's own secondary
+// actions. "Send a new code" belongs to the emailed factor alone; the way to
+// everything else is the chooser, whose keycap is a link (`Keycap href`), not a
+// button.
+Then('the code page offers {string}', async function (label) {
+  await this.page.getByRole('button', { name: label, exact: true }).waitFor({ state: 'visible' });
+});
+
+Then('the code page does not offer {string}', async function (label) {
+  const count = await this.page.getByRole('button', { name: label, exact: true }).count();
+  if (count !== 0) {
+    throw new Error(`The code page offered ${JSON.stringify(label)} at ${this.page.url()}.`);
+  }
+});
+
+Then('the code page offers to try another way', async function () {
+  await this.page
+    .getByRole('link', { name: 'Try another way', exact: true })
+    .waitFor({ state: 'visible' });
+});
+
+Then('the code page asks for the code from my email', async function () {
+  await assert.seeHeading(this.page, 'Enter your code');
+  await assert.seeText(this.page, 'We emailed a six-digit code to');
+});
+
+// ----- "try another way": the other factors the relay reports (WVR-166) -------
+
+// The chooser lists the session's ways up, in the relay's own preference order.
+// With an app enrolled that is the app's code and the emailed one — the latter
+// naming the address the code would go to.
+Then('the chooser offers my authenticator app and my email address', async function () {
+  await assert.seeHeading(this.page, 'Try another way');
+  await this.page
+    .getByRole('button', { name: 'Code from your authenticator app' })
+    .waitFor({ state: 'visible' });
+  await this.page.getByRole('button', { name: 'Code by email' }).waitFor({ state: 'visible' });
+  await assert.seeText(this.page, `We will send a six-digit code to ${this.email}.`);
+});
+
+// The whole row is the button, so its accessible name is the label and the detail
+// together: the choice is matched on the label's prefix, never the whole string.
+// Picking the emailed way is also what sends the code.
+When('I choose the way {string}', async function (label) {
+  await this.page.getByRole('button', { name: label }).click();
+});
+
+// The mailbox is emptied first, so "nothing was emailed" is an exact count and
+// not a delta: the registration and the earlier sign-in have already left mail.
+When('the mailbox is emptied', async function () {
+  await clearMail();
+});
+
+Then('no sign-in code email is sent', async function () {
+  // The send would be off the response path; give an absent one time to appear
+  // before concluding there is none.
+  await new Promise((resolve) => setTimeout(resolve, 3_000));
+  const count = await mailCount(SIGN_IN_CODE_SUBJECT);
+  if (count !== 0) {
+    throw new Error(`Expected no sign-in code email, but the mailbox holds ${count}.`);
+  }
+});
+
+When('I enter the code from my authenticator app {string}', async function (name) {
+  const secret = this.appSecrets[name];
+  if (!secret) throw new Error(`No setup key was read for the authenticator app ${JSON.stringify(name)}.`);
+  // WVR-166: a code is single use, and confirming an app burnt the step it used,
+  // so the sign-in asks for the *next* step. The relay accepts one step either
+  // side of now, and the confirming step is always ≤ now — which makes now + 30 s
+  // strictly ahead of it and still inside the window. Nothing is waited for.
+  const next = totpCode(secret, { at: Date.now() + 30_000 });
+  await this.page.getByLabel('Code', { exact: true }).fill(next);
+  await press(this, 'Continue');
+});
+
+// ----- removing one (WVR-166) ------------------------------------------------
+
+When('I open the removal for the authenticator app {string}', async function (name) {
+  await appRow(this.page, name)
+    .getByRole('button', { name: `Remove ${name}`, exact: true })
+    .click();
+  await removeAppDialog(this.page).waitFor({ state: 'visible' });
+});
+
+// Removal takes a way in away but loses nothing the password does not still
+// give, so it is not a `certain` action — the confirmation opens on its own.
+Then('I am not asked for my password', async function () {
+  if (await passwordDialog(this.page).isVisible()) {
+    throw new Error('Removing an authenticator app is not a certain action, but the step-up appeared.');
+  }
+});
+
+Then('the remove app keycap is locked', async function () {
+  const button = removeAppButton(this.page);
+  await button.waitFor({ state: 'visible' });
+  if (!(await button.isDisabled())) {
+    throw new Error('The removal was unlocked before the app name was typed back.');
+  }
+});
+
+When('I type {string} into the removal', async function (name) {
+  await removeAppDialog(this.page)
+    .getByRole('textbox', { name: `Type ${name} to confirm:`, exact: true })
+    .fill(name);
+});
+
+Then('the remove app keycap is unlocked', async function () {
+  const button = removeAppButton(this.page);
+  await poll(
+    async () => (!(await button.isDisabled()) ? true : undefined),
+    () => 'The removal never unlocked after the app name was typed back.'
+  );
+});
+
+When('I confirm the removal of the authenticator app', async function () {
+  await removeAppButton(this.page).click();
 });

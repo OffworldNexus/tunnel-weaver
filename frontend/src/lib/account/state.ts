@@ -11,13 +11,22 @@ function stored<T extends object>(storage: Storage, key: string) {
 
 /**
  * The account flow, tab-scoped: the signup flow id and address being verified,
- * the completion token, and a one-shot success notice for the sign-in page.
+ * the completion token, a one-shot success notice for the sign-in page, and the
+ * second factor the person chose on the way-chooser.
  */
 export const flow = stored<{
 	flow: string;
 	email: string;
 	completion_token: string;
 	notice: string;
+	/**
+	 * The second factor the way-chooser sent the person to the code step for.
+	 * Empty means "whatever the relay offers first". It lives here rather than in
+	 * the URL so a reload of the code step keeps the choice, and it is cleared
+	 * once a code is accepted so the *next* sign-in starts on what the relay
+	 * offers rather than on last time's choice.
+	 */
+	second_factor: string;
 }>(sessionStorage, 'weaver.account.state');
 
 /**

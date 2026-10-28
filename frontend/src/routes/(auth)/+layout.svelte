@@ -6,9 +6,9 @@
 	 * A visitor who already holds a *finished* session has no business here, so
 	 * they are sent on — to the console, or on to `/pair` when a pairing detour
 	 * is pending. A visitor whose session is only `basic` (the password is proven
-	 * but the emailed second factor is not) is sent to the code step instead:
-	 * that one page is the only thing such a session may see, and every other
-	 * auth page funnels into it.
+	 * but the second factor is not) is sent to the code step instead: that step
+	 * and the chooser it hands off to are the only things such a session may see,
+	 * and every other auth page funnels into the code step.
 	 *
 	 * The guard lives in the layout, not in each page, because gating here keeps
 	 * it ahead of the page's own work: the children never mount, so `verify` and
@@ -32,10 +32,18 @@
 
 	const session = useSession();
 	const verifyCode = resolve('/(auth)/verify-code');
+	/**
+	 * The pages a `basic` session — the password proven, the second factor not —
+	 * may see: the code step, and the chooser it hands off to. Those two are the
+	 * whole of what such a session can do, and every other auth page funnels into
+	 * the code step.
+	 */
+	const basicPages: string[] = [verifyCode, resolve('/(auth)/another-way')];
 
 	/** Whether this page is allowed to render for the current session. */
 	const visible = $derived(
-		session.level === 'none' || (session.level === 'basic' && page.url.pathname === verifyCode)
+		session.level === 'none' ||
+			(session.level === 'basic' && basicPages.includes(page.url.pathname))
 	);
 
 	$effect(() => {
@@ -43,7 +51,7 @@
 			return;
 		}
 		if (session.level === 'basic') {
-			if (page.url.pathname !== verifyCode) {
+			if (!basicPages.includes(page.url.pathname)) {
 				void goto(verifyCode, { replace: true });
 			}
 			return;

@@ -10,10 +10,11 @@
 	 * Which one it asks for is not decided here: the relay names the ways up from
 	 * the session's level on the stream, strongest first, and this page performs
 	 * the first. An account with a confirmed authenticator app is therefore asked
-	 * for the app's code, with the emailed code behind the button below. The page
-	 * asks the relay for nothing on arrival — in particular, no second email is
-	 * sent: an account with an app gets no code mailed at sign-in at all, and the
-	 * button below is what asks for one.
+	 * for the app's code, and "Try another way" hands off to the chooser
+	 * (`/(auth)/another-way`) for everything else the account can do — which is
+	 * where the emailed code lives, because it only reaches the person once it has
+	 * been asked for. The page asks the relay for nothing on arrival: an account
+	 * with an app gets no code mailed at sign-in at all.
 	 *
 	 * Once accepted, the session is finished and the person continues to the
 	 * console — or back to a pending `/pair` detour, which is why the detour flag
@@ -22,7 +23,7 @@
 	import { api } from '#lib/account/api';
 	import { jsonForm } from '#lib/account/form';
 	import { verifyCodeSchema } from '#lib/account/schemas';
-	import { pairing } from '#lib/account/state';
+	import { flow, pairing } from '#lib/account/state';
 	import { useSession } from '#lib/app/session.svelte';
 	import { climb } from '#lib/app/upgrade';
 	import Keycap from '#lib/ui/Keycap.svelte';
@@ -36,16 +37,48 @@
 	type Factor = 'app' | 'email';
 
 	/**
-	 * What the relay is offering: the first way up to `strong` names it, and it is
-	 * the relay's own answer, so it holds on a reload as well.
+	 * What the relay is offering *as a second factor*: the first way up that is a
+	 * code to enter, in the relay's own preference order.
+	 *
+	 * A passkey is deliberately not chosen here. It is a way *in* — offered on the
+	 * sign-in page, and in the chooser whenever the relay lists it — and someone
+	 * who has typed a password and landed on this step is finishing what they
+	 * started rather than reaching for a different way in. The emailed code is the
+	 * fallback because every account has one.
 	 */
 	const offered = $derived<Factor>(
-		session.pathsTo('strong')[0]?.[0]?.step === 'verify_totp' ? 'app' : 'email'
+		session
+			.pathsTo('strong')
+			.map((option) => option[0]?.step)
+			.find((step) => step === 'verify_totp' || step === 'verify_email_otp') === 'verify_totp'
+			? 'app'
+			: 'email'
 	);
 
-	/** The factor the person has switched to, if they have. */
+	/**
+	 * The factor the chooser ("try another way") sent the person here for, read
+	 * once as the page mounts. It is cleared only when a code is accepted, so a
+	 * reload of this step keeps the choice while the *next* sign-in starts on
+	 * whatever the relay offers.
+	 */
+	function chosenFactor(): Factor | null {
+		const chosen = flow.load().second_factor;
+		return chosen === 'app' || chosen === 'email' ? chosen : null;
+	}
+	const chosen = chosenFactor();
+
+	/**
+	 * Whether the chooser is worth offering at all — there has to be something to
+	 * choose. With a single way up (the emailed code, on an account with no app)
+	 * it would only list the factor the page is already asking for.
+	 */
+	const hasAlternatives = $derived(session.pathsTo('strong').length > 1);
+
+	/** The factor a local action switched to (asking for a fresh emailed code). */
 	let switched = $state<Factor | null>(null);
-	const asking = $derived<Factor>(switched ?? offered);
+
+	/** What the page asks for: this page's own action first, then the chooser, then the relay. */
+	const asking = $derived<Factor>(switched ?? chosen ?? offered);
 
 	let resending = $state(false);
 	let startingOver = $state(false);
@@ -64,6 +97,9 @@
 		if (!res.ok) {
 			return res.error ?? 'That code was not accepted. Try again.';
 		}
+		// The chosen factor has been used: the next sign-in in this tab starts on
+		// what the relay offers rather than on last time's choice.
+		flow.save({ second_factor: '' });
 		// The stream reports the new level on its own; move on once it has, so
 		// the console's guard does not see the old one.
 		await session.reached('strong');
@@ -73,14 +109,14 @@
 	const { form, errors, message, submitting, enhance } = sf;
 
 	/**
-	 * Asks the relay to email a code.
+	 * Asks the relay to email a fresh code.
 	 *
-	 * On a session whose offered factor is the app this is how the alternative is
-	 * chosen — nothing was mailed at sign-in, so there is nothing to re-send — and
-	 * on one without an app it is the ordinary re-send. Either way the page asks
-	 * for the emailed code from here on, including when the relay answers
-	 * `cooldown`: that means a code was issued moments ago, which is exactly the
-	 * case where the one the person already has is the one to type.
+	 * The way *into* the emailed factor is the chooser ("try another way"), which
+	 * sends one when it is picked; this is the re-send for someone already on that
+	 * view whose code is old or lost. Either way the person stays on the emailed
+	 * code, including when the relay answers `cooldown`: that means a code was
+	 * issued moments ago, which is exactly the case where the one they already
+	 * have is the one to type.
 	 */
 	async function resend(): Promise<void> {
 		resending = true;
@@ -111,6 +147,9 @@
 		startingOver = true;
 		// Leaving either way: a refusal here means the session is already gone.
 		await api('POST', '/api/account/logout', {}, () => {});
+		// The chosen factor goes with the session: the next sign-in starts on what
+		// the relay offers rather than on this attempt's choice.
+		flow.save({ second_factor: '' });
 		session.stop();
 		// A full load, like the other session-ending flows: it keeps the router
 		// from reading a session that was just retired.
@@ -170,9 +209,14 @@
 		</form>
 
 		<div class="secondary">
-			<Keycap type="button" variant="ghost" onclick={resend} loading={resending}>
-				{asking === 'app' ? 'Email me a code instead' : 'Send a new code'}
-			</Keycap>
+			{#if asking === 'email'}
+				<Keycap type="button" variant="ghost" onclick={resend} loading={resending}>
+					Send a new code
+				</Keycap>
+			{/if}
+			{#if hasAlternatives}
+				<Keycap href={resolve('/(auth)/another-way')} variant="ghost">Try another way</Keycap>
+			{/if}
 			<Keycap type="button" variant="ghost" onclick={startOver} loading={startingOver}>
 				Start over
 			</Keycap>
