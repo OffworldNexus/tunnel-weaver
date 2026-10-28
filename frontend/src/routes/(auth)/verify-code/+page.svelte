@@ -26,6 +26,7 @@
 	import { flow, pairing } from '#lib/account/state';
 	import { useSession } from '#lib/app/session.svelte';
 	import { climb } from '#lib/app/upgrade';
+	import Icon from '#lib/ui/Icon.svelte';
 	import Keycap from '#lib/ui/Keycap.svelte';
 	import Page from '#lib/ui/Page.svelte';
 	import { goto } from '$app/navigation';
@@ -164,17 +165,33 @@
 {#if session.level === 'basic'}
 	<Page labelledby="verify-code-title">
 		<h1 id="verify-code-title">Enter your code</h1>
-		{#if asking === 'app'}
-			<p class="lede">
-				Enter the six-digit code your authenticator app shows for
-				<strong>{session.user?.email || 'your account'}</strong>.
-			</p>
-		{:else}
-			<p class="lede">
-				We emailed a six-digit code to
-				<strong>{session.user?.email || 'your address'}</strong>.
-			</p>
-		{/if}
+
+		<!--
+			Where the code is coming from, before anything asks for it. The source
+			is the whole difference between the two states — open an app, or open a
+			mailbox — and the field below reads exactly the same either way. The
+			name is a chip so it reads as a label rather than as more prose, and the
+			detail is what the field is described by.
+		-->
+		<div class="source">
+			<span class="source__icon" aria-hidden="true">
+				<Icon name={asking === 'app' ? 'shield' : 'inbox'} size={20} />
+			</span>
+			<div class="source__copy">
+				<span class="source__name">{asking === 'app' ? 'Authenticator app' : 'Email'}</span>
+				{#if asking === 'app'}
+					<p class="source__detail" id="code-source">
+						Enter the six-digit code your authenticator app shows for
+						<strong>{session.user?.email || 'your account'}</strong>.
+					</p>
+				{:else}
+					<p class="source__detail" id="code-source">
+						We emailed a six-digit code to
+						<strong>{session.user?.email || 'your address'}</strong>.
+					</p>
+				{/if}
+			</div>
+		</div>
 
 		<form class="form" method="POST" use:enhance novalidate>
 			<div class="field">
@@ -192,7 +209,7 @@
 					bind:value={$form.code}
 					disabled={$submitting}
 					aria-invalid={$errors.code ? 'true' : undefined}
-					aria-describedby={$errors.code ? 'code-error' : undefined}
+					aria-describedby={$errors.code ? 'code-source code-error' : 'code-source'}
 				/>
 				{#if $errors.code}<p id="code-error" class="field__error" aria-live="polite">
 						{$errors.code[0]}
@@ -226,6 +243,56 @@
 {/if}
 
 <style lang="scss">
+	/* Where the code is coming from. One card, because the source is the whole
+	   difference between the two states: a person sent to their authenticator app
+	   and a person sent to their mailbox are doing different things, and the field
+	   under them is identical. */
+	.source {
+		display: flex;
+		align-items: flex-start;
+		gap: 12px;
+		margin-top: 16px;
+		padding: 14px 16px;
+		border: 1.5px solid var(--tw-border);
+		border-radius: var(--tw-radius);
+		background: var(--tw-deck);
+	}
+
+	.source__icon {
+		flex: none;
+		display: flex;
+		margin-top: 2px;
+		color: var(--tw-muted);
+	}
+
+	.source__copy {
+		display: flex;
+		flex-direction: column;
+		gap: 6px;
+		min-width: 0;
+	}
+
+	/* The chip is the label; the sentence under it is what the field is described
+	   by, so a screen reader hears where the code comes from as it reaches the
+	   input. */
+	.source__name {
+		align-self: flex-start;
+		padding: 1px 9px;
+		border: 1.5px solid currentColor;
+		border-radius: 999px;
+		font-size: 11px;
+		font-weight: 700;
+		letter-spacing: 1.2px;
+		text-transform: uppercase;
+	}
+
+	.source__detail {
+		margin: 0;
+		color: var(--tw-muted);
+		font-size: 15px;
+		line-height: 1.5;
+	}
+
 	.code {
 		font-family: var(--tw-mono);
 		font-size: 24px;

@@ -266,6 +266,11 @@ Feature: Account lifecycle
     When I confirm the authenticator app "Phone" with a code it produced
     Then I see "Authenticator app added. It signs you in with a code."
     And I see the authenticator app "Phone"
+    # WVR-163: a passkey on the same account. It is the chooser's third way, and
+    # a way to finish a sign-in on its own — enrolled here, while the sign-in's
+    # own `certain` is still fresh, exactly as the passkey scenario does.
+    When I add a passkey named "MacBook Pro"
+    Then I see the passkey "MacBook Pro"
     # Signing in again: the app is the factor offered, and no code is emailed.
     When I sign out
     Then I see the "Sign in" heading
@@ -315,9 +320,20 @@ Feature: Account lifecycle
     Then I see the "Enter your code" heading
     And the code page asks for the code from my authenticator app
     When I follow the "Try another way" link
-    Then the chooser offers my authenticator app and my email address
+    Then the chooser offers my authenticator app, my email address and my passkey
     When I choose the way "Code by email"
     Then the code page asks for the code from my email
     And the code page offers "Send a new code"
     When I enter the code from my email
     Then I see the signed-in identity for "Ada Lovelace"
+    # WVR-163: and the passkey finishes a sign-in of its own — the assertion runs
+    # in place from the chooser, with no code step in between.
+    When I sign out
+    Then I see the "Sign in" heading
+    When I sign in with the password "correct-horse-battery-staple", without the code
+    Then I see the "Enter your code" heading
+    When I follow the "Try another way" link
+    Then the chooser offers my authenticator app, my email address and my passkey
+    When I take the passkey on the chooser
+    Then I see the signed-in identity for "Ada Lovelace"
+    And the code step is left behind

@@ -169,16 +169,20 @@ fn is_public(method: &Method, path: &str) -> bool {
 }
 
 /// The minimum to climb from `Basic` to `Strong`, plus leaving: verify and
-/// re-send the code, and sign out.
+/// re-send the code, sign out, and prove a passkey.
 ///
-/// Both second factors are named here: the emailed code and the code an
-/// authenticator app produces (WVR-166) — entering either is a way out of a
-/// `Basic` session, which is the only reason a route is on this list.
+/// Both second factors are named here — the emailed code, and the code an
+/// authenticator app produces (WVR-166) — and so is the passkey assertion, which
+/// from a `Basic` session is not a step-up at all but a way *in*: the console
+/// offers it beside the codes ("try another way"), and the ceremony it starts is
+/// the same one the anonymous sign-in uses.
 fn is_basic(method: &Method, path: &str) -> bool {
     match path {
         "/api/account/login/verify"
         | "/api/account/login/resend"
         | "/api/account/login/totp"
+        | "/api/account/passkey/step-up/begin"
+        | "/api/account/passkey/step-up/finish"
         | "/api/account/logout" => *method == Method::POST,
         _ => false,
     }
@@ -289,10 +293,20 @@ mod tests {
         for (method, path) in [
             (Method::GET, "/api/account/security"),
             (Method::POST, "/api/account/passkeys/7/remove"),
-            (Method::POST, "/api/account/passkey/step-up/begin"),
-            (Method::POST, "/api/account/passkey/step-up/finish"),
         ] {
             assert_eq!(required_level(&method, path), AuthLevel::Strong, "{path}");
+        }
+        // The assertion itself is a way up from `Basic`: the console offers it
+        // beside the codes (WVR-166), so the ceremony has to be servable there.
+        for path in [
+            "/api/account/passkey/step-up/begin",
+            "/api/account/passkey/step-up/finish",
+        ] {
+            assert_eq!(
+                required_level(&Method::POST, path),
+                AuthLevel::Basic,
+                "{path}"
+            );
         }
     }
 

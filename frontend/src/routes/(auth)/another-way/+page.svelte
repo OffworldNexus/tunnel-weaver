@@ -6,15 +6,17 @@
 	 * which ways up its account actually has — one option per authentication
 	 * path, in the relay's preference order — so this page describes those and
 	 * performs the one that is chosen. An account with an authenticator app is
-	 * offered the app's code and the emailed code; an account with no app is
-	 * offered the emailed code alone; and whatever a later factor adds (backup
-	 * codes, WVR-164) appears here without this page being touched.
+	 * offered the app's code and the emailed code; one that holds a passkey is
+	 * offered that too, since an assertion is a way *in* as much as a step-up; one
+	 * with neither is offered the emailed code alone; and whatever a later factor
+	 * adds (backup codes, WVR-164) appears here without this page being touched.
 	 *
 	 * Choosing the emailed code is what *sends* one: a person who picks it is
 	 * asking for a code, so the page they land on has one waiting.
 	 */
 	import { api } from '#lib/account/api';
-	import { flow } from '#lib/account/state';
+	import { assertOnThisSession } from '#lib/account/passkeyAssertion';
+	import { flow, pairing } from '#lib/account/state';
 	import { useSession } from '#lib/app/session.svelte';
 	import { type Step, type UpgradePath } from '#lib/app/session.svelte';
 	import { climb } from '#lib/app/upgrade';
@@ -44,67 +46,78 @@
 	let error = $state('');
 
 	/**
-	 * One option, named by the step that reaches the target at this level — the
-	 * first one. A step *after* it belongs to the way up that is performed in
-	 * place (the step-up popin), not to what the person is choosing here.
-	 *
-	 * An option this page has never heard of is still offered: its label is the
-	 * relay's own step name, tidied for reading, and choosing it hands the option
-	 * to the console's way-up machinery exactly as the relay wrote it. A factor
-	 * that lands later (backup codes, WVR-164) is therefore usable here before
-	 * anyone has written copy for it — hiding a way up because this page cannot
-	 * describe it would be the worse failure.
+	 * How each way the console knows by name is described. One entry per step,
+	 * keyed by the relay's own name; anything else falls back to the generic
+	 * description below.
 	 */
-	function describe(option: UpgradePath): Way {
-		const step = option[0]?.step;
-		switch (step) {
-			case 'verify_totp':
-				return {
-					step,
-					option,
-					label: 'Code from your authenticator app',
-					detail: 'Open your authenticator app and enter the six digits it shows.',
-					icon: 'shield'
-				};
-			case 'verify_email_otp':
-				return {
-					step,
-					option,
-					label: 'Code by email',
-					detail: `We will send a six-digit code to ${session.user?.email || 'your address'}.`,
-					icon: 'inbox'
-				};
-			case 'confirm_password':
-				return {
-					step,
-					option,
-					label: 'Your password',
-					detail: 'Type your password again to prove it is you.',
-					icon: 'lock'
-				};
-			case 'assert_passkey':
-				return {
-					step,
-					option,
-					label: 'A passkey',
-					detail: 'Use your face, fingerprint, PIN or a security key.',
-					icon: 'fingerprint'
-				};
-			default:
-				return {
-					step,
-					option,
-					label: step.replaceAll('_', ' ').replace(/^./, (first) => first.toUpperCase()),
-					detail: 'Use another way this account has set up.',
-					icon: 'key'
-				};
+	const DESCRIBED: Partial<Record<Step, { label: string; detail: string; icon: Way['icon'] }>> = {
+		verify_totp: {
+			label: 'Code from your authenticator app',
+			detail: 'Open the app and enter the six digits it shows.',
+			icon: 'shield'
+		},
+		verify_email_otp: {
+			label: 'Code by email',
+			detail: `We will send a six-digit code to ${session.user?.email || 'your address'}.`,
+			icon: 'inbox'
+		},
+		confirm_password: {
+			label: 'Your password',
+			detail: 'Type your password again to prove it is you.',
+			icon: 'lock'
+		},
+		assert_passkey: {
+			label: 'A passkey',
+			detail: 'Use your face, fingerprint, PIN or a security key.',
+			icon: 'fingerprint'
 		}
+	};
+
+	/**
+	 * One option, described.
+	 *
+	 * Named by the step that reaches the target at this level — the first one. A
+	 * step *after* it belongs to the way up that is performed in place (the step-up
+	 * popin), not to what the person is choosing here.
+	 *
+	 * A step the console has never heard of is still offered: its label is the
+	 * relay's own step name, tidied for reading, and choosing it hands the option to
+	 * the console's way-up machinery exactly as the relay wrote it. A factor that
+	 * lands later (backup codes, WVR-164) is therefore usable here before anyone
+	 * has written copy for it — hiding a way up because this page cannot describe it
+	 * would be the worse failure. The one thing dropped is an option with no steps
+	 * at all, which nothing could perform.
+	 */
+	function describe(option: UpgradePath): Way | null {
+		if (option.length === 0) {
+			return null;
+		}
+		const step = option[0].step;
+		return {
+			step,
+			option,
+			...(DESCRIBED[step] ?? {
+				label: step.replaceAll('_', ' ').replace(/^./, (first) => first.toUpperCase()),
+				detail: 'Use another way this account has set up.',
+				icon: 'key' as const
+			})
+		};
 	}
 
 	/** The ways up, as the relay reports them, described for the person. */
-	const ways = $derived(session.pathsTo('strong').map(describe));
+	const ways = $derived(
+		session
+			.pathsTo('strong')
+			.map(describe)
+			.filter((way) => way !== null)
+	);
 
-	/** Takes the chosen way: send-and-go for the emailed code, name-and-go for the rest. */
+	/**
+	 * Takes the chosen way: send-and-go for the emailed code, in place for the
+	 * rest. The passkey is performed here rather than handed to the step-up popin:
+	 * the popin is for a session that is already signed in, and this one may be
+	 * finishing its sign-in with the assertion itself.
+	 */
 	async function choose(way: Way): Promise<void> {
 		if (busy !== '') {
 			return;
@@ -114,30 +127,68 @@
 		// once when it mounts, so a reload of that step keeps the choice, and it is
 		// cleared once a code is accepted so the next sign-in starts on whatever
 		// the relay offers rather than on last time's choice.
-		flow.save({ second_factor: way.step === 'verify_totp' ? 'app' : 'email' });
-		if (way.step === 'verify_totp') {
-			await goto(resolve('/(auth)/verify-code'));
+		const factor = FACTOR_OF[way.step];
+		if (factor !== undefined) {
+			flow.save({ second_factor: factor });
+		}
+		const performed = PERFORMED[way.step];
+		if (performed === undefined) {
+			// A way this page does not perform itself, handed to the console's
+			// way-up machinery exactly as the relay wrote it.
+			await climb('strong', [way.option]);
 			return;
 		}
-		if (way.step === 'verify_email_otp') {
-			busy = way.step;
-			const res = await api<{ status: string }>('POST', '/api/account/login/resend', {}, () => {
-				// A refusal here means the session is already gone, and the guard
-				// will take over; there is nothing to tell the person.
-			});
-			busy = '';
-			if (!res.ok) {
-				error = res.error ?? 'We could not email you a code. Try again.';
-				return;
-			}
-			await goto(resolve('/(auth)/verify-code'));
+		await performed();
+	}
+
+	/** The factor each of the code steps asks the code page for. */
+	const FACTOR_OF: Partial<Record<Step, string>> = {
+		verify_totp: 'app',
+		verify_email_otp: 'email'
+	};
+
+	/** What choosing each way this page performs itself does. */
+	const PERFORMED: Partial<Record<Step, () => Promise<void>>> = {
+		verify_totp: takeAppCode,
+		verify_email_otp: takeEmailCode,
+		assert_passkey: takePasskey
+	};
+
+	/** The app's code: nothing to send, the code step already asks for it. */
+	async function takeAppCode(): Promise<void> {
+		await goto(resolve('/(auth)/verify-code'));
+	}
+
+	/** The emailed code: choosing it *is* asking for one, so it is sent here. */
+	async function takeEmailCode(): Promise<void> {
+		busy = 'verify_email_otp';
+		const res = await api<{ status: string }>('POST', '/api/account/login/resend', {}, () => {
+			// A refusal here means the session is already gone, and the guard will
+			// take over; there is nothing to tell the person.
+		});
+		busy = '';
+		if (!res.ok) {
+			error = res.error ?? 'We could not email you a code. Try again.';
 			return;
 		}
-		// A way this page does not perform itself — a step the console takes in
-		// place, or one with a page of its own. The console's own machinery knows
-		// what to do with it, and it is handed the option exactly as the relay
-		// wrote it rather than a guess at what its steps mean.
-		await climb('strong', [way.option]);
+		await goto(resolve('/(auth)/verify-code'));
+	}
+
+	/** The passkey: the assertion is performed in place, on this very session. */
+	async function takePasskey(): Promise<void> {
+		busy = 'assert_passkey';
+		const result = await assertOnThisSession(climb);
+		busy = '';
+		if (result.asserted) {
+			// The relay recorded the proof; the stream reports the level, and the
+			// guard leaves for the console — or for the pairing detour.
+			await session.reached('strong');
+			await goto(resolve(pairing.load().detour ? '/pair' : '/app'));
+			return;
+		}
+		if (!result.cancelled) {
+			error = result.message !== '' ? result.message : 'That passkey was not accepted.';
+		}
 	}
 </script>
 
@@ -163,7 +214,9 @@
 							<span class="way__detail">{way.detail}</span>
 						</span>
 						{#if busy === way.step}
-							<span class="way__busy" role="status">Sending…</span>
+							<span class="way__busy" role="status">
+								{way.step === 'assert_passkey' ? 'Waiting for your passkey…' : 'Sending…'}
+							</span>
 						{/if}
 					</button>
 				</li>

@@ -219,12 +219,11 @@ impl AuthPath for PasskeyPath {
         if situation.account_id.is_none() || !situation.has_passkeys {
             return Vec::new();
         }
-        // The assertion's endpoint is `Strong`-gated: a `Basic` session's only
-        // way up is the emailed code it was just sent, so offering an assertion
-        // there would name a step the gate refuses.
-        if level_of(situation) < AuthLevel::Strong {
-            return Vec::new();
-        }
+        // Offered from `Basic` up: an assertion is a way *in* as much as it is a
+        // step-up, so someone who has just typed a password and holds a passkey
+        // can reach for that instead of the code — which is what the console's
+        // "try another way" offers them (WVR-166). The anonymous case never
+        // reaches here: it has no account to assert against.
         if self.current_level(situation) < target {
             vec![vec![Step(StepKind::AssertPasskey)]]
         } else {
@@ -563,13 +562,20 @@ mod tests {
     }
 
     #[test]
-    fn a_basic_session_is_not_offered_an_assertion() {
-        // The password was just checked: the only way up is the emailed code
-        // that was just sent, because that is what the gate will serve.
+    fn a_basic_session_is_offered_the_assertion() {
+        // The password was just checked, so the emailed code is one way up — and
+        // so is a passkey, which is a way *in* as much as it is a step-up: the
+        // console offers it beside the code (WVR-166).
         let basic = situation_with(true, true, false, &[(ProofKind::Password, 1_000)], 1_000);
         assert_eq!(level_of(&basic), AuthLevel::Basic);
-        assert!(PasskeyPath.steps_to(&basic, AuthLevel::Strong).is_empty());
-        assert!(PasskeyPath.steps_to(&basic, AuthLevel::Certain).is_empty());
+        assert_eq!(
+            PasskeyPath.steps_to(&basic, AuthLevel::Strong),
+            vec![vec![Step(StepKind::AssertPasskey)]]
+        );
+        assert_eq!(
+            levels_after(&basic, &[Step(StepKind::AssertPasskey)]),
+            vec![AuthLevel::Certain]
+        );
     }
 
     #[test]

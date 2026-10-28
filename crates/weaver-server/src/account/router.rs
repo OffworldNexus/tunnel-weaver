@@ -25,7 +25,7 @@ use serde_json::{Value, json};
 
 use weaver_abuse::AltchaError;
 
-use crate::account::auth::{AuthManager, EventKind, SessionContext, watch};
+use crate::account::auth::{AuthLevel, AuthManager, EventKind, SessionContext, watch};
 use crate::account::passkey;
 use crate::account::session::{self, CSRF_COOKIE, CSRF_HEADER, SESSION_COOKIE};
 use crate::account::views::{
@@ -1853,11 +1853,15 @@ fn authenticator_problem(
     }
 }
 
-/// `POST /api/account/passkey/step-up/begin` — start an assertion that lifts/// this session back to `Certain` (CSRF-protected).
+/// `POST /api/account/passkey/step-up/begin` — start an assertion that lifts
+/// this session back to `Certain`, or that finishes signing in a `Basic` one
+/// (CSRF-protected).
 ///
 /// The passkey twin of `confirm-password`, including its guard: it is only
 /// served where a step-up is *expected*, so a client cannot spend challenges at
 /// will, and it deliberately does not require `Certain` — it is the way there.
+/// From a `Basic` session the same guard holds (a step-up *is* expected), and the
+/// ceremony is the way to finish signing in rather than to come back up.
 async fn passkey_stepup_begin(
     State(rt): State<Arc<AccountRuntime>>,
     Extension(manager): Extension<AuthManager>,
@@ -1889,8 +1893,13 @@ async fn passkey_stepup_begin(
     }
 }
 
-/// `POST /api/account/passkey/step-up/finish` — accept the assertion (already
-/// `Strong`, and only where a step-up is expected).
+/// `POST /api/account/passkey/step-up/finish` — accept the assertion.
+///
+/// Two jobs, one ceremony. On a session that has already passed its second
+/// factor it is a step-up: the assertion lifts the level back to `Certain` in
+/// place. On a `Basic` one it is the *sign-in* — the assertion is a way in, and
+/// the console offers it beside the codes — so the inactivity clock is advanced
+/// the way the anonymous ceremony advances it.
 async fn passkey_stepup_finish(
     State(rt): State<Arc<AccountRuntime>>,
     Extension(manager): Extension<AuthManager>,
@@ -1917,17 +1926,32 @@ async fn passkey_stepup_finish(
         // The assertion has to be this session's own account's, or a ceremony
         // started elsewhere could lift this one.
         Ok(asserted) if asserted.account_id == session.account_id => {
+            // An assertion from a session that had *not* passed its second factor
+            // is a sign-in, not a step-up: the person proved a credential that is
+            // a way in, so the inactivity clock has to hear about it exactly as it
+            // does for the anonymous ceremony (WVR-166).
+            let signing_in = manager.level().await < AuthLevel::Strong;
             if manager
                 .passkey_asserted(session, asserted.user_verified)
                 .await
                 .is_err()
+                || (signing_in
+                    && rt
+                        .store
+                        .account_record_login(session.account_id, now)
+                        .await
+                        .is_err())
             {
                 return err(StatusCode::SERVICE_UNAVAILABLE, "temporarily unavailable");
             }
-            tracing::info!(
-                account_id = session.account_id,
-                "Passkey confirmed for a step-up"
-            );
+            if signing_in {
+                tracing::info!(account_id = session.account_id, "Signed in with a passkey");
+            } else {
+                tracing::info!(
+                    account_id = session.account_id,
+                    "Passkey confirmed for a step-up"
+                );
+            }
             json_ok(json!({ "ok": true }))
         }
         Ok(_) => {

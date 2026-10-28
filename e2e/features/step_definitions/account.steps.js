@@ -589,15 +589,28 @@ Then('the code page asks for the code from my email', async function () {
 // ----- "try another way": the other factors the relay reports (WVR-166) -------
 
 // The chooser lists the session's ways up, in the relay's own preference order.
-// With an app enrolled that is the app's code and the emailed one — the latter
-// naming the address the code would go to.
-Then('the chooser offers my authenticator app and my email address', async function () {
+// With an app and a passkey on the account that is the app's code, the emailed
+// one (naming the address the code would go to), and the passkey last — which is
+// what keeps the passkey from ever being the default (the relay's `PATHS` order:
+// `AuthenticatorPath` first, `PasskeyPath` last).
+Then('the chooser offers my authenticator app, my email address and my passkey', async function () {
   await assert.seeHeading(this.page, 'Try another way');
-  await this.page
-    .getByRole('button', { name: 'Code from your authenticator app' })
-    .waitFor({ state: 'visible' });
-  await this.page.getByRole('button', { name: 'Code by email' }).waitFor({ state: 'visible' });
+  // The appended row is what proves the relay listed the passkey at all; the
+  // reads below then hold the whole offer to that order. Scoped to the ways list
+  // on purpose: the root layout's toast viewport also holds buttons, and a
+  // console toast can still be on screen this far into a sign-in.
+  await this.page.getByRole('button', { name: 'A passkey' }).waitFor({ state: 'visible' });
+  const ways = this.page
+    .getByRole('list')
+    .filter({ has: this.page.getByRole('button', { name: 'A passkey' }) })
+    .getByRole('button');
+  const labels = (await ways.allInnerTexts()).map((text) => text.split('\n')[0].trim());
+  const wanted = ['Code from your authenticator app', 'Code by email', 'A passkey'];
+  if (labels.join(' | ') !== wanted.join(' | ')) {
+    throw new Error(`Expected the ways up in the relay's order, got: ${JSON.stringify(labels)}.`);
+  }
   await assert.seeText(this.page, `We will send a six-digit code to ${this.email}.`);
+  await assert.seeText(this.page, 'Use your face, fingerprint, PIN or a security key.');
 });
 
 // The whole row is the button, so its accessible name is the label and the detail
@@ -605,6 +618,29 @@ Then('the chooser offers my authenticator app and my email address', async funct
 // Picking the emailed way is also what sends the code.
 When('I choose the way {string}', async function (label) {
   await this.page.getByRole('button', { name: label }).click();
+});
+
+// WVR-163/166: the passkey row runs the assertion *in place* — no popin, no code
+// step — and the console is what it lands on. Presence is turned on after the
+// click, as the sign-in page's own conditional ceremony is pending from load and
+// a present authenticator would answer that one instead.
+When('I take the passkey on the chooser', async function () {
+  await this.page.getByRole('button', { name: 'A passkey' }).click();
+  await this.present(true);
+  await assert.seeHeading(this.page, 'Overview');
+  await this.present(false);
+});
+
+// A finished sign-in must not leave the half-way screen behind it: the assertion
+// ends on the console, so the code step and the chooser are gone with it.
+Then('the code step is left behind', async function () {
+  await this.page.waitForURL(/\/app$/);
+  const stale = await this.page
+    .getByRole('heading', { name: 'Enter your code', exact: true })
+    .count();
+  if (stale !== 0) {
+    throw new Error('The code step is still on the page after the sign-in finished.');
+  }
 });
 
 // The mailbox is emptied first, so "nothing was emailed" is an exact count and

@@ -22,16 +22,12 @@
  * they are driving a flow of their own.
  */
 import { api } from '#lib/account/api';
-import { failureOf, getAssertion, type PasskeyOptions, supported } from '#lib/account/webauthn';
+import { assertOnThisSession } from '#lib/account/passkeyAssertion';
 
 import { atLeast, type AuthLevel, session } from './session.svelte';
 
 /** The `confirm_password` step's endpoint. */
 const CONFIRM_PASSWORD_URL = '/api/account/confirm-password';
-
-/** The `assert_passkey` step's two halves. */
-const STEP_UP_BEGIN_URL = '/api/account/passkey/step-up/begin';
-const STEP_UP_FINISH_URL = '/api/account/passkey/step-up/finish';
 
 /** The relay's answer when the session turns out to have nothing to confirm. */
 const CONFLICT = 409;
@@ -124,52 +120,31 @@ class StepUp {
 		}
 		this.error = '';
 		this.busy = true;
-		const begun = await api<PasskeyOptions>('POST', STEP_UP_BEGIN_URL, {}, () => {
-			// Same refusal as the password's: nothing in this popin can climb.
+		// The ceremony itself is shared with the "try another way" chooser, which
+		// performs the same assertion to finish a sign-in rather than to step up.
+		const result = await assertOnThisSession(() => {
+			// Refused for a level this popin cannot reach — it stands on a signed-in
+			// session — so there is nothing to climb from in here: close, and let
+			// whoever asked decide again from the level the relay named.
 			this.open = false;
 			this.#settle(false);
 		});
-		if (begun.status === CONFLICT) {
-			this.busy = false;
+		this.busy = false;
+		if (result.asserted) {
+			await this.#reached();
+			return;
+		}
+		if (result.settled) {
+			// The relay says this sign-in is already confirmed, so there was nothing
+			// to ask for: a console that was behind on its level. Whatever asked can
+			// carry on from what it holds.
 			this.open = false;
 			this.#settle(atLeast(session.level, this.#required));
 			return;
 		}
-		if (!begun.ok || !begun.data) {
-			this.busy = false;
-			this.error = begun.error ?? 'We could not start that passkey. Try again.';
-			return;
+		if (!result.cancelled && result.message !== '') {
+			this.error = result.message;
 		}
-		let credential: unknown;
-		try {
-			credential = await getAssertion(begun.data.options, { mediation: 'optional' });
-		} catch (error) {
-			this.busy = false;
-			if (failureOf(error) === 'cancelled') {
-				return;
-			}
-			this.error = supported()
-				? 'That passkey was not accepted. Try again.'
-				: 'This browser cannot use passkeys.';
-			return;
-		}
-		const done = await api(
-			'POST',
-			STEP_UP_FINISH_URL,
-			{ handle: begun.data.handle, credential },
-			() => {
-				this.open = false;
-				this.#settle(false);
-			}
-		);
-		if (!done.ok) {
-			this.busy = false;
-			if (!done.refused) {
-				this.error = done.error ?? 'That passkey was not accepted. Try again.';
-			}
-			return;
-		}
-		await this.#reached();
 	}
 
 	/** The person gave up: Cancel, Escape, or the close button. */

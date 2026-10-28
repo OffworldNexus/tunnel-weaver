@@ -4046,6 +4046,67 @@ async fn the_passkey_step_up_is_only_served_when_expected() {
     );
 }
 
+/// An assertion is a way *in* as much as a step-up, so a `Basic` session is
+/// offered it beside the codes — last, never first — and may start the ceremony
+/// (WVR-166). That is what the console's "try another way" renders and performs.
+#[tokio::test]
+async fn a_basic_session_is_offered_the_passkey_and_may_start_the_ceremony() {
+    let fixture = setup().await;
+    register(
+        &fixture,
+        "Rémy",
+        "basic-passkey@example.com",
+        "correct horse battery",
+    )
+    .await;
+    let (session, _) = sign_in(
+        &fixture,
+        "basic-passkey@example.com",
+        "correct horse battery",
+    )
+    .await;
+    let account_id = account_of(&fixture, &session).await;
+    seed_passkey(&fixture, account_id, "YubiKey").await;
+
+    let (basic, csrf) = login_step(
+        &fixture,
+        "basic-passkey@example.com",
+        "correct horse battery",
+    )
+    .await;
+    let state = me(&fixture, &basic).await;
+    assert_eq!(state.body["level"], "basic");
+    let options = state.body["paths"][0]["options"].clone();
+    let listed = options.as_array().expect("options").clone();
+    assert_eq!(
+        listed,
+        vec![
+            serde_json::json!([{ "step": "verify_email_otp", "reaches": "certain" }]),
+            serde_json::json!([{ "step": "assert_passkey", "reaches": "certain" }]),
+        ],
+        "the code first, the assertion last: {options}"
+    );
+
+    // The ceremony is servable at `Basic` — the gate's business, and the reason
+    // the console can put the assertion in front of a person mid-sign-in.
+    let begun = call(
+        &fixture.router,
+        "POST",
+        "/api/account/passkey/step-up/begin",
+        &[
+            (
+                "cookie",
+                format!("__Host-weaver_session={basic}; __Host-weaver_csrf={csrf}"),
+            ),
+            ("x-csrf-token", csrf.to_string()),
+        ],
+        None,
+    )
+    .await;
+    assert_eq!(begun.status, StatusCode::OK, "{:?}", begun.body);
+    assert!(begun.body["handle"].is_string(), "{:?}", begun.body);
+}
+
 /// Listing and removing are the account's own business: the id comes from the
 /// console, so a guessed one must reach nothing but its owner's rows.
 #[tokio::test]
