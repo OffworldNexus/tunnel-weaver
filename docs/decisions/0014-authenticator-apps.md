@@ -131,14 +131,28 @@ codes (`totp::MAX_WRONG_CODES`, counted from its own `totp_failed` rows). The
 allowance is per session, never per account: a guesser exhausts their own and
 cannot lock the owner out, and the emailed code is a way through for both.
 
-### Sign-in offers the app; the email is one click away
+### Sign-in offers the best factor, and every other way is one step away
 
 When a confirmed app exists, `POST /api/account/login` issues nothing and sends
-nothing. The console reads the ways up from the relay's own answer — the app's
-code first — and "email me a code instead" is the existing re-send, which is what
-issues one on demand. An account with no app behaves exactly as before, so
-nothing about the existing flow changes. The new endpoint shares the login budget
-at the edge: it is the same guess, one factor over.
+nothing. The code step asks for the first *code* the relay offers — the app's
+code — and deliberately never defaults to a passkey: a passkey is a way *in*,
+offered on the sign-in page, and someone who has typed a password and landed on
+this step is finishing what they started.
+
+Everything else the account can do is behind **"Try another way"**, a page of its
+own built from the relay's own `paths` for the session — one row per way up, in
+the relay's preference order. Choosing the emailed code is what *sends* it, so the
+page the person lands on has a code waiting; a factor the console has never heard
+of is still listed (its label is the relay's step name, tidied) and handed to the
+same machinery that performs every other way up, so a later factor is usable
+before anyone writes copy for it.
+
+This is the difference from a single "email me instead" button: the ways up are
+the relay's answer rather than a hand-written list of two, and the console's job
+is to describe and perform them. An account with no app behaves exactly as
+before — the code step asks for the emailed code, and there is nothing to choose.
+The app's code endpoint shares the login budget at the edge: it is the same guess,
+one factor over.
 
 ## Consequences
 

@@ -182,10 +182,14 @@ What an operator should expect:
   valid, holds `Strong` once `account.confirm_window_secs` (default 300) has
   passed — exactly as an emailed code does. Nothing else about the levels
   changed.
-- **The app is offered first.** Sign-in asks for the app's code when the account
-  has a confirmed one, and **sends no email at all**: the emailed code is behind
-  the console's "email me a code instead", which issues one on demand. An account
-  with no app is unchanged — a code is emailed at sign-in as before.
+- **The best factor is offered, and everything else is a step away.** Sign-in
+  asks for the app's code when the account has a confirmed one, and **sends no
+  email at all**; "Try another way" lists every way up the relay reports (the
+  app's code, the emailed code — which is sent when it is chosen — and any
+  further factor the account gains), and it is not offered when there is only one
+  way. A passkey is never the default at this step: it is a way *in*, offered on
+  the sign-in page. An account with no app is unchanged — a code is emailed at
+  sign-in as before.
 - **Only confirmed apps exist to anyone.** An enrolment that was begun and never
   proved is not listed, is not a way up, and nothing can be verified against it.
   Abandoned ones are deleted by the nightly account sweep once they are a day old
