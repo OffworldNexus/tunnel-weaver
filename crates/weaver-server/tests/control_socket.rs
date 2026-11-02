@@ -848,7 +848,15 @@ async fn test_usage_control_verb_and_cli() {
     assert_eq!(val["services"][0]["tunnel_in"], 300);
     assert_eq!(val["services"][0]["tunnel_out"], 600);
     assert_eq!(val["services"][0]["requests"], 3);
-    assert_eq!(val["services"][0]["covered_minutes"], 1);
+    // The bucket key is the wall-clock minute, and this test registers the
+    // service, meters it, and flushes in quick succession. On a loaded runner
+    // that can straddle a minute boundary, producing one extra covered minute;
+    // the point of the figure is that the seeded usage landed in a minute at
+    // all, not that the calendar cooperated.
+    let covered = val["services"][0]["covered_minutes"]
+        .as_i64()
+        .expect("a covered-minute count");
+    assert!((1..=2).contains(&covered), "covered minutes: {covered}");
     assert!(
         val["services"][0]["open_ms"].as_i64().unwrap() > 0,
         "open time accrued: {}",
