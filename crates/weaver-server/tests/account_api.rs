@@ -21,6 +21,8 @@ use weaver_server::account::AccountRuntime;
 use weaver_server::account::inactivity;
 use weaver_server::account::password::BreachCheck;
 use weaver_server::account::router::router;
+use weaver_server::account::sso::SsoProviders;
+use weaver_server::account::sso::testing::{FakeAssertion, FakeProvider};
 use weaver_server::altcha::AltchaRuntime;
 use weaver_server::config::{AbuseConfig, AccountConfig, AltchaConfig, Config};
 use weaver_server::email::{Email, Mailbox, Mailer, MailerError, MailerIdentity, SendReceipt};
@@ -58,6 +60,8 @@ struct Fixture {
     router: Router,
     account: Arc<AccountRuntime>,
     sent: Arc<Mutex<Vec<Email>>>,
+    /// The fake identity provider the SSO tests script (WVR-175).
+    fake: Arc<FakeProvider>,
     /// The relay's safety pipeline, built from the same account tuning.
     guard: Arc<weaver_abuse::Pipeline>,
 }
@@ -105,6 +109,9 @@ async fn setup_full(adjust: impl FnOnce(&mut AccountConfig), with_mailer: bool) 
         // The daemon generates this at boot when an install has none (WVR-166);
         // a fixture builds the runtime directly, so it supplies one here.
         totp_key: weaver_server::seal::SealKey::generate(),
+        // Generated at boot too (WVR-175): the SSO registry seals refresh
+        // grants with it.
+        sso_key: weaver_server::seal::SealKey::generate(),
         ..Default::default()
     };
     adjust(&mut account_config);
@@ -115,7 +122,10 @@ async fn setup_full(adjust: impl FnOnce(&mut AccountConfig), with_mailer: bool) 
         },
         store.clone(),
     );
-    let account = AccountRuntime::with_breach(
+    let fake = Arc::new(FakeProvider::new());
+    let mut sso = SsoProviders::empty(account_config.sso_key.clone(), "https://admin.test");
+    sso.insert(fake.clone());
+    let account = AccountRuntime::with_breach_and_sso(
         &account_config,
         "admin.test",
         store.clone(),
@@ -123,6 +133,7 @@ async fn setup_full(adjust: impl FnOnce(&mut AccountConfig), with_mailer: bool) 
         mailer,
         weaver_server::live::LiveHub::new(),
         Arc::new(NoBreach),
+        Some(sso),
     )
     .unwrap();
     // The console reads its traffic figures from the metrics store over the
@@ -131,6 +142,7 @@ async fn setup_full(adjust: impl FnOnce(&mut AccountConfig), with_mailer: bool) 
         router: router(account.clone(), None),
         account,
         sent,
+        fake,
         guard,
     }
 }
@@ -3944,7 +3956,7 @@ async fn a_passkey_session_counts_as_a_live_strong_session() {
     let raw = fixture
         .account
         .sessions
-        .create(account.id, weaver_server::wall_clock::unix_secs())
+        .create(account.id, "", weaver_server::wall_clock::unix_secs())
         .await
         .unwrap();
     let session = store
@@ -4520,4 +4532,280 @@ async fn the_wrong_code_allowance_closes_a_session_not_the_account() {
     assert_eq!(mailed.status, StatusCode::OK, "{:?}", mailed.body);
     let verified = verify_code(&fixture, &basic, &csrf, &latest_signin_code(&fixture.sent)).await;
     assert_eq!(verified.status, StatusCode::OK, "{:?}", verified.body);
+}
+
+// ----- external identity providers (WVR-175) -------------------------------
+
+/// The same-origin path of an absolute provider URL, which is what the router
+/// (having no network) can be asked to serve.
+fn provider_path(location: &str) -> String {
+    let rest = location
+        .split_once("://")
+        .map_or(location, |(_, rest)| rest);
+    match rest.find('/') {
+        Some(at) => rest[at..].to_string(),
+        None => panic!("provider URL has no path: {location}"),
+    }
+}
+
+/// Starts a provider sign-in and returns the URL the browser would follow.
+async fn sso_begin(fixture: &Fixture, provider: &str) -> String {
+    let reply = call(
+        &fixture.router,
+        "GET",
+        &format!("/api/account/sso/{provider}/begin"),
+        &[],
+        None,
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::FOUND, "{:?}", reply.body);
+    reply
+        .headers
+        .get(header::LOCATION)
+        .expect("a redirect")
+        .to_str()
+        .expect("a readable location")
+        .to_string()
+}
+
+/// Follows a provider redirect as a browser would, optionally on a session.
+async fn follow(fixture: &Fixture, url: &str, session: Option<&str>) -> Reply {
+    let headers: Vec<(&str, String)> = session
+        .map(|session| ("cookie", format!("__Host-weaver_session={session}")))
+        .into_iter()
+        .collect();
+    call(&fixture.router, "GET", &provider_path(url), &headers, None).await
+}
+
+/// A whole provider sign-in: queue the assertion, begin, and come back.
+async fn sso_sign_in(fixture: &Fixture, assertion: FakeAssertion) -> Reply {
+    fixture.fake.expect(assertion);
+    let url = sso_begin(fixture, "fake").await;
+    follow(fixture, &url, None).await
+}
+
+/// An assertion for a brand-new person.
+fn sso_new(subject: &str, email: &str) -> FakeAssertion {
+    FakeAssertion::new(subject, email).verified()
+}
+
+#[tokio::test]
+async fn an_unknown_external_identity_creates_an_account_and_signs_it_in() {
+    let fixture = setup().await;
+    let reply = sso_sign_in(
+        &fixture,
+        sso_new("subject-1", "newcomer@example.test").named("Newcomer"),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::FOUND, "{:?}", reply.body);
+    assert_eq!(
+        reply.headers.get(header::LOCATION).unwrap(),
+        "/app",
+        "a finished sign-in lands on the app"
+    );
+    let session = reply.cookie("__Host-weaver_session").expect("a session");
+
+    let state = me(&fixture, &session).await;
+    assert_eq!(state.status, StatusCode::OK, "{:?}", state.body);
+    assert_eq!(state.body["level"], "basic");
+    assert_eq!(state.body["me"]["email"], "newcomer@example.test");
+    assert_eq!(state.body["me"]["name"], "Newcomer");
+    // The session names the provider that opened it, so a step-up can return
+    // to the same one (WVR-175).
+    assert_eq!(state.body["me"]["provider"], "fake");
+}
+
+#[tokio::test]
+async fn a_known_identity_signs_in_to_the_same_account() {
+    let fixture = setup().await;
+    let first = sso_sign_in(&fixture, sso_new("subject-1", "repeat@example.test")).await;
+    let first_id = account_of(
+        &fixture,
+        &first.cookie("__Host-weaver_session").expect("a session"),
+    )
+    .await;
+
+    let second = sso_sign_in(&fixture, sso_new("subject-1", "repeat@example.test")).await;
+    let session = second.cookie("__Host-weaver_session").expect("a session");
+    assert_eq!(account_of(&fixture, &session).await, first_id);
+}
+
+#[tokio::test]
+async fn an_unvouched_address_is_settled_by_the_emailed_code() {
+    let fixture = setup().await;
+    // Not `.verified()`: the provider names an address it does not vouch for.
+    let reply = sso_sign_in(
+        &fixture,
+        FakeAssertion::new("subject-2", "unproven@example.test"),
+    )
+    .await;
+    let session = reply.cookie("__Host-weaver_session").expect("a session");
+    let csrf = reply.cookie("__Host-weaver_csrf").expect("a csrf cookie");
+    let state = me(&fixture, &session).await;
+    assert_eq!(state.body["level"], "basic");
+
+    // The relay issued an address-verification code; entering it proves the
+    // mailbox and lifts the session to `strong`.
+    let code = latest_verify_code(&fixture.sent);
+    let verified = call(
+        &fixture.router,
+        "POST",
+        "/api/account/login/verify",
+        &[
+            (
+                "cookie",
+                format!("__Host-weaver_session={session}; __Host-weaver_csrf={csrf}"),
+            ),
+            ("x-csrf-token", csrf.clone()),
+        ],
+        Some(serde_json::json!({ "code": code })),
+    )
+    .await;
+    assert_eq!(verified.status, StatusCode::OK, "{:?}", verified.body);
+    let state = me(&fixture, &session).await;
+    assert_eq!(state.body["level"], "strong");
+
+    // The account has no password, so the way to `Certain` is a provider
+    // re-authentication — never a password confirmation it could not perform.
+    let certain = state.body["paths"]
+        .as_array()
+        .expect("a list of ways up")
+        .iter()
+        .find(|path| path["to"] == "certain")
+        .expect("a way to certain");
+    let steps: Vec<&str> = certain["options"]
+        .as_array()
+        .expect("options")
+        .iter()
+        .flat_map(|option| option.as_array().expect("steps"))
+        .map(|step| step["step"].as_str().expect("a step name"))
+        .collect();
+    assert!(steps.contains(&"reauth_provider"), "{steps:?}");
+    assert!(!steps.contains(&"confirm_password"), "{steps:?}");
+}
+
+#[tokio::test]
+async fn a_step_up_returns_to_the_provider_and_lifts_the_session_to_certain() {
+    let fixture = setup().await;
+    let reply = sso_sign_in(&fixture, sso_new("subject-3", "certain@example.test")).await;
+    let session = reply.cookie("__Host-weaver_session").expect("a session");
+    assert_eq!(me(&fixture, &session).await.body["level"], "basic");
+
+    // Re-authenticate at the provider named by the session stream.
+    fixture
+        .fake
+        .expect(sso_new("subject-3", "certain@example.test"));
+    let step_up = call(
+        &fixture.router,
+        "GET",
+        "/api/account/sso/fake/step-up?return_path=%2Fapp%2Fsettings",
+        &[("cookie", format!("__Host-weaver_session={session}"))],
+        None,
+    )
+    .await;
+    assert_eq!(step_up.status, StatusCode::FOUND, "{:?}", step_up.body);
+    let url = step_up
+        .headers
+        .get(header::LOCATION)
+        .expect("a redirect")
+        .to_str()
+        .unwrap();
+    let finished = follow(&fixture, url, Some(&session)).await;
+    assert_eq!(finished.status, StatusCode::FOUND, "{:?}", finished.body);
+    assert_eq!(
+        finished.headers.get(header::LOCATION).unwrap(),
+        "/app/settings",
+        "the step-up returns where it was asked to"
+    );
+    assert_eq!(me(&fixture, &session).await.body["level"], "certain");
+}
+
+#[tokio::test]
+async fn an_unverified_address_never_takes_over_an_existing_account() {
+    let fixture = setup().await;
+    register(
+        &fixture,
+        "Victim",
+        "victim@example.test",
+        "correct horse battery",
+    )
+    .await;
+
+    // A different identity claiming the same address, without the provider
+    // vouching for it: refusing is the takeover-safe answer.
+    let refused = sso_sign_in(
+        &fixture,
+        FakeAssertion::new("attacker", "victim@example.test"),
+    )
+    .await;
+    assert_eq!(refused.status, StatusCode::FOUND, "{:?}", refused.body);
+    let location = refused
+        .headers
+        .get(header::LOCATION)
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert!(
+        location.starts_with("/sign-in?sso_error=email"),
+        "refused with a reason: {location}"
+    );
+    assert!(
+        refused.cookie("__Host-weaver_session").is_none(),
+        "a refused sign-in mints no session"
+    );
+
+    // The address was not linked to the attacker's identity, and the original
+    // account still signs in with its password.
+    let (session, _) = sign_in(&fixture, "victim@example.test", "correct horse battery").await;
+    let id = account_of(&fixture, &session).await;
+    assert!(
+        fixture
+            .account
+            .store
+            .external_identity_for_account(id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    // A vouched assertion at the same address is the one-time link the design
+    // allows: same account, now with the identity attached.
+    let linked = sso_sign_in(
+        &fixture,
+        FakeAssertion::new("victim-subject", "victim@example.test").verified(),
+    )
+    .await;
+    let linked_session = linked.cookie("__Host-weaver_session").expect("a session");
+    assert_eq!(account_of(&fixture, &linked_session).await, id);
+    assert_eq!(
+        fixture
+            .account
+            .store
+            .external_identity_for_account(id)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn the_config_lists_the_enabled_providers_and_unknown_ones_are_absent() {
+    let fixture = setup().await;
+    let config = call(&fixture.router, "GET", "/api/account/config", &[], None).await;
+    assert_eq!(config.status, StatusCode::OK, "{:?}", config.body);
+    assert_eq!(
+        config.body["sso_providers"],
+        serde_json::json!([{ "id": "fake", "label": "Fake provider" }])
+    );
+
+    let unknown = call(
+        &fixture.router,
+        "GET",
+        "/api/account/sso/nope/begin",
+        &[],
+        None,
+    )
+    .await;
+    assert_eq!(unknown.status, StatusCode::NOT_FOUND);
 }

@@ -1,7 +1,7 @@
 # Microsoft Entra ID — registering the app for the SSO preset
 
 Steps an operator has to follow to enable the Microsoft identity provider
-(WVR-169). Values appear as `<placeholders>`.
+(WVR-169, provider registry since WVR-175). Values appear as `<placeholders>`.
 
 ## 1. A tenant
 

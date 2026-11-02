@@ -16,6 +16,9 @@ harness.
 - `features/pairing.feature` — approving and rejecting a machine, the
   sign-in and sign-up detours, a lost key keeping its machine, and someone
   else's machine.
+- `features/sso.feature` — signing up and in through an external identity
+  provider, settling an address it did not vouch for, and refusing a takeover
+  (driven by the harness's fake provider).
 
 ## Prerequisites
 

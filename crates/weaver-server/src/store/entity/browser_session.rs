@@ -17,6 +17,9 @@ pub struct Model {
     pub created_at: i64,
     pub expires_at: i64,
     pub invalidated_at: Option<i64>,
+    /// The identity provider that opened the session, empty when none did
+    /// (WVR-175). It is what a step-up redirects back to.
+    pub provider: String,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

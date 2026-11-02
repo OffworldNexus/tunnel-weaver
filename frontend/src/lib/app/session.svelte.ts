@@ -73,6 +73,11 @@ export interface Me {
 	name: string;
 	/** Empty for an account with no email identity. */
 	email: string;
+	/**
+	 * The external identity provider that opened this session (WVR-175), empty
+	 * for a password or passkey sign-in. It is what a provider step-up returns to.
+	 */
+	provider: string;
 }
 
 /**

@@ -1,13 +1,16 @@
-//! The Microsoft identity platform client: discovery, the authorization request,
-//! the code exchange, the refresh, and ID-token verification (WVR-169).
+//! The protocol building blocks every direct OIDC provider is assembled from
+//! (WVR-175).
 //!
-//! One [`EntraClient`] per configured app registration. It owns everything those
-//! calls share — the outbound client, the authority, the client credentials and
-//! the cached discovery document and signing keys — so callers only pass what
-//! differs per request. Microsoft-specific facts the rest of the relay must not
-//! have to know are pinned here: the login host, the personal-account tenant id,
-//! and the fact that `iss` is `https://{host}/{tid}/v2.0` rather than a single
-//! fixed string when the authority is `common` or `organizations`.
+//! These are deliberately provider-neutral: an [`HttpClient`] that owns the
+//! outbound connection, a [`Jwks`] that caches a signing-key set, and an
+//! [`OidcClient`] that speaks discovery, the authorization request, the code
+//! exchange, the refresh, and ID-token verification. A provider file supplies
+//! only *facts* — its discovery URL, how its issuer is spelled, the extra
+//! authorize parameters it needs, and how its claims map onto an [`Assertion`] —
+//! and never a second implementation of the flow.
+//!
+//! Nothing here knows a provider's name. `IssuerRule::TenantTemplate` exists for
+//! providers whose `iss` embeds a tenant claim; `Fixed` covers the rest.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -24,87 +27,167 @@ use jsonwebtoken::jwk::JwkSet;
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
 use ring::digest::{SHA256, digest};
 use serde::Deserialize;
+use serde_json::{Map, Value};
 use tokio::sync::{OnceCell, RwLock};
 
 /// How long any single outbound provider request may take.
 const TIMEOUT: Duration = Duration::from_secs(10);
 
-/// The Microsoft identity platform's fixed host.
-const LOGIN_HOST: &str = "login.microsoftonline.com";
+/// The one outbound HTTP client of a provider.
+///
+/// Built once per provider so every call shares the connection pool and the
+/// platform's TLS roots. `https_only` keeps a provider-supplied discovery URL
+/// from downgrading the grant to cleartext.
+pub struct HttpClient {
+    client: Client<HttpsConnector<HttpConnector>, Full<Bytes>>,
+}
 
-/// The tenant id Microsoft uses for personal Microsoft accounts.
-const MSA_TENANT: &str = "9188040d-6c67-4c5b-b112-36a304b66dad";
+impl HttpClient {
+    /// Builds the client over the system trust store.
+    pub fn new() -> Result<Self, String> {
+        let connector = hyper_rustls::HttpsConnectorBuilder::new()
+            .try_with_platform_verifier()
+            .map_err(|e| format!("failed to load system TLS roots: {e}"))?
+            .https_only()
+            .enable_http1()
+            .build();
+        Ok(Self {
+            client: Client::builder(TokioExecutor::new()).build(connector),
+        })
+    }
 
-/// The scopes every grant asks for: the ID token, and a refresh token.
-const SCOPE: &str = "openid profile email offline_access";
+    /// GETs a URL and returns its body as text.
+    pub async fn get_text(&self, url: &str) -> Result<String, String> {
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri(url)
+            .body(Full::new(Bytes::new()))
+            .map_err(|e| e.to_string())?;
+        let (status, bytes) = self.send(request).await?;
+        if !status.is_success() {
+            return Err(format!("provider returned {status}"));
+        }
+        String::from_utf8(bytes.to_vec()).map_err(|e| e.to_string())
+    }
 
-type HttpClient = Client<HttpsConnector<HttpConnector>, Full<Bytes>>;
+    /// POSTs a form body and returns the status with the raw answer, so the
+    /// caller can classify a refusal from the provider's error document.
+    async fn post_form(&self, url: &str, form: &str) -> Result<(http::StatusCode, Bytes), String> {
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri(url)
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .body(Full::new(Bytes::from(form.to_string())))
+            .map_err(|e| e.to_string())?;
+        self.send(request).await
+    }
 
-/// The endpoints the authority advertises.
+    async fn send(
+        &self,
+        mut request: Request<Full<Bytes>>,
+    ) -> Result<(http::StatusCode, Bytes), String> {
+        request.headers_mut().insert(
+            header::USER_AGENT,
+            header::HeaderValue::from_static("tunnel-weaver-account"),
+        );
+        let response = tokio::time::timeout(TIMEOUT, self.client.request(request))
+            .await
+            .map_err(|_| "provider request timed out".to_string())?
+            .map_err(|e| e.to_string())?;
+        let status = response.status();
+        let bytes = response
+            .into_body()
+            .collect()
+            .await
+            .map_err(|e| e.to_string())?
+            .to_bytes();
+        Ok((status, bytes))
+    }
+}
+
+/// A provider's signing-key set, cached until a `kid` it does not hold is seen.
+///
+/// A key that is not published is retried once against a freshly fetched set:
+/// that is exactly how a key rotation looks. The cache is per provider, so a
+/// rotation at one provider never refetches another's keys.
+pub struct Jwks {
+    http: Arc<HttpClient>,
+    cache: RwLock<Option<Arc<JwkSet>>>,
+}
+
+impl Jwks {
+    /// An empty cache over `http`.
+    pub fn new(http: Arc<HttpClient>) -> Self {
+        Self {
+            http,
+            cache: RwLock::new(None),
+        }
+    }
+
+    /// The key set at `uri`, from the cache unless `refresh` asks for a fetch.
+    async fn get(&self, uri: &str, refresh: bool) -> Result<Arc<JwkSet>, String> {
+        if !refresh && let Some(found) = self.cache.read().await.as_ref() {
+            return Ok(found.clone());
+        }
+        let body = self.http.get_text(uri).await?;
+        let fetched: Arc<JwkSet> =
+            Arc::new(serde_json::from_str(&body).map_err(|e| format!("bad JWKS: {e}"))?);
+        *self.cache.write().await = Some(fetched.clone());
+        Ok(fetched)
+    }
+}
+
+/// How a provider spells `iss`.
+#[derive(Debug, Clone)]
+pub enum IssuerRule {
+    /// One exact URL, whatever the claims say.
+    Fixed(String),
+    /// `prefix + <tenant claim> + suffix` — how a multi-tenant issuer embeds the
+    /// tenant the token was minted for.
+    TenantTemplate { prefix: String, suffix: String },
+}
+
+impl IssuerRule {
+    /// Whether `claims` names an issuer this provider may have minted.
+    fn accepts(&self, claims: &Map<String, Value>) -> bool {
+        let Some(issuer) = claims.get("iss").and_then(Value::as_str) else {
+            return false;
+        };
+        match self {
+            IssuerRule::Fixed(expected) => issuer.eq_ignore_ascii_case(expected),
+            IssuerRule::TenantTemplate { prefix, suffix } => {
+                let Some(tenant) = claims.get("tid").and_then(Value::as_str) else {
+                    return false;
+                };
+                issuer.eq_ignore_ascii_case(&format!("{prefix}{tenant}{suffix}"))
+            }
+        }
+    }
+}
+
+/// Provider facts, as opposed to protocol behaviour.
+pub struct OidcSettings {
+    /// The OpenID Connect discovery document.
+    pub discovery_url: String,
+    /// The OAuth client id; also the ID token's expected audience.
+    pub client_id: String,
+    /// The plaintext client secret (already unsealed).
+    pub client_secret: String,
+    /// The scopes every grant asks for.
+    pub scopes: String,
+    /// How the provider spells `iss`.
+    pub issuer: IssuerRule,
+    /// Extra fixed query parameters for the authorization request (Google's
+    /// `access_type` and `claims`, for instance).
+    pub authorize_params: Vec<(String, String)>,
+}
+
+/// The endpoints the discovery document advertises.
 #[derive(Debug, Deserialize)]
 struct Endpoints {
     authorization_endpoint: String,
     token_endpoint: String,
     jwks_uri: String,
-}
-
-/// The ID-token claims this relay reads. A missing `iss` fails deserialisation.
-#[derive(Debug, Clone, Deserialize)]
-pub struct IdToken {
-    iss: String,
-    #[serde(default)]
-    nonce: String,
-    #[serde(default)]
-    pub tid: String,
-    #[serde(default)]
-    pub oid: String,
-    /// The authentication methods the provider used; `mfa` means a second
-    /// factor was performed.
-    #[serde(default)]
-    amr: Vec<String>,
-    #[serde(default)]
-    email: String,
-    /// `true` or the string `"true"`; anything else means "not verified".
-    #[serde(default)]
-    email_verified: Option<serde_json::Value>,
-    #[serde(default)]
-    pub auth_time: Option<i64>,
-    #[serde(default)]
-    preferred_username: String,
-    #[serde(default)]
-    name: String,
-}
-
-impl IdToken {
-    /// The address to create or sign in the account with, and whether the
-    /// provider vouched for it.
-    ///
-    /// `email` is the real address. Entra often omits it, and then
-    /// `preferred_username` is the same address in practice — taken as an
-    /// **unverified** candidate, since our own emailed code is what proves the
-    /// mailbox. Only a vouched `email` counts as verified.
-    pub fn address(&self) -> Option<(&str, bool)> {
-        let email = self.email.trim();
-        if !email.is_empty() {
-            return Some((email, truthy(&self.email_verified)));
-        }
-        let username = self.preferred_username.trim();
-        username.contains('@').then_some((username, false))
-    }
-
-    /// The display name for a new account.
-    pub fn display_name(&self) -> &str {
-        [&self.name, &self.preferred_username, &self.email]
-            .into_iter()
-            .map(|value| value.trim())
-            .find(|value| !value.is_empty())
-            .unwrap_or_default()
-    }
-
-    /// Whether the provider asserted a second factor.
-    pub fn asserted_mfa(&self) -> bool {
-        self.amr.iter().any(|m| m == "mfa" || m == "ngcmfa")
-    }
 }
 
 /// A provider's token-endpoint answer.
@@ -134,42 +217,91 @@ pub enum VerifyError {
     Invalid(&'static str),
 }
 
-/// The client of one app registration.
-pub struct EntraClient {
-    http: HttpClient,
-    authority: String,
-    client_id: String,
-    client_secret: String,
-    endpoints: OnceCell<Endpoints>,
-    jwks: RwLock<Option<Arc<JwkSet>>>,
+/// An ID token whose signature, lifetime, audience, nonce and issuer have all
+/// been checked, with its claims left for the provider to map.
+pub struct VerifiedClaims {
+    claims: Map<String, Value>,
+    /// The verified token itself, for diagnostics that name (never print) its
+    /// claims.
+    pub token: String,
 }
 
-impl EntraClient {
-    /// A client for `authority` (a tenant, or `common`/`organizations`/
-    /// `consumers`) with the registration's credentials.
-    pub fn new(authority: &str, client_id: &str, client_secret: &str) -> Result<Self, String> {
-        let connector = hyper_rustls::HttpsConnectorBuilder::new()
-            .try_with_platform_verifier()
-            .map_err(|e| format!("failed to load system TLS roots: {e}"))?
-            .https_only()
-            .enable_http1()
-            .build();
+impl VerifiedClaims {
+    /// A string claim, empty when absent or of another type.
+    pub fn string(&self, name: &str) -> &str {
+        self.claims.get(name).and_then(Value::as_str).unwrap_or("")
+    }
+
+    /// A claim that is `true` in either the boolean or the string spelling.
+    pub fn truthy(&self, name: &str) -> bool {
+        match self.claims.get(name) {
+            Some(Value::Bool(value)) => *value,
+            Some(Value::String(value)) => value == "true",
+            _ => false,
+        }
+    }
+
+    /// A claim holding a list of strings.
+    pub fn strings(&self, name: &str) -> Vec<&str> {
+        self.claims
+            .get(name)
+            .and_then(Value::as_array)
+            .map(|values| values.iter().filter_map(Value::as_str).collect())
+            .unwrap_or_default()
+    }
+
+    /// An integer claim.
+    pub fn integer(&self, name: &str) -> Option<i64> {
+        self.claims.get(name).and_then(Value::as_i64)
+    }
+
+    /// The names of the claims that arrived, without their values.
+    ///
+    /// Diagnostics only: when a claim the relay needs is missing, which claims
+    /// *did* arrive is what tells one cause from another.
+    pub fn claim_names(&self) -> Vec<String> {
+        self.claims.keys().cloned().collect()
+    }
+
+    /// A verified-claims value built straight from a claim map.
+    ///
+    /// Test-only: it skips the verification this type exists to prove, so it
+    /// must never be reachable from production code.
+    #[cfg(test)]
+    pub(crate) fn from_test_claims(claims: Map<String, Value>) -> Self {
+        Self {
+            claims,
+            token: String::new(),
+        }
+    }
+}
+
+/// The OIDC client of one configured app registration.
+pub struct OidcClient {
+    http: Arc<HttpClient>,
+    jwks: Jwks,
+    settings: OidcSettings,
+    endpoints: OnceCell<Endpoints>,
+}
+
+impl OidcClient {
+    /// A client over the provider's facts.
+    pub fn new(settings: OidcSettings) -> Result<Self, String> {
+        let http = Arc::new(HttpClient::new()?);
         Ok(Self {
-            http: Client::builder(TokioExecutor::new()).build(connector),
-            authority: authority.to_string(),
-            client_id: client_id.to_string(),
-            client_secret: client_secret.to_string(),
+            jwks: Jwks::new(Arc::clone(&http)),
+            http,
+            settings,
             endpoints: OnceCell::new(),
-            jwks: RwLock::new(None),
         })
     }
 
     /// The authorization-request URL.
     ///
-    /// `prompt` is `select_account` for a sign-in and `login` for a step-up.
-    /// `max_age` makes the provider report `auth_time`; it also caps the ID
-    /// token's lifetime at `auth_time + max_age`, so it is only asked for where
-    /// the time of authentication matters (a step-up).
+    /// `prompt` is the provider's own spelling (`select_account` for a sign-in,
+    /// `login` for a step-up). `max_age` makes the provider report `auth_time`;
+    /// it also caps the ID token's lifetime at `auth_time + max_age`, so it is
+    /// only asked for where the time of authentication matters (a step-up).
     pub async fn authorize_url(
         &self,
         redirect_uri: &str,
@@ -184,14 +316,20 @@ impl EntraClient {
             "{}?client_id={}&response_type=code&response_mode=query&redirect_uri={}\
              &scope={}&state={}&nonce={}&code_challenge={}&code_challenge_method=S256&prompt={}",
             endpoints.authorization_endpoint,
-            percent_encode(&self.client_id),
+            percent_encode(&self.settings.client_id),
             percent_encode(redirect_uri),
-            percent_encode(SCOPE),
+            percent_encode(&self.settings.scopes),
             percent_encode(state),
             percent_encode(nonce),
             pkce_challenge(code_verifier),
             percent_encode(prompt),
         );
+        for (name, value) in &self.settings.authorize_params {
+            url.push('&');
+            url.push_str(&percent_encode(name));
+            url.push('=');
+            url.push_str(&percent_encode(value));
+        }
         if let Some(max_age) = max_age {
             url.push_str(&format!("&max_age={max_age}"));
         }
@@ -224,33 +362,36 @@ impl EntraClient {
     }
 
     /// Verifies an ID token: signature, `exp` and `aud`, then the claims that
-    /// bind it to this flow (`nonce`) and this authority (`tid`, `iss`).
+    /// bind it to this flow (`nonce`) and this provider (`iss`).
     ///
     /// A key that is not published is retried once against a freshly fetched
-    /// set: that is exactly how a key rotation looks.
-    pub async fn verify(&self, token: &str, nonce: &str) -> Result<IdToken, VerifyError> {
+    /// set, so a rotation is not a failed sign-in.
+    pub async fn verify(&self, token: &str, nonce: &str) -> Result<VerifiedClaims, VerifyError> {
         let claims = match self.decode(token, false).await? {
             Err(Invalid::UnknownKey) => self.decode(token, true).await?,
             decoded => decoded,
         }
         .map_err(|error| VerifyError::Invalid(error.reason()))?;
 
-        if claims.nonce != nonce {
+        let found_nonce = claims.get("nonce").and_then(Value::as_str).unwrap_or("");
+        if found_nonce != nonce {
             return Err(VerifyError::Invalid("nonce mismatch"));
         }
-        if !tenant_allowed(&self.authority, &claims.tid) {
-            return Err(VerifyError::Invalid("tenant not allowed"));
+        // `azp` names the party the token was issued to. It is optional (and
+        // only present when a provider has several audiences), but when it is
+        // there it must be us.
+        if let Some(azp) = claims.get("azp").and_then(Value::as_str)
+            && azp != self.settings.client_id
+        {
+            return Err(VerifyError::Invalid("authorized party mismatch"));
         }
-        // `iss` is pinned to the host and to the token's own tenant, so a token
-        // for another tenant cannot pass by carrying a matching `tid`.
-        let expected = format!("https://{LOGIN_HOST}/{}/v2.0", claims.tid);
-        if !claims.iss.eq_ignore_ascii_case(&expected) {
+        if !self.settings.issuer.accepts(&claims) {
             return Err(VerifyError::Invalid("issuer mismatch"));
         }
-        if claims.oid.is_empty() {
-            return Err(VerifyError::Invalid("token has no subject"));
-        }
-        Ok(claims)
+        Ok(VerifiedClaims {
+            claims,
+            token: token.to_string(),
+        })
     }
 
     /// Decodes against the cached keys, or freshly fetched ones.
@@ -258,34 +399,29 @@ impl EntraClient {
         &self,
         token: &str,
         refresh: bool,
-    ) -> Result<Result<IdToken, Invalid>, VerifyError> {
-        let jwks = self.jwks(refresh).await.map_err(VerifyError::Unavailable)?;
-        Ok(decode_with(&jwks, &self.client_id, token))
+    ) -> Result<Result<Map<String, Value>, Invalid>, VerifyError> {
+        let jwks = self
+            .jwks
+            .get(
+                &self
+                    .endpoints()
+                    .await
+                    .map_err(VerifyError::Unavailable)?
+                    .jwks_uri,
+                refresh,
+            )
+            .await
+            .map_err(VerifyError::Unavailable)?;
+        Ok(decode_with(&jwks, &self.settings.client_id, token))
     }
 
     async fn endpoints(&self) -> Result<&Endpoints, String> {
         self.endpoints
             .get_or_try_init(|| async {
-                let url = format!(
-                    "https://{LOGIN_HOST}/{}/v2.0/.well-known/openid-configuration",
-                    self.authority
-                );
-                let body = self.get_text(&url).await?;
+                let body = self.http.get_text(&self.settings.discovery_url).await?;
                 serde_json::from_str(&body).map_err(|e| format!("bad discovery document: {e}"))
             })
             .await
-    }
-
-    async fn jwks(&self, refresh: bool) -> Result<Arc<JwkSet>, String> {
-        if !refresh && let Some(found) = self.jwks.read().await.as_ref() {
-            return Ok(found.clone());
-        }
-        let uri = &self.endpoints().await?.jwks_uri;
-        let body = self.get_text(uri).await?;
-        let fetched: Arc<JwkSet> =
-            Arc::new(serde_json::from_str(&body).map_err(|e| format!("bad JWKS: {e}"))?);
-        *self.jwks.write().await = Some(fetched.clone());
-        Ok(fetched)
     }
 
     /// POSTs a grant (plus the client credentials) and classifies a refusal.
@@ -293,17 +429,15 @@ impl EntraClient {
         let endpoints = self.endpoints().await.map_err(TokenError::Unavailable)?;
         let form = format!(
             "{grant}&client_id={}&client_secret={}&scope={}",
-            percent_encode(&self.client_id),
-            percent_encode(&self.client_secret),
-            percent_encode(SCOPE),
+            percent_encode(&self.settings.client_id),
+            percent_encode(&self.settings.client_secret),
+            percent_encode(&self.settings.scopes),
         );
-        let request = Request::builder()
-            .method(Method::POST)
-            .uri(&endpoints.token_endpoint)
-            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
-            .body(Full::new(Bytes::from(form)))
-            .map_err(|e| TokenError::Unavailable(e.to_string()))?;
-        let (status, bytes) = self.send(request).await.map_err(TokenError::Unavailable)?;
+        let (status, bytes) = self
+            .http
+            .post_form(&endpoints.token_endpoint, &form)
+            .await
+            .map_err(TokenError::Unavailable)?;
         if status.is_success() {
             return serde_json::from_slice(&bytes)
                 .map_err(|e| TokenError::Unavailable(format!("bad token answer: {e}")));
@@ -312,7 +446,7 @@ impl EntraClient {
         // A refusal carries `{"error": "..."}`. `invalid_grant` and
         // `interaction_required` mean the grant itself is dead — a revoked
         // token, a changed password, a policy that now demands interaction.
-        let error = serde_json::from_slice::<serde_json::Value>(&bytes)
+        let error = serde_json::from_slice::<Value>(&bytes)
             .ok()
             .and_then(|value| value.get("error")?.as_str().map(str::to_string))
             .unwrap_or_default();
@@ -322,41 +456,6 @@ impl EntraClient {
         Err(TokenError::Unavailable(format!(
             "provider returned {status} ({error})"
         )))
-    }
-
-    async fn get_text(&self, url: &str) -> Result<String, String> {
-        let request = Request::builder()
-            .method(Method::GET)
-            .uri(url)
-            .body(Full::new(Bytes::new()))
-            .map_err(|e| e.to_string())?;
-        let (status, bytes) = self.send(request).await?;
-        if !status.is_success() {
-            return Err(format!("provider returned {status}"));
-        }
-        String::from_utf8(bytes.to_vec()).map_err(|e| e.to_string())
-    }
-
-    async fn send(
-        &self,
-        mut request: Request<Full<Bytes>>,
-    ) -> Result<(http::StatusCode, Bytes), String> {
-        request.headers_mut().insert(
-            header::USER_AGENT,
-            header::HeaderValue::from_static("tunnel-weaver-account"),
-        );
-        let response = tokio::time::timeout(TIMEOUT, self.http.request(request))
-            .await
-            .map_err(|_| "provider request timed out".to_string())?
-            .map_err(|e| e.to_string())?;
-        let status = response.status();
-        let bytes = response
-            .into_body()
-            .collect()
-            .await
-            .map_err(|e| e.to_string())?
-            .to_bytes();
-        Ok((status, bytes))
     }
 }
 
@@ -376,38 +475,23 @@ impl Invalid {
     }
 }
 
-/// Checks a token's signature, `exp` and `aud` against a key set.
-fn decode_with(jwks: &JwkSet, client_id: &str, token: &str) -> Result<IdToken, Invalid> {
+/// Checks a token's signature, `exp` and `aud` against a key set, returning the
+/// raw claims for the provider to map.
+fn decode_with(jwks: &JwkSet, client_id: &str, token: &str) -> Result<Map<String, Value>, Invalid> {
     let header = decode_header(token).map_err(|_| Invalid::Rejected("bad token header"))?;
-    if header.alg != Algorithm::RS256 {
+    // Every provider in use signs with RS256; ES256 is accepted because it is
+    // the other registered JWS algorithm a compliant issuer may use today.
+    if !matches!(header.alg, Algorithm::RS256 | Algorithm::ES256) {
         return Err(Invalid::Rejected("unexpected token algorithm"));
     }
     let kid = header.kid.ok_or(Invalid::Rejected("token has no key id"))?;
     let jwk = jwks.find(&kid).ok_or(Invalid::UnknownKey)?;
     let key = DecodingKey::from_jwk(jwk).map_err(|_| Invalid::Rejected("unusable token key"))?;
-    let mut validation = Validation::new(Algorithm::RS256);
+    let mut validation = Validation::new(header.alg);
     validation.set_audience(&[client_id]);
-    decode::<IdToken>(token, &key, &validation)
+    decode::<Map<String, Value>>(token, &key, &validation)
         .map(|data| data.claims)
         .map_err(|_| Invalid::Rejected("token signature or lifetime rejected"))
-}
-
-/// The `tid` matrix for the configured authority.
-fn tenant_allowed(authority: &str, tid: &str) -> bool {
-    let is_guid = tid.len() == 36 && tid.chars().filter(|c| *c == '-').count() == 4;
-    if !is_guid {
-        return false;
-    }
-    match authority.to_ascii_lowercase().as_str() {
-        // Any work or school tenant, but not a personal account.
-        "organizations" => !tid.eq_ignore_ascii_case(MSA_TENANT),
-        // Work, school, and personal.
-        "common" => true,
-        // Personal only.
-        "consumers" => tid.eq_ignore_ascii_case(MSA_TENANT),
-        // A specific tenant.
-        tenant => tid.eq_ignore_ascii_case(tenant),
-    }
 }
 
 /// The PKCE challenge for a verifier: base64url(SHA-256(verifier)), unpadded.
@@ -429,78 +513,45 @@ pub fn percent_encode(value: &str) -> String {
     out
 }
 
-/// The names of the claims a JWT carries, without their values.
-///
-/// Diagnostics only: when a claim the relay needs is missing, which claims *did*
-/// arrive is what tells one cause from another. Values are never read.
-pub fn claim_names(token: &str) -> Vec<String> {
-    token
-        .split('.')
-        .nth(1)
-        .and_then(|payload| {
-            base64::engine::general_purpose::URL_SAFE_NO_PAD
-                .decode(payload)
-                .ok()
-        })
-        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
-        .and_then(|value| value.as_object().map(|map| map.keys().cloned().collect()))
-        .unwrap_or_default()
-}
-
-/// Reads a claim that is `true` in either the boolean or the string spelling.
-fn truthy(value: &Option<serde_json::Value>) -> bool {
-    match value {
-        Some(serde_json::Value::Bool(value)) => *value,
-        Some(serde_json::Value::String(value)) => value == "true",
-        _ => false,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    const TENANT: &str = "32fb7b25-9b31-4552-a225-7cb8da0afb61";
-
-    fn token(json: serde_json::Value) -> IdToken {
-        serde_json::from_value(json).expect("claims deserialise")
+    fn claims(json: Value) -> Map<String, Value> {
+        json.as_object().cloned().expect("an object")
     }
 
     #[test]
-    fn the_tenant_matrix_follows_the_authority() {
-        assert!(tenant_allowed("common", TENANT));
-        assert!(tenant_allowed("common", MSA_TENANT));
-        assert!(tenant_allowed("organizations", TENANT));
-        assert!(!tenant_allowed("organizations", MSA_TENANT));
-        assert!(tenant_allowed("consumers", MSA_TENANT));
-        assert!(!tenant_allowed("consumers", TENANT));
-        assert!(tenant_allowed(TENANT, TENANT));
-        assert!(!tenant_allowed(TENANT, MSA_TENANT));
-        assert!(!tenant_allowed("common", "not-a-guid"));
+    fn a_fixed_issuer_is_exact() {
+        let rule = IssuerRule::Fixed("https://accounts.google.com".into());
+        assert!(rule.accepts(&claims(serde_json::json!({
+            "iss": "https://accounts.google.com",
+        }))));
+        assert!(!rule.accepts(&claims(serde_json::json!({
+            "iss": "https://accounts.evil.example",
+        }))));
+        assert!(!rule.accepts(&claims(serde_json::json!({}))));
     }
 
     #[test]
-    fn only_a_vouched_email_claim_is_a_verified_address() {
-        let vouched = token(serde_json::json!({
-            "iss": "x", "email": "a@b.c", "email_verified": "true",
-        }));
-        assert_eq!(vouched.address(), Some(("a@b.c", true)));
-        let unvouched = token(serde_json::json!({ "iss": "x", "email": "a@b.c" }));
-        assert_eq!(unvouched.address(), Some(("a@b.c", false)));
-        let username = token(serde_json::json!({
-            "iss": "x", "preferred_username": "a@b.c", "email_verified": true,
-        }));
-        assert_eq!(username.address(), Some(("a@b.c", false)));
-        let none = token(serde_json::json!({ "iss": "x", "preferred_username": "alice" }));
-        assert_eq!(none.address(), None);
-    }
-
-    #[test]
-    fn mfa_is_read_from_amr() {
-        assert!(token(serde_json::json!({ "iss": "x", "amr": ["pwd", "mfa"] })).asserted_mfa());
-        assert!(token(serde_json::json!({ "iss": "x", "amr": ["ngcmfa"] })).asserted_mfa());
-        assert!(!token(serde_json::json!({ "iss": "x", "amr": ["pwd"] })).asserted_mfa());
-        assert!(!token(serde_json::json!({ "iss": "x" })).asserted_mfa());
+    fn a_tenant_template_uses_the_tid_claim() {
+        let rule = IssuerRule::TenantTemplate {
+            prefix: "https://login.example/".into(),
+            suffix: "/v2.0".into(),
+        };
+        assert!(rule.accepts(&claims(serde_json::json!({
+            "iss": "https://login.example/tenant-a/v2.0",
+            "tid": "tenant-a",
+        }))));
+        // A token whose `iss` names one tenant while `tid` names another cannot
+        // pass by carrying a matching `tid`.
+        assert!(!rule.accepts(&claims(serde_json::json!({
+            "iss": "https://login.example/tenant-a/v2.0",
+            "tid": "tenant-b",
+        }))));
+        assert!(!rule.accepts(&claims(serde_json::json!({
+            "iss": "https://login.example/tenant-a/v2.0",
+        }))));
     }
 
     #[test]

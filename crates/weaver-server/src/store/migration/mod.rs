@@ -14,6 +14,7 @@ mod m0005_passkeys;
 mod m0006_totp;
 mod m0007_external_identity;
 mod m0008_login_challenge_purpose;
+mod m0009_session_provider;
 
 /// The ordered list of every migration known to this binary.
 pub struct Migrator;
@@ -30,6 +31,7 @@ impl MigratorTrait for Migrator {
             Box::new(m0006_totp::Migration),
             Box::new(m0007_external_identity::Migration),
             Box::new(m0008_login_challenge_purpose::Migration),
+            Box::new(m0009_session_provider::Migration),
         ]
     }
 }

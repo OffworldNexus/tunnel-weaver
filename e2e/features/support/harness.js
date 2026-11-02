@@ -88,6 +88,24 @@ async function call(method, route, query = {}) {
 
 export const clearMail = () => call('DELETE', '/messages');
 
+/**
+ * Queues what the fake identity provider asserts on the next redirect (WVR-175).
+ *
+ * The provider is scripted per scenario: `subject`, `email`, `email_verified`,
+ * `name`, `mfa`, `auth_time` and `refresh_grant`, all optional. The e2e harness
+ * registers it so the shared SSO pipeline runs without a real provider.
+ */
+export async function expectSso(assertion) {
+  const response = await fetch(`${harness.mailUrl}/sso/expect`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(assertion)
+  });
+  if (!response.ok) {
+    throw new Error(`POST /sso/expect failed with ${response.status}`);
+  }
+}
+
 const describeMailbox = async () => {
   const captured = await call('GET', '/messages');
   return `the mailbox holds ${captured.length}: ${captured.map((m) => JSON.stringify(m.subject)).join(', ')}`;

@@ -105,10 +105,24 @@ impl Sessions {
 
     /// Mints a fresh session for `account_id`, returning the raw cookie token.
     /// Because the raw token is random, this is also the login-rotation step.
-    pub async fn create(&self, account_id: i32, now: i64) -> Result<String, StoreError> {
+    ///
+    /// `provider` is the external identity provider that opened the session, or
+    /// the empty string for a password or passkey sign-in (WVR-175).
+    pub async fn create(
+        &self,
+        account_id: i32,
+        provider: &str,
+        now: i64,
+    ) -> Result<String, StoreError> {
         let raw = new_token();
         self.store
-            .session_create(account_id, &token_hash(&raw), now, now + self.ttl_secs)
+            .session_create(
+                account_id,
+                &token_hash(&raw),
+                provider,
+                now,
+                now + self.ttl_secs,
+            )
             .await?;
         Ok(raw)
     }

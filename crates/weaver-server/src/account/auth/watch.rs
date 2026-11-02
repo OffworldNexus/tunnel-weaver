@@ -94,8 +94,11 @@ struct Watched {
     /// Whether the account holds a confirmed authenticator app (WVR-166), which
     /// decides whether `verify_totp` is part of those ways up.
     has_totp: bool,
-    /// Whether the account holds a linked external identity (WVR-169), which the
-    /// SSO path needs before it can name a single way up.
+    /// Whether the account holds a password, which decides whether
+    /// `confirm_password` is part of them (WVR-173).
+    has_password: bool,
+    /// The identity frame: id, name, address and the provider that opened the
+    /// session (WVR-175).
     me: Value,
 }
 
@@ -106,6 +109,7 @@ impl Watched {
             account_id: Some(self.session.account_id),
             has_passkeys: self.has_passkeys,
             has_totp: self.has_totp,
+            has_password: self.has_password,
             proofs: self.proofs.clone(),
             now,
             session_ttl_secs: self.session_ttl_secs,
@@ -150,10 +154,16 @@ async fn load(
         // session change that reloads everything else.
         has_passkeys: situation.has_passkeys,
         has_totp: situation.has_totp,
+        has_password: situation.has_password,
         me: json!({
             "id": account.id,
             "name": account.name,
             "email": email,
+            // The provider that opened this session, empty when a password or
+            // passkey did (WVR-175). The console builds a provider step-up from
+            // it; the account may hold several linked identities, so only the
+            // session knows which one signed in.
+            "provider": row.provider,
         }),
     }))
 }
@@ -175,6 +185,7 @@ fn state(watched: Option<&Watched>, now: i64) -> (Value, Option<i64>) {
             account_id: None,
             has_passkeys: false,
             has_totp: false,
+            has_password: false,
             proofs: BTreeMap::new(),
             now,
             session_ttl_secs: 0,

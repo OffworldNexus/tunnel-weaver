@@ -253,10 +253,11 @@ pub async fn run_server(
         )));
     }
     // Keeps a linked provider grant live and, when the provider rejects it,
-    // revokes the sessions it was acting for (WVR-169).
-    if let Some(microsoft) = account.microsoft.clone() {
+    // revokes the sessions it was acting for (WVR-169, provider-neutral since
+    // WVR-175). Nothing to do when no provider is enabled.
+    if !account.sso.is_empty() {
         scheduler_tasks.push(Arc::new(crate::account::sso::SsoRefreshTask::new(
-            microsoft,
+            account.sso.clone(),
             store.clone(),
         )));
     }

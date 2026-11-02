@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand};
 use crossterm::style::Stylize;
 use tracing_subscriber::EnvFilter;
+use weaver_server::config::{ProviderKind, ProviderPreset};
 use weaver_server::server::{self, EX_CONFIG, ServerError};
 use weaver_server::{Config, Store};
 
@@ -110,47 +111,40 @@ pub enum Commands {
 
     /// Manages external identity providers (SSO).
     Sso {
-        /// The operation to perform.
-        #[command(subcommand)]
-        command: SsoCommands,
-    },
-}
+        /// The provider id (`microsoft`, `google`).
+        provider: String,
 
-/// Subcommands for external identity providers (WVR-169).
-#[derive(Subcommand, Debug, Clone)]
-pub enum SsoCommands {
-    /// Manages the Microsoft (Entra ID) identity provider.
-    Microsoft {
         /// Outputs the result as raw JSON (the secret is never included).
         #[arg(long, global = true)]
         json: bool,
 
         /// The operation to perform.
         #[command(subcommand)]
-        command: MicrosoftCommands,
+        command: SsoCommands,
     },
 }
 
-/// Subcommands for the Microsoft (Entra ID) identity provider.
+/// Subcommands for one external identity provider (WVR-169, WVR-175).
+///
+/// `set` keeps the flags each kind needs; `enable`, `disable`, `show` and
+/// `clear` are the same operation whatever the provider is, so they are here
+/// once over the registry rather than repeated per provider.
 #[derive(Subcommand, Debug, Clone)]
-pub enum MicrosoftCommands {
+pub enum SsoCommands {
     /// Stores the preset, sealing the client secret, and starts offering it.
     Set {
-        /// Authority: a tenant id or domain, or `organizations`/`common`/`consumers`.
+        /// Microsoft only: a tenant id or domain, or `organizations`/`common`/
+        /// `consumers`.
         #[arg(long, value_name = "TENANT")]
-        authority: String,
+        authority: Option<String>,
 
-        /// The application (client) id from the app registration.
-        #[arg(long, value_name = "UUID")]
-        client_id: String,
+        /// The OAuth client id from the provider's console.
+        #[arg(long, value_name = "ID")]
+        client_id: Option<String>,
 
         /// The client secret. Omit it to keep a stored one; a secret is required
         /// the first time.
-        #[arg(
-            long,
-            value_name = "SECRET",
-            env = "WEAVER_SSO_MICROSOFT_CLIENT_SECRET"
-        )]
+        #[arg(long, value_name = "SECRET", env = "WEAVER_SSO_CLIENT_SECRET")]
         client_secret: Option<String>,
     },
 
@@ -1065,11 +1059,15 @@ async fn main() {
             let code = handle_altcha(command, db_path).await;
             std::process::exit(code);
         }
-        Commands::Sso { command } => {
+        Commands::Sso {
+            provider,
+            json,
+            command,
+        } => {
             let db_path = cli
                 .db
                 .unwrap_or_else(|| PathBuf::from("/var/lib/weaver/weaver.db"));
-            let code = handle_sso(command, db_path).await;
+            let code = handle_sso(provider, json, command, db_path).await;
             std::process::exit(code);
         }
     }
@@ -1759,14 +1757,18 @@ fn gather_acme_config(mut inputs: AcmeConfigInputs, options: GatherOptions) -> G
     }
 }
 
-/// Handles `weaver-server sso …` against the local store (WVR-169).
+/// Handles `weaver-server sso <provider> …` against the local store (WVR-169,
+/// registry-wide since WVR-175).
 ///
 /// Like `altcha` and `configure`, this opens the database directly rather than
 /// going through the daemon: the account config is read once at boot, so a change
 /// here takes effect on the next restart and the daemon never has to be running.
 /// The client secret is sealed with the account's `sso_key` **before** it ever
 /// reaches the struct, and is never printed.
-async fn handle_sso(command: SsoCommands, db_path: PathBuf) -> i32 {
+///
+/// `set` keeps the flags each provider kind needs; the other verbs are the same
+/// over the registry, whatever the provider is.
+async fn handle_sso(provider: String, json: bool, command: SsoCommands, db_path: PathBuf) -> i32 {
     let store = match Store::open(&db_path).await {
         Ok(store) => store,
         Err(err) => {
@@ -1786,19 +1788,30 @@ async fn handle_sso(command: SsoCommands, db_path: PathBuf) -> i32 {
         eprintln!("Failed to persist the sealing keys: {err}");
         return 1;
     }
+    if !matches!(provider.as_str(), "microsoft" | "google") {
+        eprintln!("Unknown provider '{provider}'. Known providers: microsoft, google.");
+        return 1;
+    }
 
-    let SsoCommands::Microsoft { json, command } = command;
-    let preset = &mut config.account.microsoft;
+    let stored = config.account.sso.get(&provider);
+    let existing_kind = stored.map(|preset| preset.kind.clone());
     match command {
-        MicrosoftCommands::Set {
+        SsoCommands::Set {
             authority,
             client_id,
             client_secret,
         } => {
-            let sealed = match (client_secret, preset.as_ref()) {
-                (Some(secret), _) => {
-                    match weaver_server::account::sso::Microsoft::seal_client_secret(
+            let Some(client_id) = client_id else {
+                eprintln!("--client-id is required.");
+                return 1;
+            };
+            // Either a new plaintext secret (sealed here, before it reaches the
+            // struct) or the sealed value already stored.
+            let sealed = match client_secret.or_else(|| legacy_secret_env(&provider)) {
+                Some(secret) => {
+                    match weaver_server::account::sso::SsoProviders::seal(
                         &config.account.sso_key,
+                        &provider,
                         &secret,
                     ) {
                         Ok(sealed) => sealed,
@@ -1808,80 +1821,165 @@ async fn handle_sso(command: SsoCommands, db_path: PathBuf) -> i32 {
                         }
                     }
                 }
-                (None, Some(stored)) => stored.client_secret.clone(),
-                (None, None) => {
-                    eprintln!(
-                        "No client secret to store: pass --client-secret, or set \
-                         WEAVER_SSO_MICROSOFT_CLIENT_SECRET, the first time."
-                    );
-                    return 1;
-                }
+                None => match existing_kind
+                    .as_ref()
+                    .map(|kind| kind.client_secret().to_string())
+                {
+                    Some(stored) if !stored.is_empty() => stored,
+                    _ => {
+                        eprintln!(
+                            "No client secret to store: pass --client-secret, or set \
+                             WEAVER_SSO_CLIENT_SECRET, the first time."
+                        );
+                        return 1;
+                    }
+                },
             };
-            *preset = Some(weaver_server::config::MicrosoftPreset {
-                authority,
-                client_id,
-                client_secret: sealed,
-                enabled: true,
-            });
-        }
-        MicrosoftCommands::Enable | MicrosoftCommands::Disable => {
-            let Some(preset) = preset.as_mut() else {
-                eprintln!("No Microsoft (Entra ID) provider is configured.");
+            let Some(kind) = build_kind(&provider, authority, client_id, sealed) else {
                 return 1;
             };
-            preset.enabled = matches!(command, MicrosoftCommands::Enable);
+            config.account.sso.insert(
+                provider.clone(),
+                ProviderPreset {
+                    enabled: true,
+                    kind,
+                },
+            );
         }
-        MicrosoftCommands::Show => {
-            report_sso(&config, json);
+        SsoCommands::Enable | SsoCommands::Disable => {
+            let Some(preset) = config.account.sso.get_mut(&provider) else {
+                eprintln!("No {provider} provider is configured.");
+                return 1;
+            };
+            preset.enabled = matches!(command, SsoCommands::Enable);
+        }
+        SsoCommands::Show => {
+            report_sso(&config, &provider, json);
             return 0;
         }
-        MicrosoftCommands::Clear => *preset = None,
+        SsoCommands::Clear => {
+            config.account.sso.remove(&provider);
+        }
     }
+    save_sso(&store, &config, &provider, json).await
+}
 
-    if let Err(err) = store.save_config(&config).await {
+/// Saves and reports, or explains why it could not.
+async fn save_sso(store: &Store, config: &Config, provider: &str, json: bool) -> i32 {
+    if let Err(err) = store.save_config(config).await {
         eprintln!("Failed to save configuration: {err}");
         return 1;
     }
-    report_sso(&config, json);
+    report_sso(config, provider, json);
     0
 }
 
-/// Prints the Microsoft preset without ever revealing the sealed secret.
-fn report_sso(config: &Config, json: bool) {
-    let secret_state = |preset: &weaver_server::config::MicrosoftPreset| {
-        if preset.client_secret.is_empty() {
-            "<empty>"
-        } else {
-            "<set>"
-        }
-    };
-    match &config.account.microsoft {
-        Some(preset) if json => println!(
-            "{}",
-            serde_json::json!({
-                "provider": "microsoft",
-                "authority": preset.authority,
-                "client_id": preset.client_id,
-                "client_secret": secret_state(preset),
-                "enabled": preset.enabled,
-            })
-        ),
-        Some(preset) => {
-            println!("Microsoft (Entra ID) provider");
-            println!("  Authority:     {}", preset.authority);
-            println!("  Client id:     {}", preset.client_id);
-            println!("  Client secret: {}", secret_state(preset));
-            println!(
-                "  Enabled:       {}",
-                if preset.enabled { "yes" } else { "no" }
-            );
-        }
-        None if json => println!(
-            "{}",
-            serde_json::json!({ "provider": "microsoft", "configured": false })
-        ),
-        None => println!("No Microsoft (Entra ID) provider is configured."),
+/// The pre-registry environment variable, still honoured for Microsoft so an
+/// existing deployment's command line keeps working.
+fn legacy_secret_env(provider: &str) -> Option<String> {
+    if provider != "microsoft" {
+        return None;
     }
+    std::env::var("WEAVER_SSO_MICROSOFT_CLIENT_SECRET")
+        .ok()
+        .filter(|secret| !secret.is_empty())
+}
+
+/// Builds the provider-specific half of a preset, refusing flags the kind does
+/// not take.
+fn build_kind(
+    provider: &str,
+    authority: Option<String>,
+    client_id: String,
+    client_secret: String,
+) -> Option<ProviderKind> {
+    match provider {
+        "microsoft" => {
+            let Some(authority) = authority else {
+                eprintln!("--authority is required for Microsoft.");
+                return None;
+            };
+            Some(ProviderKind::Microsoft {
+                authority,
+                client_id,
+                client_secret,
+            })
+        }
+        "google" => {
+            if authority.is_some() {
+                eprintln!("--authority is a Microsoft option; Google's issuer is fixed.");
+                return None;
+            }
+            Some(ProviderKind::Google {
+                client_id,
+                client_secret,
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Prints one provider's preset without ever revealing the sealed secret.
+fn report_sso(config: &Config, provider: &str, json: bool) {
+    let Some(preset) = config.account.sso.get(provider) else {
+        if json {
+            println!(
+                "{}",
+                serde_json::json!({ "provider": provider, "configured": false })
+            );
+        } else {
+            println!("No {provider} provider is configured.");
+        }
+        return;
+    };
+    let secret_state = if preset.kind.client_secret().is_empty() {
+        "<empty>"
+    } else {
+        "<set>"
+    };
+    let mut body = serde_json::json!({
+        "provider": preset.kind.id(),
+        "kind": preset.kind.id(),
+        "client_secret": secret_state,
+        "enabled": preset.enabled,
+    });
+    let object = body.as_object_mut().expect("an object literal");
+    match &preset.kind {
+        ProviderKind::Microsoft {
+            authority,
+            client_id,
+            ..
+        } => {
+            object.insert("authority".into(), authority.clone().into());
+            object.insert("client_id".into(), client_id.clone().into());
+        }
+        ProviderKind::Google { client_id, .. } => {
+            object.insert("client_id".into(), client_id.clone().into());
+        }
+    }
+    if json {
+        println!("{body}");
+        return;
+    }
+    println!("{} provider", preset.kind.label());
+    match &preset.kind {
+        ProviderKind::Microsoft {
+            authority,
+            client_id,
+            ..
+        } => {
+            println!("  Authority:     {authority}");
+            println!("  Client id:     {client_id}");
+        }
+        ProviderKind::Google { client_id, .. } => {
+            println!("  Client id:     {client_id}");
+        }
+    }
+    println!("  Client secret: {secret_state}");
+    println!(
+        "  Enabled:       {}",
+        if preset.enabled { "yes" } else { "no" }
+    );
 }
 
 /// Handles `weaver-server altcha …` against the local store.

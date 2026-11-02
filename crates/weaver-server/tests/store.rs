@@ -122,17 +122,17 @@ async fn test_store_open_runs_migrations_and_is_idempotent() {
         assert_eq!(count, 18);
         // Eight migrations: `m0001_init`, `m0002_usage_daily`,
         // `m0003_inactivity`, `m0004_auth_levels`, `m0005_passkeys`,
-        // `m0006_totp`, `m0007_external_identity` and
-        // `m0008_login_challenge_purpose`.
-        assert_eq!(store.schema_version().await.expect("schema_version"), 8);
+        // `m0006_totp`, `m0007_external_identity`,
+        // `m0008_login_challenge_purpose` and `m0009_session_provider`.
+        assert_eq!(store.schema_version().await.expect("schema_version"), 9);
     }
 
     // Re-open existing database: should succeed and not re-apply migrations
     {
         let store = Store::open(&db_path).await.expect("re-open failed");
         let migration_count: i64 = scalar(&store, "SELECT count(*) FROM seaql_migrations").await;
-        assert_eq!(migration_count, 8);
-        assert_eq!(store.schema_version().await.expect("schema_version"), 8);
+        assert_eq!(migration_count, 9);
+        assert_eq!(store.schema_version().await.expect("schema_version"), 9);
     }
 }
 
@@ -1141,11 +1141,11 @@ async fn test_account_reset_password_supersedes_and_revokes() {
 
     // Two live sessions before the reset (e.g. laptop and phone).
     store
-        .session_create(account_id, "session-one", now, now + 100_000)
+        .session_create(account_id, "session-one", "", now, now + 100_000)
         .await
         .unwrap();
     store
-        .session_create(account_id, "session-two", now, now + 100_000)
+        .session_create(account_id, "session-two", "", now, now + 100_000)
         .await
         .unwrap();
 
@@ -1234,11 +1234,11 @@ async fn test_account_change_password_supersedes_and_revokes() {
 
     // Two live sessions: the device making the change, and another.
     store
-        .session_create(account_id, "change-session-one", now, now + 100_000)
+        .session_create(account_id, "change-session-one", "", now, now + 100_000)
         .await
         .unwrap();
     store
-        .session_create(account_id, "change-session-two", now, now + 100_000)
+        .session_create(account_id, "change-session-two", "", now, now + 100_000)
         .await
         .unwrap();
 
@@ -1612,7 +1612,7 @@ async fn test_delete_account_removes_every_trace_and_is_idempotent() {
         .unwrap();
     let now = 1_800_000_000;
     store
-        .session_create(account.id, "deadbeef", now, now + 100)
+        .session_create(account.id, "deadbeef", "", now, now + 100)
         .await
         .unwrap();
 
@@ -2458,25 +2458,25 @@ async fn test_inactivity_candidates_flag_only_live_sessions() {
 
     // A live, unexpired session that has passed the second factor...
     let proven = store
-        .session_create(live.id, "live-hash", now - 60, now + 3600)
+        .session_create(live.id, "live-hash", "", now - 60, now + 3600)
         .await
         .unwrap();
     email_otp_proof(&store, live.id, proven.id, now - 30).await;
     // ...versus a live one that only proved the password: a half-signed-in
     // session is not activity (WVR-167)...
     store
-        .session_create(pending.id, "pending-hash", now - 60, now + 3600)
+        .session_create(pending.id, "pending-hash", "", now - 60, now + 3600)
         .await
         .unwrap();
     // ...versus one that is already expired...
     store
-        .session_create(expired.id, "expired-hash", now - 7200, now - 3600)
+        .session_create(expired.id, "expired-hash", "", now - 7200, now - 3600)
         .await
         .unwrap();
     // ...versus one that was explicitly retired, even though it had proven the
     // second factor.
     let retired = store
-        .session_create(invalidated.id, "invalidated-hash", now - 60, now + 3600)
+        .session_create(invalidated.id, "invalidated-hash", "", now - 60, now + 3600)
         .await
         .unwrap();
     email_otp_proof(&store, invalidated.id, retired.id, now - 30).await;
@@ -2865,6 +2865,46 @@ async fn test_seal_keys_are_generated_once_and_persisted() {
 }
 
 // ----- external identities (WVR-169) ---------------------------------------
+
+/// A config written before the provider registry (WVR-175) keeps its Microsoft
+/// preset working: `load` moves it into `account.sso` and rewrites the store, so
+/// the legacy key never survives a restart.
+#[tokio::test]
+async fn test_a_legacy_microsoft_preset_is_migrated_into_the_registry() {
+    let temp = TempDir::new().expect("tempdir");
+    let store = Store::open(temp.path().join("legacy-sso.db"))
+        .await
+        .expect("open failed");
+    let mut config = sample_config();
+    config.account.microsoft = Some(weaver_server::config::MicrosoftPreset {
+        authority: "common".into(),
+        client_id: "legacy-client".into(),
+        client_secret: "sealed".into(),
+        enabled: true,
+    });
+    store.save_config(&config).await.expect("save");
+
+    let loaded = Config::load(&store).await.expect("loads");
+    assert!(loaded.account.microsoft.is_none());
+    let preset = loaded
+        .account
+        .sso
+        .get("microsoft")
+        .expect("the preset moved into the registry");
+    assert!(preset.enabled);
+    assert!(matches!(
+        preset.kind,
+        weaver_server::config::ProviderKind::Microsoft { ref authority, .. } if authority == "common"
+    ));
+
+    // The rewritten config is the registry shape; the legacy key is gone.
+    let raw: serde_json::Value =
+        serde_json::from_str(&store.load_config_json().await.unwrap().unwrap()).unwrap();
+    assert!(raw["account"].get("microsoft").is_none());
+    assert_eq!(raw["account"]["sso"]["microsoft"]["kind"], "microsoft");
+    let reloaded = Config::load(&store).await.expect("loads again");
+    assert_eq!(reloaded.account.sso.len(), 1);
+}
 
 fn microsoft_identity<'a>(
     subject: &'a str,

@@ -1,18 +1,16 @@
 //! Keeping linked provider grants live, and revoking the sessions they act for
-//! when the provider rejects one (WVR-169).
+//! when a provider rejects one (WVR-169, provider-neutral since WVR-175).
 //!
 //! A rejected refresh is the only account-status signal a third-party relying
-//! party gets from Entra, so it is handled fail-closed: the stored grant is
-//! dropped and every live session of the account has its trail ended with an
-//! `identity_provider_grant_invalid` row, which the level derivation treats
-//! exactly like a logout.
-
-use std::sync::Arc;
+//! party gets from a direct provider, so it is handled fail-closed: the stored
+//! grant is dropped and every live session of the account has its trail ended
+//! with an `identity_provider_grant_invalid` row, which the level derivation
+//! treats exactly like a logout. It is never recorded as "the account was
+//! deleted": a provider rejection says the grant is no longer valid, not why.
 
 use tracing::warn;
 
-use super::oidc::TokenError;
-use super::{Microsoft, PROVIDER};
+use super::{RefreshOutcome, SsoProviders};
 use crate::account::auth::EventKind;
 use crate::scheduler::Task;
 use crate::store::account::NewAuthEvent;
@@ -23,59 +21,66 @@ use crate::store::{Store, StoreError};
 /// so a revoked grant is noticed long before anything it guards would lapse.
 const INTERVAL_SECS: i64 = 3600;
 
-/// The housekeeping task over every stored grant of one provider.
+/// The housekeeping task over every stored grant, for every enabled provider.
 pub struct SsoRefreshTask {
-    provider: Arc<Microsoft>,
+    providers: SsoProviders,
     store: Store,
 }
 
 impl SsoRefreshTask {
-    pub fn new(provider: Arc<Microsoft>, store: Store) -> Self {
-        Self { provider, store }
+    pub fn new(providers: SsoProviders, store: Store) -> Self {
+        Self { providers, store }
     }
 
     async fn refresh_all(&self, now: i64) -> Result<(), StoreError> {
         for identity in self.store.external_identity_with_refresh().await? {
-            if identity.provider == PROVIDER {
-                self.refresh_one(&identity, now).await?;
-            }
+            // A provider the operator has disabled keeps its linked identities
+            // working (and its grants intact): only an enabled one can refresh.
+            let Some(provider) = self.providers.get(&identity.provider) else {
+                continue;
+            };
+            self.refresh_one(&*provider, &identity, now).await?;
         }
         Ok(())
     }
 
     async fn refresh_one(
         &self,
+        provider: &dyn super::IdentityProvider,
         identity: &external_identity::Model,
         now: i64,
     ) -> Result<(), StoreError> {
         // A grant that cannot be opened (a rotated `sso_key`) is dropped rather
         // than retried forever.
-        let Ok(refresh_token) = self.provider.open(&identity.refresh_token) else {
+        let Ok(refresh_token) = self
+            .providers
+            .open(&identity.provider, &identity.refresh_token)
+        else {
             return self
                 .store
                 .external_identity_clear_refresh(identity.id)
                 .await;
         };
-        match self.provider.client.refresh(&refresh_token).await {
-            Ok(tokens) => {
-                if let Some(sealed) = tokens
-                    .refresh_token
-                    .and_then(|fresh| self.provider.seal(&fresh).ok())
-                {
+        match provider.refresh(&refresh_token).await {
+            RefreshOutcome::Rotated(fresh) => {
+                if let Ok(sealed) = self.providers.seal_refresh(&identity.provider, &fresh) {
                     self.store
                         .external_identity_rotate_refresh(identity.id, &sealed, now)
                         .await?;
                 }
             }
-            Err(TokenError::Rejected) => {
+            RefreshOutcome::Rejected => {
                 self.store
                     .external_identity_clear_refresh(identity.id)
                     .await?;
                 self.revoke_sessions(identity.account_id, now).await?;
             }
-            Err(TokenError::Unavailable(error)) => {
-                warn!(%error, "provider refresh unavailable; will retry");
+            RefreshOutcome::Unavailable(error) => {
+                warn!(%error, provider = identity.provider, "provider refresh unavailable; will retry");
             }
+            // Nothing to rotate (a broker token, or a provider that kept the
+            // stored grant valid): the identity keeps what it has.
+            RefreshOutcome::Unsupported => {}
         }
         Ok(())
     }
