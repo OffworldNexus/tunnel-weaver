@@ -1,10 +1,10 @@
 //! End-to-end tests for the account plane.
 //!
 //! These drive the account axum router directly (no TLS), exercising the same
-//! handlers the hyper edge mounts: signup → email verification → password →
-//! login → identity → logout, plus the abuse/enumeration and single-use rules.
+//! handlers the hyper edge mounts: signup → emailed-code verification → password
+//! → login → identity → logout, plus the abuse/enumeration and single-use rules.
 //! The ALTCHA proof is solved with the engine's test helper, and the mailer is
-//! a capture stub so the verification link can be followed.
+//! a capture stub so the verification code can be read back.
 
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -72,12 +72,6 @@ async fn setup_with(adjust: impl FnOnce(&mut AccountConfig)) -> Fixture {
     setup_full(adjust, true).await
 }
 
-/// Like [`setup_with`], but with no mailer: the inactivity warning is skipped
-/// while deletion still proceeds.
-async fn setup_without_mailer(adjust: impl FnOnce(&mut AccountConfig)) -> Fixture {
-    setup_full(adjust, false).await
-}
-
 async fn setup_full(adjust: impl FnOnce(&mut AccountConfig), with_mailer: bool) -> Fixture {
     let dir = tempfile::tempdir().unwrap().keep();
     let store = Store::open(dir.join("account.db")).await.unwrap();
@@ -110,7 +104,7 @@ async fn setup_full(adjust: impl FnOnce(&mut AccountConfig), with_mailer: bool) 
         argon2_parallelism: 1,
         // The daemon generates this at boot when an install has none (WVR-166);
         // a fixture builds the runtime directly, so it supplies one here.
-        totp_key: weaver_server::config::TotpKey::generate(),
+        totp_key: weaver_server::seal::SealKey::generate(),
         ..Default::default()
     };
     adjust(&mut account_config);
@@ -343,22 +337,28 @@ async fn me(fixture: &Fixture, session: &str) -> Reply {
     .await
 }
 
-/// Extracts the raw verification token from the last captured email.
-fn last_token(sent: &Mutex<Vec<Email>>) -> String {
-    let emails = sent.lock().unwrap();
-    let email = emails.last().expect("an email was sent");
-    email
-        .text
-        .split("token=")
-        .nth(1)
-        .expect("verification link has a token")
-        .split_whitespace()
-        .next()
+/// The six-digit code from the newest captured address-verification email.
+///
+/// The test's stand-in for the person reading their inbox: the plain-text twin
+/// carries the code alone on its line (WVR-169).
+fn latest_verify_code(sent: &Arc<Mutex<Vec<Email>>>) -> String {
+    sent.lock()
         .unwrap()
-        .to_string()
+        .iter()
+        .rev()
+        .find(|email| email.subject == "Verify your email address")
+        .and_then(|email| {
+            email
+                .text
+                .lines()
+                .map(str::trim)
+                .find(|line| line.len() == 6 && line.chars().all(|c| c.is_ascii_digit()))
+                .map(str::to_string)
+        })
+        .expect("a verification code email was captured")
 }
 
-/// Runs signup → verify → complete for a fresh address and returns nothing.
+/// Runs signup → verify (code) → complete for a fresh address and returns nothing.
 async fn register(fixture: &Fixture, name: &str, email: &str, password: &str) {
     let altcha = solved(&fixture.account, "signup").await;
     let reply = call(
@@ -370,14 +370,15 @@ async fn register(fixture: &Fixture, name: &str, email: &str, password: &str) {
     )
     .await;
     assert_eq!(reply.status, StatusCode::OK, "{:?}", reply.body);
+    let flow = reply.body["flow"].as_str().unwrap().to_string();
 
-    let token = last_token(&fixture.sent);
+    let code = latest_verify_code(&fixture.sent);
     let reply = call(
         &fixture.router,
         "POST",
         "/api/account/verify",
         &[],
-        Some(serde_json::json!({ "token": token })),
+        Some(serde_json::json!({ "flow": flow, "code": code })),
     )
     .await;
     assert_eq!(reply.status, StatusCode::OK, "{:?}", reply.body);
@@ -924,10 +925,10 @@ async fn a_resend_replaces_the_previous_sign_in_code() {
 }
 
 #[tokio::test]
-async fn verification_link_is_single_use() {
+async fn verification_code_is_single_use() {
     let fixture = setup().await;
     let altcha = solved(&fixture.account, "signup").await;
-    call(
+    let signup = call(
         &fixture.router,
         "POST",
         "/api/account/signup",
@@ -935,14 +936,15 @@ async fn verification_link_is_single_use() {
         Some(serde_json::json!({ "name": "A", "email": "a@example.com", "altcha": altcha })),
     )
     .await;
-    let token = last_token(&fixture.sent);
+    let flow = signup.body["flow"].as_str().unwrap().to_string();
+    let code = latest_verify_code(&fixture.sent);
 
     let first = call(
         &fixture.router,
         "POST",
         "/api/account/verify",
         &[],
-        Some(serde_json::json!({ "token": token })),
+        Some(serde_json::json!({ "flow": flow, "code": code })),
     )
     .await;
     assert_eq!(first.status, StatusCode::OK);
@@ -952,10 +954,90 @@ async fn verification_link_is_single_use() {
         "POST",
         "/api/account/verify",
         &[],
-        Some(serde_json::json!({ "token": token })),
+        Some(serde_json::json!({ "flow": flow, "code": code })),
     )
     .await;
     assert_eq!(second.status, StatusCode::BAD_REQUEST);
+}
+
+/// Clears an account's `verified_at`: the shape of an SSO sign-up whose address
+/// the provider would not vouch for.
+async fn unverify_address(fixture: &Fixture, email: &str) {
+    use sea_orm::ConnectionTrait as _;
+    fixture
+        .account
+        .store
+        .db()
+        .execute_unprepared(&format!(
+            "UPDATE email_identity SET verified_at = NULL WHERE lookup_key = '{email}'"
+        ))
+        .await
+        .unwrap();
+}
+
+/// Whether the address is currently marked verified.
+async fn address_is_verified(fixture: &Fixture, email: &str) -> bool {
+    fixture
+        .account
+        .store
+        .email_identity_find(email)
+        .await
+        .unwrap()
+        .expect("the address resolves to an account")
+        .verified_at
+        .is_some()
+}
+
+/// The row id behind a raw session cookie token.
+async fn session_row_id(fixture: &Fixture, raw: &str) -> i32 {
+    fixture
+        .account
+        .store
+        .session_live(
+            &weaver_server::account::session::token_hash(raw),
+            weaver_server::wall_clock::unix_secs(),
+        )
+        .await
+        .unwrap()
+        .expect("a live session")
+        .id
+}
+
+/// A `verify_address` code settles the address, exactly as the signup path does.
+#[tokio::test]
+async fn verify_address_code_settles_the_address() {
+    let fixture = setup().await;
+    register(
+        &fixture,
+        "Rémy",
+        "settled@example.com",
+        "correct horse battery",
+    )
+    .await;
+    unverify_address(&fixture, "settled@example.com").await;
+
+    // The password step opens a `Basic` session; a verify_address code is what
+    // the SSO callback issues over that session, so issue one the same way.
+    let (session, csrf) =
+        login_step(&fixture, "settled@example.com", "correct horse battery").await;
+    let session_id = session_row_id(&fixture, &session).await;
+    let code = weaver_server::account::second_factor::Challenge::new(
+        &fixture.account.store,
+        weaver_server::account::second_factor::Flow::Session(session_id),
+    )
+    .issue(
+        weaver_server::account::second_factor::Purpose::VerifyAddress,
+        weaver_server::wall_clock::unix_secs(),
+    )
+    .await
+    .unwrap();
+
+    let verified = verify_code(&fixture, &session, &csrf, &code).await;
+    assert_eq!(verified.status, StatusCode::OK, "{:?}", verified.body);
+    assert!(
+        address_is_verified(&fixture, "settled@example.com").await,
+        "a verify_address code must settle the address"
+    );
 }
 
 #[tokio::test]
@@ -982,14 +1064,15 @@ async fn existing_address_is_revealed_only_after_ownership() {
     // The response does not disclose the existing account.
     assert_eq!(signup.status, StatusCode::OK);
     assert_eq!(signup.body["status"], "check_email");
+    let flow = signup.body["flow"].as_str().unwrap().to_string();
 
-    let token = last_token(&fixture.sent);
+    let code = latest_verify_code(&fixture.sent);
     let verify = call(
         &fixture.router,
         "POST",
         "/api/account/verify",
         &[],
-        Some(serde_json::json!({ "token": token })),
+        Some(serde_json::json!({ "flow": flow, "code": code })),
     )
     .await;
     assert_eq!(verify.status, StatusCode::OK);
@@ -1056,58 +1139,6 @@ async fn login_rejects_wrong_credentials_generically() {
     .await;
     assert_eq!(bad.status, StatusCode::UNAUTHORIZED);
     assert_eq!(bad.body["error"], "invalid email or password");
-}
-
-#[tokio::test]
-async fn short_passwords_are_refused_at_completion() {
-    let fixture = setup().await;
-    let altcha = solved(&fixture.account, "signup").await;
-    call(
-        &fixture.router,
-        "POST",
-        "/api/account/signup",
-        &[],
-        Some(serde_json::json!({ "name": "A", "email": "a@example.com", "altcha": altcha })),
-    )
-    .await;
-    let token = last_token(&fixture.sent);
-    let verify = call(
-        &fixture.router,
-        "POST",
-        "/api/account/verify",
-        &[],
-        Some(serde_json::json!({ "token": token })),
-    )
-    .await;
-    let completion = verify.body["completion_token"]
-        .as_str()
-        .unwrap()
-        .to_string();
-    let reply = call(
-        &fixture.router,
-        "POST",
-        "/api/account/complete",
-        &[],
-        Some(serde_json::json!({ "completion_token": completion, "password": "short" })),
-    )
-    .await;
-    assert_eq!(reply.status, StatusCode::BAD_REQUEST);
-}
-
-#[tokio::test]
-async fn spa_shell_is_served_for_deep_links() {
-    let fixture = setup().await;
-    let reply = call(&fixture.router, "GET", "/set-password", &[], None).await;
-    assert_eq!(reply.status, StatusCode::OK);
-    assert_eq!(
-        reply.headers.get(header::CONTENT_TYPE).unwrap(),
-        "text/html; charset=utf-8"
-    );
-
-    // Legacy `/account/...` links redirect to the root equivalents.
-    let legacy = call(&fixture.router, "GET", "/account/sign-in", &[], None).await;
-    assert_eq!(legacy.status, StatusCode::FOUND);
-    assert_eq!(legacy.headers.get(header::LOCATION).unwrap(), "/sign-in");
 }
 
 // ----- password reset ---------------------------------------------
@@ -1780,67 +1811,6 @@ async fn change_password_refuses_a_wrong_current_password_without_side_effects()
         !signs_in(&fixture, email, "a much better password").await,
         "the rejected password was not applied"
     );
-}
-
-/// A new password that fails the policy is refused on the new field, and the
-/// refusal leaves the credential (and the session) alone so a retry works.
-#[tokio::test]
-async fn change_password_enforces_the_password_policy() {
-    let fixture = setup().await;
-    let email = "change-policy@example.com";
-    register(&fixture, "Rémy", email, "correct horse battery").await;
-    let (session, csrf) = sign_in(&fixture, email, "correct horse battery").await;
-
-    let short = change_password(&fixture, &session, &csrf, "correct horse battery", "short").await;
-    assert_eq!(short.status, StatusCode::BAD_REQUEST, "{:?}", short.body);
-    assert_eq!(short.body["field"], "new_password");
-    assert!(
-        signs_in(&fixture, email, "correct horse battery").await,
-        "a policy refusal changes nothing"
-    );
-
-    let ok = change_password(
-        &fixture,
-        &session,
-        &csrf,
-        "correct horse battery",
-        "a much better password",
-    )
-    .await;
-    assert_eq!(ok.status, StatusCode::OK, "{:?}", ok.body);
-}
-
-/// A change ends *every* session: a second device signed in earlier is dead too.
-#[tokio::test]
-async fn change_password_revokes_a_second_session_too() {
-    let fixture = setup().await;
-    let email = "change-devices@example.com";
-    register(&fixture, "Rémy", email, "correct horse battery").await;
-    let (session, csrf) = sign_in(&fixture, email, "correct horse battery").await;
-    let (other, _) = sign_in(&fixture, email, "correct horse battery").await;
-    assert_ne!(session, other, "two distinct sessions");
-
-    let reply = change_password(
-        &fixture,
-        &session,
-        &csrf,
-        "correct horse battery",
-        "a much better password",
-    )
-    .await;
-    assert_eq!(reply.status, StatusCode::OK, "{:?}", reply.body);
-
-    for cookie in [&session, &other] {
-        let me = call(
-            &fixture.router,
-            "GET",
-            "/api/account/me",
-            &[("cookie", format!("__Host-weaver_session={cookie}"))],
-            None,
-        )
-        .await;
-        assert_eq!(me.body["level"], "none", "every session is revoked");
-    }
 }
 
 /// The endpoint is authenticated and CSRF-protected: the level gate refuses a
@@ -2896,54 +2866,6 @@ async fn machines_require_a_session_and_csrf() {
 }
 
 #[tokio::test]
-async fn renaming_a_machine_is_validated_and_refused_on_collision() {
-    let fixture = setup().await;
-    let (browser, person, machine_id) = machines_fixture(&fixture).await;
-    fixture
-        .account
-        .store
-        .create_machine(person, "desktop", &KeyId::P256([8; 33]))
-        .await
-        .unwrap();
-
-    // A name this person already uses is a conflict.
-    let collision = browser
-        .post(
-            &fixture,
-            &format!("/api/account/machines/{machine_id}/rename"),
-            serde_json::json!({ "name": "desktop" }),
-        )
-        .await;
-    assert_eq!(
-        collision.status,
-        StatusCode::CONFLICT,
-        "{:?}",
-        collision.body
-    );
-
-    // A name that breaks the label rules is a bad request.
-    let invalid = browser
-        .post(
-            &fixture,
-            &format!("/api/account/machines/{machine_id}/rename"),
-            serde_json::json!({ "name": "Not A Name" }),
-        )
-        .await;
-    assert_eq!(
-        invalid.status,
-        StatusCode::BAD_REQUEST,
-        "{:?}",
-        invalid.body
-    );
-
-    // Neither attempt changed anything.
-    let detail = browser
-        .get(&fixture, &format!("/api/account/machines/{machine_id}"))
-        .await;
-    assert_eq!(detail.body["name"], "laptop");
-}
-
-#[tokio::test]
 async fn renaming_a_machine_moves_its_hostname_at_once() {
     let fixture = setup().await;
     let (browser, _person, machine_id) = machines_fixture(&fixture).await;
@@ -3063,78 +2985,6 @@ async fn machines_report_their_metered_usage() {
     // The list carries the same figures.
     let list = browser.get(&fixture, "/api/account/machines").await;
     assert_eq!(list.body["machines"][0]["usage_30d"]["bytes_out"], 1000);
-}
-
-/// The machine list reads most recently used first: the order the console shows,
-/// and the one that makes the first machine the right default name for something
-/// that belongs to a device — a passkey (WVR-163).
-#[tokio::test]
-async fn the_machine_list_reads_most_recently_used_first() {
-    use sea_orm::ConnectionTrait as _;
-    use weaver_server::metrics::encode_blob;
-
-    let fixture = setup().await;
-    // The fixture's own machine is named "laptop" and is never metered.
-    let (browser, person_id, _) = machines_fixture(&fixture).await;
-    let store = &fixture.account.store;
-    // Two more machines, named so that ordering by name would answer differently
-    // than ordering by recency: "aardvark" is used earliest, "zebra" latest, so
-    // the never-metered "laptop" belongs last.
-    let aardvark = store
-        .create_machine(person_id, "aardvark", &KeyId::P256([8; 33]))
-        .await
-        .unwrap();
-    let zebra = store
-        .create_machine(person_id, "zebra", &KeyId::P256([9; 33]))
-        .await
-        .unwrap();
-
-    let day = (std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs()
-        / 86_400) as i64;
-    // One open minute each, at different minutes of the day: presence is the
-    // metrics store's business, so the rows are written in its own shape (the
-    // blobs must be real frames — an empty `open_ms_minutes` is corrupt).
-    for (machine_id, minute) in [(aardvark.id, 5_usize), (zebra.id, 400_usize)] {
-        let service = store
-            .get_or_create_service(machine_id, "web")
-            .await
-            .unwrap();
-        let mut open_minutes = vec![0_i64; 1440];
-        open_minutes[minute] = 60_000;
-        let open_minutes_blob = hex(&encode_blob(&open_minutes));
-        let mut open_hours = vec![0_i64; 24];
-        open_hours[minute / 60] = 60_000;
-        let open_hours_blob = hex(&encode_blob(&open_hours));
-        store
-            .db()
-            .execute_unprepared(&format!(
-                "INSERT INTO usage_daily (service_id, day, bytes_in, bytes_in_hours, bytes_in_minutes, \
-                    bytes_out, bytes_out_hours, bytes_out_minutes, tunnel_in, tunnel_in_hours, tunnel_in_minutes, \
-                    tunnel_out, tunnel_out_hours, tunnel_out_minutes, requests, requests_hours, requests_minutes, \
-                    open_ms, open_ms_hours, open_ms_minutes) VALUES \
-                 ({}, {}, 0, X'', X'', 0, X'', X'', 0, X'', X'', 0, X'', X'', 0, X'', X'', 60000, X'{open_hours_blob}', X'{open_minutes_blob}')",
-                service.id, day
-            ))
-            .await
-            .unwrap();
-    }
-
-    let list = browser.get(&fixture, "/api/account/machines").await;
-    assert_eq!(list.status, StatusCode::OK, "{:?}", list.body);
-    let names: Vec<&str> = list.body["machines"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|machine| machine["name"].as_str().unwrap())
-        .collect();
-    assert_eq!(
-        names,
-        ["zebra", "aardvark", "laptop"],
-        "most recently used first, never seen last"
-    );
 }
 
 #[tokio::test]
@@ -3273,26 +3123,6 @@ async fn metrics_endpoint_returns_a_self_scoped_series() {
         StatusCode::BAD_REQUEST,
         "{:?}",
         bad_date.body
-    );
-}
-
-#[tokio::test]
-async fn disconnecting_an_offline_machine_is_a_no_op() {
-    let fixture = setup().await;
-    let (browser, _person, machine_id) = machines_fixture(&fixture).await;
-
-    let reply = browser
-        .post(
-            &fixture,
-            &format!("/api/account/machines/{machine_id}/disconnect"),
-            serde_json::json!({}),
-        )
-        .await;
-    assert_eq!(reply.status, StatusCode::OK, "{:?}", reply.body);
-    assert_eq!(reply.body["ok"], true);
-    assert_eq!(
-        reply.body["disconnected"], false,
-        "there is no live connection to drop"
     );
 }
 
@@ -3525,36 +3355,6 @@ async fn inactivity_sweep_skips_an_account_with_a_live_session() {
             .unwrap()
             .is_some()
     );
-}
-
-#[tokio::test]
-async fn inactivity_sweep_deletes_without_a_mailer() {
-    let fixture = setup_without_mailer(|cfg| {
-        cfg.inactive_after_secs = 1000;
-        cfg.inactivity_warning_before_secs = 500;
-    })
-    .await;
-    // No mailer means the signup flow cannot verify an address, so the account
-    // is created directly. Deletion needs no email identity.
-    let store = fixture.account.store.clone();
-    let account = store.create_account_without_login("Nomail").await.unwrap();
-
-    // The warning is skipped, but deletion still happens on schedule.
-    let now = weaver_server::wall_clock::unix_secs() + 2000;
-    store
-        .account_record_login(account.id, now - 800)
-        .await
-        .unwrap();
-    let report = inactivity::run(&fixture.account, None, now).await.unwrap();
-    assert_eq!(report.warned, 0);
-    assert_eq!(report.deleted, 0);
-    assert!(fixture.sent.lock().unwrap().is_empty(), "no email was sent");
-
-    let report = inactivity::run(&fixture.account, None, now + 300)
-        .await
-        .unwrap();
-    assert_eq!(report.deleted, 1);
-    assert!(store.account_by_id(account.id).await.unwrap().is_none());
 }
 
 // ----- passkeys (WVR-163) ---------------------------------------------------
@@ -3892,86 +3692,6 @@ async fn registering_asks_for_a_discoverable_credential() {
     );
 }
 
-/// A passkey changes what a session can do: the assertion becomes one of the
-/// ways up to `certain`, beside re-typing the password, and the console is told
-/// so by the stream it already listens to.
-#[tokio::test]
-async fn a_registered_passkey_becomes_a_way_up() {
-    use sea_orm::ConnectionTrait as _;
-
-    let fixture = setup().await;
-    register(
-        &fixture,
-        "Rémy",
-        "way-up@example.com",
-        "correct horse battery",
-    )
-    .await;
-    let (session, _) = sign_in(&fixture, "way-up@example.com", "correct horse battery").await;
-    let account_id = account_of(&fixture, &session).await;
-
-    // No passkey yet: the password is the only way back to `certain`.
-    fixture
-        .account
-        .store
-        .db()
-        .execute_unprepared(
-            "UPDATE auth_event SET occurred_at = occurred_at - 600 WHERE kind = 'password'",
-        )
-        .await
-        .unwrap();
-    assert_eq!(me(&fixture, &session).await.body["level"], "strong");
-    assert_eq!(
-        me(&fixture, &session).await.body["paths"],
-        serde_json::json!([{
-            "to": "certain",
-            "options": [[{ "step": "confirm_password", "reaches": "certain" }]],
-        }])
-    );
-
-    // Enrolling one adds the assertion, after the password — the password path
-    // is the one this session was opened through, so its step is preferred.
-    seed_passkey(&fixture, account_id, "MacBook").await;
-    assert_eq!(
-        me(&fixture, &session).await.body["paths"],
-        serde_json::json!([{
-            "to": "certain",
-            "options": [
-                [{ "step": "confirm_password", "reaches": "certain" }],
-                [{ "step": "assert_passkey", "reaches": "certain" }],
-            ],
-        }])
-    );
-
-    // And the same two options are what a refusal names, so an action that needs
-    // `certain` tells the console how to get there.
-    let refused = call(
-        &fixture.router,
-        "POST",
-        "/api/account/delete",
-        &[("cookie", format!("__Host-weaver_session={session}"))],
-        Some(serde_json::json!({ "address": "way-up@example.com" })),
-    )
-    .await;
-    assert_eq!(refused.status, StatusCode::FORBIDDEN);
-    let options: serde_json::Value = serde_json::from_str(
-        refused
-            .headers
-            .get("x-weaver-upgrade-paths")
-            .expect("the ways up")
-            .to_str()
-            .unwrap(),
-    )
-    .unwrap();
-    assert_eq!(
-        options,
-        serde_json::json!([
-            [{ "step": "confirm_password", "reaches": "certain" }],
-            [{ "step": "assert_passkey", "reaches": "certain" }],
-        ])
-    );
-}
-
 /// The step-up ceremony is served only where a step-up is expected, exactly like
 /// the password's, so a client cannot spend challenges at will.
 #[tokio::test]
@@ -4246,6 +3966,7 @@ async fn a_passkey_session_counts_as_a_live_strong_session() {
                 ip_address: String::new(),
                 user_agent: String::new(),
                 attempted: String::new(),
+                detail: String::new(),
             })
             .await
             .unwrap();

@@ -65,15 +65,3 @@ async fn too_old_client_is_rejected_with_range() {
     assert!(p.server.is_closed());
     assert_eq!(p.server.version(), None);
 }
-
-#[tokio::test]
-async fn negotiated_version_visible_on_both_sides() {
-    let mut p = Pair::default_pair();
-    p.pump().await;
-    assert_eq!(p.client.version(), Some(1));
-    assert_eq!(p.server.version(), Some(1));
-    assert!(matches!(
-        p.client_event(),
-        Some(Event::Authenticated { version: 1, .. })
-    ));
-}

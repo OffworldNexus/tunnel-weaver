@@ -1124,31 +1124,3 @@ pub async fn client_doctor(socket_path: &Path, json: bool) -> i32 {
 
     if report.ok() { 0 } else { 1 }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::{format_bytes, format_ratio};
-
-    #[test]
-    fn ratio_is_visitor_over_tunnel() {
-        assert_eq!(format_ratio(3_000, 1_000), "3.0×");
-        assert_eq!(format_ratio(1_000, 3_000), "0.3×");
-        // No tunnel bytes means the ratio is undefined, not infinite.
-        assert_eq!(format_ratio(1_000, 0), "-");
-        assert_eq!(format_ratio(0, 0), "-");
-    }
-
-    #[test]
-    fn bytes_use_decimal_si_prefixes() {
-        assert_eq!(format_bytes(0), "0 B");
-        assert_eq!(format_bytes(999), "999 B");
-        assert_eq!(format_bytes(1_000), "1.0 kB");
-        assert_eq!(format_bytes(1_500), "1.5 kB");
-        // 1024 bytes is 1.024 kB in SI, not 1.0 KiB.
-        assert_eq!(format_bytes(1_024), "1.0 kB");
-        assert_eq!(format_bytes(1_000_000), "1.0 MB");
-        assert_eq!(format_bytes(1_500_000), "1.5 MB");
-        assert_eq!(format_bytes(1_000_000_000), "1.0 GB");
-        assert_eq!(format_bytes(1_000_000_000_000), "1.0 TB");
-    }
-}

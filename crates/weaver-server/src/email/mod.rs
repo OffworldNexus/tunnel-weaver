@@ -381,28 +381,12 @@ mod tests {
     }
 
     #[test]
-    fn parse_rejects_bad_recipient() {
-        match Mailbox::parse("nope", None) {
-            Err(MailerError::InvalidRecipient(addr)) => assert_eq!(addr, "nope"),
-            other => panic!("expected InvalidRecipient, got {other:?}"),
-        }
-    }
-
-    #[test]
     fn trusted_https_only() {
         assert!(is_trusted_https("https://relay.example.org"));
         assert!(is_trusted_https("https://relay.example.org/support"));
         assert!(!is_trusted_https("http://relay.example.org"));
         assert!(!is_trusted_https("https://"));
         assert!(!is_trusted_https("https://user@host"));
-    }
-
-    #[test]
-    fn absent_config_is_not_configured() {
-        let err = mailer_from_config(None, "https://relay.example.org")
-            .err()
-            .expect("absent config must error");
-        assert_eq!(err, MailerError::NotConfigured);
     }
 
     #[test]

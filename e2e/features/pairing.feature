@@ -45,15 +45,15 @@ Feature: Pairing a machine to the relay
     Then I see the "Approve a machine" heading
     And the confirmation proposes the machine "laptop" and a person slug
 
-  # The pending pairing survives the whole registration, including a
-  # verification link that may open in another tab.
+  # The pending pairing survives the whole registration, verification code
+  # and password step included.
   Scenario: Opening a pairing link with no account, then creating one, returns to the confirmation
     Given a pending pairing is seeded for the machine "laptop"
     When I open the pairing link
     Then I see the "Sign in" heading
     When I follow the "Create an account" link
     And I create an account for "Ada Lovelace"
-    And I open the verification link from the latest email
+    And I enter the code from the verification email
     And I set the password to "correct-horse-battery-staple"
     And I sign in with the password "correct-horse-battery-staple"
     Then I see the "Approve a machine" heading

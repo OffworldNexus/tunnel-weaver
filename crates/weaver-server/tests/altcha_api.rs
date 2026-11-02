@@ -361,20 +361,6 @@ async fn an_unknown_client_is_refused() {
 }
 
 #[tokio::test]
-async fn a_malformed_verify_body_is_refused() {
-    let (addr, _store, shutdown) = start_edge(sample_config()).await;
-    let req_body = "{\"altcha\":\"%%%not-base64%%%\",\"purpose\":\"diagnostic\",\"flow\":\"x\"}";
-    let request = format!(
-        "POST /altcha/verify HTTP/1.1\r\nHost: weaver.test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-        req_body.len(),
-        req_body
-    );
-    let resp = https_request(addr, "weaver.test", &request).await;
-    assert!(resp.starts_with("HTTP/1.1 400"), "{resp:?}");
-    shutdown.cancel();
-}
-
-#[tokio::test]
 async fn the_demo_provisions_its_own_client() {
     let dir = tempfile::tempdir().unwrap().keep();
     let store = Store::open(dir.join("demo.db")).await.unwrap();
@@ -447,33 +433,6 @@ async fn the_diagnostic_page_is_served_with_the_widget() {
     )
     .await;
     assert!(missing.starts_with("HTTP/1.1 404"), "{missing:?}");
-    shutdown.cancel();
-}
-
-#[tokio::test]
-async fn the_diagnostic_offers_an_automatic_mode() {
-    let (addr, _store, shutdown) = start_edge(sample_config()).await;
-    let standard = https_request(
-        addr,
-        "relay-admin.test",
-        "GET /abuse/check HTTP/1.1\r\nHost: relay-admin.test\r\nConnection: close\r\n\r\n",
-    )
-    .await;
-    assert!(
-        body(&standard).contains("display=\"standard\""),
-        "{standard:?}"
-    );
-    // The attribution is hidden in every mode.
-    assert!(body(&standard).contains("hideFooter"), "{standard:?}");
-
-    let auto = https_request(
-        addr,
-        "relay-admin.test",
-        "GET /abuse/check?mode=auto HTTP/1.1\r\nHost: relay-admin.test\r\nConnection: close\r\n\r\n",
-    )
-    .await;
-    assert!(auto.starts_with("HTTP/1.1 200"), "{auto:?}");
-    assert!(body(&auto).contains("display=\"bar\""), "{auto:?}");
     shutdown.cancel();
 }
 

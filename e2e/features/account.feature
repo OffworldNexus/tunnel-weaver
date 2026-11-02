@@ -12,8 +12,9 @@ Feature: Account lifecycle
     Given I open the "landing" page
     When I follow the "Create account" link
     And I create an account for "Ada Lovelace"
-    Then I see the "Check your email" heading
-    When I open the verification link from the latest email
+    Then I see the "Enter your code" heading
+    And I see "We emailed a six-digit code to"
+    When I enter the code from the verification email
     Then I see the "Set your password" heading
     And the verified email is shown as the account address
     When I set the password to "correct-horse-battery-staple"
@@ -59,8 +60,7 @@ Feature: Account lifecycle
     Given an account exists for "Ada Lovelace" with the password "correct-horse-battery-staple"
     When I open the "sign-up" page
     And I create an account for "Ada Lovelace"
-    Then I see the "Check your email" heading
-    When I open the verification link from the latest email
+    And I enter the code from the verification email
     Then I see the "You already have an account" heading
 
   Scenario: Requesting a reset link by email and signing in with the new password

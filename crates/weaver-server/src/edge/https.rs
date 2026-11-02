@@ -292,6 +292,10 @@ fn view_for(surface: Surface, path: &str) -> ViewId {
         Host::TunnelRoot if path == "/altcha/verify" => ViewId::ALTCHA_VERIFY,
         _ if admin && path == "/api/account/signup" => ViewId::ACCOUNT_SIGNUP,
         _ if admin && path == "/api/account/login" => ViewId::ACCOUNT_LOGIN,
+        // The external-identity front door (WVR-169): `begin`, `callback` and the
+        // provider step-up are redirect builders with nothing to guess, so they
+        // share the login budget rather than minting one of their own.
+        _ if admin && path.starts_with("/api/account/sso") => ViewId::ACCOUNT_LOGIN,
         // Checking an emailed code guesses digits behind the same password guess
         // that opened the session, so it shares the login budget rather than
         // minting a new one (WVR-167).

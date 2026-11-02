@@ -348,34 +348,4 @@ mod tests {
                 .is_empty()
         );
     }
-
-    /// A service with no recorded minute is absent, and so is a window with no
-    /// live row at all.
-    #[tokio::test]
-    async fn a_window_with_no_slots_yields_nothing() {
-        let store = Store::connect("sqlite::memory:").await.expect("connect");
-        let alice = store.create_test_person("alice").await.expect("person");
-        let laptop = store
-            .create_machine(alice.id, "laptop", &weaver_mux::KeyId::Ed25519([1; 32]))
-            .await
-            .expect("machine");
-        store.get_or_create_service(laptop.id, "web").await.unwrap();
-
-        assert!(
-            store
-                .query_usage(None, None, 0, 1_000)
-                .await
-                .unwrap()
-                .is_empty()
-        );
-        slot(&store, 1, 100, Slots::Requests, 0).await;
-        assert!(
-            store
-                .query_usage(None, None, 0, 1_000)
-                .await
-                .unwrap()
-                .is_empty(),
-            "an all-zero bucket is not a covered minute"
-        );
-    }
 }

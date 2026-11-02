@@ -13,7 +13,7 @@ import {
 import {
   SIGN_IN_CODE_SUBJECT,
   createAccount,
-  openVerificationLink,
+  enterVerificationCode,
   press,
   setPassword
 } from '../support/flow.js';
@@ -25,8 +25,8 @@ When('I create an account for {string}', async function (name) {
   await createAccount(this, name);
 });
 
-When('I open the verification link from the latest email', async function () {
-  await openVerificationLink(this);
+When('I enter the code from the verification email', async function () {
+  await enterVerificationCode(this);
 });
 
 When('I set the password to {string}', async function (password) {
@@ -387,7 +387,7 @@ Then('I see the passkey {string}', async function (name) {
 // person in before the button could be pressed at all.
 When('I sign in with the passkey from the button', async function () {
   await assert.seeHeading(this.page, 'Sign in');
-  await this.page.getByRole('button', { name: /Sign in with a passkey/ }).click();
+  await this.page.getByRole('button', { name: 'Passkey', exact: true }).click();
   await this.present(true);
   await assert.seeHeading(this.page, 'Overview');
   await this.present(false);
@@ -406,7 +406,7 @@ Then('the sign-in field is ready to offer a passkey, and holds nothing', async f
   if (autocomplete !== 'username webauthn') {
     throw new Error(`Expected an autofill-ready email field, but its autocomplete is "${autocomplete}".`);
   }
-  await assert.seeText(this.page, 'No password, no emailed code');
+  await this.page.getByRole('button', { name: 'Passkey', exact: true }).waitFor();
 });
 
 When('the passkey signs me in without a click', async function () {

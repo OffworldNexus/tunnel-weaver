@@ -12,6 +12,8 @@ mod m0003_inactivity;
 mod m0004_auth_levels;
 mod m0005_passkeys;
 mod m0006_totp;
+mod m0007_external_identity;
+mod m0008_login_challenge_purpose;
 
 /// The ordered list of every migration known to this binary.
 pub struct Migrator;
@@ -26,6 +28,8 @@ impl MigratorTrait for Migrator {
             Box::new(m0004_auth_levels::Migration),
             Box::new(m0005_passkeys::Migration),
             Box::new(m0006_totp::Migration),
+            Box::new(m0007_external_identity::Migration),
+            Box::new(m0008_login_challenge_purpose::Migration),
         ]
     }
 }

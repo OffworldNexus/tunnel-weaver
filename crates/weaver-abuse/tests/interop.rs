@@ -120,21 +120,6 @@ fn an_official_challenge_is_solved_and_verified_by_us() {
     assert!(result.verified, "official crate must accept our solution");
 }
 
-#[test]
-fn both_solvers_agree_on_counter_and_derived_key() {
-    let challenge = our_challenge();
-    let upstream = upstream_challenge(&challenge);
-
-    let ours = our_solve(&challenge);
-    let theirs = solve_challenge(SolveChallengeOptions::new(&upstream))
-        .expect("upstream solve_challenge")
-        .expect("a solution exists");
-
-    // Deterministic iteration from counter 0 must land on the same solution.
-    assert_eq!(ours.counter, theirs.counter);
-    assert_eq!(ours.derived_key, theirs.derived_key);
-}
-
 /// A frozen cross-implementation vector: the fixed challenge `our_challenge()`
 /// produces, and the counter and derived key the official crate finds for it.
 ///

@@ -25,14 +25,16 @@ use serde_json::{Value, json};
 
 use weaver_abuse::AltchaError;
 
-use crate::account::auth::{AuthLevel, AuthManager, EventKind, SessionContext, watch};
+use crate::account::auth::{AuthLevel, AuthManager, EventKind, watch};
 use crate::account::passkey;
+use crate::account::second_factor::{Challenge, Flow, Purpose};
 use crate::account::session::{self, CSRF_COOKIE, CSRF_HEADER, SESSION_COOKIE};
+use crate::account::signin::{DeliverError, OpenedSession, deliver_code};
 use crate::account::views::{
     USAGE_WINDOW_SECS, key_of, load_error, owned_machine, person_of, person_services, signed_in,
 };
-use crate::account::{AccountRuntime, pairing, second_factor, totp, views};
-use crate::email::{Mailbox, PasswordChanged, Reset, SignInCode, Verification, Welcome};
+use crate::account::{AccountRuntime, pairing, totp, views};
+use crate::email::{Mailbox, PasswordChanged, Reset, Welcome};
 use crate::live::{Change, Entity, Viewer};
 use crate::metrics::{Function, Metric, MetricsQuery, MetricsStore};
 use crate::store::StoreError;
@@ -75,7 +77,7 @@ pub fn router(runtime: Arc<AccountRuntime>, tunnel: Option<Arc<TunnelRegistry>>)
         .route("/api/account/config", get(config))
         .route("/api/account/signup", post(signup))
         .route("/api/account/resend", post(resend))
-        .route("/api/account/verify", post(verify_link))
+        .route("/api/account/verify", post(verify_signup))
         .route("/api/account/complete", post(complete))
         .route("/api/account/reset/request", post(reset_request))
         .route("/api/account/reset/check", post(reset_check))
@@ -102,6 +104,21 @@ pub fn router(runtime: Arc<AccountRuntime>, tunnel: Option<Arc<TunnelRegistry>>)
         .route(
             "/api/account/passkey/step-up/finish",
             post(passkey_stepup_finish),
+        )
+        // External identity providers (WVR-169). `begin` and `callback` are the
+        // public front door (the callback arrives with no session at all);
+        // `step-up` re-authenticates an existing session at the provider.
+        .route(
+            "/api/account/sso/microsoft/begin",
+            get(super::sso::microsoft_begin),
+        )
+        .route(
+            "/api/account/sso/microsoft/callback",
+            get(super::sso::microsoft_callback),
+        )
+        .route(
+            "/api/account/sso/microsoft/step-up",
+            get(super::sso::microsoft_step_up),
         )
         .route("/api/account/passkeys/begin", post(passkey_register_begin))
         .route(
@@ -162,7 +179,10 @@ struct ResendRequest {
 
 #[derive(Deserialize)]
 struct VerifyRequest {
-    token: String,
+    /// The opaque signup flow id returned by `/signup`.
+    flow: String,
+    /// The six-digit code emailed for that flow.
+    code: String,
 }
 
 #[derive(Deserialize)]
@@ -266,6 +286,9 @@ async fn config(State(rt): State<Arc<AccountRuntime>>) -> Response {
         "resend_cooldown_secs": rt.config.resend_cooldown_secs,
         "support_email": rt.support_email,
         "relay_host": rt.relay_host(),
+        // The identity providers the operator enabled (WVR-169). The sign-in page
+        // renders one button per entry; an empty list means none.
+        "sso_providers": if rt.microsoft.is_some() { vec!["microsoft"] } else { vec![] },
     }))
 }
 
@@ -300,7 +323,7 @@ async fn signup(
             email: email.to_string(),
             lookup_key: normalize_email(email),
             created_at: now,
-            // Outlive the link so a verified user can still finish setting a
+            // Outlive the code so a verified user can still finish setting a
             // password inside the completion window.
             expires_at: now
                 + rt.config.verification_ttl_secs as i64
@@ -314,15 +337,15 @@ async fn signup(
 
     // A send failure must not disclose anything, and the pending row survives so
     // the user can resend.
-    if let Err(error) = send_verification(&rt, &pending, now).await {
-        tracing::warn!(%error, "signup verification email was not sent");
+    if let Err(error) = send_verify_address(&rt, &pending, now).await {
+        tracing::warn!(%error, "signup verification code was not sent");
     }
 
     // Identical body whether or not the address already belongs to an account.
     json_ok(json!({ "status": "check_email", "flow": flow_id }))
 }
 
-/// `POST /api/account/resend` — re-issue a verification link, throttled.
+/// `POST /api/account/resend` — re-issue a verification code, throttled.
 async fn resend(
     State(rt): State<Arc<AccountRuntime>>,
     headers: HeaderMap,
@@ -344,28 +367,28 @@ async fn resend(
         return json_ok(json!({ "status": "check_email" }));
     };
 
-    // Enforce the resend cooldown against the last issued token.
-    if let Ok(Some(latest)) = rt
-        .store
-        .verification_token_latest_for_flow(pending.id)
-        .await
-        && now - latest.issued_at < rt.config.resend_cooldown_secs as i64
+    // Enforce the resend cooldown against the last code issued for this flow.
+    if let Some((_, last_sent_at)) =
+        Challenge::new(&rt.store, Flow::PendingRegistration(pending.id))
+            .pending()
+            .await
+        && now - last_sent_at < rt.config.resend_cooldown_secs as i64
     {
         return json_ok(json!({ "status": "cooldown" }));
     }
 
-    if let Err(error) = send_verification(&rt, &pending, now).await {
-        tracing::warn!(%error, "resend verification email was not sent");
+    if let Err(error) = send_verify_address(&rt, &pending, now).await {
+        tracing::warn!(%error, "resend verification code was not sent");
     }
     json_ok(json!({ "status": "check_email" }))
 }
 
-/// `POST /api/account/verify` — exchange an email link token for the next step.
+/// `POST /api/account/verify` — trade an emailed code for the next step.
 ///
-/// Consumes the link (single-use). A new address gets a short-lived completion
+/// Consumes the code (single-use). A new address gets a short-lived completion
 /// token for password setup; an address that already belongs to an account is
 /// only now revealed, with no credential written and no session created.
-async fn verify_link(
+async fn verify_signup(
     State(rt): State<Arc<AccountRuntime>>,
     headers: HeaderMap,
     Json(req): Json<VerifyRequest>,
@@ -374,32 +397,9 @@ async fn verify_link(
         return err(StatusCode::FORBIDDEN, "request refused");
     }
     let now = unix_secs();
-    let digest = session::token_hash(&req.token);
-    let Some(token) = rt
-        .store
-        .verification_token_by_digest(&digest)
-        .await
-        .ok()
-        .flatten()
-    else {
-        return err(
-            StatusCode::BAD_REQUEST,
-            "this link is invalid or has already been used",
-        );
-    };
-    if token.purpose != PURPOSE_EMAIL_VERIFICATION
-        || token.consumed_at.is_some()
-        || token.revoked_at.is_some()
-        || token.expires_at <= now
-    {
-        return err(
-            StatusCode::BAD_REQUEST,
-            "this link has expired or has already been used",
-        );
-    }
     let Some(pending) = rt
         .store
-        .pending_registration_by_id(token.pending_registration_id)
+        .pending_registration_by_flow(&req.flow)
         .await
         .ok()
         .flatten()
@@ -407,31 +407,62 @@ async fn verify_link(
     else {
         return err(
             StatusCode::BAD_REQUEST,
-            "this link has expired or has already been used",
+            "this code is invalid or has expired",
         );
     };
 
-    // Single-use: consume the link now, before deciding the next step.
-    if !rt
-        .store
-        .verification_token_consume(token.id, now)
-        .await
-        .unwrap_or(false)
-    {
-        return err(
+    // The one refusal message for every way a code can fail, so a wrong flow and
+    // a wrong code are indistinguishable.
+    let refuse = || {
+        err(
             StatusCode::BAD_REQUEST,
-            "this link has expired or has already been used",
-        );
+            "this code is invalid or has expired",
+        )
+    };
+    let purpose = match Challenge::new(&rt.store, Flow::PendingRegistration(pending.id))
+        .verify(&req.code, now)
+        .await
+    {
+        Ok(purpose) => purpose,
+        Err(_) => return refuse(),
+    };
+    // A signup flow only ever issues an address-verification code; anything else
+    // under its identity is a state this program never writes.
+    if purpose != Purpose::VerifyAddress {
+        return refuse();
     }
+
+    // The code proved the mailbox. Record it as the consumed proof token the
+    // ownership history (`email_verification`) cites, then open the completion
+    // window; this is the one part of the old link flow the activation path
+    // still expects, so a signup lands exactly as it always did.
+    let raw_proof = session::new_token();
+    let Ok(proof) = rt
+        .store
+        .verification_token_issue(
+            pending.id,
+            NewVerificationToken {
+                email_lookup_key: pending.lookup_key.clone(),
+                token_digest: session::token_hash(&raw_proof),
+                purpose: PURPOSE_EMAIL_VERIFICATION.to_string(),
+                issued_at: now,
+                expires_at: now + rt.config.verification_ttl_secs as i64,
+            },
+        )
+        .await
+    else {
+        return err(StatusCode::SERVICE_UNAVAILABLE, "temporarily unavailable");
+    };
+    let _ = rt.store.verification_token_consume(proof.id, now).await;
     let _ = rt
         .store
-        .pending_registration_set_proved_by(pending.id, token.id)
+        .pending_registration_set_proved_by(pending.id, proof.id)
         .await;
 
     // Existing address: reveal only after ownership is proven.
     if rt
         .store
-        .email_identity_find(&token.email_lookup_key)
+        .email_identity_find(&pending.lookup_key)
         .await
         .ok()
         .flatten()
@@ -451,7 +482,7 @@ async fn verify_link(
         .verification_token_issue(
             pending.id,
             NewVerificationToken {
-                email_lookup_key: token.email_lookup_key.clone(),
+                email_lookup_key: pending.lookup_key.clone(),
                 token_digest: session::token_hash(&raw),
                 purpose: PURPOSE_REGISTRATION_COMPLETION.to_string(),
                 issued_at: now,
@@ -848,28 +879,11 @@ async fn login(
         );
     };
 
-    let raw = match rt.sessions.create(account.id, now).await {
-        Ok(raw) => raw,
-        Err(_) => return err(StatusCode::SERVICE_UNAVAILABLE, "temporarily unavailable"),
-    };
-    let Some(session) = rt
-        .store
-        .session_live(&session::token_hash(&raw), now)
-        .await
-        .ok()
-        .flatten()
-    else {
-        let _ = rt.sessions.invalidate(&raw, now).await;
+    let Some(opened) = OpenedSession::open(&rt, account.id, now).await else {
         return err(StatusCode::SERVICE_UNAVAILABLE, "temporarily unavailable");
     };
-    let context = SessionContext {
-        session_id: session.id,
-        account_id: account.id,
-    };
-
-    if manager.password_checked(context).await.is_err() {
-        let _ = rt.sessions.invalidate(&raw, now).await;
-        return err(StatusCode::SERVICE_UNAVAILABLE, "temporarily unavailable");
+    if manager.password_checked(opened.context).await.is_err() {
+        return opened.abort().await;
     }
 
     // The factor offered is the strongest the account configured, and the one it
@@ -877,34 +891,20 @@ async fn login(
     // is no code to issue and no email to send (WVR-166). Nothing is taken from
     // anyone — the emailed code is one click away, `POST /login/resend` being
     // what the console's "email me a code instead" calls.
-    let has_app = rt
-        .store
-        .totp_confirmed_count_for(account.id)
+    match opened
+        .offer_emailed_code(&manager, Purpose::SignIn, &account.name, &identity.email)
         .await
-        .map(|count| count > 0)
-        .unwrap_or(false);
-    if !has_app {
-        let Ok(code) = second_factor::issue(&rt.store, session.id, now).await else {
-            let _ = rt.sessions.invalidate(&raw, now).await;
-            return err(StatusCode::SERVICE_UNAVAILABLE, "temporarily unavailable");
-        };
-        if manager.email_otp_issued(context).await.is_err() {
-            let _ = rt.sessions.invalidate(&raw, now).await;
-            return err(StatusCode::SERVICE_UNAVAILABLE, "temporarily unavailable");
-        }
-        if let Err(error) = send_signin_code(&rt, &account.name, &identity.email, &code).await {
-            tracing::warn!(account_id = account.id, error = %error, "sign-in code email was not sent");
-            let _ = rt.sessions.invalidate(&raw, now).await;
-            return err(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "we could not send your code; try again",
-            );
+    {
+        Ok(()) => {}
+        Err(DeliverError::Store) => return opened.abort().await,
+        Err(error) => {
+            tracing::warn!(account_id = account.id, %error, "sign-in code email was not sent");
+            return opened
+                .abort_with("we could not send your code; try again")
+                .await;
         }
     }
-    let csrf = session::new_token();
-    let response = json_ok(json!({ "status": "second_factor" }));
-    let response = with_cookie(response, rt.sessions.session_cookie(&raw));
-    with_cookie(response, rt.sessions.csrf_cookie(&csrf))
+    opened.finish(json_ok(json!({ "status": "second_factor" })))
 }
 
 /// Body of a `POST /api/account/login/verify`.
@@ -933,10 +933,23 @@ async fn login_verify(
         return err(StatusCode::UNAUTHORIZED, "not signed in");
     };
     let now = unix_secs();
-    match second_factor::verify(&rt.store, session.session_id, &req.code, now).await {
-        Ok(()) => {
+    match Challenge::new(&rt.store, Flow::Session(session.session_id))
+        .verify(&req.code, now)
+        .await
+    {
+        Ok(purpose) => {
             if manager.email_otp_verified(session).await.is_err() {
                 return err(StatusCode::SERVICE_UNAVAILABLE, "temporarily unavailable");
+            }
+            // A code issued to settle an address — the sign-up of an account an
+            // identity provider would not vouch for — confirms it here, exactly
+            // as the ordinary signup does. A plain sign-in code proves the
+            // mailbox but leaves the address as the provider left it (WVR-169).
+            if purpose == Purpose::VerifyAddress {
+                let _ = rt
+                    .store
+                    .email_identity_mark_verified(session.account_id, now)
+                    .await;
             }
             // The sign-in is complete only now: this is what the sweep reads.
             if rt
@@ -1051,12 +1064,19 @@ async fn login_resend(
     };
     let now = unix_secs();
 
+    // The re-send preserves the existing challenge's purpose: a code issued to
+    // settle an SSO sign-up's address must still do that when re-sent. With no
+    // challenge yet — an account with an app whose owner asked for a code
+    // instead — the ordinary sign-in purpose is the only sensible one.
+    let flow = Flow::Session(session.session_id);
+    let pending = Challenge::new(&rt.store, flow).pending().await;
     // Enforce the re-send cooldown against the last issued code.
-    if let Some(last_sent_at) = second_factor::last_sent_at(&rt.store, session.session_id).await
+    if let Some((_, last_sent_at)) = pending
         && now - last_sent_at < rt.config.resend_cooldown_secs as i64
     {
         return json_ok(json!({ "status": "cooldown" }));
     }
+    let purpose = pending.map_or(Purpose::SignIn, |(purpose, _)| purpose);
 
     let Some(identity) = rt
         .store
@@ -1071,16 +1091,20 @@ async fn login_resend(
         return err(StatusCode::SERVICE_UNAVAILABLE, "temporarily unavailable");
     };
 
-    let Ok(code) = second_factor::issue(&rt.store, session.session_id, now).await else {
-        return err(StatusCode::SERVICE_UNAVAILABLE, "temporarily unavailable");
-    };
-    let _ = manager.email_otp_issued(session).await;
-    if let Err(error) = send_signin_code(&rt, &account.name, &identity.email, &code).await {
-        tracing::warn!(account_id = account.id, error = %error, "sign-in code email was not sent");
-        return err(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "we could not send your code; try again",
-        );
+    match deliver_code(&rt, flow, purpose, &account.name, &identity.email, now).await {
+        Ok(()) => {
+            let _ = manager.email_otp_issued(session).await;
+        }
+        Err(DeliverError::Store) => {
+            return err(StatusCode::SERVICE_UNAVAILABLE, "temporarily unavailable");
+        }
+        Err(error) => {
+            tracing::warn!(account_id = account.id, %error, "sign-in code email was not sent");
+            return err(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "we could not send your code; try again",
+            );
+        }
     }
     json_ok(json!({ "status": "second_factor" }))
 }
@@ -1491,43 +1515,19 @@ async fn passkey_signin_finish(
     };
     let _ = identity;
 
-    let raw = match rt.sessions.create(asserted.account_id, now).await {
-        Ok(raw) => raw,
-        Err(_) => return err(StatusCode::SERVICE_UNAVAILABLE, "temporarily unavailable"),
-    };
-    let Some(session) = rt
-        .store
-        .session_live(&session::token_hash(&raw), now)
-        .await
-        .ok()
-        .flatten()
-    else {
-        let _ = rt.sessions.invalidate(&raw, now).await;
+    let Some(opened) = OpenedSession::open(&rt, asserted.account_id, now).await else {
         return err(StatusCode::SERVICE_UNAVAILABLE, "temporarily unavailable");
-    };
-    let context = SessionContext {
-        session_id: session.id,
-        account_id: asserted.account_id,
     };
     if manager
-        .passkey_asserted(context, asserted.user_verified)
+        .passkey_asserted(opened.context, asserted.user_verified)
         .await
         .is_err()
-        || rt
-            .store
-            .account_record_login(asserted.account_id, now)
-            .await
-            .is_err()
+        || opened.record_login().await.is_err()
     {
-        let _ = rt.sessions.invalidate(&raw, now).await;
-        return err(StatusCode::SERVICE_UNAVAILABLE, "temporarily unavailable");
+        return opened.abort().await;
     }
     tracing::info!(account_id = asserted.account_id, "Signed in with a passkey");
-
-    let csrf = session::new_token();
-    let response = json_ok(json!({ "status": "signed_in" }));
-    let response = with_cookie(response, rt.sessions.session_cookie(&raw));
-    with_cookie(response, rt.sessions.csrf_cookie(&csrf))
+    opened.finish(json_ok(json!({ "status": "signed_in" })))
 }
 
 /// `GET /api/account/security` — everything the Security page shows (WVR-166).
@@ -2796,63 +2796,22 @@ async fn consume_altcha(rt: &AccountRuntime, encoded: &str, purpose: &str) -> Op
     }
 }
 
-/// Issues a fresh verification token and emails the link. The pending row is the
-/// retry mechanism, so a failure here is logged, not fatal.
-async fn send_verification(
+/// Issues a fresh address-verification code for a signup and emails it. The
+/// pending row is the retry mechanism, so a failure here is logged, not fatal.
+async fn send_verify_address(
     rt: &AccountRuntime,
     pending: &pending_registration::Model,
     now: i64,
-) -> Result<(), String> {
-    let raw = session::new_token();
-    rt.store
-        .verification_token_issue(
-            pending.id,
-            NewVerificationToken {
-                email_lookup_key: pending.lookup_key.clone(),
-                token_digest: session::token_hash(&raw),
-                purpose: PURPOSE_EMAIL_VERIFICATION.to_string(),
-                issued_at: now,
-                expires_at: now + rt.config.verification_ttl_secs as i64,
-            },
-        )
-        .await
-        .map_err(|e| e.to_string())?;
-
-    let Some(mailer) = &rt.mailer else {
-        return Err("email is not configured".into());
-    };
-    let to =
-        Mailbox::parse(&pending.email, Some(pending.name.clone())).map_err(|e| e.to_string())?;
-    let template = Verification {
-        verification_url: rt.verification_url(&raw),
-        expires_in: human_duration(rt.config.verification_ttl_secs),
-    };
-    let email = mailer.compose(to, &template).map_err(|e| e.to_string())?;
-    mailer.send(&email).await.map_err(|e| e.to_string())?;
-    Ok(())
-}
-
-/// Composes and sends the sign-in second-factor code.
-///
-/// `code` is the plaintext code; it is never logged here. A failure is returned
-/// so the caller can fail the sign-in closed rather than leaving a page that can
-/// never be satisfied.
-async fn send_signin_code(
-    rt: &AccountRuntime,
-    name: &str,
-    email: &str,
-    code: &str,
-) -> Result<(), String> {
-    let Some(mailer) = &rt.mailer else {
-        return Err("email is not configured".into());
-    };
-    let to = Mailbox::parse(email, Some(name.to_string())).map_err(|e| e.to_string())?;
-    let template = SignInCode {
-        code: code.to_string(),
-    };
-    let email = mailer.compose(to, &template).map_err(|e| e.to_string())?;
-    mailer.send(&email).await.map_err(|e| e.to_string())?;
-    Ok(())
+) -> Result<(), DeliverError> {
+    deliver_code(
+        rt,
+        Flow::PendingRegistration(pending.id),
+        Purpose::VerifyAddress,
+        &pending.name,
+        &pending.email,
+        now,
+    )
+    .await
 }
 
 /// Sends the welcome email once, best-effort, after activation succeeds.
@@ -2996,8 +2955,8 @@ fn csrf_ok(headers: &HeaderMap) -> bool {
     }
 }
 
-/// A 302 redirect to a same-origin path.
-fn redirect(location: &str) -> Response {
+/// A 302 redirect to a same-origin path (or an absolute provider URL).
+pub(crate) fn redirect(location: &str) -> Response {
     let mut response = Response::new(axum::body::Body::empty());
     *response.status_mut() = StatusCode::FOUND;
     if let Ok(value) = HeaderValue::from_str(location) {
@@ -3027,7 +2986,7 @@ pub(crate) fn err(status: StatusCode, message: &str) -> Response {
 }
 
 /// Appends a `Set-Cookie` header if it is a valid header value.
-fn with_cookie(mut response: Response, cookie: String) -> Response {
+pub(crate) fn with_cookie(mut response: Response, cookie: String) -> Response {
     if let Ok(value) = HeaderValue::from_str(&cookie) {
         response.headers_mut().append(header::SET_COOKIE, value);
     }

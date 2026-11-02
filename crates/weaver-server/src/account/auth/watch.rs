@@ -94,6 +94,8 @@ struct Watched {
     /// Whether the account holds a confirmed authenticator app (WVR-166), which
     /// decides whether `verify_totp` is part of those ways up.
     has_totp: bool,
+    /// Whether the account holds a linked external identity (WVR-169), which the
+    /// SSO path needs before it can name a single way up.
     me: Value,
 }
 

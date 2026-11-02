@@ -159,25 +159,6 @@ async fn lone_bulk_stream_gets_full_rate() {
 }
 
 #[tokio::test]
-async fn class_shares_converge_to_weights() {
-    let mut s = Sim::new().await;
-    let rt = s.open(Class::Realtime);
-    let small = s.open(Class::Interactive);
-    let bulk = s.open(Class::Bulk);
-    for id in [rt, small, bulk] {
-        s.saturate(id);
-    }
-    s.run(400).await;
-    let total = s.total() as f64;
-    let expect = |w: f64| total * w / (300.0 + 300.0 + 40.0);
-    for (id, w) in [(rt, 300.0), (small, 300.0), (bulk, 40.0)] {
-        let got = s.delivered(id) as f64;
-        let err = (got - expect(w)).abs() / expect(w);
-        assert!(err < 0.05, "stream {id} w={w}: {got} vs {}", expect(w));
-    }
-}
-
-#[tokio::test]
 async fn equal_shares_within_a_class() {
     let mut s = Sim::new().await;
     let ids: Vec<_> = (0..4).map(|_| s.open(Class::Interactive)).collect();

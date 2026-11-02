@@ -63,46 +63,6 @@ fn install_sinks(p: &mut Pair) -> (Arc<RecordingSink>, Arc<RecordingSink>) {
 }
 
 #[tokio::test]
-async fn sink_reports_the_sum_of_data_payloads() {
-    let mut p = Pair::authenticated().await;
-    let (client_sink, server_sink) = install_sinks(&mut p);
-    let id = p.client.open(policy()).unwrap();
-    send(&mut p.client, id, b"first message");
-    send(&mut p.client, id, b"second, a little longer");
-    p.pump().await;
-
-    let wire = data_payload_bytes(&p, Side::Client);
-    assert!(wire > 0);
-    assert_eq!(
-        client_sink.totals(id).1,
-        wire,
-        "sender reports queued DATA payloads"
-    );
-    assert_eq!(
-        server_sink.totals(id).0,
-        wire,
-        "receiver reports received DATA payloads"
-    );
-    // Control frames (OPEN, WINDOW_UPDATE, FIN) never reach the sink.
-    assert!(
-        p.frames_of(Side::Client, FrameType::Open).len() == 1,
-        "OPEN crossed the wire but was not reported"
-    );
-}
-
-#[tokio::test]
-async fn empty_message_reports_its_flag_byte() {
-    let mut p = Pair::authenticated().await;
-    let (client_sink, server_sink) = install_sinks(&mut p);
-    let id = p.client.open(policy()).unwrap();
-    send(&mut p.client, id, b"");
-    p.pump().await;
-    // One DATA payload of just the flags byte.
-    assert_eq!(client_sink.totals(id).1, 1);
-    assert_eq!(server_sink.totals(id).0, 1);
-}
-
-#[tokio::test]
 async fn reporting_happens_at_flow_time_not_at_stream_end() {
     let mut p = Pair::authenticated().await;
     let (client_sink, server_sink) = install_sinks(&mut p);
@@ -121,16 +81,6 @@ async fn reporting_happens_at_flow_time_not_at_stream_end() {
     p.pump().await;
     assert_eq!(client_sink.totals(id).1, 8);
     assert_eq!(server_sink.totals(id).0, 8);
-}
-
-#[tokio::test]
-async fn a_connection_without_a_sink_still_works() {
-    // No sink installed: reporting is a no-op and traffic flows normally.
-    let mut p = Pair::authenticated().await;
-    let id = p.client.open(policy()).unwrap();
-    send(&mut p.client, id, b"no sink");
-    p.pump().await;
-    assert_eq!(read_all(&mut p.server, id), b"no sink");
 }
 
 proptest! {

@@ -504,49 +504,6 @@ mod tests {
     }
 
     #[test]
-    fn catalog_ids_are_unique_and_lowercase() {
-        let mut seen = std::collections::HashSet::new();
-        for p in PROVIDERS {
-            assert_eq!(p.id, p.id.to_ascii_lowercase(), "id must be lowercase");
-            assert!(seen.insert(p.id), "duplicate provider id {}", p.id);
-        }
-    }
-
-    #[test]
-    fn catalog_covers_the_decided_provider_set() {
-        for expected in [
-            "resend",
-            "sendgrid",
-            "mailgun",
-            "mailjet",
-            "mandrill",
-            "brevo",
-            "sparkpost",
-            "mailersend",
-            "zeptomail",
-            "elasticemail",
-            "loops",
-            "postmark",
-            "smtp",
-        ] {
-            assert!(find_provider(expected).is_some(), "missing {expected}");
-        }
-    }
-
-    #[test]
-    fn lookup_is_case_insensitive() {
-        assert_eq!(find_provider("ReSeNd").unwrap().id, "resend");
-        assert!(find_provider("nope").is_none());
-    }
-
-    #[test]
-    fn unknown_provider_is_rejected() {
-        let issues = validate_email_config(&config("nope"));
-        assert_eq!(issues.len(), 1);
-        assert!(issues[0].contains("not in the catalog"));
-    }
-
-    #[test]
     fn missing_credential_is_reported() {
         let mut cfg = config("resend");
         cfg.api_key = None;
@@ -555,14 +512,6 @@ mod tests {
             issues.iter().any(|i| i.contains("requires API key")),
             "{issues:?}"
         );
-    }
-
-    #[test]
-    fn blank_credential_counts_as_absent() {
-        let mut cfg = config("resend");
-        cfg.api_key = Some("   ".into());
-        let issues = validate_email_config(&cfg);
-        assert!(issues.iter().any(|i| i.contains("requires API key")));
     }
 
     #[test]

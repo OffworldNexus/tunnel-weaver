@@ -1,9 +1,0 @@
-{{ heading }}
-
-{{ intro }}
-
-{{ verification_url }}
-
-{{ expiry }}
-
-{{ support_url }}

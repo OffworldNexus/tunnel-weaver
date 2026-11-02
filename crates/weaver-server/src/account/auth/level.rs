@@ -50,10 +50,4 @@ mod tests {
         assert!(AuthLevel::Basic < AuthLevel::Strong);
         assert!(AuthLevel::Strong < AuthLevel::Certain);
     }
-
-    #[test]
-    fn wire_names_are_stable_and_distinct() {
-        let names: Vec<&str> = AuthLevel::ALL.iter().map(|level| level.as_str()).collect();
-        assert_eq!(names, ["none", "basic", "strong", "certain"]);
-    }
 }

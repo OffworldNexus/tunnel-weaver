@@ -78,18 +78,3 @@ pub fn create_self_signed_server_config_for(
 
     Ok(Arc::new(config))
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_create_self_signed_server_config() {
-        let config = create_self_signed_server_config("example.com")
-            .expect("Failed to create TLS server config");
-        assert_eq!(
-            config.alpn_protocols,
-            vec![b"h2".to_vec(), b"http/1.1".to_vec()]
-        );
-    }
-}

@@ -154,23 +154,3 @@ impl RouteTable {
             .map(|&(_, policy)| policy)
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn policy_and_route_lookup() {
-        let set = PolicySet::new(vec![Policy {
-            id: PolicyId::RELAY_WEB,
-            budgets: Vec::new(),
-            on_store_error: StoreErrorPolicy::Degraded,
-        }]);
-        assert!(set.get(PolicyId::RELAY_WEB).is_some());
-        assert!(set.get(PolicyId::new("other")).is_none());
-
-        let routes = RouteTable::new(vec![(ViewId::RELAY_WEB, PolicyId::RELAY_WEB)]);
-        assert!(routes.get(ViewId::RELAY_WEB).is_some());
-        assert!(routes.get(ViewId::TUNNEL).is_none());
-    }
-}

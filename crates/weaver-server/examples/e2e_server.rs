@@ -4,7 +4,7 @@
 //! real ALTCHA runtime, the real HTTPS edge — against a temporary database and a
 //! self-signed certificate, and exposes the captured transactional emails over a
 //! small plain-HTTP endpoint. A browser driver (Playwright via Cucumber) can
-//! then exercise signup → emailed verification link → password → login against
+//! then exercise signup → emailed verification code → password → login against
 //! the same code the daemon runs, with no mocking of the account plane itself.
 //!
 //! Run it with:
@@ -31,7 +31,6 @@
 use std::collections::HashMap;
 use std::io::Write as _;
 use std::net::SocketAddr;
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -41,13 +40,11 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
-use tokio::signal::unix::{SignalKind, signal};
 use tokio_util::sync::CancellationToken;
 use weaver_mux::KeyId;
 use weaver_proto::pair::{ServerMessage, Target};
 
 use weaver_server::account::AccountRuntime;
-use weaver_server::account::password::BreachCheck;
 use weaver_server::altcha::AltchaRuntime;
 use weaver_server::cert::managed::ManagedCerts;
 use weaver_server::config::{AccountConfig, BudgetConfig, Config};
@@ -56,16 +53,7 @@ use weaver_server::edge::tls::create_self_signed_server_config_for;
 use weaver_server::email::{Email, Mailbox, Mailer, MailerError, MailerIdentity, SendReceipt};
 use weaver_server::{Store, abuse};
 
-/// A breach checker that never flags anything: the harness must not depend on
-/// network access to the Have I Been Pwned range API.
-struct NoBreach;
-
-#[async_trait]
-impl BreachCheck for NoBreach {
-    async fn is_breached(&self, _password: &str) -> Result<bool, String> {
-        Ok(false)
-    }
-}
+mod support;
 
 /// One captured outbound email, shaped for the test runner's JSON.
 #[derive(Clone, Serialize)]
@@ -100,69 +88,37 @@ impl Mailer for CaptureMailer {
     }
 }
 
-/// The account-plane config the harness runs with.
+/// The config the harness runs with.
 ///
 /// `base_url` must carry the real HTTPS port: it doubles as the browser
-/// `Origin` the account plane checks on every state-changing request. Argon2 is
-/// dialled down so a browser-driven signup stays snappy, and the per-network
-/// abuse budgets are widened for the same reason — a suite is many clients on
-/// one address, so the production burst would throttle the run rather than the
+/// `Origin` the account plane checks on every state-changing request. The
+/// per-network abuse budgets are widened — a suite is many clients on one
+/// address, so the production burst would throttle the run rather than the
 /// abuse it is meant to stop.
-fn account_config(base_url: String) -> AccountConfig {
+fn sample_config(https_port: u16) -> Config {
     let generous = || BudgetConfig {
         burst: 100_000,
         refill_units: 100_000,
         refill_per_secs: 1,
     };
-    AccountConfig {
-        base_url: Some(base_url),
-        argon2_memory_kib: 8,
-        argon2_iterations: 1,
-        argon2_parallelism: 1,
+    let account = AccountConfig {
         // A step-up lasts five minutes in production, which no browser test can
         // wait for. Twelve seconds keeps the `certain` window walkable — and
         // leaves seven seconds of it that the console still *holds* `certain`
         // for, after the relay has already reported the fall (its lead is five),
         // which is the whole point of the lead.
         confirm_window_secs: 12,
-        // The daemon repairs a missing TOTP key at boot (WVR-166); the harness
-        // builds the runtime directly, so it has to supply one itself. A fresh
-        // store per run means a fresh key is exactly right.
-        totp_key: weaver_server::config::TotpKey::generate(),
         signup: generous(),
         login: generous(),
         resend: generous(),
         pair: generous(),
-        ..AccountConfig::default()
-    }
-}
-
-/// The store config, valid for `localhost`, persisted then reloaded so the
-/// harness exercises `Config::load` exactly as the daemon does.
-fn sample_config(https_port: u16) -> Config {
-    Config {
-        tunnel_domain: "weaver.test".into(),
-        admin_domain: "localhost".into(),
-        admin_email: "admin@weaver.test".into(),
-        acme_provider: "letsencrypt-staging".into(),
-        // Unused: the harness binds both listeners explicitly. Present because
-        // `Config::load` requires them.
-        listen_http: SocketAddr::from(([127, 0, 0, 1], 0)),
-        listen_https: SocketAddr::from(([127, 0, 0, 1], 0)),
-        control_socket: PathBuf::from("e2e-server.sock"),
-        acme_directory: None,
-        acme_eab_kid: None,
-        acme_eab_hmac: None,
-        acme_root_ca_pem: None,
-        acme_fallback_providers: Vec::new(),
-        usage_flush_interval_secs: 60,
-        usage_retention_secs: 31_536_000,
-        relay_ips: Vec::new(),
-        setup_complete: false,
-        email: Some(weaver_server::config::test_email_config()),
-        abuse: None,
-        account: account_config(format!("https://localhost:{https_port}")),
-    }
+        ..support::account_config(format!("https://localhost:{https_port}"))
+    };
+    support::config(
+        account,
+        "e2e-server.sock",
+        Some(weaver_server::config::test_email_config()),
+    )
 }
 
 // ----- mail endpoint --------------------------------------------------------
@@ -321,15 +277,6 @@ async fn serve_mail(sent: Captured, account: Arc<AccountRuntime>, https_port: u1
 
 // ----- lifecycle ------------------------------------------------------------
 
-/// Waits for SIGINT or SIGTERM.
-async fn wait_for_shutdown() {
-    let mut term = signal(SignalKind::terminate()).expect("SIGTERM handler");
-    tokio::select! {
-        _ = tokio::signal::ctrl_c() => {}
-        _ = term.recv() => {}
-    }
-}
-
 #[tokio::main]
 async fn main() {
     // Logs never touch stdout: stdout carries only the two URL lines.
@@ -376,7 +323,7 @@ async fn main() {
         Arc::clone(&altcha),
         Some(mailer),
         weaver_server::live::LiveHub::new(),
-        Arc::new(NoBreach),
+        Arc::new(support::NoBreach),
     )
     .expect("account runtime");
 
@@ -417,6 +364,6 @@ async fn main() {
     println!("E2E_MAIL_URL=http://127.0.0.1:{}", mail_addr.port());
     std::io::stdout().flush().expect("flush stdout");
 
-    wait_for_shutdown().await;
+    support::wait_for_shutdown().await;
     shutdown.cancel();
 }

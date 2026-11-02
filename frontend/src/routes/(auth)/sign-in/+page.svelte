@@ -3,6 +3,7 @@
 
 	import Altcha from '#lib/account/Altcha.svelte';
 	import { api } from '#lib/account/api';
+	import { ensureConfig, ssoProviders } from '#lib/account/config.svelte';
 	import EmailField from '#lib/account/EmailField.svelte';
 	import { jsonForm } from '#lib/account/form';
 	import { notify } from '#lib/account/notices';
@@ -18,6 +19,7 @@
 	import { climb } from '#lib/app/upgrade';
 	import Icon from '#lib/ui/Icon.svelte';
 	import Keycap from '#lib/ui/Keycap.svelte';
+	import Microsoft from '#lib/ui/Microsoft.svelte';
 	import Page from '#lib/ui/Page.svelte';
 	import { goto } from '$app/navigation';
 	import { resolve } from '$app/paths';
@@ -35,6 +37,46 @@
 
 	/** Whether this browser can run a passkey ceremony at all. */
 	const passkeys = passkeysSupported();
+
+	/** The external identity providers the operator enabled (WVR-169). */
+	let providers = $state<string[]>([]);
+
+	/** Why an SSO sign-in came back refused, if it did (the relay puts it in the URL). */
+	let ssoError = $state('');
+
+	/** The relay's short refusal reasons, in words. */
+	const SSO_ERRORS: Record<string, string> = {
+		email:
+			'That Microsoft account has no email address we can use, or the address belongs to another account.',
+		denied: 'The Microsoft sign-in was cancelled.',
+		expired: 'That sign-in took too long. Try again.',
+		state: 'That sign-in was not started here. Try again.',
+		code: 'Microsoft did not return a code. Try again.',
+		rejected: 'Microsoft refused the sign-in. Try again.',
+		token: 'Microsoft’s answer could not be verified. Try again.',
+		disabled: 'Microsoft sign-in is not available.',
+		identity: 'That Microsoft account is not linked to this account.',
+		stale: 'Microsoft did not ask you to sign in again, so we could not confirm it was you.'
+	};
+
+	onMount(() => {
+		ensureConfig()
+			.then(() => (providers = ssoProviders()))
+			.catch(() => (providers = []));
+		const reason = new URLSearchParams(window.location.search).get('sso_error');
+		if (reason) {
+			ssoError = SSO_ERRORS[reason] ?? 'The provider sign-in did not complete. Try again.';
+		}
+	});
+
+	/**
+	 * Starts a provider sign-in: a full-page navigation, not an SPA route. The
+	 * relay redirects to the provider, and the provider redirects back to the
+	 * relay's callback, which opens the session and lands on `/app`.
+	 */
+	function signInWithProvider(provider: string): void {
+		window.location.assign(`/api/account/sso/${provider}/begin`);
+	}
 
 	/**
 	 * The field's discreet offer: one conditional-UI request, pending for the
@@ -228,39 +270,40 @@
 		</Keycap>
 	</form>
 
-	{#if passkeys}
-		<div class="passkey">
-			<Keycap
-				type="button"
-				variant="key"
-				loading={passkeyBusy}
-				disabled={$submitting || passkeyBusy}
-				wide
-				onclick={signInWithPasskey}
-			>
-				<Icon name="fingerprint" size={14} /> Sign in with a passkey
-			</Keycap>
-			<p class="passkey__note">
-				No password, no emailed code — Face ID, Touch ID, Windows Hello or a security key.
-			</p>
+	{#if passkeys || providers.includes('microsoft')}
+		<div class="alternatives">
+			{#if passkeys}
+				<Keycap
+					type="button"
+					variant="key"
+					loading={passkeyBusy}
+					disabled={$submitting || passkeyBusy}
+					wide
+					onclick={signInWithPasskey}
+				>
+					<Icon name="fingerprint" size={14} /> Passkey
+				</Keycap>
+			{/if}
+			{#if providers.includes('microsoft')}
+				<Keycap type="button" variant="key" wide onclick={() => signInWithProvider('microsoft')}>
+					<Microsoft /> Microsoft
+				</Keycap>
+			{/if}
 		</div>
+	{/if}
+
+	{#if ssoError}
+		<p class="notice-error" role="alert">{ssoError}</p>
 	{/if}
 
 	<p class="switch"><a href={resolve('/(auth)/sign-up')}>Create an account</a></p>
 </Page>
 
 <style lang="scss">
-	.passkey {
-		display: flex;
-		flex-direction: column;
-		gap: 8px;
+	.alternatives {
+		display: grid;
+		grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+		gap: 12px;
 		margin-top: 24px;
-	}
-
-	.passkey__note {
-		margin: 0;
-		color: var(--tw-muted);
-		font-size: 14px;
-		text-align: center;
 	}
 </style>

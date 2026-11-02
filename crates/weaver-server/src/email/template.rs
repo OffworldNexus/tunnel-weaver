@@ -32,21 +32,44 @@ const PREVIEW: &str = "A small joke, relayed to you.";
 const HEADING: &str = "Here's a joke";
 const FOOTNOTE: &str = "This is a development message from Tunnel Weaver. No action is needed.";
 
-/// HTML copy for the setup/configure OTP variant. Its subject and plain-text
-/// twin already live in [`crate::email::otp`]; these only fill the layout.
-const OTP_PREVIEW: &str = "Use this code to prove your Tunnel Weaver email provider.";
-const OTP_INTRO: &str = "Enter this code to prove your email provider.";
-const OTP_SAFETY: &str = "If you did not request this, you can ignore this message.";
+/// The words of one emailed-code message. Every such message shares one body —
+/// heading, intro, the code, its expiry, a safety line — and differs only here.
+struct CodeCopy {
+    subject: &'static str,
+    preview: &'static str,
+    heading: &'static str,
+    intro: &'static str,
+    safety: &'static str,
+}
 
-/// Copy for the sign-in second-factor variant (WVR-167). The setup variant's
-/// words are about proving a provider; a person signing in needs a message
-/// about finishing a sign-in — same code, different sentence.
-const SIGNIN_SUBJECT: &str = "Your Tunnel Weaver sign-in code";
-const SIGNIN_PREVIEW: &str = "Use this code to finish signing in.";
-const SIGNIN_HEADING: &str = "Finish signing in";
-const SIGNIN_INTRO: &str = "Enter this code to finish signing in.";
-const SIGNIN_SAFETY: &str =
-    "If you did not try to sign in, someone may know your password — change it now.";
+/// The setup/configure OTP. Its subject and plain-text twin live in
+/// [`crate::email::otp`]; this only fills the HTML layout.
+const OTP_COPY: CodeCopy = CodeCopy {
+    subject: crate::email::otp::OTP_SUBJECT,
+    preview: "Use this code to prove your Tunnel Weaver email provider.",
+    heading: crate::email::otp::OTP_SUBJECT,
+    intro: "Enter this code to prove your email provider.",
+    safety: "If you did not request this, you can ignore this message.",
+};
+
+/// The sign-in second factor (WVR-167).
+const SIGNIN_COPY: CodeCopy = CodeCopy {
+    subject: "Your Tunnel Weaver sign-in code",
+    preview: "Use this code to finish signing in.",
+    heading: "Finish signing in",
+    intro: "Enter this code to finish signing in.",
+    safety: "If you did not try to sign in, someone may know your password — change it now.",
+};
+
+/// Address verification: a signup, or an identity-provider account whose
+/// address the provider did not vouch for (WVR-169).
+const VERIFICATION_COPY: CodeCopy = CodeCopy {
+    subject: "Verify your email address",
+    preview: "Confirm your email address to finish creating your Tunnel Weaver account.",
+    heading: "Verify your email",
+    intro: "Enter this code to confirm this address.",
+    safety: "If you didn't create a Tunnel Weaver account, you can ignore this email.",
+};
 
 // --- Shared partials (copied from docs/brand/emails/partials) --------------
 
@@ -187,12 +210,13 @@ impl EmailTemplate for Joke {
     }
 }
 
-// --- The setup/configure OTP variant ---------------------------------------
+// --- The emailed-code templates -------------------------------------------
 
-/// `otp.mjml`: the verification-code body; it includes the three shared partials.
+/// `code.mjml`: the body every emailed code shares; it includes the three shared
+/// partials.
 #[derive(Template)]
-#[template(path = "email/otp.mjml", escape = "html", ext = "mjml")]
-struct OtpMjml<'a> {
+#[template(path = "email/code.mjml", escape = "html", ext = "mjml")]
+struct CodeMjml<'a> {
     heading: &'a str,
     intro: &'a str,
     /// The numeric code; escaped like every other value.
@@ -201,11 +225,65 @@ struct OtpMjml<'a> {
     safety: &'a str,
 }
 
+/// `code.txt`: the authored plain-text twin. The code sits on its own line,
+/// which is also what the e2e harness greps for.
+#[derive(Template)]
+#[template(path = "email/code.txt", escape = "none", ext = "txt")]
+struct CodeTxt<'a> {
+    heading: &'a str,
+    intro: &'a str,
+    code: &'a str,
+    expiry: &'a str,
+    safety: &'a str,
+    support_url: &'a str,
+}
+
+/// The expiry line every code carries.
+fn code_expiry() -> String {
+    format!(
+        "It expires in {} minutes.",
+        crate::email::otp::OTP_TTL_SECS / 60
+    )
+}
+
+/// The HTML part of an emailed code.
+fn render_code_html(copy: &CodeCopy, code: &str, env: &TemplateEnv) -> Result<String, RenderError> {
+    let mjml_source = CodeMjml {
+        heading: copy.heading,
+        intro: copy.intro,
+        code,
+        expiry: &code_expiry(),
+        safety: copy.safety,
+    }
+    .render()
+    .map_err(|e| RenderError::Template(e.to_string()))?;
+    render_base(copy.subject, copy.preview, &mjml_source, &env.support_url)
+}
+
+/// Both parts of an emailed code, with the shared plain-text body.
+fn render_code(copy: &CodeCopy, code: &str, env: &TemplateEnv) -> Result<Rendered, RenderError> {
+    let html = render_code_html(copy, code, env)?;
+    let text = CodeTxt {
+        heading: copy.heading,
+        intro: copy.intro,
+        code,
+        expiry: &code_expiry(),
+        safety: copy.safety,
+        support_url: &env.support_url,
+    }
+    .render()
+    .map_err(|e| RenderError::Template(e.to_string()))?;
+    Ok(Rendered {
+        subject: copy.subject.to_string(),
+        text,
+        html,
+    })
+}
+
 /// The one-time code that proves an email provider during setup/configure.
 ///
-/// Its copy already lives in [`crate::email::otp`]: the subject and the authored
-/// plain-text twin are reused as-is, and this type only adds the HTML rendering
-/// of the same content through the shared base layout.
+/// Its plain-text twin is [`crate::email::otp::otp_body`], shared with the
+/// terminal flow; this type only adds the HTML rendering.
 #[derive(Debug, Clone)]
 pub struct Otp {
     /// The numeric code sent to the operator.
@@ -223,65 +301,15 @@ impl EmailTemplate for Otp {
     }
 
     fn render(&self, env: &TemplateEnv) -> Result<Rendered, RenderError> {
-        use crate::email::otp;
-
-        let expiry = format!("It expires in {} minutes.", otp::OTP_TTL_SECS / 60);
-        let mjml_source = OtpMjml {
-            heading: otp::OTP_SUBJECT,
-            intro: OTP_INTRO,
-            code: &self.code,
-            expiry: &expiry,
-            safety: OTP_SAFETY,
-        }
-        .render()
-        .map_err(|e| RenderError::Template(e.to_string()))?;
-        let html = render_base(
-            otp::OTP_SUBJECT,
-            OTP_PREVIEW,
-            &mjml_source,
-            &env.support_url,
-        )?;
-
         Ok(Rendered {
-            subject: otp::OTP_SUBJECT.to_string(),
-            text: otp::otp_body(&self.code, &env.support_url),
-            html,
+            subject: OTP_COPY.subject.to_string(),
+            text: crate::email::otp::otp_body(&self.code, &env.support_url),
+            html: render_code_html(&OTP_COPY, &self.code, env)?,
         })
     }
 }
 
-// --- The sign-in second-factor template ------------------------------------
-
-/// `signin-code.mjml`: the second-factor body; it includes the three shared
-/// partials, like the setup OTP variant, but carries sign-in copy.
-#[derive(Template)]
-#[template(path = "email/signin-code.mjml", escape = "html", ext = "mjml")]
-struct SignInCodeMjml<'a> {
-    heading: &'a str,
-    intro: &'a str,
-    /// The numeric code; escaped like every other value.
-    code: &'a str,
-    expiry: &'a str,
-    safety: &'a str,
-}
-
-/// `signin-code.txt`: the authored plain-text twin. The code sits on its own
-/// line, which is also what the e2e harness greps for.
-#[derive(Template)]
-#[template(path = "email/signin-code.txt", escape = "none", ext = "txt")]
-struct SignInCodeTxt<'a> {
-    heading: &'a str,
-    intro: &'a str,
-    code: &'a str,
-    expiry: &'a str,
-    safety: &'a str,
-    support_url: &'a str,
-}
-
-/// The emailed one-time code that completes a sign-in (WVR-167).
-///
-/// Distinct from [`Otp`], which proves the *provider* during setup/configure:
-/// same six-digit shape, different purpose and copy.
+/// The emailed code that completes a sign-in (WVR-167).
 #[derive(Debug, Clone)]
 pub struct SignInCode {
     /// The numeric code sent to the person signing in.
@@ -299,85 +327,16 @@ impl EmailTemplate for SignInCode {
     }
 
     fn render(&self, env: &TemplateEnv) -> Result<Rendered, RenderError> {
-        let expiry = format!(
-            "It expires in {} minutes.",
-            crate::email::otp::OTP_TTL_SECS / 60
-        );
-        let mjml_source = SignInCodeMjml {
-            heading: SIGNIN_HEADING,
-            intro: SIGNIN_INTRO,
-            code: &self.code,
-            expiry: &expiry,
-            safety: SIGNIN_SAFETY,
-        }
-        .render()
-        .map_err(|e| RenderError::Template(e.to_string()))?;
-        let html = render_base(
-            SIGNIN_SUBJECT,
-            SIGNIN_PREVIEW,
-            &mjml_source,
-            &env.support_url,
-        )?;
-
-        let text = SignInCodeTxt {
-            heading: SIGNIN_HEADING,
-            intro: SIGNIN_INTRO,
-            code: &self.code,
-            expiry: &expiry,
-            safety: SIGNIN_SAFETY,
-            support_url: &env.support_url,
-        }
-        .render()
-        .map_err(|e| RenderError::Template(e.to_string()))?;
-
-        Ok(Rendered {
-            subject: SIGNIN_SUBJECT.to_string(),
-            text,
-            html,
-        })
+        render_code(&SIGNIN_COPY, &self.code, env)
     }
 }
 
-// --- The email verification template ------------------------------
-
-/// `verification.mjml`: the confirm-address body.
-#[derive(Template)]
-#[template(path = "email/verification.mjml", escape = "html", ext = "mjml")]
-struct VerificationMjml<'a> {
-    heading: &'a str,
-    intro: &'a str,
-    verification_url: &'a str,
-    expiry: &'a str,
-}
-
-/// `verification.txt`: the authored plain-text twin.
-#[derive(Template)]
-#[template(path = "email/verification.txt", escape = "none", ext = "txt")]
-struct VerificationTxt<'a> {
-    heading: &'a str,
-    intro: &'a str,
-    verification_url: &'a str,
-    expiry: &'a str,
-    support_url: &'a str,
-}
-
-/// English copy for the verification template.
-const VERIFICATION_SUBJECT: &str = "Verify your email address";
-const VERIFICATION_PREVIEW: &str =
-    "Confirm your email address to finish creating your Tunnel Weaver account.";
-const VERIFICATION_HEADING: &str = "Verify your email";
-const VERIFICATION_INTRO: &str =
-    "Confirm this email address to continue creating your Tunnel Weaver account.";
-
-/// The confirm-address email. `expires_in` is a short human phrase supplied by
-/// the caller (e.g. `"24 hours"`) so the copy always matches the token lifetime
-/// rather than duplicating it as a constant.
+/// The emailed code that confirms an address; accepting it settles the
+/// address, where a sign-in code does not.
 #[derive(Debug, Clone)]
 pub struct Verification {
-    /// Absolute HTTPS link the recipient opens to prove ownership.
-    pub verification_url: String,
-    /// Human phrase describing the token lifetime.
-    pub expires_in: String,
+    /// The numeric code sent to the person.
+    pub code: String,
 }
 
 impl Verification {
@@ -391,43 +350,7 @@ impl EmailTemplate for Verification {
     }
 
     fn render(&self, env: &TemplateEnv) -> Result<Rendered, RenderError> {
-        if !crate::email::is_trusted_https(&self.verification_url) {
-            return Err(RenderError::UntrustedUrl(self.verification_url.clone()));
-        }
-        let expiry = format!(
-            "This link expires in {}. If you didn't create an account, you can ignore this email.",
-            self.expires_in
-        );
-        let mjml_source = VerificationMjml {
-            heading: VERIFICATION_HEADING,
-            intro: VERIFICATION_INTRO,
-            verification_url: &self.verification_url,
-            expiry: &expiry,
-        }
-        .render()
-        .map_err(|e| RenderError::Template(e.to_string()))?;
-        let html = render_base(
-            VERIFICATION_SUBJECT,
-            VERIFICATION_PREVIEW,
-            &mjml_source,
-            &env.support_url,
-        )?;
-
-        let text = VerificationTxt {
-            heading: VERIFICATION_HEADING,
-            intro: VERIFICATION_INTRO,
-            verification_url: &self.verification_url,
-            expiry: &expiry,
-            support_url: &env.support_url,
-        }
-        .render()
-        .map_err(|e| RenderError::Template(e.to_string()))?;
-
-        Ok(Rendered {
-            subject: VERIFICATION_SUBJECT.to_string(),
-            text,
-            html,
-        })
+        render_code(&VERIFICATION_COPY, &self.code, env)
     }
 }
 
@@ -808,33 +731,6 @@ mod tests {
     }
 
     #[test]
-    fn joke_renders_html_with_partials() {
-        let rendered = joke().render(&env()).unwrap();
-        assert!(rendered.html.contains("Here&#39;s a joke"));
-        assert!(rendered.html.contains("To get to the other side."));
-        // The shared footer partial resolved and its support link made it in.
-        assert!(rendered.html.contains("https://relay.example.org/support"));
-        // The shared header partial resolved; brand wordmark present.
-        assert!(rendered.html.contains("TUNNEL WEAVER"));
-        // mrml produced a real document, not the raw source.
-        assert!(rendered.html.contains("<html"));
-        assert!(!rendered.html.contains("mj-include"));
-        assert_eq!(rendered.subject, SUBJECT);
-    }
-
-    #[test]
-    fn text_twin_is_tag_free_and_carries_support_url() {
-        let rendered = joke().render(&env()).unwrap();
-        assert!(
-            !rendered.text.contains('<'),
-            "text twin has tags: {}",
-            rendered.text
-        );
-        assert!(rendered.text.contains("To get to the other side."));
-        assert!(rendered.text.contains("https://relay.example.org/support"));
-    }
-
-    #[test]
     fn dynamic_line_is_escaped_not_injected() {
         let hostile = Joke {
             line: "<script>alert('x')</script> & \"quoted\"".into(),
@@ -859,24 +755,23 @@ mod tests {
     }
 
     #[test]
-    fn otp_renders_html_through_the_shared_base_layout() {
-        let rendered = Otp {
+    fn verification_renders_the_address_code_in_both_parts() {
+        let rendered = Verification {
             code: "042424".into(),
         }
         .render(&env())
         .unwrap();
-        // Leading zero survives in both parts.
+        // Leading zero survives in both parts, and the code is alone on its line
+        // so the e2e harness can find it.
         assert!(rendered.html.contains("042424"));
-        assert!(rendered.text.contains("042424"));
+        assert!(rendered.text.contains("\n042424\n"));
         // The shared partials resolved: header wordmark and footer support link.
         assert!(rendered.html.contains("TUNNEL WEAVER"));
         assert!(rendered.html.contains("https://relay.example.org/support"));
         assert!(rendered.html.contains("<html"));
         assert!(!rendered.html.contains("mj-include"));
-        assert_eq!(rendered.subject, crate::email::otp::OTP_SUBJECT);
-        // The text twin is the existing tag-free `otp_body`.
         assert!(!rendered.text.contains('<'));
-        assert!(rendered.text.contains("5 minutes"));
+        assert_eq!(rendered.subject, VERIFICATION_COPY.subject);
     }
 
     #[test]

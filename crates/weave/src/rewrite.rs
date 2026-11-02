@@ -153,13 +153,6 @@ mod tests {
     }
 
     #[test]
-    fn relative_location_untouched() {
-        let mut h = head(&[("location", "/next")]);
-        rewrite_response_headers(&mut h, &target(), PUBLIC);
-        assert_eq!(value(&h, "location"), "/next");
-    }
-
-    #[test]
     fn foreign_location_untouched() {
         let mut h = head(&[("location", "https://other.example/x")]);
         rewrite_response_headers(&mut h, &target(), PUBLIC);

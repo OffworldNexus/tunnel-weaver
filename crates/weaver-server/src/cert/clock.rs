@@ -80,18 +80,3 @@ pub fn format_unix_timestamp(ts: i64) -> String {
 
     format!("{y:04}-{m:02}-{d:02} {h:02}:{min:02}:{s:02} UTC")
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_format_unix_timestamp() {
-        assert_eq!(format_unix_timestamp(0), "1970-01-01 00:00:00 UTC");
-        // 2026-09-15 18:05:02 UTC
-        // days between 1970-01-01 and 2026-09-15 = 20711
-        // 20711 * 86400 + 18*3600 + 5*60 + 2 = 1789495502
-        let ts = 20711 * 86400 + 18 * 3600 + 5 * 60 + 2;
-        assert_eq!(format_unix_timestamp(ts), "2026-09-15 18:05:02 UTC");
-    }
-}

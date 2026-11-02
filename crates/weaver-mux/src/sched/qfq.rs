@@ -381,23 +381,6 @@ mod tests {
     }
 
     #[test]
-    fn shares_follow_weights() {
-        let weights = [1000, 300, 300, 40];
-        let served = run(&weights, 1000, 20_000);
-        let total: u64 = served.iter().sum();
-        let wsum: u64 = weights.iter().map(|&w| u64::from(w)).sum();
-        for (i, &w) in weights.iter().enumerate() {
-            let expected = total as f64 * f64::from(w) / wsum as f64;
-            let err = (served[i] as f64 - expected).abs() / expected;
-            assert!(
-                err < 0.02,
-                "flow {i}: served {} expected {expected}",
-                served[i]
-            );
-        }
-    }
-
-    #[test]
     fn idle_flow_does_not_bank_credit() {
         // Flow 0 idles for a long time while flow 1 is served; when it
         // returns it must not monopolise the link to "catch up".

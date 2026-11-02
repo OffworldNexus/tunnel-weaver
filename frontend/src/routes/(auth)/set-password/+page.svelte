@@ -1,8 +1,8 @@
 <script lang="ts">
 	/**
-	 * Sets the first password, reached from a verified email link. Submitting
-	 * the completion token activates the account, or reports that the address
-	 * already has one.
+	 * Sets the first password, reached once the emailed signup code is accepted.
+	 * Submitting the completion token activates the account, or reports that the
+	 * address already has one.
 	 */
 	import { api } from '#lib/account/api';
 	import { jsonForm } from '#lib/account/form';
@@ -71,7 +71,7 @@
 			</Keycap>
 		</form>
 	{:else}
-		<p class="lede">This password setup link has expired. Start again to verify your email.</p>
+		<p class="lede">This password setup has expired. Start again to verify your email.</p>
 		<div class="actions">
 			<Keycap wide href={resolve('/(auth)/sign-up')}>Start again</Keycap>
 		</div>

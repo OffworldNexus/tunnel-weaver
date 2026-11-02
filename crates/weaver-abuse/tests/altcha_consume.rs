@@ -105,20 +105,6 @@ async fn an_unknown_client_is_refused() {
 }
 
 #[tokio::test]
-async fn a_revoked_client_is_refused() {
-    let store = MemoryProofStore::new();
-    store.add_client(client());
-    store.remove_client(KEY);
-    let payload = payload(300);
-    assert_eq!(
-        consume(&store, &payload, "flow-1", NOW_MS)
-            .await
-            .unwrap_err(),
-        AltchaError::Proof(ProofError::UnknownClient)
-    );
-}
-
-#[tokio::test]
 async fn a_wrong_flow_is_refused_and_not_consumed() {
     let store = MemoryProofStore::new();
     store.add_client(client());

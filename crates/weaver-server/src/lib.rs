@@ -13,6 +13,7 @@ pub mod metering;
 pub mod metrics;
 pub mod notify;
 pub mod scheduler;
+pub mod seal;
 pub mod server;
 pub mod setup;
 pub mod store;

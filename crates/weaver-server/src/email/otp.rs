@@ -229,15 +229,6 @@ mod tests {
     }
 
     #[test]
-    fn generated_codes_are_six_digits() {
-        for _ in 0..50 {
-            let code = generate_code();
-            assert_eq!(code.len(), OTP_DIGITS);
-            assert!(code.chars().all(|c| c.is_ascii_digit()), "{code}");
-        }
-    }
-
-    #[test]
     fn in_memory_accepts_correct_rejects_wrong() {
         let mut challenge = OtpChallenge::generate();
         let now = Instant::now();

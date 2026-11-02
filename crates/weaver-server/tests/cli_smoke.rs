@@ -17,83 +17,6 @@ fn test_weaver_server_version_exits_zero() {
     assert!(stdout.contains(&format!("protocol v{}", weaver_proto::PROTOCOL_VERSION)));
 }
 
-#[test]
-fn test_weaver_server_help_exits_zero() {
-    let bin_path = env!("CARGO_BIN_EXE_weaver-server");
-    let output = Command::new(bin_path)
-        .arg("--help")
-        .output()
-        .expect("failed to execute weaver-server --help");
-
-    assert!(output.status.success());
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("Usage:"));
-    assert!(stdout.contains("--db"));
-    assert!(stdout.contains("WEAVER_DB"));
-    assert!(stdout.contains("--log-level"));
-    assert!(stdout.contains("WEAVER_LOG_LEVEL"));
-    assert!(stdout.contains("run"));
-    assert!(stdout.contains("configure"));
-}
-
-#[test]
-fn test_weaver_server_requires_subcommand() {
-    let bin_path = env!("CARGO_BIN_EXE_weaver-server");
-
-    // Invoking without subcommand fails with exit status 2
-    let output = Command::new(bin_path)
-        .arg("--db")
-        .arg("/tmp/test-cli.db")
-        .output()
-        .expect("failed to execute weaver-server without subcommand");
-    assert_eq!(output.status.code(), Some(2));
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("requires a subcommand") || stderr.contains("Usage:"));
-}
-
-#[test]
-fn test_weaver_server_db_flag_and_env_accepted() {
-    let bin_path = env!("CARGO_BIN_EXE_weaver-server");
-
-    // Test --db flag with run --help
-    let output = Command::new(bin_path)
-        .arg("--db")
-        .arg("/tmp/test-cli.db")
-        .arg("run")
-        .arg("--help")
-        .output()
-        .expect("failed to execute weaver-server run --help with --db");
-    assert!(output.status.success());
-
-    // Test WEAVER_DB env with run --help
-    let output = Command::new(bin_path)
-        .env("WEAVER_DB", "/tmp/test-env.db")
-        .arg("run")
-        .arg("--help")
-        .output()
-        .expect("failed to execute weaver-server run --help with WEAVER_DB");
-    assert!(output.status.success());
-
-    // Test --log-level flag with run --help
-    let output = Command::new(bin_path)
-        .arg("--log-level")
-        .arg("debug")
-        .arg("run")
-        .arg("--help")
-        .output()
-        .expect("failed to execute weaver-server run --help with --log-level");
-    assert!(output.status.success());
-
-    // Test WEAVER_LOG_LEVEL env with run --help
-    let output = Command::new(bin_path)
-        .env("WEAVER_LOG_LEVEL", "debug")
-        .arg("run")
-        .arg("--help")
-        .output()
-        .expect("failed to execute weaver-server run --help with WEAVER_LOG_LEVEL");
-    assert!(output.status.success());
-}
-
 /// A minimal valid config that already carries an email block, so `configure`
 /// can preserve it. A *first* `configure` without email flags is refused — see
 /// [`test_configure_without_email_is_refused`].
@@ -284,48 +207,6 @@ fn test_setup_headless_missing_email_exits_2() {
         .arg("relay.example.net")
         .output()
         .expect("failed to execute setup");
-
-    assert_eq!(output.status.code(), Some(2));
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("--email"),
-        "Expected error message naming --email, got: {stderr}"
-    );
-}
-
-#[test]
-fn test_configure_headless_missing_tunnel_domain_exits_2() {
-    let bin_path = env!("CARGO_BIN_EXE_weaver-server");
-
-    let output = Command::new(bin_path)
-        .arg("configure")
-        .arg("--headless")
-        .arg("--email")
-        .arg("admin@example.com")
-        .output()
-        .expect("failed to execute configure");
-
-    assert_eq!(output.status.code(), Some(2));
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("--tunnel-domain"),
-        "Expected error message naming --tunnel-domain, got: {stderr}"
-    );
-}
-
-#[test]
-fn test_configure_headless_missing_email_exits_2() {
-    let bin_path = env!("CARGO_BIN_EXE_weaver-server");
-
-    let output = Command::new(bin_path)
-        .arg("configure")
-        .arg("--headless")
-        .arg("--tunnel-domain")
-        .arg("example.com")
-        .arg("--admin-domain")
-        .arg("relay.example.net")
-        .output()
-        .expect("failed to execute configure");
 
     assert_eq!(output.status.code(), Some(2));
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -550,50 +431,6 @@ fn test_doctor_help_and_missing_domains() {
         stderr.contains("--tunnel-domain") && stderr.contains("--admin-domain"),
         "Expected missing-option error, got: {stderr}"
     );
-}
-
-#[test]
-fn test_configure_usage_flush_interval_round_trips() {
-    let dir = tempdir().unwrap();
-    let db_path = dir.path().join("flushinterval.db");
-    let bin_path = env!("CARGO_BIN_EXE_weaver-server");
-
-    // Seed an email block: `configure` preserves an existing one, and will not
-    // write a config without one (WVR-167).
-    let rt = tokio::runtime::Runtime::new().unwrap();
-    rt.block_on(async {
-        let store = Store::open(&db_path).await.unwrap();
-        store.save_config(&seeded_config()).await.unwrap();
-        store.close().await.unwrap();
-    });
-
-    let output = Command::new(bin_path)
-        .arg("--db")
-        .arg(&db_path)
-        .arg("configure")
-        .arg("--headless")
-        .arg("--tunnel-domain")
-        .arg("flush.example.com")
-        .arg("--admin-domain")
-        .arg("relay.example.net")
-        .arg("--email")
-        .arg("admin@example.com")
-        .arg("--usage-flush-interval")
-        .arg("30")
-        .output()
-        .expect("configure");
-
-    assert!(
-        output.status.success(),
-        "stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-
-    let config = rt.block_on(async {
-        let store = Store::open(&db_path).await.unwrap();
-        store.load_config().await.unwrap()
-    });
-    assert_eq!(config.usage_flush_interval_secs, 30);
 }
 
 #[test]

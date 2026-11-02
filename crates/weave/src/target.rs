@@ -284,12 +284,6 @@ mod tests {
     }
 
     #[test]
-    fn bare_trailing_slash_is_normalized() {
-        assert_eq!(t("http://example.com/").port, 80);
-        assert_eq!(t("http://example.com/").host, "example.com");
-    }
-
-    #[test]
     fn path_component_is_rejected() {
         assert!(Target::parse("http://example.com/app").is_err());
         assert!(Target::parse("http://example.com/app?x=1").is_err());

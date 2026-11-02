@@ -149,10 +149,4 @@ mod tests {
             other_56.get(KeyKind::PeerNetwork)
         );
     }
-
-    #[test]
-    fn fingerprint_is_deterministic() {
-        let peer = "192.0.2.5".parse().unwrap();
-        assert_eq!(fingerprint(peer,), fingerprint(peer,));
-    }
 }

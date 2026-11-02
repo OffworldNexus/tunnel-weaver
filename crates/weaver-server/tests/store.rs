@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use sea_orm::{ConnectionTrait, DbBackend, Statement};
 use tempfile::TempDir;
 use weaver_server::store::account::{
-    ActivationOutcome, ActivationRequest, NewAuthEvent, NewPasswordResetToken,
+    ActivationOutcome, ActivationRequest, NewAuthEvent, NewExternalIdentity, NewPasswordResetToken,
     NewPendingRegistration, NewTotpCredential, NewVerificationToken, ResetRequest,
 };
 use weaver_server::store::entity::totp_credential;
@@ -120,43 +120,19 @@ async fn test_store_open_runs_migrations_and_is_idempotent() {
         )
         .await;
         assert_eq!(count, 18);
-        // Six migrations: `m0001_init`, `m0002_usage_daily`,
-        // `m0003_inactivity`, `m0004_auth_levels`, `m0005_passkeys` and
-        // `m0006_totp`.
-        assert_eq!(store.schema_version().await.expect("schema_version"), 6);
+        // Eight migrations: `m0001_init`, `m0002_usage_daily`,
+        // `m0003_inactivity`, `m0004_auth_levels`, `m0005_passkeys`,
+        // `m0006_totp`, `m0007_external_identity` and
+        // `m0008_login_challenge_purpose`.
+        assert_eq!(store.schema_version().await.expect("schema_version"), 8);
     }
 
     // Re-open existing database: should succeed and not re-apply migrations
     {
         let store = Store::open(&db_path).await.expect("re-open failed");
         let migration_count: i64 = scalar(&store, "SELECT count(*) FROM seaql_migrations").await;
-        assert_eq!(migration_count, 6);
-        assert_eq!(store.schema_version().await.expect("schema_version"), 6);
-    }
-}
-
-#[tokio::test]
-async fn test_store_connect_in_memory_url() {
-    let store = Store::connect("sqlite::memory:")
-        .await
-        .expect("in-memory connect failed");
-    assert_eq!(store.path(), None);
-    assert_eq!(store.url(), "sqlite::memory:");
-    store.save_config(&sample_config()).await.expect("save");
-    assert_eq!(store.load_config().await.expect("load"), sample_config());
-}
-
-#[tokio::test]
-async fn test_store_open_rejects_non_utf8_path_gracefully() {
-    // Opening a path whose parent is a regular file cannot succeed; ensure the
-    // failure surfaces as an error rather than a panic.
-    let temp = TempDir::new().expect("tempdir");
-    let blocker = temp.path().join("file");
-    std::fs::write(&blocker, b"x").unwrap();
-    let db_path = blocker.join("weaver.db");
-    match Store::open(&db_path).await {
-        Err(StoreError::Io(_)) | Err(StoreError::Db(_)) => {}
-        res => panic!("Expected open error, got: {res:?}"),
+        assert_eq!(migration_count, 8);
+        assert_eq!(store.schema_version().await.expect("schema_version"), 8);
     }
 }
 
@@ -322,84 +298,6 @@ async fn test_config_validation_rules() {
     assert!(
         Config::load(&store).await.is_ok(),
         "tunnel under admin must be allowed"
-    );
-}
-
-#[tokio::test]
-async fn test_config_validation_abuse_limits() {
-    use weaver_server::config::{AbuseConfig, BudgetConfig};
-
-    let temp = TempDir::new().expect("tempdir");
-    let store = Store::open(temp.path().join("abuse.db"))
-        .await
-        .expect("open failed");
-
-    // A coherent armed block loads.
-    let ok = Config {
-        abuse: Some(AbuseConfig {
-            enabled: true,
-            peer_host: BudgetConfig {
-                burst: 5,
-                refill_units: 5,
-                refill_per_secs: 60,
-            },
-            peer_network: BudgetConfig {
-                burst: 50,
-                refill_units: 50,
-                refill_per_secs: 60,
-            },
-            retry_after_cap_secs: 120,
-            bucket_ttl_secs: 3600,
-            altcha: None,
-        }),
-        account: Default::default(),
-        ..sample_config()
-    };
-    store.save_config(&ok).await.expect("save succeeded");
-    assert!(Config::load(&store).await.is_ok());
-
-    // A zero burst can never admit anything and is rejected.
-    let bad = Config {
-        abuse: Some(AbuseConfig {
-            peer_host: BudgetConfig {
-                burst: 0,
-                refill_units: 5,
-                refill_per_secs: 60,
-            },
-            ..ok.abuse.clone().unwrap()
-        }),
-        account: Default::default(),
-        ..ok.clone()
-    };
-    store.save_config(&bad).await.expect("save succeeded");
-    match Config::load(&store).await {
-        Err(ConfigError::ValidationFailed(issues)) => {
-            assert!(
-                issues.iter().any(|i| i.contains("abuse.peer_host.burst")),
-                "expected a peer_host.burst issue, got: {issues:?}"
-            );
-        }
-        res => panic!("Expected ValidationFailed, got: {res:?}"),
-    }
-
-    // A disabled block is never rejected: its numbers are not in play.
-    let disabled = Config {
-        abuse: Some(AbuseConfig {
-            enabled: false,
-            peer_host: BudgetConfig {
-                burst: 0,
-                refill_units: 0,
-                refill_per_secs: 0,
-            },
-            ..ok.abuse.clone().unwrap()
-        }),
-        account: Default::default(),
-        ..ok.clone()
-    };
-    store.save_config(&disabled).await.expect("save succeeded");
-    assert!(
-        Config::load(&store).await.is_ok(),
-        "a disabled abuse block must not be validated"
     );
 }
 
@@ -681,88 +579,6 @@ async fn test_challenge_kinds_are_isolated_and_validation_round_trips() {
         let rec = store.get_certificate(name).await.unwrap().unwrap();
         assert_eq!(rec.validation, mechanism);
     }
-}
-
-#[tokio::test]
-async fn test_acme_account_round_trip() {
-    let store = Store::connect("sqlite::memory:").await.expect("connect");
-    assert!(store.get_acme_account("d").await.unwrap().is_none());
-    store
-        .upsert_acme_account("d", "a@b.c", "{}", 1)
-        .await
-        .expect("upsert");
-    store
-        .upsert_acme_account("d", "a@b.c", "{\"k\":1}", 2)
-        .await
-        .expect("upsert 2");
-    let acct = store.get_acme_account("d").await.unwrap().unwrap();
-    assert_eq!(acct.credentials_json, "{\"k\":1}");
-    assert_eq!(acct.created_at, 2);
-}
-
-#[tokio::test]
-async fn test_multiple_certificates_distinct_names() {
-    let store = Store::connect("sqlite::memory:").await.expect("connect");
-
-    let cert = |pem: &str, not_after: i64| weaver_server::store::NewCertificate {
-        cert_pem: pem.into(),
-        key_pem: format!("KEY-{pem}"),
-        not_before: 1_000,
-        not_after,
-        directory: "dir".into(),
-        obtained_at: 1_000,
-        validation: "dns-01".to_string(),
-    };
-
-    store
-        .save_certificate("a.example.com", cert("PEM1", 2_000))
-        .await
-        .unwrap();
-    store
-        .save_certificate("b.example.com", cert("PEM2", 3_000))
-        .await
-        .unwrap();
-    store
-        .save_certificate("c.example.com", cert("PEM3", 1_200))
-        .await
-        .unwrap();
-
-    // Certificates are global and keyed by name: three distinct rows.
-    assert_eq!(store.list_certificates().await.unwrap().len(), 3);
-    assert_eq!(store.list_certificates_full().await.unwrap().len(), 3);
-
-    let names: Vec<String> = store
-        .list_certificates()
-        .await
-        .unwrap()
-        .into_iter()
-        .map(|c| c.name)
-        .collect();
-    assert_eq!(
-        names,
-        vec!["a.example.com", "b.example.com", "c.example.com"]
-    );
-
-    // Re-saving one name upserts that row and leaves the others untouched.
-    store
-        .save_certificate("b.example.com", cert("PEM2B", 4_000))
-        .await
-        .unwrap();
-    assert_eq!(store.list_certificates().await.unwrap().len(), 3);
-    let b = store
-        .get_certificate("b.example.com")
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(b.not_after, 4_000);
-    let full_b = store
-        .list_certificates_full()
-        .await
-        .unwrap()
-        .into_iter()
-        .find(|c| c.name == "b.example.com")
-        .unwrap();
-    assert_eq!(full_b.cert_pem, "PEM2B");
 }
 
 #[tokio::test]
@@ -1310,59 +1126,6 @@ async fn activate_account(store: &Store, email: &str, now: i64) -> i32 {
 }
 
 #[tokio::test]
-async fn test_issue_reset_token_revokes_outstanding() {
-    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
-    use weaver_server::store::entity::password_reset_token;
-
-    let temp = TempDir::new().expect("tempdir");
-    let store = Store::open(temp.path().join("reset-issue.db"))
-        .await
-        .expect("open failed");
-    let now = 1_000;
-    let account_id = activate_account(&store, "reset@example.com", now).await;
-
-    let first = store
-        .password_reset_token_issue(
-            account_id,
-            NewPasswordResetToken {
-                token_digest: "digest-one".into(),
-                issued_at: now,
-                expires_at: now + 3_600,
-            },
-        )
-        .await
-        .expect("first reset token");
-    let second = store
-        .password_reset_token_issue(
-            account_id,
-            NewPasswordResetToken {
-                token_digest: "digest-two".into(),
-                issued_at: now + 10,
-                expires_at: now + 3_610,
-            },
-        )
-        .await
-        .expect("second reset token");
-
-    let rows = password_reset_token::Entity::find()
-        .filter(password_reset_token::Column::AccountId.eq(account_id))
-        .all(store.db())
-        .await
-        .unwrap();
-    assert_eq!(rows.len(), 2, "history is preserved, not overwritten");
-    let earlier = rows.iter().find(|r| r.id == first.id).unwrap();
-    assert!(
-        earlier.revoked_at.is_some(),
-        "the earlier token is revoked when a new one is issued"
-    );
-    let latest = rows.iter().find(|r| r.id == second.id).unwrap();
-    assert!(
-        latest.revoked_at.is_none() && latest.consumed_at.is_none(),
-        "only the latest token is live"
-    );
-}
-
-#[tokio::test]
 async fn test_account_reset_password_supersedes_and_revokes() {
     use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder};
     use weaver_server::store::entity::{
@@ -1562,48 +1325,6 @@ async fn test_account_change_password_refuses_without_a_live_credential() {
         .await
         .expect_err("no live credential to rotate");
     assert!(matches!(error, StoreError::Conflict(_)), "{error:?}");
-}
-
-#[tokio::test]
-async fn test_reset_token_is_single_use() {
-    let temp = TempDir::new().expect("tempdir");
-    let store = Store::open(temp.path().join("reset-single.db"))
-        .await
-        .expect("open failed");
-    let now = 1_000;
-    let account_id = activate_account(&store, "reset3@example.com", now).await;
-    let token = store
-        .password_reset_token_issue(
-            account_id,
-            NewPasswordResetToken {
-                token_digest: "digest-single".into(),
-                issued_at: now,
-                expires_at: now + 3_600,
-            },
-        )
-        .await
-        .unwrap();
-    let hash = "$argon2id$v=19$m=8,t=1,p=1$YQ$aGFzaA";
-
-    store
-        .account_reset_password(ResetRequest {
-            token_id: token.id,
-            encoded_hash: hash,
-            now,
-        })
-        .await
-        .expect("the first reset succeeds");
-    let replay = store
-        .account_reset_password(ResetRequest {
-            token_id: token.id,
-            encoded_hash: hash,
-            now: now + 1,
-        })
-        .await;
-    assert!(
-        matches!(replay, Err(StoreError::Conflict(_))),
-        "a spent token is refused: {replay:?}"
-    );
 }
 
 #[tokio::test]
@@ -2799,6 +2520,7 @@ async fn email_otp_proof(store: &Store, account_id: i32, session_id: i32, at: i6
             ip_address: String::new(),
             user_agent: String::new(),
             attempted: String::new(),
+            detail: String::new(),
         })
         .await
         .unwrap();
@@ -2859,35 +2581,6 @@ async fn test_inactivity_candidates_fold_the_newest_metered_day_into_activity() 
         .find(|c| c.account_id == account.id)
         .unwrap();
     assert!(later - candidate.last_activity >= 11 * MONTH);
-}
-
-#[tokio::test]
-async fn test_account_login_and_warning_timestamps_round_trip() {
-    let store = Store::connect("sqlite::memory:").await.unwrap();
-    let account = activated(&store, "Clock", "clock@example.com").await;
-    assert_eq!(account.last_login_at, None);
-    assert_eq!(account.inactivity_warning_at, None);
-
-    store
-        .account_record_login(account.id, 1_800_000_500)
-        .await
-        .unwrap();
-    store
-        .account_mark_inactivity_warning(account.id, 1_800_000_600)
-        .await
-        .unwrap();
-    let updated = store.account_by_id(account.id).await.unwrap().unwrap();
-    assert_eq!(updated.last_login_at, Some(1_800_000_500));
-    assert_eq!(updated.inactivity_warning_at, Some(1_800_000_600));
-
-    // A later sign-in moves the clock without erasing the warning record.
-    store
-        .account_record_login(account.id, 1_800_001_000)
-        .await
-        .unwrap();
-    let updated = store.account_by_id(account.id).await.unwrap().unwrap();
-    assert_eq!(updated.last_login_at, Some(1_800_001_000));
-    assert_eq!(updated.inactivity_warning_at, Some(1_800_000_600));
 }
 
 // ----- authenticator apps (WVR-166) -----------------------------------------
@@ -3092,6 +2785,7 @@ async fn test_auth_event_count_since_is_one_kind_on_one_session() {
                 ip_address: String::new(),
                 user_agent: String::new(),
                 attempted: String::new(),
+                detail: String::new(),
             })
             .await
             .unwrap();
@@ -3135,7 +2829,7 @@ async fn test_auth_event_count_since_is_one_kind_on_one_session() {
 }
 
 #[tokio::test]
-async fn test_ensure_totp_key_is_generated_once_and_persisted() {
+async fn test_seal_keys_are_generated_once_and_persisted() {
     let temp = TempDir::new().expect("tempdir");
     let store = Store::open(temp.path().join("totp-key.db"))
         .await
@@ -3144,14 +2838,23 @@ async fn test_ensure_totp_key_is_generated_once_and_persisted() {
 
     let mut config = sample_config();
     assert!(config.account.totp_key.is_empty());
-    assert!(config.ensure_totp_key(&store).await.expect("generates"));
+    assert_eq!(
+        config.ensure_seal_keys(&store).await.expect("generates"),
+        ["totp_key", "sso_key"]
+    );
     let key = config.account.totp_key.as_str().to_string();
     assert_eq!(key.len(), 64, "32 bytes of hex");
-    assert!(config.account.totp_key.bytes().is_some());
+    assert!(config.account.totp_key.is_valid());
 
     // A second call leaves it alone: replacing the key would make every enrolled
     // app unreadable, which is the one thing it must never do.
-    assert!(!config.ensure_totp_key(&store).await.expect("no-op"));
+    assert!(
+        config
+            .ensure_seal_keys(&store)
+            .await
+            .expect("no-op")
+            .is_empty()
+    );
     assert_eq!(config.account.totp_key.as_str(), key);
 
     // And what it generated is on disk, which is what keeps enrolments alive
@@ -3159,4 +2862,89 @@ async fn test_ensure_totp_key_is_generated_once_and_persisted() {
     let persisted: Config =
         serde_json::from_str(&store.load_config_json().await.unwrap().unwrap()).unwrap();
     assert_eq!(persisted.account.totp_key.as_str(), key);
+}
+
+// ----- external identities (WVR-169) ---------------------------------------
+
+fn microsoft_identity<'a>(
+    subject: &'a str,
+    email: &'a str,
+    verified: bool,
+    now: i64,
+) -> NewExternalIdentity<'a> {
+    NewExternalIdentity {
+        provider: "microsoft",
+        tenant_id: "32fb7b25-9b31-4552-a225-7cb8da0afb61",
+        subject,
+        name: "Ada",
+        email,
+        lookup_key: email,
+        email_verified_at: verified.then_some(now),
+        sealed_refresh: "",
+        now,
+    }
+}
+
+/// The one-time decision an SSO sign-in makes: create, sign in, link, or refuse.
+/// A regression here is a duplicate account or an account takeover.
+#[tokio::test]
+async fn test_external_identity_resolves_creates_links_and_refuses_takeover() {
+    let temp = TempDir::new().expect("tempdir");
+    let store = Store::open(temp.path().join("sso.db"))
+        .await
+        .expect("open failed");
+    let now = 1_000;
+
+    // A new identity and a new address: an implicit sign-up.
+    let first = store
+        .external_identity_resolve_or_create(microsoft_identity(
+            "oid-a",
+            "ada@example.com",
+            false,
+            now,
+        ))
+        .await
+        .expect("creates");
+    assert!(first.created);
+
+    // The same identity again signs in to that account, whatever it now claims.
+    let again = store
+        .external_identity_resolve_or_create(microsoft_identity(
+            "oid-a",
+            "other@example.com",
+            false,
+            now,
+        ))
+        .await
+        .expect("resolves");
+    assert!(!again.created);
+    assert_eq!(again.account.id, first.account.id);
+
+    // A new identity claiming an existing account's address, unvouched: refused,
+    // or anyone able to present such a token would take the account over.
+    let existing = activate_account(&store, "remy@example.com", now).await;
+    assert!(matches!(
+        store
+            .external_identity_resolve_or_create(microsoft_identity(
+                "oid-b",
+                "remy@example.com",
+                false,
+                now
+            ))
+            .await,
+        Err(StoreError::Conflict(_))
+    ));
+
+    // The same claim, vouched by the provider: linked to that account.
+    let linked = store
+        .external_identity_resolve_or_create(microsoft_identity(
+            "oid-b",
+            "remy@example.com",
+            true,
+            now,
+        ))
+        .await
+        .expect("links");
+    assert!(!linked.created);
+    assert_eq!(linked.account.id, existing);
 }

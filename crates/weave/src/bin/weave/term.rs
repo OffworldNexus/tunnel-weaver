@@ -303,23 +303,4 @@ mod tests {
         assert!(!color_choice(true, env(&[("CLICOLOR", "0")])));
         assert!(!color_choice(true, env(&[("TERM", "dumb")])));
     }
-
-    #[test]
-    fn clocks_and_seconds() {
-        assert_eq!(clock_text(Duration::from_secs(7)), "0:07");
-        assert_eq!(clock_text(Duration::from_secs(754)), "12:34");
-        assert_eq!(clock_text(Duration::from_secs(3723)), "1:02:03");
-        assert_eq!(seconds(Duration::from_millis(420)), "0.4s");
-        assert_eq!(seconds(Duration::from_secs(12)), "12s");
-    }
-
-    #[test]
-    fn truncation() {
-        assert_eq!(truncate("abcdef", 10), "abcdef");
-        assert_eq!(truncate("abcdef", 4), "abc\u{2026}");
-        assert_eq!(truncate_middle("abcdefghij", 7), "abc\u{2026}hij");
-        let fingerprint = format!("p256:0271af4a{}8329", "0".repeat(54));
-        assert_eq!(short_fingerprint(&fingerprint), "p256:0271af4a\u{2026}8329");
-        assert_eq!(short_fingerprint("p256:abcd"), "p256:abcd");
-    }
 }

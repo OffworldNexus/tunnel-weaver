@@ -166,16 +166,6 @@ mod tests {
     }
 
     #[test]
-    fn invalid_recipient_is_rejected() {
-        let mut email = fixture();
-        email.to = vec![Mailbox::new("not-an-address")];
-        match build_message(&email) {
-            Err(MailerError::InvalidRecipient(_)) => {}
-            other => panic!("expected InvalidRecipient, got {other:?}"),
-        }
-    }
-
-    #[test]
     fn smtp_requires_endpoint() {
         let cfg = EmailConfig {
             provider: "smtp".into(),

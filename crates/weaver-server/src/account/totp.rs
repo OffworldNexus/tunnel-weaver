@@ -21,13 +21,11 @@
 //!   fail to open, rather than quietly become that account's second factor.
 
 use hmac::{Hmac, KeyInit, Mac};
-use ring::aead::{AES_256_GCM, Aad, LessSafeKey, NONCE_LEN, Nonce, UnboundKey};
-use ring::rand::{SecureRandom, SystemRandom};
 use serde::Serialize;
 use sha1::Sha1;
 use subtle::ConstantTimeEq;
 
-use crate::config::TotpKey;
+use crate::seal::{SealError, SealKey};
 use crate::store::Store;
 use crate::store::account::NewTotpCredential;
 use crate::store::entity::totp_credential;
@@ -53,31 +51,6 @@ pub const ISSUER: &str = "Tunnel Weaver";
 /// The secret's length: 160 bits, the size RFC 4226 recommends for HMAC-SHA-1
 /// and the one every app is comfortable with.
 const SECRET_BYTES: usize = 20;
-
-/// Why a secret could not be sealed or opened.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SealError {
-    /// The configured key is empty or is not a 32-byte hex key.
-    Key,
-    /// The stored value is malformed, or it was sealed under a different key or
-    /// for a different account.
-    Tampered,
-}
-
-impl SealError {
-    /// The line to log. These are operator problems, never something to show a
-    /// person: an enrolment cannot say more than "start again".
-    pub const fn message(self) -> &'static str {
-        match self {
-            SealError::Key => {
-                "account.totp_key is not a 32-byte hex key; authenticator-app secrets cannot be read"
-            }
-            SealError::Tampered => {
-                "a stored authenticator-app secret could not be opened (wrong key, or the row changed)"
-            }
-        }
-    }
-}
 
 /// A fresh random secret.
 pub fn generate_secret() -> Vec<u8> {
@@ -189,30 +162,10 @@ fn percent_encode(value: &str) -> String {
     out
 }
 
-/// Seals a secret for storage under the account's TOTP key.
-///
-/// The returned value is the nonce followed by the ciphertext, hex-encoded: one
-/// opaque string the store can hold without ever knowing what it is.
-pub fn seal(key: &TotpKey, account_id: i32, secret: &[u8]) -> Result<String, SealError> {
-    let sealing = LessSafeKey::new(
-        UnboundKey::new(&AES_256_GCM, &key.bytes().ok_or(SealError::Key)?)
-            .map_err(|_| SealError::Key)?,
-    );
-    let mut nonce = [0u8; NONCE_LEN];
-    SystemRandom::new()
-        .fill(&mut nonce)
-        .map_err(|_| SealError::Key)?;
-    let mut in_out = secret.to_vec();
-    sealing
-        .seal_in_place_append_tag(
-            Nonce::assume_unique_for_key(nonce),
-            Aad::from(account_id.to_be_bytes().as_slice()),
-            &mut in_out,
-        )
-        .map_err(|_| SealError::Key)?;
-    let mut sealed = nonce.to_vec();
-    sealed.extend_from_slice(&in_out);
-    Ok(hex::encode(sealed))
+/// Seals a secret for storage under the account's TOTP key, bound to the
+/// account it belongs to.
+pub fn seal(key: &SealKey, account_id: i32, secret: &[u8]) -> Result<String, SealError> {
+    key.seal(&account_id.to_be_bytes(), secret)
 }
 
 /// Opens a sealed secret, binding it back to the account it was sealed for.
@@ -221,23 +174,8 @@ pub fn seal(key: &TotpKey, account_id: i32, secret: &[u8]) -> Result<String, Sea
 /// at all (a changed `account.totp_key`, or a row that was tampered with). The
 /// caller logs it and falls back to the emailed code rather than failing the
 /// sign-in.
-pub fn open(key: &TotpKey, account_id: i32, sealed: &str) -> Result<Vec<u8>, SealError> {
-    let opening = LessSafeKey::new(
-        UnboundKey::new(&AES_256_GCM, &key.bytes().ok_or(SealError::Key)?)
-            .map_err(|_| SealError::Key)?,
-    );
-    let raw = hex::decode(sealed).map_err(|_| SealError::Tampered)?;
-    let (nonce, ciphertext) = raw.split_at_checked(NONCE_LEN).ok_or(SealError::Tampered)?;
-    let nonce = Nonce::try_assume_unique_for_key(nonce).map_err(|_| SealError::Tampered)?;
-    let mut in_out = ciphertext.to_vec();
-    let plain = opening
-        .open_in_place(
-            nonce,
-            Aad::from(account_id.to_be_bytes().as_slice()),
-            &mut in_out,
-        )
-        .map_err(|_| SealError::Tampered)?;
-    Ok(plain.to_vec())
+pub fn open(key: &SealKey, account_id: i32, sealed: &str) -> Result<Vec<u8>, SealError> {
+    key.open(&account_id.to_be_bytes(), sealed)
 }
 
 // ----- the account's side: enrolling, confirming, entering a code -----------
@@ -341,7 +279,7 @@ pub fn view(row: &totp_credential::Model) -> AuthenticatorView {
 /// account sweep.
 pub async fn begin(
     store: &Store,
-    key: &TotpKey,
+    key: &SealKey,
     account_id: i32,
     address: &str,
     name: &str,
@@ -381,7 +319,7 @@ pub async fn begin(
 /// be accepted again at sign-in.
 pub async fn confirm(
     store: &Store,
-    key: &TotpKey,
+    key: &SealKey,
     account_id: i32,
     id: i32,
     candidate: &str,
@@ -434,7 +372,7 @@ pub async fn confirm(
 /// its app, not its way in — the emailed code still works.
 pub async fn verify(
     store: &Store,
-    key: &TotpKey,
+    key: &SealKey,
     account_id: i32,
     candidate: &str,
     wrong_codes: u64,
@@ -566,14 +504,14 @@ mod tests {
 
     #[test]
     fn a_sealed_secret_opens_for_its_own_account_only() {
-        let key = TotpKey::generate();
+        let key = SealKey::generate();
         let secret = generate_secret();
         let sealed = seal(&key, 7, &secret).expect("sealing works with a generated key");
         assert_eq!(open(&key, 7, &sealed).expect("it opens"), secret);
         // Another account's row must not open it: the id is authenticated.
         assert_eq!(open(&key, 8, &sealed), Err(SealError::Tampered));
         // Neither must another key, nor a value that was edited.
-        let other = TotpKey::generate();
+        let other = SealKey::generate();
         assert_eq!(open(&other, 7, &sealed), Err(SealError::Tampered));
         let mut edited = sealed.clone();
         edited.pop();
@@ -581,32 +519,5 @@ mod tests {
         assert_eq!(open(&key, 7, &edited), Err(SealError::Tampered));
         assert_eq!(open(&key, 7, "not hex"), Err(SealError::Tampered));
         assert_eq!(open(&key, 7, "abcd"), Err(SealError::Tampered));
-    }
-
-    #[test]
-    fn an_empty_or_malformed_key_is_refused_rather_than_defaulted() {
-        let empty = TotpKey::default();
-        assert_eq!(seal(&empty, 1, b"secret"), Err(SealError::Key));
-        assert_eq!(open(&empty, 1, "00"), Err(SealError::Key));
-        let short: TotpKey = serde_json::from_str("\"00ff\"").expect("a hex string deserialises");
-        assert_eq!(seal(&short, 1, b"secret"), Err(SealError::Key));
-    }
-
-    #[test]
-    fn sealed_secrets_are_not_the_plaintext() {
-        let key = TotpKey::generate();
-        let secret = generate_secret();
-        let sealed = seal(&key, 1, &secret).expect("sealing works");
-        assert!(!sealed.contains(&hex::encode(&secret)));
-        assert_ne!(sealed, hex::encode(&secret));
-        // Two sealings of the same secret differ: the nonce is random.
-        assert_ne!(seal(&key, 1, &secret).expect("sealing works"), sealed);
-    }
-
-    #[test]
-    fn every_seal_error_has_a_line_to_log() {
-        for error in [SealError::Key, SealError::Tampered] {
-            assert!(!error.message().is_empty());
-        }
     }
 }

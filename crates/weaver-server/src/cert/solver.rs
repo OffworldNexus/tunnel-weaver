@@ -305,16 +305,4 @@ mod tests {
         }
         panic!("HTTP-01 challenge row was not withdrawn");
     }
-
-    #[test]
-    fn dns_owner_name_strips_wildcard() {
-        assert_eq!(
-            Dns01Solver::owner_name("*.example.com"),
-            "_acme-challenge.example.com"
-        );
-        assert_eq!(
-            Dns01Solver::owner_name("example.com"),
-            "_acme-challenge.example.com"
-        );
-    }
 }

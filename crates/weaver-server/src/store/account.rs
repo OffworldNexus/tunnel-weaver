@@ -12,17 +12,17 @@
 
 use sea_orm::sea_query::{Expr, OnConflict};
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, Condition, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder,
-    QuerySelect, Set, TransactionTrait,
+    ActiveModelTrait, ColumnTrait, Condition, DatabaseTransaction, EntityTrait, PaginatorTrait,
+    QueryFilter, QueryOrder, QuerySelect, Set, TransactionTrait,
 };
 
 use std::collections::{HashMap, HashSet};
 
 use super::entity::{
     account, auth_event, browser_session, domain, email_identity, email_verification,
-    login_challenge, machine, machine_key_log, passkey_credential, password_credential,
-    password_reset_token, pending_registration, person, service, totp_credential, usage_daily,
-    usage_live, verification_token,
+    external_identity, login_challenge, machine, machine_key_log, passkey_credential,
+    password_credential, password_reset_token, pending_registration, person, service, sso_flow,
+    totp_credential, usage_daily, usage_live, verification_token,
 };
 use super::{Store, StoreError};
 
@@ -48,6 +48,16 @@ const PROOF_PASSKEY: &str = "passkey";
 /// same thing an emailed code does — possession of the second factor — so the
 /// inactivity sweep reads it too (`strong_session_accounts`).
 const PROOF_TOTP: &str = "totp";
+
+/// `auth_event.kind` for the external-identity second-factor proof (WVR-169).
+///
+/// Same rule as [`PROOF_EMAIL_OTP`]: the literal is duplicated on purpose and
+/// `account::auth` asserts the pair. Entra's own assertion of a second factor
+/// proves the same thing an emailed code does — possession of the second factor —
+/// so the inactivity sweep reads it too ([`Store::strong_session_accounts`]).
+/// The single-factor `identity_provider` proof is deliberately absent from that
+/// list: on its own it is only `Basic`.
+const PROOF_IDENTITY_PROVIDER_MFA: &str = "identity_provider_mfa";
 
 /// Caller-supplied fields for a new in-flight signup.
 #[derive(Debug, Clone)]
@@ -92,12 +102,76 @@ pub struct NewAuthEvent {
     pub user_agent: String,
     /// The identifier a failed login was attempted against; empty otherwise.
     pub attempted: String,
+    /// A bounded extra value the event needs beyond its kind and `attempted`;
+    /// empty for every event that needs none (WVR-169).
+    pub detail: String,
 }
 
-/// Caller-supplied fields for a pending sign-in challenge (WVR-167).
+/// Caller-supplied fields for linking an external identity, creating an account
+/// for it when none matches (WVR-169).
+#[derive(Debug, Clone)]
+pub struct NewExternalIdentity<'a> {
+    pub provider: &'a str,
+    /// The provider's tenant identifier, part of the durable key.
+    pub tenant_id: &'a str,
+    /// The provider's subject identifier, part of the durable key.
+    pub subject: &'a str,
+    /// The provider's display name: kept on the identity, and the name of a
+    /// newly created account.
+    pub name: &'a str,
+    /// The address the provider reported, for display.
+    pub email: &'a str,
+    /// The normalized address used for uniqueness and lookup.
+    pub lookup_key: &'a str,
+    /// When the provider asserted the address was verified; `None` when it did not.
+    pub email_verified_at: Option<i64>,
+    /// The sealed refresh grant, `nonce ‖ ciphertext` in hex; empty means none.
+    pub sealed_refresh: &'a str,
+    pub now: i64,
+}
+
+/// The account an external sign-in resolved to, and whether it was created.
+#[derive(Debug, Clone)]
+pub struct ExternalSignIn {
+    pub account: account::Model,
+    /// True when this call created the account; false when it linked to or matched
+    /// an existing one.
+    pub created: bool,
+}
+
+/// Caller-supplied fields for one pending SSO flow (WVR-169).
+#[derive(Debug, Clone)]
+pub struct NewSsoFlow<'a> {
+    /// The single-use `state` value; the row is found by it.
+    pub handle: &'a str,
+    /// `signin` or `stepup`.
+    pub kind: &'a str,
+    pub provider: &'a str,
+    pub nonce: &'a str,
+    pub code_verifier: &'a str,
+    /// A same-origin return path for a step-up; empty means the default.
+    pub return_path: &'a str,
+    pub account_id: Option<i32>,
+    pub session_id: Option<i32>,
+    pub created_at: i64,
+    pub expires_at: i64,
+}
+
+/// Caller-supplied fields for a pending emailed-code challenge (WVR-167,
+/// WVR-169).
+///
+/// Exactly one of `session_id` and `pending_registration_id` identifies the
+/// flow: a browser session for a sign-in, a pending registration for an address
+/// verification. The unique index on each column enforces one challenge per
+/// flow.
 #[derive(Debug, Clone)]
 pub struct NewLoginChallenge {
-    pub session_id: i32,
+    /// `sign_in` or `verify_address`.
+    pub purpose: String,
+    /// The sign-in session, for a `sign_in` challenge.
+    pub session_id: Option<i32>,
+    /// The pending registration, for a `verify_address` challenge.
+    pub pending_registration_id: Option<i32>,
     /// SHA-256 digest (base64) of the issued code; the raw code is never stored.
     pub code_hash: String,
     pub created_at: i64,
@@ -443,6 +517,25 @@ impl Store {
             .filter(email_identity::Column::AccountId.eq(account_id))
             .one(&self.db)
             .await?)
+    }
+
+    /// Marks an account's address verified, once the mailbox has been proven.
+    ///
+    /// An identity provider that does not vouch for the address leaves it
+    /// unverified; entering the emailed code proves the mailbox and settles it
+    /// here (WVR-169). A no-op when it already is verified.
+    pub async fn email_identity_mark_verified(
+        &self,
+        account_id: i32,
+        now: i64,
+    ) -> Result<(), StoreError> {
+        email_identity::Entity::update_many()
+            .col_expr(email_identity::Column::VerifiedAt, Expr::value(Some(now)))
+            .filter(email_identity::Column::AccountId.eq(account_id))
+            .filter(email_identity::Column::VerifiedAt.is_null())
+            .exec(&self.db)
+            .await?;
+        Ok(())
     }
 
     // ----- accounts -----
@@ -1048,6 +1141,296 @@ impl Store {
         Ok(result.rows_affected)
     }
 
+    // ----- external identities & SSO flows (WVR-169) -----
+
+    /// Reads an account inside a transaction, or errors when it is gone.
+    async fn account_in_txn(
+        &self,
+        conn: &DatabaseTransaction,
+        id: i32,
+    ) -> Result<account::Model, StoreError> {
+        account::Entity::find_by_id(id)
+            .one(conn)
+            .await?
+            .ok_or_else(|| StoreError::Conflict("identity references a missing account".into()))
+    }
+
+    /// Inserts one external-identity row, ignoring a conflicting durable key.
+    ///
+    /// Shared by resolve-and-create and its address-race fallback. Returns the
+    /// number of rows written (`0` when the key was already taken).
+    async fn external_identity_insert(
+        &self,
+        conn: &DatabaseTransaction,
+        account_id: i32,
+        req: &NewExternalIdentity<'_>,
+    ) -> Result<u64, StoreError> {
+        let result = external_identity::Entity::insert(external_identity::ActiveModel {
+            account_id: Set(account_id),
+            provider: Set(req.provider.to_string()),
+            tenant_id: Set(req.tenant_id.to_string()),
+            subject: Set(req.subject.to_string()),
+            display_name: Set(req.name.to_string()),
+            email: Set(req.email.to_string()),
+            email_verified_at: Set(req.email_verified_at),
+            linked_at: Set(req.now),
+            refresh_token: Set(req.sealed_refresh.to_string()),
+            refresh_token_updated_at: Set(if req.sealed_refresh.is_empty() {
+                None
+            } else {
+                Some(req.now)
+            }),
+            ..Default::default()
+        })
+        .on_conflict(
+            OnConflict::columns([
+                external_identity::Column::Provider,
+                external_identity::Column::TenantId,
+                external_identity::Column::Subject,
+            ])
+            .do_nothing()
+            .to_owned(),
+        )
+        .exec_without_returning(conn)
+        .await?;
+        Ok(result)
+    }
+
+    /// Resolves an external sign-in to an account, creating one when the identity
+    /// and its verified address are both new (WVR-169).
+    ///
+    /// The whole first-sign-in decision is one transaction, so two concurrent
+    /// callbacks cannot make two accounts for one identity or one address:
+    ///
+    /// * the identity is already linked → sign in as its account, whatever the
+    ///   address says now;
+    /// * the provider verified an address an existing account already owns → link
+    ///   the identity to that account (the one-time linking rule);
+    /// * neither → create the account, its identity, and its address.
+    pub async fn external_identity_resolve_or_create(
+        &self,
+        req: NewExternalIdentity<'_>,
+    ) -> Result<ExternalSignIn, StoreError> {
+        let txn = self.db.begin().await?;
+
+        if let Some(identity) = external_identity::Entity::find()
+            .filter(external_identity::Column::Provider.eq(req.provider))
+            .filter(external_identity::Column::TenantId.eq(req.tenant_id))
+            .filter(external_identity::Column::Subject.eq(req.subject))
+            .one(&txn)
+            .await?
+        {
+            let account = self.account_in_txn(&txn, identity.account_id).await?;
+            txn.commit().await?;
+            return Ok(ExternalSignIn {
+                account,
+                created: false,
+            });
+        }
+
+        if req.email_verified_at.is_some()
+            && let Some(existing) = email_identity::Entity::find()
+                .filter(email_identity::Column::LookupKey.eq(req.lookup_key))
+                .one(&txn)
+                .await?
+        {
+            let account = self.account_in_txn(&txn, existing.account_id).await?;
+            self.external_identity_insert(&txn, account.id, &req)
+                .await?;
+            txn.commit().await?;
+            return Ok(ExternalSignIn {
+                account,
+                created: false,
+            });
+        }
+
+        let created = account::ActiveModel {
+            name: Set(req.name.to_string()),
+            state: Set("active".to_string()),
+            created_at: Set(req.now),
+            activated_at: Set(req.now),
+            ..Default::default()
+        }
+        .insert(&txn)
+        .await?;
+        self.external_identity_insert(&txn, created.id, &req)
+            .await?;
+
+        if !req.lookup_key.is_empty() {
+            let claimed = email_identity::Entity::insert(email_identity::ActiveModel {
+                account_id: Set(created.id),
+                email: Set(req.email.to_string()),
+                lookup_key: Set(req.lookup_key.to_string()),
+                created_at: Set(req.now),
+                verified_at: Set(req.email_verified_at),
+                ..Default::default()
+            })
+            .on_conflict(
+                OnConflict::column(email_identity::Column::LookupKey)
+                    .do_nothing()
+                    .to_owned(),
+            )
+            .exec_without_returning(&txn)
+            .await?;
+            if claimed == 0 {
+                // The address belongs to another account — a race, since the
+                // verified case was settled by the lookup above. A *verified*
+                // address links the identity to the winner; an *unverified* one
+                // must not, or whoever can present a token naming the address
+                // could take the account over. Refuse, and let the placeholder
+                // (with its identity) cascade away.
+                account::Entity::delete_by_id(created.id).exec(&txn).await?;
+                if req.email_verified_at.is_none() {
+                    txn.rollback().await?;
+                    return Err(StoreError::Conflict(
+                        "address is already associated with an account".into(),
+                    ));
+                }
+                let existing = email_identity::Entity::find()
+                    .filter(email_identity::Column::LookupKey.eq(req.lookup_key))
+                    .one(&txn)
+                    .await?
+                    .ok_or_else(|| StoreError::Conflict("address lost after a conflict".into()))?;
+                let account = self.account_in_txn(&txn, existing.account_id).await?;
+                self.external_identity_insert(&txn, account.id, &req)
+                    .await?;
+                txn.commit().await?;
+                return Ok(ExternalSignIn {
+                    account,
+                    created: false,
+                });
+            }
+        }
+
+        txn.commit().await?;
+        Ok(ExternalSignIn {
+            account: created,
+            created: true,
+        })
+    }
+
+    /// The identities linked to an account.
+    pub async fn external_identity_for_account(
+        &self,
+        account_id: i32,
+    ) -> Result<Vec<external_identity::Model>, StoreError> {
+        Ok(external_identity::Entity::find()
+            .filter(external_identity::Column::AccountId.eq(account_id))
+            .order_by_asc(external_identity::Column::LinkedAt)
+            .order_by_asc(external_identity::Column::Id)
+            .all(&self.db)
+            .await?)
+    }
+
+    /// Replaces one identity's sealed refresh grant (WVR-169).
+    pub async fn external_identity_rotate_refresh(
+        &self,
+        id: i32,
+        sealed_refresh: &str,
+        now: i64,
+    ) -> Result<(), StoreError> {
+        external_identity::Entity::update_many()
+            .col_expr(
+                external_identity::Column::RefreshToken,
+                Expr::value(sealed_refresh.to_string()),
+            )
+            .col_expr(
+                external_identity::Column::RefreshTokenUpdatedAt,
+                Expr::value(Some(now)),
+            )
+            .filter(external_identity::Column::Id.eq(id))
+            .exec(&self.db)
+            .await?;
+        Ok(())
+    }
+
+    /// Forgets one identity's refresh grant — what a rejected refresh leaves
+    /// behind (WVR-169). The identity itself stays linked.
+    pub async fn external_identity_clear_refresh(&self, id: i32) -> Result<(), StoreError> {
+        external_identity::Entity::update_many()
+            .col_expr(
+                external_identity::Column::RefreshToken,
+                Expr::value(String::new()),
+            )
+            .col_expr(
+                external_identity::Column::RefreshTokenUpdatedAt,
+                Expr::value(Option::<i64>::None),
+            )
+            .filter(external_identity::Column::Id.eq(id))
+            .exec(&self.db)
+            .await?;
+        Ok(())
+    }
+
+    /// Every identity holding a refresh grant — the housekeeping refresh's work
+    /// list (WVR-169).
+    pub async fn external_identity_with_refresh(
+        &self,
+    ) -> Result<Vec<external_identity::Model>, StoreError> {
+        Ok(external_identity::Entity::find()
+            .filter(external_identity::Column::RefreshToken.ne(""))
+            .order_by_asc(external_identity::Column::Id)
+            .all(&self.db)
+            .await?)
+    }
+
+    /// Stores one pending SSO flow (WVR-169).
+    pub async fn sso_flow_create(&self, flow: NewSsoFlow<'_>) -> Result<(), StoreError> {
+        sso_flow::Entity::insert(sso_flow::ActiveModel {
+            handle: Set(flow.handle.to_string()),
+            kind: Set(flow.kind.to_string()),
+            provider: Set(flow.provider.to_string()),
+            nonce: Set(flow.nonce.to_string()),
+            code_verifier: Set(flow.code_verifier.to_string()),
+            return_path: Set(flow.return_path.to_string()),
+            account_id: Set(flow.account_id),
+            session_id: Set(flow.session_id),
+            created_at: Set(flow.created_at),
+            expires_at: Set(flow.expires_at),
+            consumed_at: Set(None),
+            ..Default::default()
+        })
+        .exec_without_returning(&self.db)
+        .await?;
+        Ok(())
+    }
+
+    /// Consumes and returns a pending SSO flow, atomically (WVR-169).
+    ///
+    /// Single-use and TTL-bounded: a replayed, already-redeemed or expired
+    /// `handle` yields `None`, so a guessed `state` is as good as absent. Mirrors
+    /// [`Store::login_challenge_consume`], but hands back the row the callback
+    /// still needs (the nonce and PKCE verifier).
+    pub async fn sso_flow_take(
+        &self,
+        handle: &str,
+        now: i64,
+    ) -> Result<Option<sso_flow::Model>, StoreError> {
+        let consumed = sso_flow::Entity::update_many()
+            .col_expr(sso_flow::Column::ConsumedAt, Expr::value(Some(now)))
+            .filter(sso_flow::Column::Handle.eq(handle))
+            .filter(sso_flow::Column::ConsumedAt.is_null())
+            .filter(sso_flow::Column::ExpiresAt.gt(now))
+            .exec(&self.db)
+            .await?;
+        if consumed.rows_affected != 1 {
+            return Ok(None);
+        }
+        Ok(sso_flow::Entity::find()
+            .filter(sso_flow::Column::Handle.eq(handle))
+            .one(&self.db)
+            .await?)
+    }
+
+    /// Deletes SSO flows that expired before `cutoff`; returns the count.
+    pub async fn sso_flow_sweep(&self, cutoff: i64) -> Result<u64, StoreError> {
+        let result = sso_flow::Entity::delete_many()
+            .filter(sso_flow::Column::ExpiresAt.lt(cutoff))
+            .exec(&self.db)
+            .await?;
+        Ok(result.rows_affected)
+    }
+
     /// How many `auth_event` rows of one kind a session has accumulated since
     /// `since`.
     ///
@@ -1127,6 +1510,26 @@ impl Store {
         Ok(result.rows_affected)
     }
 
+    /// The ids of an account's live sessions at `now` (WVR-169).
+    ///
+    /// The provider-refresh task reads this to end the trail of every session a
+    /// dead upstream grant should revoke, without going through a request.
+    pub async fn live_session_ids_for_account(
+        &self,
+        account_id: i32,
+        now: i64,
+    ) -> Result<Vec<i32>, StoreError> {
+        Ok(browser_session::Entity::find()
+            .filter(browser_session::Column::AccountId.eq(account_id))
+            .filter(browser_session::Column::InvalidatedAt.is_null())
+            .filter(browser_session::Column::ExpiresAt.gt(now))
+            .select_only()
+            .column(browser_session::Column::Id)
+            .into_tuple::<i32>()
+            .all(&self.db)
+            .await?)
+    }
+
     // ----- authentication trail (WVR-167) -----
 
     /// Appends one `auth_event` row.
@@ -1142,6 +1545,7 @@ impl Store {
             ip_address: Set(event.ip_address),
             user_agent: Set(event.user_agent),
             attempted: Set(event.attempted),
+            detail: Set(event.detail),
             ..Default::default()
         }
         .insert(&self.db)
@@ -1174,7 +1578,9 @@ impl Store {
     /// session, a live session with an `email_otp` row is a `Strong` one — and
     /// so is one with a `passkey` row, which is the same thing proven by a
     /// passkey assertion instead of a code (WVR-163), or a `totp` row, the same
-    /// thing proven by a code from an authenticator app (WVR-166).
+    /// thing proven by a code from an authenticator app (WVR-166), or an
+    /// `identity_provider_mfa` row, the same thing asserted by an external
+    /// identity provider (WVR-169).
     pub async fn strong_session_accounts(&self, now: i64) -> Result<HashSet<i32>, StoreError> {
         let live: Vec<(i32, i32)> = browser_session::Entity::find()
             .filter(browser_session::Column::InvalidatedAt.is_null())
@@ -1195,6 +1601,7 @@ impl Store {
                 PROOF_EMAIL_OTP.to_string(),
                 PROOF_PASSKEY.to_string(),
                 PROOF_TOTP.to_string(),
+                PROOF_IDENTITY_PROVIDER_MFA.to_string(),
             ]))
             .select_only()
             .column(auth_event::Column::SessionId)
@@ -1212,16 +1619,25 @@ impl Store {
 
     // ----- pending sign-in challenges (WVR-167) -----
 
-    /// Issues or replaces the pending emailed-code challenge for a session.
+    /// Issues or replaces the pending emailed-code challenge for a flow.
     ///
     /// Replacing is the point: only the newest code is ever accepted, and its
-    /// TTL, attempt count and cooldown clock all restart with it.
+    /// TTL, attempt count and cooldown clock all restart with it. The conflict
+    /// target is whichever flow column is set, so the two kinds of challenge
+    /// share one table without seeing each other.
     pub async fn login_challenge_upsert(
         &self,
         challenge: NewLoginChallenge,
     ) -> Result<(), StoreError> {
+        let mut conflict = if challenge.session_id.is_some() {
+            OnConflict::column(login_challenge::Column::SessionId)
+        } else {
+            OnConflict::column(login_challenge::Column::PendingRegistrationId)
+        };
         login_challenge::Entity::insert(login_challenge::ActiveModel {
+            purpose: Set(challenge.purpose),
             session_id: Set(challenge.session_id),
+            pending_registration_id: Set(challenge.pending_registration_id),
             code_hash: Set(challenge.code_hash),
             created_at: Set(challenge.created_at),
             expires_at: Set(challenge.expires_at),
@@ -1232,8 +1648,9 @@ impl Store {
             ..Default::default()
         })
         .on_conflict(
-            OnConflict::column(login_challenge::Column::SessionId)
+            conflict
                 .update_columns([
+                    login_challenge::Column::Purpose,
                     login_challenge::Column::CodeHash,
                     login_challenge::Column::CreatedAt,
                     login_challenge::Column::ExpiresAt,
@@ -1249,13 +1666,24 @@ impl Store {
         Ok(())
     }
 
-    /// The pending challenge for a session, if one exists.
+    /// The pending challenge for a sign-in session, if one exists.
     pub async fn login_challenge_by_session(
         &self,
         session_id: i32,
     ) -> Result<Option<login_challenge::Model>, StoreError> {
         Ok(login_challenge::Entity::find()
             .filter(login_challenge::Column::SessionId.eq(session_id))
+            .one(&self.db)
+            .await?)
+    }
+
+    /// The pending challenge for a signup's pending registration, if one exists.
+    pub async fn login_challenge_by_pending_registration(
+        &self,
+        pending_registration_id: i32,
+    ) -> Result<Option<login_challenge::Model>, StoreError> {
+        Ok(login_challenge::Entity::find()
+            .filter(login_challenge::Column::PendingRegistrationId.eq(pending_registration_id))
             .one(&self.db)
             .await?)
     }

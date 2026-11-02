@@ -46,7 +46,27 @@ export function stepPage(step: Step): '/(auth)/sign-in' | '/(auth)/verify-code' 
 		case 'assert_passkey':
 			// Both are performed in place, by the step-up popin.
 			return null;
+		case 'reauth_provider':
+			// Not an SPA route at all: it is a full-page navigation to the relay,
+			// which redirects to the provider. `stepRedirect` owns it.
+			return null;
 	}
+}
+
+/**
+ * The API navigation that performs `step`, for a step the relay carries out by
+ * redirecting the whole page rather than by an SPA route (WVR-169). `null` for
+ * every step the console performs itself or hands to a guard.
+ *
+ * `returnTo` is where the person should land afterwards; the relay validates it
+ * as a same-origin path and ignores it if it is not one.
+ */
+export function stepRedirect(step: Step, returnTo?: string): string | null {
+	if (step !== 'reauth_provider') {
+		return null;
+	}
+	const path = returnTo ?? (typeof window === 'undefined' ? '/app' : window.location.pathname);
+	return `/api/account/sso/microsoft/step-up?return_path=${encodeURIComponent(path)}`;
 }
 
 /**
@@ -66,6 +86,13 @@ export async function climb(
 		return true;
 	}
 	for (const step of options[0] ?? []) {
+		const redirect = stepRedirect(step.step);
+		if (redirect) {
+			// A whole-page navigation to the relay: it bounces to the provider and
+			// back, and the callback records the proof on this same session.
+			window.location.assign(redirect);
+			return false;
+		}
 		const page = stepPage(step.step);
 		if (page) {
 			if (step.step === 'login') {

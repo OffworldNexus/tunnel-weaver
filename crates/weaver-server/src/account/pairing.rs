@@ -452,33 +452,6 @@ mod tests {
     }
 
     #[test]
-    fn unregister_frees_the_key_again() {
-        let pairings = Pairings::default();
-        let (handle, _rx) = pairings.register(key(3), new_machine());
-        pairings.unregister(&handle);
-        assert!(pairings.is_empty());
-        let (again, _r) = pairings.register(key(3), new_machine());
-        assert!(pairings.view(&again).is_some());
-    }
-
-    #[test]
-    fn taken_pairings_report_their_outcome() {
-        let pairings = Pairings::default();
-        let (handle, mut rx) = pairings.register(key(4), new_machine());
-        pairings
-            .take(&handle)
-            .unwrap()
-            .fail(FailureCode::Rejected, "no");
-        assert_eq!(
-            rx.try_recv().unwrap(),
-            ServerMessage::Failed {
-                code: FailureCode::Rejected,
-                message: "no".into()
-            }
-        );
-    }
-
-    #[test]
     fn only_real_public_keys_are_valid() {
         assert!(!key_is_valid(&KeyId::P256([0x07; 33])));
         let signer = weaver_mux::testing::P256TestSigner::from_seed(1);

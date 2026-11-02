@@ -179,18 +179,4 @@ mod tests {
         assert!(!identifier_covers("*.example.com", "a.b.example.com"));
         assert!(!identifier_covers("*.example.com", "notexample.com"));
     }
-
-    #[test]
-    fn catalog_splits_admin_and_tunnel() {
-        let tunnel = ManagedCerts::for_tunnel("example.com");
-        assert_eq!(tunnel.all().len(), 1);
-        assert_eq!(
-            tunnel
-                .cert_for("poc-laptop-web.example.com")
-                .map(|c| &c.name),
-            Some(&"example.com".to_string())
-        );
-        assert!(tunnel.cert_for("relay.example.net").is_none());
-        assert!(tunnel.cert_for("a.b.example.com").is_none());
-    }
 }

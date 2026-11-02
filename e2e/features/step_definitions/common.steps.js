@@ -13,7 +13,6 @@ const PAGES = {
   reset: '/reset',
   verify: '/verify',
   'existing-account': '/existing-account',
-  'check-email': '/check-email',
   'set-password': '/set-password',
   'verify-code': '/verify-code',
   'reset request': '/forgot-password',

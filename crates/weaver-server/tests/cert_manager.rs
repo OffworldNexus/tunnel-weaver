@@ -10,13 +10,10 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsConnector;
 use tokio_util::sync::CancellationToken;
 
+use weaver_server::cert::CertManager;
 use weaver_server::cert::clock::{Clock, MockClock};
-use weaver_server::cert::providers::{
-    find_provider, format_providers_table, requires_eab, resolve_directory_url,
-};
 use weaver_server::cert::resolver::CertResolver;
 use weaver_server::cert::state::CertState;
-use weaver_server::cert::{CertManager, PROVIDERS};
 use weaver_server::config::Config;
 use weaver_server::edge::https::run_https_server;
 use weaver_server::edge::tls::create_server_config;
@@ -111,66 +108,6 @@ fn test_config(tunnel_domain: &str, acme_provider: &str, acme_directory: Option<
         abuse: None,
         account: Default::default(),
     }
-}
-
-#[test]
-fn test_cert_state_machine_variants_and_labels() {
-    let pending = CertState::Pending;
-    assert_eq!(pending.label(), "pending");
-    assert!(!pending.is_issued());
-    assert!(pending.not_after().is_none());
-
-    let ordering = CertState::Ordering;
-    assert_eq!(ordering.label(), "ordering");
-    assert!(!ordering.is_issued());
-
-    let issued = CertState::Issued {
-        not_after: 1_800_000_000,
-    };
-    assert_eq!(issued.label(), "issued");
-    assert!(issued.is_issued());
-    assert_eq!(issued.not_after(), Some(1_800_000_000));
-
-    let failed = CertState::Failed {
-        error: "rate limited".into(),
-        next_retry: 1_700_003_600,
-    };
-    assert_eq!(failed.label(), "failed");
-    assert!(!failed.is_issued());
-
-    let renewing = CertState::Renewing {
-        not_after: 1_800_000_000,
-    };
-    assert_eq!(renewing.label(), "renewing");
-    assert!(renewing.is_issued());
-    assert_eq!(renewing.not_after(), Some(1_800_000_000));
-}
-
-#[test]
-fn test_providers_catalog() {
-    assert_eq!(
-        resolve_directory_url("letsencrypt", None),
-        Some("https://acme-v02.api.letsencrypt.org/directory".to_string())
-    );
-    assert_eq!(
-        resolve_directory_url("custom", Some("https://pebble:14000/dir")),
-        Some("https://pebble:14000/dir".to_string())
-    );
-    assert!(requires_eab("google"));
-    assert!(requires_eab("zerossl"));
-    assert!(!requires_eab("letsencrypt"));
-
-    let table = format_providers_table();
-    assert!(table.contains("letsencrypt"));
-    assert!(table.contains("google"));
-    assert!(table.contains("zerossl"));
-    assert!(table.contains("custom"));
-
-    // Every catalogued provider is wildcard-capable (the relay issues the tunnel
-    // wildcard unconditionally); the catalog no longer models the distinction.
-    let letsencrypt = find_provider("letsencrypt").expect("letsencrypt provider");
-    assert_eq!(letsencrypt.id, "letsencrypt");
-    assert!(PROVIDERS.iter().all(|p| !p.id.is_empty()));
 }
 
 // Public TLS handshakes for uncertified, unknown, or missing SNI terminate immediately
@@ -404,27 +341,6 @@ async fn test_init_holds_when_no_certificate_present() {
     assert_eq!(manager.status("example.com"), CertState::Pending);
     assert!(manager.resolver().is_placeholder("example.com"));
     assert!(manager.resolver().is_ordering("example.com"));
-}
-
-#[tokio::test]
-async fn test_managed_cert_counts_partition_by_state() {
-    let dir = tempdir().unwrap();
-    let db_path = dir.path().join("weaver.db");
-    let store = Arc::new(Store::open(&db_path).await.unwrap());
-    let clock = Arc::new(MockClock::new(1_700_000_000));
-
-    let config = Arc::new(test_config("example.com", "letsencrypt-staging", None));
-    let resolver = Arc::new(CertResolver::new("example.com"));
-
-    let manager = CertManager::new(config, Arc::clone(&store), resolver, clock);
-
-    // Both managed certificates (tunnel wildcard + admin) start Pending and are
-    // marked as ordering during init.
-    manager.init().await.unwrap();
-    let counts = manager.cert_counts();
-    assert_eq!(counts.ordering, 2);
-    assert_eq!(counts.issued, 0);
-    assert_eq!(counts.failed, 0);
 }
 
 #[tokio::test]

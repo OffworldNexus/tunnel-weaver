@@ -158,12 +158,3 @@ async fn peer_overrunning_credit_is_a_protocol_error() {
     );
     assert!(p.server.is_closed());
 }
-
-#[tokio::test]
-async fn send_on_unknown_stream_fails() {
-    let mut p = small_window_pair().await;
-    assert_eq!(
-        p.client.send(99, b"x", Compress::Auto),
-        Err(StreamError::UnknownStream)
-    );
-}

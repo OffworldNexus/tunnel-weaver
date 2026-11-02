@@ -9,6 +9,8 @@ export interface AccountConfig {
 	support_email: string | null;
 	/** The admin host the CLI dials to pair, for the `weave pair <host>` hint. */
 	relay_host: string;
+	/** The external identity providers the operator enabled, by name (WVR-169). */
+	sso_providers: string[];
 }
 
 export const config = $state<{ value: AccountConfig | null }>({ value: null });
@@ -18,6 +20,12 @@ export const config = $state<{ value: AccountConfig | null }>({ value: null });
  * A function, not a value, so a read from inside a `$derived` is still tracked.
  */
 export const minPasswordLength = (): number => config.value?.min_password_length ?? 8;
+
+/**
+ * The enabled external identity providers, by name (WVR-169). A function, not a
+ * value, so a read from inside a `$derived` is still tracked.
+ */
+export const ssoProviders = (): string[] => config.value?.sso_providers ?? [];
 
 let loading: Promise<AccountConfig> | null = null;
 

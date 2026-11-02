@@ -48,6 +48,12 @@
 
 	$effect(() => {
 		if (session.level === 'none') {
+			// The code step belongs to a session that has proved one factor: an
+			// anonymous visitor typing the URL has no code to enter, so send them
+			// to the sign-in form instead of rendering a dead page.
+			if (basicPages.includes(page.url.pathname)) {
+				void goto(resolve('/(auth)/sign-in'), { replace: true });
+			}
 			return;
 		}
 		if (session.level === 'basic') {
