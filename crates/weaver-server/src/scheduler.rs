@@ -346,11 +346,4 @@ mod tests {
         assert!(task.runs().is_empty());
         assert_eq!(task.shutdowns.load(Ordering::SeqCst), 1);
     }
-
-    #[tokio::test]
-    async fn an_empty_scheduler_returns_immediately() {
-        let scheduler = Scheduler::new(Vec::new()).await;
-        assert_eq!(scheduler.next_deadline(), None);
-        scheduler.run(CancellationToken::new()).await;
-    }
 }

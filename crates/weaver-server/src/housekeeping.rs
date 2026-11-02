@@ -145,6 +145,13 @@ impl Task for AccountSweepTask {
         {
             warn!(error = %err, "pending authenticator enrolment sweep failed");
         }
+        if let Err(err) = self
+            .store
+            .sso_flow_sweep(tick.saturating_sub(crate::account::sso::FLOW_TTL_SECS))
+            .await
+        {
+            warn!(error = %err, "pending SSO flow sweep failed");
+        }
     }
 }
 

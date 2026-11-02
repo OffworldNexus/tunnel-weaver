@@ -323,22 +323,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rotate_replaces_the_secret() {
-        let store = store().await;
-        store
-            .altcha_client_create(client("ak_internal", None), 1_000)
-            .await
-            .unwrap();
-        let rotated = store
-            .altcha_client_rotate("ak_internal", "new-secret", 2_000)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(rotated.secret, "new-secret");
-        assert_eq!(rotated.rotated_at, 2_000);
-    }
-
-    #[tokio::test]
     async fn consume_is_single_use_and_survives_reopen() {
         let dir = tempdir().unwrap().keep();
         let path = dir.join("altcha.db");

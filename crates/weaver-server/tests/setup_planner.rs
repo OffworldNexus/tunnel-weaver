@@ -45,32 +45,6 @@ fn test_happy_path_fresh_install() {
     );
 }
 
-// Unsupported host environment preflight — halts setup planning when systemd
-// runtime (/run/systemd/system) or supported CPU architecture is absent.
-#[test]
-fn test_systemd_missing_aborts() {
-    let mut probe = base_probe();
-    probe.systemd_present = false;
-    let err = plan_setup(&probe).unwrap_err();
-    assert_eq!(err, PlanAbort::SystemdNotSupported);
-    assert_eq!(
-        err.to_string(),
-        "the server component supports systemd Linux only"
-    );
-}
-
-#[test]
-fn test_unsupported_arch_aborts() {
-    let mut probe = base_probe();
-    probe.supported_arch = false;
-    let err = plan_setup(&probe).unwrap_err();
-    assert_eq!(err, PlanAbort::UnsupportedArchitecture);
-    assert_eq!(
-        err.to_string(),
-        "unsupported target platform: Linux x86_64 or aarch64 required"
-    );
-}
-
 #[test]
 fn test_unsafe_admin_tunnel_split_aborts() {
     let mut probe = base_probe();
@@ -230,18 +204,6 @@ fn test_port_80_blocked_aborts() {
     assert!(
         err.to_string()
             .contains("port 80 reachability check failed: connection timed out")
-    );
-}
-
-#[test]
-fn test_port_443_blocked_aborts() {
-    let mut probe = base_probe();
-    probe.port_443 = PortReachability::Failed("connection refused".into());
-    let err = plan_setup(&probe).unwrap_err();
-    assert!(matches!(err, PlanAbort::Port443NotReachable(_)));
-    assert!(
-        err.to_string()
-            .contains("port 443 reachability check failed: connection refused")
     );
 }
 

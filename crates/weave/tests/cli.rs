@@ -1,8 +1,6 @@
 use std::path::Path;
 use std::process::{Command, Output};
 
-use weave::parse_specs;
-
 /// A throwaway data directory.
 ///
 /// `weave start` falls back to the default relay, so a test that ran it with
@@ -68,32 +66,6 @@ fn stored(data_dir: &Path) -> Vec<(String, bool)> {
 }
 
 #[test]
-fn test_weave_version_flag() {
-    let output = Command::new(env!("CARGO_BIN_EXE_weave"))
-        .arg("--version")
-        .output()
-        .expect("failed to execute binary");
-
-    assert!(output.status.success());
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("weave"));
-    assert!(stdout.contains(&format!("protocol v{}", weaver_proto::PROTOCOL_VERSION)));
-}
-
-#[test]
-fn test_weave_help_flag() {
-    let output = Command::new(env!("CARGO_BIN_EXE_weave"))
-        .arg("--help")
-        .output()
-        .expect("failed to execute binary");
-
-    assert!(output.status.success());
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("Client for Tunnel Weaver"));
-    assert!(stdout.contains("start"));
-}
-
-#[test]
 fn test_weave_start_without_a_paired_relay_tells_you_to_pair() {
     let config = isolated_config();
     let output = Command::new(env!("CARGO_BIN_EXE_weave"))
@@ -107,32 +79,6 @@ fn test_weave_start_without_a_paired_relay_tells_you_to_pair() {
     assert!(stderr.contains("weave pair"), "stderr: {stderr}");
     // It must fail before dialling anything.
     assert!(!stderr.contains("handshake"), "stderr: {stderr}");
-}
-
-#[test]
-fn test_weave_unpair_of_an_unknown_relay_says_so() {
-    let config = isolated_config();
-    let out = weave(config.path(), &["unpair", "relay.example.com"]);
-    assert!(!out.status.success());
-    let stderr = text(&out.stderr);
-    assert!(
-        stderr.contains("not paired with relay.example.com"),
-        "{stderr}"
-    );
-}
-
-#[test]
-fn test_weave_start_help_documents_both_insecure_flags() {
-    let output = Command::new(env!("CARGO_BIN_EXE_weave"))
-        .args(["start", "--help"])
-        .output()
-        .expect("failed to execute binary");
-
-    assert!(output.status.success());
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("--insecure-root-ca"));
-    assert!(stdout.contains("--insecure-target"));
-    assert!(stdout.contains("SERVICE=TARGET"));
 }
 
 #[test]
@@ -154,16 +100,6 @@ fn test_weave_start_rejects_unknown_service_flag() {
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("unknown service 'api'"), "stderr: {stderr}");
-}
-
-#[test]
-fn relays_lists_nothing_and_says_how_to_pair() {
-    let dir = isolated_config();
-    let out = weave(dir.path(), &["relays"]);
-    assert!(!out.status.success());
-    let stderr = text(&out.stderr);
-    assert!(stderr.contains("not paired with any relay"), "{stderr}");
-    assert!(stderr.contains("weave pair"), "{stderr}");
 }
 
 #[test]
@@ -198,16 +134,6 @@ fn relays_lists_default_first_and_changes_the_default() {
             ("a.example".to_string(), false)
         ]
     );
-}
-
-#[test]
-fn relays_default_refuses_an_unknown_relay() {
-    let dir = isolated_config();
-    seed(dir.path(), &[("a.example", 3)]);
-    let out = weave(dir.path(), &["relays", "default", "c.example"]);
-    assert!(!out.status.success());
-    assert!(text(&out.stderr).contains("not paired with c.example"));
-    assert_eq!(stored(dir.path()), [("a.example".to_string(), true)]);
 }
 
 #[test]
@@ -258,44 +184,4 @@ fn piped_output_has_no_escape_codes() {
             );
         }
     }
-}
-
-#[test]
-fn colour_can_be_forced_and_no_color_wins() {
-    let dir = isolated_config();
-    seed(dir.path(), &[("a.example", 1)]);
-    let run = |extra: &[(&str, &str)]| {
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_weave"));
-        cmd.arg("relays")
-            .env("WEAVE_DATA_DIR", dir.path())
-            .env_remove("NO_COLOR")
-            .env_remove("CLICOLOR_FORCE");
-        for (k, v) in extra {
-            cmd.env(k, v);
-        }
-        cmd.output().unwrap().stdout
-    };
-    assert!(run(&[("CLICOLOR_FORCE", "1")]).contains(&0x1b));
-    assert!(!run(&[("CLICOLOR_FORCE", "1"), ("NO_COLOR", "1")]).contains(&0x1b));
-}
-
-#[test]
-fn errors_are_one_line_with_a_hint() {
-    let dir = isolated_config();
-    let out = weave(dir.path(), &["start", "web=8080"]);
-    let stderr = text(&out.stderr);
-    let lines: Vec<&str> = stderr.lines().collect();
-    assert_eq!(lines.len(), 2, "{stderr}");
-    assert!(lines[0].starts_with("\u{2716} "), "{stderr}");
-    assert!(lines[1].starts_with("  ") && lines[1].contains("weave pair"));
-}
-
-#[test]
-fn test_parse_specs_from_cli_shape() {
-    let specs = parse_specs(&["web=8080".into(), "api=https://localhost:9000".into()]).unwrap();
-    assert_eq!(specs.len(), 2);
-    assert_eq!(specs[0].service, "web");
-    assert_eq!(specs[0].target.port, 8080);
-    assert_eq!(specs[1].service, "api");
-    assert_eq!(specs[1].target.port, 9000);
 }

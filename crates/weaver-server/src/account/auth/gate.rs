@@ -164,6 +164,11 @@ fn is_public(method: &Method, path: &str) -> bool {
         // `/api/account/passkeys` routes below, which manage credentials.
         | "/api/account/passkey/begin"
         | "/api/account/passkey/finish" => *method == Method::POST,
+        // The external-identity front door (WVR-169): the callback comes back
+        // from the provider carrying a `state`, so it is a GET like `begin`.
+        "/api/account/sso/microsoft/begin" | "/api/account/sso/microsoft/callback" => {
+            *method == Method::GET
+        }
         _ => false,
     }
 }
@@ -184,6 +189,9 @@ fn is_basic(method: &Method, path: &str) -> bool {
         | "/api/account/passkey/step-up/begin"
         | "/api/account/passkey/step-up/finish"
         | "/api/account/logout" => *method == Method::POST,
+        // Re-authenticating at the provider only needs a session, not a strong
+        // one: it is itself a way up (WVR-169).
+        "/api/account/sso/microsoft/step-up" => *method == Method::GET,
         _ => false,
     }
 }

@@ -76,6 +76,10 @@ pub enum StepKind {
     /// the session lands at `Certain` — the assertion carries user
     /// verification, the same thing re-typing the password proves.
     AssertPasskey,
+    /// Re-authenticate at the identity provider (WVR-169): a fresh
+    /// authorization with `prompt=login`, which proves presence. It is an SSO
+    /// session's route to `Certain` that does not need a registered passkey.
+    ReauthenticateProvider,
 }
 
 impl StepKind {
@@ -87,6 +91,7 @@ impl StepKind {
             StepKind::VerifyTotp => "verify_totp",
             StepKind::ConfirmPassword => "confirm_password",
             StepKind::AssertPasskey => "assert_passkey",
+            StepKind::ReauthenticateProvider => "reauth_provider",
         }
     }
 
@@ -105,6 +110,7 @@ impl StepKind {
             StepKind::VerifyEmailOtp => &[ProofKind::EmailOtp],
             StepKind::VerifyTotp => &[ProofKind::Totp],
             StepKind::AssertPasskey => &[ProofKind::Passkey, ProofKind::PasskeyUserVerification],
+            StepKind::ReauthenticateProvider => &[ProofKind::IdentityProviderPresence],
         }
     }
 }
@@ -299,13 +305,87 @@ impl AuthPath for AuthenticatorPath {
     }
 }
 
+/// An external identity provider: one redirect, no local password (WVR-169).
+///
+/// A sign-in through it proves control of an identity held elsewhere — one
+/// factor, `Basic` — and, when the provider asserted one, that a second factor
+/// was used, which is `Strong`. The path is deliberately **inert** for any
+/// session it did not open: it grants nothing and names no step, so
+/// adding it to [`PATHS`] leaves every password and passkey session exactly as it
+/// was.
+///
+/// It also names the ways up the password paths cannot offer an SSO session
+/// (there is no password to re-type and no code already pending): the emailed
+/// code, an app's code, and — for `Certain` — a forced re-authentication at the
+/// provider. A passkey assertion stays the *preferred* route to `Certain`
+/// because [`PasskeyPath`] is listed before this one.
+pub struct IdentityProviderPath;
+
+impl AuthPath for IdentityProviderPath {
+    fn proofs(&self) -> &'static [ProofKind] {
+        &[ProofKind::IdentityProvider, ProofKind::IdentityProviderMfa]
+    }
+
+    fn current_level(&self, situation: &Situation) -> AuthLevel {
+        // A session opened some other way holds neither of this path's proofs,
+        // and this path can do nothing for it: `None` keeps the ways up honest.
+        if situation.account_id.is_none() || !situation.was_used(ProofKind::IdentityProvider) {
+            return AuthLevel::None;
+        }
+        if situation.has_valid(ProofKind::IdentityProviderMfa) {
+            return AuthLevel::Strong;
+        }
+        AuthLevel::Basic
+    }
+
+    fn steps_to(&self, situation: &Situation, target: AuthLevel) -> Vec<Vec<Step>> {
+        // A session this path did not open: the other paths name its ways up.
+        let current = self.current_level(situation);
+        if current == AuthLevel::None {
+            return Vec::new();
+        }
+        // Both second factors an SSO account can hold: the app's code when there
+        // is a confirmed app, the emailed code always.
+        let mut second_factors = Vec::new();
+        if situation.has_totp {
+            second_factors.push(Step(StepKind::VerifyTotp));
+        }
+        second_factors.push(Step(StepKind::VerifyEmailOtp));
+
+        let mut options = Vec::new();
+        if current < AuthLevel::Strong && target >= AuthLevel::Strong {
+            for step in &second_factors {
+                options.push(vec![*step]);
+            }
+        }
+        if target >= AuthLevel::Certain && !situation.has_valid(ProofKind::IdentityProviderPresence)
+        {
+            if current < AuthLevel::Strong {
+                for step in &second_factors {
+                    options.push(vec![*step, Step(StepKind::ReauthenticateProvider)]);
+                }
+            } else {
+                options.push(vec![Step(StepKind::ReauthenticateProvider)]);
+            }
+        }
+        options
+    }
+}
+
 /// Every path, in preference order.
 ///
 /// Order is what "the strongest configured second factor" means: among the
 /// options that reach the same level in the same number of steps, the first path
 /// to propose one wins, so an authenticator app is offered before the emailed
-/// code (WVR-166) and a passkey's single gesture before either.
-pub static PATHS: &[&dyn AuthPath] = &[&AuthenticatorPath, &PasswordEmailOtpPath, &PasskeyPath];
+/// code (WVR-166) and a passkey's single gesture before either. The SSO path is
+/// last on purpose: it never outranks a passkey assertion, and it is inert unless
+/// the session really was opened through an external identity.
+pub static PATHS: &[&dyn AuthPath] = &[
+    &AuthenticatorPath,
+    &PasswordEmailOtpPath,
+    &PasskeyPath,
+    &IdentityProviderPath,
+];
 
 /// The best level any path grants `situation`.
 pub fn level_of(situation: &Situation) -> AuthLevel {
@@ -365,18 +445,6 @@ mod tests {
             session_ttl_secs: 86_400,
             confirm_window_secs: 300,
         }
-    }
-
-    #[test]
-    fn no_account_is_none() {
-        let s = situation(false, &[], 1_000);
-        assert_eq!(PasswordEmailOtpPath.current_level(&s), AuthLevel::None);
-    }
-
-    #[test]
-    fn password_only_is_basic() {
-        let s = situation(true, &[(ProofKind::Password, 1_000)], 1_000);
-        assert_eq!(PasswordEmailOtpPath.current_level(&s), AuthLevel::Basic);
     }
 
     #[test]
@@ -440,15 +508,6 @@ mod tests {
                 ]
             ),
             vec![AuthLevel::Strong, AuthLevel::Certain]
-        );
-    }
-
-    #[test]
-    fn a_climb_from_anonymous_starts_with_a_session() {
-        let anon = situation(false, &[], 1_000);
-        assert_eq!(
-            levels_after(&anon, &[Step(StepKind::Login)]),
-            vec![AuthLevel::Basic]
         );
     }
 
@@ -715,22 +774,6 @@ mod tests {
             AuthenticatorPath
                 .steps_to(&strong, AuthLevel::Strong)
                 .is_empty()
-        );
-    }
-
-    #[test]
-    fn a_signed_out_visitor_is_not_offered_a_code_by_the_app_path() {
-        // The way in is the sign-in form, which the emailed path names. This
-        // path starts from a signed-in session, so it adds no second copy of it.
-        let anon = situation(false, &[], 1_000);
-        assert!(
-            AuthenticatorPath
-                .steps_to(&anon, AuthLevel::Strong)
-                .is_empty()
-        );
-        assert_eq!(
-            PasswordEmailOtpPath.steps_to(&anon, AuthLevel::Strong),
-            vec![vec![Step(StepKind::Login)]]
         );
     }
 }

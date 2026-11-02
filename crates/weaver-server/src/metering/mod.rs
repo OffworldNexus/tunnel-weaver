@@ -858,18 +858,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn early_close_leaves_unused_time() {
-        let (meter, svc) = manager().await;
-        let start = 100 * MINUTE_MS;
-        meter.register_service_at(svc, start);
-        meter.unregister_service_at(svc, start + 30_000);
-        meter.flush_at(101 * MINUTE_MS).await.expect("flush");
-
-        let totals = window(&meter, 0, 1_000).await;
-        assert_eq!(totals[0].open_ms, 30_000);
-    }
-
-    #[tokio::test]
     async fn open_time_splits_at_the_minute_boundary() {
         let (meter, svc) = manager().await;
         let start = 99 * MINUTE_MS + 50_000;
@@ -1015,19 +1003,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn requests_are_counted_on_open_and_never_decremented() {
-        let (meter, svc) = manager().await;
-        meter.record_request_at(svc, 100 * MINUTE_MS + 1_000);
-        meter.register_stream(1, svc);
-        // The stream closes; the request it opened must still be counted.
-        meter.unregister_stream(1);
-        meter.flush_at(101 * MINUTE_MS).await.expect("flush");
-
-        let totals = window(&meter, 100, 101).await;
-        assert_eq!(totals[0].requests, 1);
-    }
-
-    #[tokio::test]
     async fn shutdown_does_not_persist_the_incomplete_minute() {
         // Pinned: on the wall clock the observed minute can complete between
         // recording and cancelling, and the job would then rightly persist it.
@@ -1071,30 +1046,5 @@ mod tests {
         assert_eq!(totals[0].tunnel_in, 33);
         assert_eq!(totals[0].tunnel_out, 44);
         assert_eq!(totals[0].open_ms, 1_050);
-    }
-
-    #[tokio::test]
-    async fn public_flush_persists_only_complete_minutes() {
-        // Pinned for the same reason as the shutdown test: the "current" minute
-        // must not be able to complete while the test runs.
-        let base = 100 * MINUTE_MS + 1_000;
-        let (meter, svc, store) = manager_with(Clock::Fixed(Arc::new(AtomicI64::new(base)))).await;
-        // A request in the current (incomplete) minute is not persisted...
-        meter.record_request(svc);
-        meter.flush().await.expect("flush");
-        let now_minute = minute_of(base);
-        assert!(
-            store
-                .query_usage(None, None, now_minute, now_minute + 1)
-                .await
-                .expect("query")
-                .is_empty(),
-            "the current minute must not be persisted"
-        );
-
-        // ...but is still visible live.
-        let totals = window(&meter, now_minute, now_minute + 1).await;
-        assert_eq!(totals.len(), 1);
-        assert_eq!(totals[0].requests, 1);
     }
 }

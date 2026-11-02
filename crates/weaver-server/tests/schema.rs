@@ -63,13 +63,22 @@ async fn references_point_where_the_model_says() {
         ),
         ("machine_key_log", vec![]),
         // WVR-167: the authentication trail cascades with its account but has no
-        // session foreign key (it outlives the session sweep); the pending
-        // challenge cascades with its session.
+        // session foreign key (it outlives the session sweep). WVR-169:
+        // `login_challenge` serves both purposes, so it cascades from whichever
+        // flow keys it — a sign-in session or a pending registration.
         ("auth_event", vec!["account"]),
-        ("login_challenge", vec!["browser_session"]),
+        (
+            "login_challenge",
+            vec!["browser_session", "pending_registration"],
+        ),
         // WVR-166: an account may hold as many authenticator apps as it likes,
         // and they go when it goes.
         ("totp_credential", vec!["account"]),
+        // WVR-169: a linked external identity belongs to its account and goes
+        // with it; a pending flow references an account and a session that may not
+        // exist yet, so it carries their ids as plain columns.
+        ("external_identity", vec!["account"]),
+        ("sso_flow", vec![]),
     ] {
         let mut found: Vec<String> = rows(
             &store,
@@ -96,6 +105,12 @@ async fn references_point_where_the_model_says() {
         "idx_machine_key_log_retired_at",
         "idx_altcha_proof_public_key_nonce",
         "idx_totp_credential_account_id",
+        "ux_external_identity_key",
+        "idx_external_identity_account_id",
+        "idx_sso_flow_expires_at",
+        // WVR-169: one challenge per flow, whichever column keys it.
+        "ux_login_challenge_session_id",
+        "ux_login_challenge_pending_registration_id",
     ] {
         assert_eq!(
             rows(

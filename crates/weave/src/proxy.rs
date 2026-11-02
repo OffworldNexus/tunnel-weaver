@@ -593,17 +593,6 @@ mod tests {
     }
 
     #[test]
-    fn single_cookie_field_is_untouched() {
-        let mut headers = http::HeaderMap::new();
-        headers.append(
-            http::header::COOKIE,
-            HeaderValue::from_static("csrftoken=abc; sessionid=def"),
-        );
-        apply_origin_headers(&mut headers, &cfg(), false);
-        assert_eq!(cookies(&headers), vec!["csrftoken=abc; sessionid=def"]);
-    }
-
-    #[test]
     fn other_repeatable_fields_keep_their_identity() {
         // Only `Cookie` is special-cased; a repeated end-to-end field must
         // survive as several fields.

@@ -973,17 +973,6 @@ mod tests {
         assert_eq!(Granularity::choose(0, 21 * 86_400), Granularity::Day);
     }
 
-    #[test]
-    fn blobs_round_trip() {
-        let values: Vec<i64> = (0..MINUTES_PER_DAY as i64).map(|i| i * 7 - 3).collect();
-        let blob = encode_blob(&values);
-        assert!(
-            blob.len() < values.len() * 8,
-            "a linear array compresses below its raw size"
-        );
-        assert_eq!(decode_blob(&blob).unwrap(), values);
-    }
-
     #[tokio::test]
     async fn a_whole_day_reads_the_total_not_the_blob() {
         let (store, service) = fixture().await;

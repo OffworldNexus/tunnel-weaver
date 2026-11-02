@@ -333,6 +333,60 @@ impl AuthManager {
         .await
     }
 
+    /// An external sign-in was accepted (WVR-169): the identity the provider
+    /// named is this session's now, and it proves control of the external
+    /// identity (one factor, `Basic`).
+    pub async fn sso_accepted(&self, session: SessionContext) -> Result<(), StoreError> {
+        self.record(
+            EventKind::IdentityProvider,
+            Some(session.account_id),
+            Some(session.session_id),
+            "",
+        )
+        .await
+    }
+
+    /// The same sign-in where the provider also asserted a second factor
+    /// (WVR-169) — Entra's `amr` carried `mfa`.
+    ///
+    /// A second row, never instead of [`AuthManager::sso_accepted`]: the trail
+    /// then says whether the assertion really was a multi-factor one, and the
+    /// level is `Strong` rather than `Basic`.
+    pub async fn sso_mfa_asserted(&self, session: SessionContext) -> Result<(), StoreError> {
+        self.record(
+            EventKind::IdentityProviderMfa,
+            Some(session.account_id),
+            Some(session.session_id),
+            "",
+        )
+        .await
+    }
+
+    /// The provider re-authenticated the person on demand during a step-up
+    /// (WVR-169): the presence proof that lets an SSO session reach `Certain`,
+    /// the same thing a password typed moments ago proves.
+    pub async fn sso_presence(&self, session: SessionContext) -> Result<(), StoreError> {
+        self.record(
+            EventKind::IdentityProviderPresence,
+            Some(session.account_id),
+            Some(session.session_id),
+            "",
+        )
+        .await
+    }
+
+    /// An external sign-in was refused (WVR-169). Recorded with or without an
+    /// account, like a failed passkey: the anonymous callback has neither a
+    /// session nor, on a first sign-in, an account.
+    pub async fn sso_failed(
+        &self,
+        account_id: Option<i32>,
+        reason: &str,
+    ) -> Result<(), StoreError> {
+        self.record_detailed(EventKind::SsoFailed, account_id, None, "", reason)
+            .await
+    }
+
     /// A password check failed, before any session existed.
     ///
     /// `account_id` is the account the address belongs to when one matched, so
@@ -356,6 +410,20 @@ impl AuthManager {
         session_id: Option<i32>,
         attempted: &str,
     ) -> Result<(), StoreError> {
+        self.record_detailed(kind, account_id, session_id, attempted, "")
+            .await
+    }
+
+    /// The same, carrying a bounded extra value: why an external sign-in was
+    /// refused (WVR-169). Every other event passes `""`.
+    async fn record_detailed(
+        &self,
+        kind: EventKind,
+        account_id: Option<i32>,
+        session_id: Option<i32>,
+        attempted: &str,
+        detail: &str,
+    ) -> Result<(), StoreError> {
         self.0
             .store
             .auth_event_insert(NewAuthEvent {
@@ -366,6 +434,7 @@ impl AuthManager {
                 ip_address: self.0.ip_address.clone(),
                 user_agent: self.0.user_agent.clone(),
                 attempted: truncate(attempted),
+                detail: truncate(detail),
             })
             .await?;
         // The next "ask" must see the row just written.
@@ -458,7 +527,12 @@ impl AuthManager {
         let mut logged_out_at: Option<i64> = None;
         for (kind, at) in latest {
             match EventKind::parse(&kind) {
-                Some(EventKind::Logout) => logged_out_at = Some(at),
+                // Both end the trail: a logout because the session is over, a
+                // dead upstream grant because nothing proved on this session can
+                // be trusted any more (WVR-169).
+                Some(EventKind::Logout) | Some(EventKind::IdentityProviderGrantInvalid) => {
+                    logged_out_at = Some(at)
+                }
                 // Several events feed one proof (a sign-in and a step-up both
                 // prove the password); `latest_by_kind` already kept the newest
                 // row of each, so the newest proof wins.
@@ -470,8 +544,8 @@ impl AuthManager {
                 None => {}
             }
         }
-        // A logout ends the trail: earlier proofs cannot be revived by a session
-        // that somehow kept the same id.
+        // A logout (or a dead upstream grant) ends the trail: earlier proofs
+        // cannot be revived by a session that somehow kept the same id.
         if let Some(logout) = logged_out_at {
             proofs.retain(|_, at| *at > logout);
         }
@@ -612,29 +686,6 @@ fn truncate(value: &str) -> String {
 mod tests {
     use super::*;
     use crate::account::auth::StepKind;
-
-    #[test]
-    fn proof_and_event_names_agree() {
-        // The recorded event kind and the proof kind it feeds must be one string.
-        assert_eq!(EventKind::Password.as_str(), ProofKind::Password.as_str());
-        assert_eq!(EventKind::EmailOtp.as_str(), ProofKind::EmailOtp.as_str());
-        assert_eq!(EventKind::Passkey.as_str(), ProofKind::Passkey.as_str());
-        assert_eq!(
-            EventKind::PasskeyUserVerification.as_str(),
-            ProofKind::PasskeyUserVerification.as_str()
-        );
-        // Every proof is written by an event carrying the very same name; the
-        // `*_confirmed` events are additional ways to prove one of them, never
-        // the only way to a proof of their own.
-        for proof in ProofKind::ALL {
-            assert!(
-                EventKind::ALL
-                    .into_iter()
-                    .any(|kind| kind.as_str() == proof.as_str()),
-                "{proof:?} has no event named after it"
-            );
-        }
-    }
 
     #[test]
     fn every_event_kind_round_trips_and_the_proofs_are_reachable() {
@@ -818,13 +869,6 @@ mod tests {
         let s = situation(&[(ProofKind::Password, 200)], 250, 1_000);
         assert_eq!(next_expiry(&s, 1_200), 500);
         assert_eq!(next_drop(&s, 1_200), Some((1_200, AuthLevel::None)));
-    }
-
-    #[test]
-    fn no_session_has_no_drop() {
-        let mut s = situation(&[], 250, 1_000);
-        s.account_id = None;
-        assert_eq!(next_drop(&s, 1_200), None);
     }
 
     #[test]

@@ -33,10 +33,10 @@
 - Conformance (nightly / PR to develop only, needs the DO droplet): h2spec
   and Autobahn run in `.github/workflows/nightly.yml`; allow-lists live in
   `ci/conformance/*-allowlist.txt`, one case per line with a justification.
-- Last measured: 2026-10-26, full suite 700 passed/0 failed/4 ignored (99s),
-  e2e 27 scenarios/360 steps passed (93s), ignored e2e 4 passed (1s), SPA lint
-  and svelte-check clean, fmt/clippy/deny/fuzz clean.
-  (Prior: 2026-10-25, 678 passed/0 failed/4 ignored (135s),
+- Last measured: 2026-11-02, after pruning low-value tests: full suite 593
+  passed/0 failed/3 ignored, e2e 28 scenarios/430 steps passed, ignored e2e 3
+  passed, SPA lint and svelte-check clean, fmt/clippy/deny/fuzz clean.
+  (Prior: 2026-10-26, 700 passed/4 ignored (99s), e2e 27/360 (93s); 2026-10-25, 678 passed/0 failed/4 ignored (135s),
   e2e 25 scenarios/307 steps passed (86s), ignored e2e 4 passed (2s); 678
   passed/4 ignored (110s), e2e 25 scenarios/307 steps (76s); 678 passed/4
   ignored (127s), e2e 25/304 (69s); 664 passed/4 ignored (115s), e2e 25/282

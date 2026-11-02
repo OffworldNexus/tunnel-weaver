@@ -40,7 +40,12 @@ export function atLeast(level: AuthLevel, required: AuthLevel): boolean {
  * More arrive with more factors.
  */
 export type Step =
-	'login' | 'verify_email_otp' | 'verify_totp' | 'confirm_password' | 'assert_passkey';
+	| 'login'
+	| 'verify_email_otp'
+	| 'verify_totp'
+	| 'confirm_password'
+	| 'assert_passkey'
+	| 'reauth_provider';
 
 /**
  * One step of a way up, with the level taking it would leave the session at.

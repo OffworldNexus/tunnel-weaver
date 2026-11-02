@@ -525,30 +525,10 @@ jobs:
           curl -s -v --fail --max-time 15 --cacert /tmp/certs/staging-ca.pem "https://$TARGET_DOMAIN/" > /dev/null
           curl -s -v --fail --max-time 15 --cacert /tmp/certs/staging-ca.pem "https://$ADMIN_DOMAIN/" > /dev/null
 
-      # The real sign-up journey in a browser: create the account, then — once
-      # the emailed verification link is known — verify, set a password, sign in.
+      # The real sign-up journey in a browser, in one session: sign up, enter
+      # the emailed verification code, set a password, sign in with the emailed
+      # sign-in code. The codes are read back through Resend's Receiving API.
       - name: Create the account in the browser
-        env:
-          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
-          WEAVER_E2E_EMAIL: ${{ secrets.WEAVER_E2E_EMAIL }}
-        run: |
-          ADMIN_DOMAIN="${{ steps.domain.outputs.admin_domain }}"
-          # The receiving mailbox is shared across runs, so snapshot the ids
-          # already there *before* the signup mail is sent: only a message that
-          # arrives after this point can belong to this run.
-          BEFORE=$(curl -s -H "Authorization: Bearer $RESEND_API_KEY" \
-            "https://api.resend.com/emails/receiving?limit=20" | jq -r '.data[].id' | tr '\n' ' ')
-          echo "RESEND_VERIFY_SNAPSHOT=$BEFORE" >> "$GITHUB_ENV"
-          echo "ACCOUNT_EMAIL=$WEAVER_E2E_EMAIL" >> "$GITHUB_ENV"
-          echo "PROVISION_STATE=$RUNNER_TEMP/provision-state.json" >> "$GITHUB_ENV"
-
-          (cd e2e && node nightly/provision.mjs signup \
-            --base "https://$ADMIN_DOMAIN" \
-            --email "$WEAVER_E2E_EMAIL" \
-            --name nightly \
-            --state "$RUNNER_TEMP/provision-state.json")
-
-      - name: Verify the account by its emailed link
         env:
           RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
           WEAVER_E2E_EMAIL: ${{ secrets.WEAVER_E2E_EMAIL }}
@@ -556,43 +536,15 @@ jobs:
           ADMIN_DOMAIN="${{ steps.domain.outputs.admin_domain }}"
           PASSWORD="nightly-password-$(openssl rand -hex 4)"
           echo "ACCOUNT_PASSWORD=$PASSWORD" >> "$GITHUB_ENV"
+          echo "ACCOUNT_EMAIL=$WEAVER_E2E_EMAIL" >> "$GITHUB_ENV"
+          echo "PROVISION_STATE=$RUNNER_TEMP/provision-state.json" >> "$GITHUB_ENV"
 
-          # The verification link is the real one the relay mailed through
-          # Resend; read it back through Resend's Receiving API, accepting only a
-          # message that arrived after the pre-signup snapshot.
-          LINK=""
-          for _ in $(seq 1 30); do
-            RESP=$(curl -s -H "Authorization: Bearer $RESEND_API_KEY" \
-              "https://api.resend.com/emails/receiving?limit=20")
-            ID=$(echo "$RESP" | jq -r --arg to "$WEAVER_E2E_EMAIL" --arg before "$RESEND_VERIFY_SNAPSHOT" '
-              ($before | split(" ")) as $seen
-              | .data[]
-              | select((.to | index($to)) and (.subject | test("verify your email"; "i")))
-              | .id as $id
-              | select(($seen | index($id)) == null)
-              | $id' | head -n 1)
-            if [ -n "$ID" ] && [ "$ID" != "null" ]; then
-              TEXT=$(curl -s -H "Authorization: Bearer $RESEND_API_KEY" \
-                "https://api.resend.com/emails/receiving/$ID" | jq -r '.text // .html // ""')
-              LINK=$(printf '%s' "$TEXT" | grep -oE 'https://[A-Za-z0-9.:_-]+/verify\?token=[0-9a-f]+' | head -n 1 || true)
-              if [ -n "$LINK" ]; then
-                break
-              fi
-            fi
-            sleep 2
-          done
-          if [ -z "$LINK" ]; then
-            echo "::error::did not receive the account verification email at $WEAVER_E2E_EMAIL"
-            exit 1
-          fi
-          echo "received the account verification email (link redacted)"
-
-          (cd e2e && node nightly/provision.mjs verify \
+          (cd e2e && node nightly/provision.mjs signup \
             --base "https://$ADMIN_DOMAIN" \
-            --email "$ACCOUNT_EMAIL" \
+            --email "$WEAVER_E2E_EMAIL" \
+            --name nightly \
             --password "$PASSWORD" \
-            --link "$LINK" \
-            --state "$PROVISION_STATE")
+            --state "$RUNNER_TEMP/provision-state.json")
 
       # The real pairing: `weave pair` provisions the key in tpmd, solves the
       # relay's proof of work, prints the approval link and waits; the browser

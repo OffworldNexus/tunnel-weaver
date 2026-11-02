@@ -1,43 +1,47 @@
 <script lang="ts">
 	/**
-	 * Exchanges the single-use email-link token for the next step: a new address
-	 * goes on to set a password; an address that already has an account is only
-	 * disclosed now that ownership is proven. Either way the link is spent, so a
-	 * failure is terminal.
+	 * The signup verification step: enter the six-digit code the relay emailed.
+	 * The pending flow id lives in session state, not the URL, so a shared
+	 * screen cannot resume someone else's signup.
 	 *
-	 * This is a one-shot mutation, not a load: the token in the URL is consumed
-	 * here, so it stays an explicit one-shot effect rather than a route loader —
-	 * a loader could re-run and would have to ask about a token that is already
-	 * spent. `untrack` keeps it from ever re-running.
+	 * The code proves ownership of the address; a new one goes on to set a
+	 * password, while an address that already has an account is only disclosed
+	 * now that ownership is proven.
 	 */
-	import { untrack } from 'svelte';
-
 	import { api } from '#lib/account/api';
+	import CodeEntry from '#lib/account/CodeEntry.svelte';
+	import { useCooldown } from '#lib/account/cooldown.svelte';
 	import { flow } from '#lib/account/state';
 	import { climb } from '#lib/app/upgrade';
 	import Keycap from '#lib/ui/Keycap.svelte';
 	import Page from '#lib/ui/Page.svelte';
 	import { goto } from '$app/navigation';
 	import { resolve } from '$app/paths';
-	import { page } from '$app/state';
 
 	type VerifyOutcome =
 		| { outcome: 'set_password'; completion_token: string; email: string }
 		| { outcome: 'existing_account'; email: string };
 
-	let message = $state('');
-	const canResend = Boolean(flow.load().flow);
+	const carried = flow.load();
+	const cooldown = useCooldown();
 
-	async function run() {
-		const token = page.url.searchParams.get('token');
-		if (!token) {
-			message = 'This link is missing its token.';
-			return;
-		}
-		const res = await api<VerifyOutcome>('POST', '/api/account/verify', { token }, climb);
+	let status = $state('');
+	let resending = $state(false);
+
+	// A code was emailed on the way here.
+	if (carried.flow) {
+		void cooldown.start();
+	}
+
+	async function submit(code: string): Promise<string | void> {
+		const res = await api<VerifyOutcome>(
+			'POST',
+			'/api/account/verify',
+			{ flow: carried.flow, code },
+			climb
+		);
 		if (!res.ok || !res.data) {
-			message = res.error ?? 'This link has expired or has already been used.';
-			return;
+			return res.error ?? 'That code was not accepted. Request a new one.';
 		}
 		if (res.data.outcome === 'set_password') {
 			flow.save({ completion_token: res.data.completion_token, email: res.data.email });
@@ -48,29 +52,64 @@
 		}
 	}
 
-	$effect(() => {
-		untrack(() => {
-			void run();
-		});
-	});
+	async function resend(): Promise<void> {
+		resending = true;
+		status = '';
+		const res = await api<{ status: string }>(
+			'POST',
+			'/api/account/resend',
+			{ flow: carried.flow },
+			climb
+		);
+		resending = false;
+		if (!res.ok) {
+			status = res.error ?? 'We could not send a new code. Try again.';
+			return;
+		}
+		status =
+			res.data?.status === 'cooldown'
+				? 'A code was just sent. Enter the last one you received.'
+				: 'A new code is on its way.';
+		await cooldown.start();
+	}
+
+	function useAnotherEmail(): void {
+		flow.clear();
+		void goto(resolve('/(auth)/sign-up'));
+	}
 </script>
 
 <svelte:head>
-	<title>Verify email · Tunnel Weaver</title>
+	<title>Enter your code · Tunnel Weaver</title>
 </svelte:head>
 
 <Page labelledby="verify-title">
-	{#if !message}
-		<h1 id="verify-title">Verifying your link</h1>
-		<p class="lede" aria-live="polite">One moment while we confirm your email address…</p>
+	{#if carried.flow}
+		<h1 id="verify-title">Enter your code</h1>
+		<CodeEntry icon="inbox" source="Email" {submit} {status}>
+			{#snippet detail()}
+				We emailed a six-digit code to <strong>{carried.email || 'your address'}</strong>.
+			{/snippet}
+			{#snippet actions()}
+				<Keycap
+					type="button"
+					variant="ghost"
+					onclick={resend}
+					loading={resending}
+					disabled={cooldown.remaining > 0}
+				>
+					{cooldown.remaining > 0 ? `Send a new code in ${cooldown.remaining}s` : 'Send a new code'}
+				</Keycap>
+				<Keycap type="button" variant="ghost" onclick={useAnotherEmail}>
+					Use a different email
+				</Keycap>
+			{/snippet}
+		</CodeEntry>
 	{:else}
-		<h1 id="verify-title">This link no longer works</h1>
-		<p class="lede">{message}</p>
+		<h1 id="verify-title">Nothing to verify</h1>
+		<p class="lede">This page needs a signup in progress. Start one to get a code.</p>
 		<div class="actions">
-			{#if canResend}
-				<Keycap wide href={resolve('/(auth)/check-email')}>Request a new link</Keycap>
-			{/if}
-			<Keycap wide variant="ghost" href={resolve('/(auth)/sign-up')}>Start again</Keycap>
+			<Keycap wide href={resolve('/(auth)/sign-up')}>Create an account</Keycap>
 		</div>
 	{/if}
 

@@ -16,6 +16,8 @@ pub mod password;
 pub mod router;
 pub mod second_factor;
 pub mod session;
+pub mod signin;
+pub mod sso;
 pub mod totp;
 pub mod views;
 
@@ -50,6 +52,8 @@ pub struct AccountRuntime {
     /// in-memory registry of started passkey ceremonies (WVR-163).
     pub webauthn: Arc<Webauthn>,
     pub ceremonies: passkey::Ceremonies,
+    /// The Microsoft identity provider, when the operator enabled it (WVR-169).
+    pub microsoft: Option<Arc<sso::Microsoft>>,
     /// The console's real-time change bus: presence transitions, membership
     /// writes and metered minutes announce the affected person here, and every
     /// open SSE stream of that person recomputes (WVR-25).
@@ -125,6 +129,7 @@ impl AccountRuntime {
             config.cookie_secure,
         );
         let webauthn = Arc::new(webauthn_relying_party(&base_url, admin_domain)?);
+        let microsoft = sso::Microsoft::from_config(config, &base_url)?;
         // Prefer an explicit support address; otherwise reuse the mailer's sender
         // so the footer can link somewhere real rather than a dead placeholder.
         let support_email = config.support_email.clone().or_else(|| {
@@ -142,19 +147,12 @@ impl AccountRuntime {
             pairings: pairing::Pairings::default(),
             webauthn,
             ceremonies: passkey::Ceremonies::default(),
+            microsoft,
             live,
             base_url,
             dummy_hash,
             support_email,
         }))
-    }
-
-    /// Builds the single-use verification link for a raw token.
-    pub fn verification_url(&self, raw_token: &str) -> String {
-        format!(
-            "{}/verify?token={raw_token}",
-            self.base_url.trim_end_matches('/')
-        )
     }
 
     /// Builds the single-use password-reset link for a raw token.

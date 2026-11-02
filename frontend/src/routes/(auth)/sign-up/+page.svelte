@@ -30,7 +30,7 @@
 			return res.error ?? 'We could not start your signup. Please try again.';
 		}
 		flow.save({ flow: res.data.flow, email: data.email });
-		await goto(resolve('/(auth)/check-email'));
+		await goto(resolve('/(auth)/verify'));
 	});
 
 	const { form, errors, message, submitting, enhance } = sf;

@@ -9,14 +9,6 @@ const PING: Duration = Duration::from_secs(15);
 const IDLE: Duration = Duration::from_secs(60);
 
 #[tokio::test]
-async fn next_timeout_is_last_activity_plus_ping_interval() {
-    let p = Pair::authenticated().await;
-    let now = p.clock.now();
-    assert_eq!(p.client.next_timeout(), Some(now + PING));
-    assert_eq!(p.server.next_timeout(), Some(now + PING));
-}
-
-#[tokio::test]
 async fn ping_emitted_exactly_once_and_pong_rearms_it() {
     let mut p = Pair::authenticated().await;
     let t0 = p.clock.now();

@@ -82,6 +82,26 @@ pub enum EventKind {
     /// A passkey assertion was refused (unknown credential, wrong account,
     /// failed verification, or a replay). The session keeps whatever it had.
     PasskeyFailed,
+    /// An external identity provider accepted a sign-in, and the identity it
+    /// named is the session's now (WVR-169) — control of the external identity.
+    IdentityProvider,
+    /// The same sign-in where the provider also asserted a second factor
+    /// (WVR-169): Entra's `amr` carried `mfa`. Recorded alongside
+    /// [`EventKind::IdentityProvider`], never instead of it, so the trail says
+    /// whether the assertion really was a multi-factor one.
+    IdentityProviderMfa,
+    /// The provider re-authenticated the person on demand during a step-up
+    /// (WVR-169), proving presence the way a password typed moments ago does.
+    IdentityProviderPresence,
+    /// An external sign-in was refused (no verified email, a bad `state` or
+    /// `nonce`, an unmatched `tid`, or a token that failed validation). Recorded
+    /// without a session, like a failed password check.
+    SsoFailed,
+    /// The provider's refresh grant is no longer valid (WVR-169): the session's
+    /// authentication is revoked, fail closed. It ends the trail exactly as
+    /// [`EventKind::Logout`] does — and is deliberately *not* a logout, so
+    /// nothing about it can be read as "the account was deleted".
+    IdentityProviderGrantInvalid,
     /// A password check failed, before any session existed.
     LoginFailed,
     /// The session was closed; proofs before it cannot be revived.
@@ -90,7 +110,7 @@ pub enum EventKind {
 
 impl EventKind {
     /// Every kind, for parsing a stored row.
-    pub const ALL: [EventKind; 13] = [
+    pub const ALL: [EventKind; 18] = [
         EventKind::Password,
         EventKind::PasswordConfirmed,
         EventKind::PasswordConfirmFailed,
@@ -102,6 +122,11 @@ impl EventKind {
         EventKind::Passkey,
         EventKind::PasskeyUserVerification,
         EventKind::PasskeyFailed,
+        EventKind::IdentityProvider,
+        EventKind::IdentityProviderMfa,
+        EventKind::IdentityProviderPresence,
+        EventKind::SsoFailed,
+        EventKind::IdentityProviderGrantInvalid,
         EventKind::LoginFailed,
         EventKind::Logout,
     ];
@@ -120,6 +145,11 @@ impl EventKind {
             EventKind::Passkey => "passkey",
             EventKind::PasskeyUserVerification => "passkey_user_verification",
             EventKind::PasskeyFailed => "passkey_failed",
+            EventKind::IdentityProvider => "identity_provider",
+            EventKind::IdentityProviderMfa => "identity_provider_mfa",
+            EventKind::IdentityProviderPresence => "identity_provider_presence",
+            EventKind::SsoFailed => "sso_failed",
+            EventKind::IdentityProviderGrantInvalid => "identity_provider_grant_invalid",
             EventKind::LoginFailed => "login_failed",
             EventKind::Logout => "logout",
         }
@@ -141,11 +171,16 @@ impl EventKind {
             EventKind::Totp => Some(ProofKind::Totp),
             EventKind::Passkey => Some(ProofKind::Passkey),
             EventKind::PasskeyUserVerification => Some(ProofKind::PasskeyUserVerification),
+            EventKind::IdentityProvider => Some(ProofKind::IdentityProvider),
+            EventKind::IdentityProviderMfa => Some(ProofKind::IdentityProviderMfa),
+            EventKind::IdentityProviderPresence => Some(ProofKind::IdentityProviderPresence),
             EventKind::PasswordConfirmFailed
             | EventKind::EmailOtpIssued
             | EventKind::EmailOtpFailed
             | EventKind::TotpFailed
             | EventKind::PasskeyFailed
+            | EventKind::SsoFailed
+            | EventKind::IdentityProviderGrantInvalid
             | EventKind::LoginFailed
             | EventKind::Logout => None,
         }

@@ -89,6 +89,12 @@ instant-acme = { version = "0.8", default-features = false, features = ["hyper-r
 # ourselves (UDP/TCP 53 inherited via systemd socket activation).
 hickory-proto = { version = "0.26", default-features = false, features = ["std"] }
 base64 = "0.22"
+# RS256 verification of an external identity provider's ID token (WVR-169).
+# `default-features = false` drops PEM parsing, which is unneeded here: a
+# provider's keys arrive as JWK components in its discovery document. Its only
+# dependencies (`base64` and `ring`) are already pinned above, so it pulls in no
+# second crypto stack and no C/asm toolchain.
+jsonwebtoken = { version = "9.3", default-features = false }
 bytes = "1"
 socket2 = "0.6"
 libc = "0.2"

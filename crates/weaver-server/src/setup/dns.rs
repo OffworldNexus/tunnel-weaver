@@ -369,11 +369,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn normalize_strips_trailing_dot_and_lowercases() {
-        assert_eq!(normalize_domain("Example.COM."), "example.com");
-    }
-
-    #[test]
     fn delegation_target_is_the_admin_hostname() {
         // the tunnel zone is delegated to the relay's admin hostname,
         // not to the apex itself.

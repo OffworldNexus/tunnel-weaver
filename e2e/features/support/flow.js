@@ -4,9 +4,10 @@
  */
 
 import * as assert from './assertions.js';
-import { latestMailCode, latestMailLink } from './harness.js';
+import { latestMailCode } from './harness.js';
 
-const VERIFY_LINK = /https:\/\/localhost:\d+\/verify\?token=[0-9a-f]+/g;
+/** Subject of the emailed sign-up verification code (WVR-169). */
+export const VERIFICATION_SUBJECT = 'Verify your email address';
 
 /** Subject of the emailed second-factor code (WVR-167). */
 export const SIGN_IN_CODE_SUBJECT = 'Your Tunnel Weaver sign-in code';
@@ -30,12 +31,26 @@ export async function createAccount(world, name) {
   await world.page.getByLabel('Name', { exact: true }).fill(name);
   await world.page.getByLabel('Email', { exact: true }).fill(world.email);
   await press(world, 'Continue with email');
-  await assert.seeHeading(world.page, 'Check your email');
+  await assert.seeHeading(world.page, 'Enter your code');
 }
 
-/** Opens the newest verification link; ends on set-password or existing-account. */
-export async function openVerificationLink(world) {
-  await world.page.goto(await latestMailLink(VERIFY_LINK));
+/**
+ * Types the six-digit code from the newest `subject` email into a code page
+ * and submits it. The signup verification page and the sign-in code step share
+ * the heading, the field and the submit, so one leg serves both.
+ */
+async function enterEmailedCode(world, subject) {
+  await assert.seeHeading(world.page, 'Enter your code');
+  await world.page.getByLabel('Code', { exact: true }).fill(await latestMailCode(subject));
+  await press(world, 'Continue');
+}
+
+/**
+ * Enters the signup verification code on `/verify`; ends on set-password or,
+ * for an address that already has an account, existing-account.
+ */
+export async function enterVerificationCode(world) {
+  await enterEmailedCode(world, VERIFICATION_SUBJECT);
   await world.page.waitForURL(/\/(set-password|existing-account)$/);
 }
 
@@ -49,7 +64,7 @@ export async function setPassword(world, password) {
 /** Sign up, verify and set a password, ending on the sign-in form. */
 export async function registerAccount(world, name, password) {
   await createAccount(world, name);
-  await openVerificationLink(world);
+  await enterVerificationCode(world);
   await setPassword(world, password);
 }
 
@@ -69,10 +84,4 @@ export async function signIn(world, password) {
  * Enters the emailed second-factor code, completing the sign-in (WVR-167). The
  * caller asserts the destination: the console, or `/pair` on a pairing detour.
  */
-export async function enterSignInCode(world) {
-  await assert.seeHeading(world.page, 'Enter your code');
-  await world.page
-    .getByLabel('Code', { exact: true })
-    .fill(await latestMailCode(SIGN_IN_CODE_SUBJECT));
-  await press(world, 'Continue');
-}
+export const enterSignInCode = (world) => enterEmailedCode(world, SIGN_IN_CODE_SUBJECT);

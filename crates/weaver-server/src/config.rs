@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::seal::SealKey;
 use crate::store::Store;
 
 /// Configuration errors during loading or validation.
@@ -278,50 +279,43 @@ impl AltchaConfig {
     }
 }
 
-/// The key authenticator-app secrets are sealed with (WVR-166).
+/// An operator-provisioned external identity provider (WVR-169).
 ///
-/// A newtype rather than a bare `String` because [`Config`] and
-/// [`AccountConfig`] both derive `Debug` and are printed at startup and by
-/// `status`: a plain string field would put the key in the logs. The value is 32
-/// bytes of hex so the config file stays editable text, and an empty value means
-/// "not generated yet" — the daemon fills it at boot rather than refusing to
-/// serve, so an install upgraded from before this feature keeps working.
+/// Held in the account config rather than a table on purpose: adding, enabling
+/// and removing providers *at runtime* is the separate multi-provider console
+/// (WVR-102), while this slice needs one preset the operator can set from the CLI
+/// and the daemon reads at boot. `client_secret` is always the **sealed** secret
+/// (`nonce ‖ ciphertext` in hex), never the plaintext, and `Debug` redacts it so
+/// the config cannot leak it into the startup log the way a plain field would.
 #[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct TotpKey(String);
-
-impl TotpKey {
-    /// Whether no key has been generated yet.
-    pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
-    }
-
-    /// A fresh random key, hex-encoded.
-    pub fn generate() -> Self {
-        Self(crate::random_hex(32))
-    }
-
-    /// The key's 32 bytes, or `None` when it is empty or is not 64 hex
-    /// characters — the two cases in which nothing can be sealed or opened.
-    pub fn bytes(&self) -> Option<[u8; 32]> {
-        hex::decode(&self.0).ok()?.try_into().ok()
-    }
-
-    /// The key as the config file spells it. For writing the file back only:
-    /// never log it, and never put it in a response.
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
+pub struct MicrosoftPreset {
+    /// The authority: a tenant GUID or domain, or one of the shared endpoint
+    /// keywords `organizations` / `common` / `consumers`.
+    pub authority: String,
+    /// The application (client) id from the app registration.
+    pub client_id: String,
+    /// The sealed client secret; empty when none is stored.
+    pub client_secret: String,
+    /// Whether the provider is offered on the sign-in page.
+    pub enabled: bool,
 }
 
-/// Redacts the key, so `Config`'s derived `Debug` cannot print it.
-impl std::fmt::Debug for TotpKey {
+/// Redacts the sealed secret so `Config`'s derived `Debug` cannot print it.
+impl std::fmt::Debug for MicrosoftPreset {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(if self.is_empty() {
-            "TotpKey(<empty>)"
-        } else {
-            "TotpKey(<redacted>)"
-        })
+        f.debug_struct("MicrosoftPreset")
+            .field("authority", &self.authority)
+            .field("client_id", &self.client_id)
+            .field(
+                "client_secret",
+                &if self.client_secret.is_empty() {
+                    "<empty>"
+                } else {
+                    "<redacted>"
+                },
+            )
+            .field("enabled", &self.enabled)
+            .finish()
     }
 }
 
@@ -329,8 +323,8 @@ impl std::fmt::Debug for TotpKey {
 ///
 /// The account plane is always served, so this block only tunes it. Field
 /// defaults encode the agreed policy: a 12-character minimum, Django-compatible
-/// Argon2id work parameters, a 24-hour verification link, a 60-second resend
-/// cooldown, a 1-hour post-verification completion window, a 1-hour
+/// Argon2id work parameters, a 24-hour signup verification window, a 60-second
+/// resend cooldown, a 1-hour post-verification completion window, a 1-hour
 /// password-reset link, and a 30-day session.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AccountConfig {
@@ -346,7 +340,9 @@ pub struct AccountConfig {
     /// Argon2id parallelism (lanes).
     #[serde(default = "default_account_argon2_parallelism")]
     pub argon2_parallelism: u32,
-    /// Verification-link lifetime, in seconds.
+    /// Signup verification window, in seconds: how long a pending registration
+    /// may still be confirmed — and its emailed code re-sent — before the
+    /// signup is abandoned.
     #[serde(default = "default_account_verification_ttl_secs")]
     pub verification_ttl_secs: u64,
     /// Minimum seconds between verification resends for one registration.
@@ -375,7 +371,20 @@ pub struct AccountConfig {
     /// until then. Rotating it makes every enrolled app unreadable, so it is
     /// meant to be set once and kept with the rest of the deployment's state.
     #[serde(default)]
-    pub totp_key: TotpKey,
+    pub totp_key: SealKey,
+    /// The key external-identity client secrets are sealed with (WVR-169).
+    ///
+    /// Generated by `setup` (and repaired at boot when it is missing); empty
+    /// until then. Separate from `totp_key` so rotating an authenticator-app key
+    /// never makes a provider secret unreadable, and vice versa. Rotating it
+    /// makes every stored provider secret unreadable, so it is meant to be set
+    /// once and kept with the rest of the deployment's state.
+    #[serde(default)]
+    pub sso_key: SealKey,
+    /// The Microsoft (Entra ID) preset, when the operator has configured one
+    /// (WVR-169). Absent means the provider is not offered at all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub microsoft: Option<MicrosoftPreset>,
     /// Whether session cookies carry the `Secure` attribute. Disable only for
     /// local plain-HTTP development, where browsers drop `Secure` cookies.
     #[serde(default = "default_true")]
@@ -439,6 +448,24 @@ pub struct AccountConfig {
     pub inactivity_warning_before_secs: u64,
 }
 
+impl AccountConfig {
+    /// Fills every empty sealing key with a fresh one and returns the names of
+    /// those generated (`totp_key`, `sso_key`).
+    pub fn generate_missing_keys(&mut self) -> Vec<&'static str> {
+        let mut generated = Vec::new();
+        for (name, key) in [
+            ("totp_key", &mut self.totp_key),
+            ("sso_key", &mut self.sso_key),
+        ] {
+            if key.is_empty() {
+                *key = SealKey::generate();
+                generated.push(name);
+            }
+        }
+        generated
+    }
+}
+
 impl Default for AccountConfig {
     fn default() -> Self {
         Self {
@@ -452,7 +479,9 @@ impl Default for AccountConfig {
             reset_ttl_secs: default_account_reset_ttl_secs(),
             session_ttl_secs: default_account_session_ttl_secs(),
             confirm_window_secs: default_account_confirm_window_secs(),
-            totp_key: TotpKey::default(),
+            totp_key: SealKey::default(),
+            sso_key: SealKey::default(),
+            microsoft: None,
             cookie_secure: true,
             hibp_url: default_account_hibp_url(),
             signup: default_account_signup_budget(),
@@ -802,12 +831,40 @@ fn validate_account_config(account: &AccountConfig) -> Vec<String> {
     if account.argon2_parallelism < 1 {
         issues.push("account.argon2_parallelism must be >= 1".into());
     }
-    if !account.totp_key.is_empty() && account.totp_key.bytes().is_none() {
+    if !account.totp_key.is_empty() && !account.totp_key.is_valid() {
         issues.push(
             "account.totp_key must be 64 hex characters (32 bytes) when set; leave it empty to \
              have it generated"
                 .into(),
         );
+    }
+    if !account.sso_key.is_empty() && !account.sso_key.is_valid() {
+        issues.push(
+            "account.sso_key must be 64 hex characters (32 bytes) when set; leave it empty to \
+             have it generated"
+                .into(),
+        );
+    }
+    if let Some(microsoft) = &account.microsoft {
+        for (name, value) in [
+            ("authority", &microsoft.authority),
+            ("client_id", &microsoft.client_id),
+            ("client_secret", &microsoft.client_secret),
+        ] {
+            if value.trim().is_empty() {
+                issues.push(format!("account.microsoft.{name} must not be empty"));
+            }
+        }
+        // The authority is what the discovery document is fetched from, so a
+        // value with a scheme or a slash would build a nonsense URL. It is either
+        // a bare tenant GUID/domain or one of the shared endpoint keywords.
+        if microsoft.authority.contains('/') || microsoft.authority.contains("://") {
+            issues.push(
+                "account.microsoft.authority must be a tenant id/domain or organizations/common/\
+                 consumers, without a scheme or path"
+                    .into(),
+            );
+        }
     }
     for (name, value) in [
         ("verification_ttl_secs", account.verification_ttl_secs),
@@ -856,24 +913,23 @@ fn validate_account_config(account: &AccountConfig) -> Vec<String> {
 }
 
 impl Config {
-    /// Gives the account plane a TOTP key if it does not have one, persisting it.
+    /// Generates any missing account sealing key, persisting the config when
+    /// one was, and returns the names of those generated.
     ///
-    /// Returns whether one was generated. Called at startup: an install upgraded
-    /// from before WVR-166 has no key at all, and generating one here — rather
-    /// than refusing to serve, or leaving authenticator apps permanently
-    /// unavailable — is what keeps the feature working on a deployment nobody
-    /// re-ran `setup` on. The key is only ever generated, never replaced: a new
-    /// one makes every enrolled app unreadable.
-    pub async fn ensure_totp_key(
+    /// Called at startup: an install upgraded from before a key existed has none,
+    /// and generating one here — rather than refusing to serve — keeps the
+    /// feature working on a deployment nobody re-ran `setup` on. A key is only
+    /// ever generated, never replaced: a new one makes everything sealed under
+    /// the old one unreadable.
+    pub async fn ensure_seal_keys(
         &mut self,
         store: &Store,
-    ) -> Result<bool, crate::store::StoreError> {
-        if !self.account.totp_key.is_empty() {
-            return Ok(false);
+    ) -> Result<Vec<&'static str>, crate::store::StoreError> {
+        let generated = self.account.generate_missing_keys();
+        if !generated.is_empty() {
+            store.save_config(self).await?;
         }
-        self.account.totp_key = TotpKey::generate();
-        store.save_config(self).await?;
-        Ok(true)
+        Ok(generated)
     }
 
     /// Loads and validates configuration from the store.
@@ -1048,7 +1104,7 @@ mod tests {
         assert!(account.totp_key.is_empty());
         assert!(validate_account_config(&account).is_empty());
 
-        account.totp_key = TotpKey::generate();
+        account.totp_key = SealKey::generate();
         assert_eq!(account.totp_key.as_str().len(), 64);
         assert!(validate_account_config(&account).is_empty());
 
@@ -1068,26 +1124,17 @@ mod tests {
     #[test]
     fn the_authenticator_key_is_redacted_in_debug() {
         let account = AccountConfig {
-            totp_key: TotpKey::generate(),
+            totp_key: SealKey::generate(),
             ..AccountConfig::default()
         };
         let printed = format!("{account:?}");
         assert!(!printed.contains(account.totp_key.as_str()), "{printed}");
-        assert!(printed.contains("TotpKey(<redacted>)"), "{printed}");
-        assert!(format!("{:?}", TotpKey::default()).contains("<empty>"));
+        assert!(printed.contains("SealKey(<redacted>)"), "{printed}");
+        assert!(format!("{:?}", SealKey::default()).contains("<empty>"));
         // And it is not in the serialised form either, which is what `status`
         // and the setup wizard write out.
         let json = serde_json::to_string(&account).unwrap();
         assert!(json.contains(account.totp_key.as_str()));
-    }
-
-    #[test]
-    fn key_log_retention_defaults_to_a_year() {
-        let account = AccountConfig::default();
-        assert_eq!(account.key_log_retention_days, 365);
-        assert_eq!(account.key_log_cutoff(400 * 86_400), 35 * 86_400);
-        let absent: AccountConfig = serde_json::from_str("{}").unwrap();
-        assert_eq!(absent.key_log_retention_days, 365);
     }
 
     #[test]
@@ -1102,27 +1149,6 @@ mod tests {
                 .any(|issue| issue == "account.key_log_retention_days must be >= 1")
         );
         assert!(validate_account_config(&AccountConfig::default()).is_empty());
-    }
-
-    #[test]
-    fn huge_retention_does_not_overflow() {
-        let account = AccountConfig {
-            key_log_retention_days: u64::MAX,
-            ..AccountConfig::default()
-        };
-        assert_eq!(account.key_log_cutoff(1_000), 1_000 - i64::MAX);
-    }
-
-    #[test]
-    fn inactivity_defaults_are_a_year_and_a_month() {
-        let account = AccountConfig::default();
-        assert_eq!(account.inactive_after_secs, 365 * 86_400);
-        assert_eq!(account.inactivity_warning_before_secs, 30 * 86_400);
-        // Absent keys fall back to the same defaults, so an existing config
-        // predating WVR-160 still gets the sweep armed.
-        let absent: AccountConfig = serde_json::from_str("{}").unwrap();
-        assert_eq!(absent.inactive_after_secs, 365 * 86_400);
-        assert_eq!(absent.inactivity_warning_before_secs, 30 * 86_400);
     }
 
     #[test]

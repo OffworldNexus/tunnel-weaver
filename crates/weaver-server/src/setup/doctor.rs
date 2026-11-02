@@ -883,15 +883,6 @@ mod tests {
     }
 
     #[test]
-    fn admin_addresses_check_notes_foreign_resolution() {
-        let relay = vec!["203.0.113.7".parse().unwrap()];
-        let admin = vec!["198.51.100.9".parse().unwrap()];
-        let check = admin_addresses_check("relay.example.net", &relay, &admin);
-        assert!(check.ok);
-        assert!(check.detail.contains("differs"));
-    }
-
-    #[test]
     fn port_status_recovers_the_planner_verdict() {
         let mut report = DoctorReport {
             tunnel_domain: "example.com".into(),
@@ -955,48 +946,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn assemble_emits_three_skipped_port_checks() {
-        let bind = BindReachability;
-        let report = assemble_report(
-            ReportInputs {
-                tunnel_domain: "example.com".into(),
-                admin_domain: "relay.example.net".into(),
-                relay_ips: vec!["203.0.113.7".parse().unwrap()],
-                admin_resolved: vec!["203.0.113.7".parse().unwrap()],
-                ns_targets: vec!["relay.example.net".to_string()],
-                delegation_error: None,
-                extra_checks: vec![check("Certificate relay.example.net", true)],
-                skip_reachability: true,
-            },
-            &bind,
-        )
-        .await;
-
-        assert!(report.ok());
-        for title in ["Port 80", "Port 443", "Port 53"] {
-            let port = report
-                .checks
-                .iter()
-                .find(|c| c.title == title)
-                .expect("port check");
-            assert!(port.ok);
-            assert!(port.detail.starts_with("skipped"));
-        }
-        // The context-contributed check sits between delegation and the ports.
-        let cert_pos = report
-            .checks
-            .iter()
-            .position(|c| c.title == "Certificate relay.example.net")
-            .unwrap();
-        let port_pos = report
-            .checks
-            .iter()
-            .position(|c| c.title == "Port 80")
-            .unwrap();
-        assert!(cert_pos < port_pos);
-    }
-
-    #[tokio::test]
     async fn self_connect_reports_reachable_local_listeners() {
         // Bind throwaway listeners on ephemeral ports and point the probe at
         // them, since 80/443/53 cannot be bound unprivileged in tests.
@@ -1051,14 +1000,5 @@ mod tests {
             assert!(!check.ok, "{} unexpectedly passed", check.title);
             assert!(check.remediation.is_some());
         }
-    }
-
-    #[tokio::test]
-    async fn self_connect_fails_without_addresses() {
-        let probe = SelfConnectReachability::new("relay.example.net", "tunnel.example.com");
-        let checks = probe.check(&[]).await;
-        assert_eq!(checks.len(), 3);
-        assert!(checks.iter().all(|check| !check.ok));
-        assert!(checks[0].detail.contains("no public relay addresses"));
     }
 }

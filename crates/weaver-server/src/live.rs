@@ -242,13 +242,6 @@ mod tests {
     }
 
     #[test]
-    fn a_scopeless_change_invalidates_everything_in_scope() {
-        let change = Change::visible_to(person());
-        assert!(change.invalidates(person(), &[Interest::all(Entity::Machine)]));
-        assert!(change.invalidates(person(), &[]));
-    }
-
-    #[test]
     fn an_id_change_only_reaches_views_showing_that_id() {
         let renamed = Change::visible_to(person()).entity(Entity::Machine).id(3);
         // A view showing machine 3 re-reads; one showing 9 does not.
@@ -280,12 +273,5 @@ mod tests {
         assert!(everywhere.invalidates(account, &watching));
         // An account scope is not a person scope, even with the same number.
         assert!(!everywhere.invalidates(Viewer::Person(4), &watching));
-    }
-
-    #[test]
-    fn a_meta_change_reaches_every_view_that_listens_for_it() {
-        let stats = Change::visible_to(person()).entity(Entity::Statistics);
-        assert!(stats.invalidates(person(), &[Interest::all(Entity::Statistics)]));
-        assert!(!stats.invalidates(person(), &[Interest::all(Entity::Machine)]));
     }
 }

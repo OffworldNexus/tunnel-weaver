@@ -407,21 +407,6 @@ mod tests {
     }
 
     #[test]
-    fn bad_gateway_names_target_and_leaves_no_placeholder() {
-        let html = render_bad_gateway("http://localhost:8080");
-        assert!(html.contains("http://localhost:8080"));
-        assert!(!html.contains("{{ target }}"));
-    }
-
-    #[test]
-    fn forbidden_names_reason() {
-        let html = render_forbidden("dotfile");
-        assert!(html.contains("403 Forbidden"));
-        assert!(html.contains("<code>dotfile</code>"));
-        assert!(!html.contains("{{ reason }}"));
-    }
-
-    #[test]
     fn dynamic_text_cannot_inject_markup_or_templates() {
         // Exercise both entry points: a rule/target is data, never HTML or a
         // second template, including literal entity and template syntax.

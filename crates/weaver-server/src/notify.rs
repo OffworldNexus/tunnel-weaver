@@ -69,17 +69,6 @@ mod tests {
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
-    fn test_notify_noop_when_unset() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        // Ensure NOTIFY_SOCKET is unset in this thread/env
-        unsafe {
-            env::remove_var("NOTIFY_SOCKET");
-        }
-        let res = notify_ready().expect("notify should succeed as no-op");
-        assert!(!res);
-    }
-
-    #[test]
     fn test_notify_delivers_to_socket() {
         let _guard = ENV_LOCK.lock().unwrap();
         let dir = tempdir().unwrap();

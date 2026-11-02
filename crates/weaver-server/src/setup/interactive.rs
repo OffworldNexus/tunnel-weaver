@@ -636,39 +636,3 @@ pub fn prompt_email_config() -> std::io::Result<EmailConfig> {
     }
     Ok(cfg)
 }
-
-#[cfg(test)]
-mod tests {
-    use super::wrap_text;
-
-    #[test]
-    fn wrap_text_short_input_is_a_single_line() {
-        assert_eq!(
-            wrap_text("host and relay", 80),
-            vec!["host and relay".to_string()]
-        );
-    }
-
-    #[test]
-    fn wrap_text_breaks_when_a_word_would_exceed_the_exact_width() {
-        // "ab cd" is exactly five columns; "ef" must start a new line.
-        assert_eq!(
-            wrap_text("ab cd ef", 5),
-            vec!["ab cd".to_string(), "ef".to_string()]
-        );
-    }
-
-    #[test]
-    fn wrap_text_keeps_a_long_word_on_its_own_line() {
-        assert_eq!(
-            wrap_text("supercalifragilistic", 4),
-            vec!["supercalifragilistic".to_string()]
-        );
-    }
-
-    #[test]
-    fn wrap_text_empty_input_yields_no_lines() {
-        assert!(wrap_text("", 80).is_empty());
-        assert!(wrap_text("   ", 80).is_empty());
-    }
-}

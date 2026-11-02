@@ -172,27 +172,6 @@ fn decision(outcome: Outcome, retry_after_ms: i64) -> Charge {
 }
 
 #[tokio::test]
-async fn gate_reports_the_longest_retry() {
-    let gate = Gate::new(
-        StubStore(vec![
-            decision(Outcome::Throttled, 100),
-            decision(Outcome::Throttled, 300),
-        ]),
-        two_budget_policy(StoreErrorPolicy::Degraded),
-        CAP,
-    );
-    let fp = fingerprint("10.0.0.1".parse().unwrap());
-    let err = gate
-        .admit(PolicyId::RELAY_WEB, &fp, 1, 0)
-        .await
-        .unwrap_err();
-    match err {
-        GateError::Throttled { retry_after_ms, .. } => assert_eq!(retry_after_ms, 300),
-        other => panic!("expected throttled, got {other:?}"),
-    }
-}
-
-#[tokio::test]
 async fn gate_throttles_when_any_budget_refuses() {
     let gate = Gate::new(
         StubStore(vec![

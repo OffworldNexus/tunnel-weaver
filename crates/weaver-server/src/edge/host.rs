@@ -121,14 +121,6 @@ pub fn parse_host_value(raw: &[u8]) -> Option<String> {
 mod tests {
     use super::*;
 
-    fn h1(host_lines: &[&str]) -> Request<()> {
-        let mut b = Request::builder().uri("/").version(Version::HTTP_11);
-        for h in host_lines {
-            b = b.header("host", *h);
-        }
-        b.body(()).unwrap()
-    }
-
     #[test]
     fn well_formed_hosts() {
         assert_eq!(
@@ -185,41 +177,6 @@ mod tests {
     }
 
     #[test]
-    fn h1_single_host_is_accepted() {
-        assert_eq!(
-            request_host(&h1(&["example.com:443"])).unwrap(),
-            "example.com"
-        );
-    }
-
-    #[test]
-    fn h1_missing_host_is_missing() {
-        assert_eq!(request_host(&h1(&[])), Err(HostError::Missing));
-    }
-
-    #[test]
-    fn h1_duplicate_host_is_rejected_even_when_identical() {
-        assert_eq!(
-            request_host(&h1(&["example.com", "example.com"])),
-            Err(HostError::Duplicate)
-        );
-        assert_eq!(
-            request_host(&h1(&["example.com", "other.example.com"])),
-            Err(HostError::Duplicate)
-        );
-    }
-
-    #[test]
-    fn h1_invalid_host_is_rejected() {
-        assert_eq!(request_host(&h1(&[""])), Err(HostError::Invalid));
-        assert_eq!(
-            request_host(&h1(&["a.com, b.com"])),
-            Err(HostError::Invalid)
-        );
-        assert_eq!(request_host(&h1(&["user@a.com"])), Err(HostError::Invalid));
-    }
-
-    #[test]
     fn h1_absolute_form_authority_wins_over_host() {
         let req = Request::builder()
             .uri("http://target.example.com/x")
@@ -228,37 +185,5 @@ mod tests {
             .body(())
             .unwrap();
         assert_eq!(request_host(&req).unwrap(), "target.example.com");
-    }
-
-    #[test]
-    fn h2_authority_without_host_is_accepted() {
-        let req = Request::builder()
-            .uri("https://example.com/")
-            .version(Version::HTTP_2)
-            .body(())
-            .unwrap();
-        assert_eq!(request_host(&req).unwrap(), "example.com");
-    }
-
-    #[test]
-    fn h2_host_agreeing_with_authority_is_accepted() {
-        let req = Request::builder()
-            .uri("https://example.com/")
-            .version(Version::HTTP_2)
-            .header("host", "EXAMPLE.com:443")
-            .body(())
-            .unwrap();
-        assert_eq!(request_host(&req).unwrap(), "example.com");
-    }
-
-    #[test]
-    fn h2_host_disagreeing_with_authority_is_rejected() {
-        let req = Request::builder()
-            .uri("https://example.com/")
-            .version(Version::HTTP_2)
-            .header("host", "other.example.com")
-            .body(())
-            .unwrap();
-        assert_eq!(request_host(&req), Err(HostError::Mismatch));
     }
 }

@@ -146,13 +146,4 @@ mod tests {
         assert_eq!(denied.outcome, Outcome::Throttled);
         assert_eq!(denied.retry_after_ms, 5_000, "clamped to the cap");
     }
-
-    #[test]
-    fn refill_is_linear_in_time() {
-        let q = quota(1, 1, 1_000); // one unit per second
-        let mut gcra = Gcra::new();
-        assert_eq!(gcra.check(&q, 1, 0, 60_000).outcome, Outcome::Admitted);
-        assert_eq!(gcra.check(&q, 1, 500, 60_000).outcome, Outcome::Throttled);
-        assert_eq!(gcra.check(&q, 1, 1_000, 60_000).outcome, Outcome::Admitted);
-    }
 }

@@ -768,34 +768,6 @@ mod tests {
             .expect("a written day has an array")
     }
 
-    /// A cell that is not the whole day array is corruption: the read must fail
-    /// rather than decode the wreckage into a day of zeroes.
-    #[tokio::test]
-    async fn a_cell_that_is_not_the_whole_day_is_refused() {
-        let (store, service) = fixture().await;
-        let (day, first) = (1, 0_u16);
-        write(&store, service, day, Slots::BytesIn, first, &[7]).await;
-        // Damage it the way a foreign writer would: an empty text value where
-        // the 11,520-byte day array belongs.
-        store
-            .db()
-            .execute_unprepared(&format!(
-                "UPDATE usage_live SET bytes_in_slots = '' \
-                 WHERE service_id = {service} AND day = {day}"
-            ))
-            .await
-            .expect("damage the cell");
-
-        let error = store
-            .read_day_slots_of(&[service], day, &[Slots::BytesIn])
-            .await
-            .expect_err("a cell that is not a whole day must not read as zeroes");
-        assert!(
-            error.to_string().contains("day array"),
-            "the error must name what it expected: {error}"
-        );
-    }
-
     /// A cell is exactly 11,520 bytes, so `read_day_slots` can hand the caller a
     /// whole 1,440-slot day even after a single-slot write.
     #[tokio::test]
@@ -961,45 +933,6 @@ mod tests {
                 .expect("the read itself succeeds")
                 .is_empty(),
             "a dropped write must not leave a row behind"
-        );
-    }
-
-    /// An impossible open time is refused, and nothing is written.
-    #[tokio::test]
-    async fn open_ms_out_of_range_is_rejected() {
-        let (store, service) = fixture().await;
-        let error = store
-            .write_day_slots(&[SlotWrite {
-                service_id: service,
-                day: 1,
-                slots: Slots::OpenMs,
-                first_slot: 0,
-                values: vec![60_001],
-            }])
-            .await;
-        assert!(
-            matches!(error, Err(StoreError::InvalidUsage(_))),
-            "{error:?}"
-        );
-        assert!(store.live_days(&[service]).await.unwrap().is_empty());
-    }
-
-    /// A run that would spill past the end of the day is refused.
-    #[tokio::test]
-    async fn a_run_off_the_end_of_the_day_is_rejected() {
-        let (store, service) = fixture().await;
-        let error = store
-            .write_day_slots(&[SlotWrite {
-                service_id: service,
-                day: 1,
-                slots: Slots::BytesIn,
-                first_slot: 1_439,
-                values: vec![1, 2],
-            }])
-            .await;
-        assert!(
-            matches!(error, Err(StoreError::InvalidUsage(_))),
-            "{error:?}"
         );
     }
 

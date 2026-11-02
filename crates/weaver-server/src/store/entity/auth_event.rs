@@ -33,6 +33,9 @@ pub struct Model {
     pub user_agent: String,
     /// The identifier a failed login was attempted against; empty otherwise.
     pub attempted: String,
+    /// A bounded extra value an event needs beyond its kind and `attempted` —
+    /// why an external sign-in was refused (WVR-169); empty otherwise.
+    pub detail: String,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

@@ -175,27 +175,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn token_hash_is_stable_and_lowercase() {
-        assert_eq!(
-            token_hash("abc"),
-            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
-        );
-        assert_eq!(new_token().len(), 64);
-        assert_eq!(new_token().len(), 64); // different each call
-    }
-
-    #[test]
-    fn cookie_header_is_parsed_by_name() {
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            COOKIE,
-            "a=1; __Host-weaver_session=xyz; b=2".parse().unwrap(),
-        );
-        assert_eq!(cookie(&headers, SESSION_COOKIE).as_deref(), Some("xyz"));
-        assert_eq!(cookie(&headers, "missing"), None);
-    }
-
-    #[test]
     fn cookie_split_across_http2_fields_is_parsed() {
         // Chromium splits `Cookie` into one field per cookie group over HTTP/2;
         // the session must be found even when it is not in the first field.

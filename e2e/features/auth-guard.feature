@@ -21,8 +21,6 @@ Feature: A signed-in person is kept out of the account-entry pages
     Then I land on my console
     When I open the "forgot-password" page
     Then I land on my console
-    When I open the "check-email" page
-    Then I land on my console
     When I open the "verify" page
     Then I land on my console
     When I open the "set-password" page

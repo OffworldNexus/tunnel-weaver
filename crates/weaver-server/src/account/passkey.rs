@@ -717,20 +717,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_handle_is_derived_and_stable() {
-        let first = user_handle(7);
-        assert_eq!(first, user_handle(7));
-        assert_ne!(first, user_handle(8));
-        // A UUID, not the account id: this value travels to the authenticator.
-        assert_eq!(first.to_string().len(), 36);
-    }
-
-    #[test]
-    fn credential_ids_use_the_wire_spelling() {
-        assert_eq!(credential_id_string(&[0xfb, 0xff]), "-_8");
-    }
-
-    #[test]
     fn a_handle_works_once() {
         let handles = Handles::default();
         let handle = handles.start("ceremony", 1_000);

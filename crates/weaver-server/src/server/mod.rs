@@ -98,22 +98,21 @@ pub async fn run_server(
         }
     };
 
-    // An install upgraded from before WVR-166 has no key to seal authenticator
-    // app secrets with. Generating one here — rather than refusing to serve, or
-    // leaving enrolment unavailable — is what keeps the feature working on a
-    // deployment nobody re-ran `setup` on; the warning is the operator's only
-    // cue to keep it with the rest of the deployment's state, because losing it
-    // makes every enrolled app unreadable.
-    match config.ensure_totp_key(&store).await {
-        Ok(true) => warn!(
-            "generated a new account.totp_key for authenticator apps; keep it with the \
-             deployment's state, or enrolled apps will stop working"
-        ),
-        Ok(false) => {}
+    // The warning is the operator's only cue to keep a generated key with the
+    // rest of the deployment's state: losing it makes what it sealed unreadable.
+    match config.ensure_seal_keys(&store).await {
+        Ok(generated) => {
+            for name in generated {
+                warn!(
+                    "generated a new account.{name}; keep it with the deployment's state, or \
+                     the secrets it seals will stop working"
+                );
+            }
+        }
         Err(error) => warn!(
             %error,
-            "the generated account.totp_key could not be persisted; authenticator apps \
-             enrolled before the next restart will stop working"
+            "a generated account sealing key could not be persisted; secrets sealed before \
+             the next restart will stop working"
         ),
     }
 
@@ -251,6 +250,14 @@ pub async fn run_server(
         scheduler_tasks.push(Arc::new(crate::housekeeping::AbuseSweepTask::new(
             store.clone(),
             ttl_ms,
+        )));
+    }
+    // Keeps a linked provider grant live and, when the provider rejects it,
+    // revokes the sessions it was acting for (WVR-169).
+    if let Some(microsoft) = account.microsoft.clone() {
+        scheduler_tasks.push(Arc::new(crate::account::sso::SsoRefreshTask::new(
+            microsoft,
+            store.clone(),
         )));
     }
     let scheduler = crate::scheduler::Scheduler::new(scheduler_tasks).await;

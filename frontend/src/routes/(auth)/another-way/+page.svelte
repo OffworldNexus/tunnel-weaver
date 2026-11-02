@@ -22,6 +22,7 @@
 	import { climb } from '#lib/app/upgrade';
 	import Icon from '#lib/ui/Icon.svelte';
 	import Keycap from '#lib/ui/Keycap.svelte';
+	import Microsoft from '#lib/ui/Microsoft.svelte';
 	import Page from '#lib/ui/Page.svelte';
 	import { goto } from '$app/navigation';
 	import { resolve } from '$app/paths';
@@ -37,7 +38,7 @@
 		option: UpgradePath;
 		label: string;
 		detail: string;
-		icon: 'shield' | 'inbox' | 'lock' | 'fingerprint' | 'key';
+		icon: 'shield' | 'inbox' | 'lock' | 'fingerprint' | 'key' | 'microsoft';
 	}
 
 	/** The step a request is in flight for; empty when none is. */
@@ -70,6 +71,11 @@
 			label: 'A passkey',
 			detail: 'Use your face, fingerprint, PIN or a security key.',
 			icon: 'fingerprint'
+		},
+		reauth_provider: {
+			label: 'Sign in with Microsoft again',
+			detail: 'We will send you back to Microsoft to confirm it is you.',
+			icon: 'microsoft'
 		}
 	};
 
@@ -208,7 +214,12 @@
 			{#each ways as way (way.step)}
 				<li>
 					<button class="way" type="button" onclick={() => choose(way)} disabled={busy !== ''}>
-						<span class="way__icon"><Icon name={way.icon} size={18} /></span>
+						<span class="way__icon"
+							>{#if way.icon === 'microsoft'}<Microsoft size={18} />{:else}<Icon
+									name={way.icon}
+									size={18}
+								/>{/if}</span
+						>
 						<span class="way__copy">
 							<span class="way__label">{way.label}</span>
 							<span class="way__detail">{way.detail}</span>

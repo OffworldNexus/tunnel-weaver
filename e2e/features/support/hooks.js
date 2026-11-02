@@ -13,7 +13,9 @@ let browser;
 
 BeforeAll(async function () {
   await startHarness();
-  browser = await chromium.launch({ headless: true });
+  // Headless by default; `E2E_HEADED=1` opens the real window, so a run can be
+  // watched on a desktop (the scenarios are identical either way).
+  browser = await chromium.launch({ headless: process.env.E2E_HEADED !== '1' });
 });
 
 AfterAll(async function () {

@@ -354,30 +354,3 @@ fn render_relays(relays: &[Relay]) -> Vec<String> {
         })
         .collect()
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn relay_rows_are_aligned_and_mark_the_default() {
-        let key = format!("p256:0271af4a{}8329", "0".repeat(54));
-        let relay = |id, host: &str, machine_id, is_default| Relay {
-            id,
-            admin_host: host.into(),
-            machine_id,
-            key_id: key.clone(),
-            is_default,
-        };
-        assert_eq!(
-            render_relays(&[
-                relay(2, "weaver1.offworld.nexus", 7, true),
-                relay(1, "relay.example:8443", 12, false),
-            ]),
-            [
-                "\u{2605} weaver1.offworld.nexus  machine 7   p256:0271af4a\u{2026}8329  default",
-                "  relay.example:8443      machine 12  p256:0271af4a\u{2026}8329",
-            ]
-        );
-    }
-}

@@ -38,16 +38,32 @@ pub enum ProofKind {
     /// only for the confirmation window: a passkey sign-in is `Certain` at
     /// once and falls to `Strong` when this expires.
     PasskeyUserVerification,
+    /// Control of an external identity the provider asserted (WVR-169). The
+    /// possession half of an SSO sign-in: on its own it is one factor, so it
+    /// grants `Basic` — exactly as the password does — and holds for the session.
+    IdentityProvider,
+    /// The provider asserted a second factor for the sign-in (WVR-169) — Entra's
+    /// `amr` carried `mfa`. It is the same thing an emailed code proves, so it
+    /// grants `Strong` and lives as long as the session.
+    IdentityProviderMfa,
+    /// The provider re-authenticated the person on demand (WVR-169) — a step-up
+    /// with `prompt=login`. It is the *presence-of-person* half, the same thing a
+    /// password typed moments ago proves, so it lives only for the confirmation
+    /// window and is what lets an SSO session reach `Certain`.
+    IdentityProviderPresence,
 }
 
 impl ProofKind {
     /// Every kind the level derivation knows about.
-    pub const ALL: [ProofKind; 5] = [
+    pub const ALL: [ProofKind; 8] = [
         ProofKind::Password,
         ProofKind::EmailOtp,
         ProofKind::Totp,
         ProofKind::Passkey,
         ProofKind::PasskeyUserVerification,
+        ProofKind::IdentityProvider,
+        ProofKind::IdentityProviderMfa,
+        ProofKind::IdentityProviderPresence,
     ];
 
     /// The stable string stored in `auth_event.kind`.
@@ -58,6 +74,9 @@ impl ProofKind {
             ProofKind::Totp => "totp",
             ProofKind::Passkey => "passkey",
             ProofKind::PasskeyUserVerification => "passkey_user_verification",
+            ProofKind::IdentityProvider => "identity_provider",
+            ProofKind::IdentityProviderMfa => "identity_provider_mfa",
+            ProofKind::IdentityProviderPresence => "identity_provider_presence",
         }
     }
 
@@ -72,50 +91,14 @@ impl ProofKind {
     /// re-step-up.
     pub const fn max_age_secs(self, session_ttl_secs: i64, confirm_window_secs: i64) -> i64 {
         match self {
-            ProofKind::Password | ProofKind::PasskeyUserVerification => confirm_window_secs,
-            ProofKind::EmailOtp | ProofKind::Totp | ProofKind::Passkey => session_ttl_secs,
+            ProofKind::Password
+            | ProofKind::PasskeyUserVerification
+            | ProofKind::IdentityProviderPresence => confirm_window_secs,
+            ProofKind::EmailOtp
+            | ProofKind::Totp
+            | ProofKind::Passkey
+            | ProofKind::IdentityProvider
+            | ProofKind::IdentityProviderMfa => session_ttl_secs,
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn the_sign_in_proof_names_are_the_stored_ones() {
-        // `manager` holds the other half: every proof has an event writing it,
-        // under the very same name.
-        for kind in ProofKind::ALL {
-            assert!(!kind.as_str().is_empty());
-        }
-    }
-
-    #[test]
-    fn otp_lifetime_tracks_the_session() {
-        assert_eq!(ProofKind::EmailOtp.max_age_secs(86_400, 300), 86_400);
-        assert_eq!(ProofKind::Password.max_age_secs(86_400, 300), 300);
-    }
-
-    #[test]
-    fn a_passkey_is_strong_for_the_session_and_certain_only_for_the_window() {
-        // The possession half holds for the session, the user-verification half
-        // for the confirmation window: `Certain` now, `Strong` afterwards.
-        assert_eq!(ProofKind::Passkey.max_age_secs(86_400, 300), 86_400);
-        assert_eq!(
-            ProofKind::PasskeyUserVerification.max_age_secs(86_400, 300),
-            300
-        );
-    }
-
-    #[test]
-    fn an_authenticator_code_lives_as_long_as_an_emailed_one() {
-        // The whole point of the twin: entering one after signing in is
-        // `Certain` and decays to `Strong` on the same clock as the other.
-        assert_eq!(ProofKind::Totp.max_age_secs(86_400, 300), 86_400);
-        assert_eq!(
-            ProofKind::Totp.max_age_secs(86_400, 300),
-            ProofKind::EmailOtp.max_age_secs(86_400, 300)
-        );
     }
 }

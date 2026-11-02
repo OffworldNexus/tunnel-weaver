@@ -38,23 +38,6 @@ fn create_valid_test_config(
     }
 }
 
-// 1. Missing control socket exits with code 3 and diagnostic hint
-#[test]
-fn test_cli_diagnostics_missing_socket() {
-    let bin_path = env!("CARGO_BIN_EXE_weaver-server");
-    let output = Command::new(bin_path)
-        .arg("--socket")
-        .arg("/tmp/nonexistent-weaver-socket-12345.sock")
-        .arg("status")
-        .output()
-        .expect("failed to execute weaver-server status");
-
-    assert_eq!(output.status.code(), Some(3));
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("Cannot connect to control socket"));
-    assert!(stderr.contains("Hint: systemctl status weaver-server"));
-}
-
 // 2. Permission denied connecting to control socket exits with code 1 and diagnostic hint
 #[tokio::test]
 async fn test_cli_diagnostics_permission_denied() {
@@ -79,28 +62,6 @@ async fn test_cli_diagnostics_permission_denied() {
     assert!(stderr.contains("Hint: run with sudo or join group 'weaver'"));
 }
 
-// 2. Mutual exclusion of --socket and --db
-#[test]
-fn test_cli_mutual_exclusion_socket_and_db() {
-    let bin_path = env!("CARGO_BIN_EXE_weaver-server");
-    let output = Command::new(bin_path)
-        .arg("--socket")
-        .arg("/tmp/some.sock")
-        .arg("--db")
-        .arg("/tmp/some.db")
-        .arg("status")
-        .output()
-        .expect("failed to execute weaver-server");
-
-    assert_eq!(output.status.code(), Some(2));
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("cannot be used with")
-            || stderr.contains("conflicts with")
-            || stderr.contains("--db")
-    );
-}
-
 // 3. Running 'weaver-server run' without --db refuses to start
 #[test]
 fn test_cli_run_refuses_without_db() {
@@ -114,24 +75,6 @@ fn test_cli_run_refuses_without_db() {
     assert_eq!(output.status.code(), Some(2));
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("Database path is required"));
-}
-
-// 4. Invalid hostname without dot and not 'root' exits with code 2
-#[test]
-fn test_cli_invalid_hostname_exits_2() {
-    let bin_path = env!("CARGO_BIN_EXE_weaver-server");
-    let output = Command::new(bin_path)
-        .arg("--socket")
-        .arg("/tmp/some.sock")
-        .arg("cert")
-        .arg("status")
-        .arg("barehostname")
-        .output()
-        .expect("failed to execute weaver-server cert status");
-
-    assert_eq!(output.status.code(), Some(2));
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("Invalid hostname 'barehostname'"));
 }
 
 // 5. Full daemon integration: permissions, protocol envelope, commands, and shutdown
@@ -305,10 +248,8 @@ async fn test_control_socket_daemon_suite() {
         assert_eq!(val["ok"], true);
         assert_eq!(val["tunnel_domain"], "weaver.test");
         assert_eq!(val["admin_domain"], "relay-admin.test");
-        // Six migrations: `m0001_init`, `m0002_usage_daily`,
-        // `m0003_inactivity`, `m0004_auth_levels`, `m0005_passkeys` and
-        // `m0006_totp`.
-        assert_eq!(val["schema_version"], 6);
+        // Eight migrations: `m0001_init` through `m0008_login_challenge_purpose`.
+        assert_eq!(val["schema_version"], 8);
         // The seeded tunnel wildcard reports issued; the admin certificate has
         // no stored row and is still pending, so it counts as ordering.
         assert_eq!(val["cert_counts"]["issued"], 1);

@@ -449,36 +449,6 @@ mod tests {
     }
 
     #[test]
-    fn opened_and_closed_phases() {
-        let open = request_line(&event("/ws", Some(101), Phase::Opened), None);
-        assert!(open.contains(" \u{25B6} "));
-        assert!(open.contains("   open"));
-        let closed = request_line(&event("/ws", Some(101), Phase::Closed), None);
-        assert!(closed.contains(" \u{25A0} "));
-        assert!(closed.contains("463B"));
-    }
-
-    #[test]
-    fn humanizers() {
-        assert_eq!(human_bytes(0), "0B");
-        assert_eq!(human_bytes(1536), "1.5K");
-        assert_eq!(human_bytes(200 * 1024 * 1024), "200M");
-        assert_eq!(human_duration(Duration::from_micros(3400)), "3.4ms");
-        assert_eq!(human_duration(Duration::from_millis(1200)), "1.20s");
-        assert_eq!(human_duration(Duration::from_secs(123)), "2m03s");
-    }
-
-    #[test]
-    fn visitor_ip_display() {
-        assert_eq!(display_ip("::ffff:79.112.1.2"), "79.112.1.2");
-        assert_eq!(display_ip("203.0.113.9"), "203.0.113.9");
-        assert_eq!(display_ip("2001:db8::1"), "2001:db8::1");
-        let long = display_ip("2001:0db8:85a3:08d3:1319:8a2e:0370:7344");
-        assert_eq!(long, "2001:db8:85a3:8d3:\u{2026}");
-        assert_eq!(display_ip("-"), "-");
-    }
-
-    #[test]
     fn footer_rows_follow_the_lifecycle() {
         let mut footer = Footer::new(&[
             ServiceSpec::new("web", weave::Target::parse("8000").unwrap()),

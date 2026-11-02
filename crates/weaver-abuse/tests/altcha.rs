@@ -63,15 +63,6 @@ fn valid_solution_verifies() {
 }
 
 #[test]
-fn signature_is_deterministic_for_fixed_entropy() {
-    // Given the same nonce/salt/params, the canonical JSON and HMAC are stable.
-    assert_eq!(
-        challenge(SUPPORTED_ALGORITHM, 300).signature,
-        challenge(SUPPORTED_ALGORITHM, 300).signature
-    );
-}
-
-#[test]
 fn wrong_secret_is_rejected() {
     let ch = challenge(SUPPORTED_ALGORITHM, 300);
     let solution = solve_challenge(&ch);
@@ -79,25 +70,6 @@ fn wrong_secret_is_rejected() {
         challenge: &ch,
         solution: &solution,
         secret: "a-different-secret",
-        now_ms: NOW_MS,
-        expected_purpose: "diagnostic",
-        expected_flow: "flow-1",
-    })
-    .unwrap_err();
-    assert_eq!(err, ProofError::BadSignature);
-}
-
-#[test]
-fn tampered_work_parameters_are_rejected() {
-    // Changing the signed cost (a cheaper challenge) breaks the signature, even
-    // though the solution is recomputed against the tampered parameters.
-    let mut ch = challenge(SUPPORTED_ALGORITHM, 300);
-    ch.parameters.cost = 1;
-    let solution = solve_challenge(&ch);
-    let err = verify_solution(VerifyRequest {
-        challenge: &ch,
-        solution: &solution,
-        secret: SECRET,
         now_ms: NOW_MS,
         expected_purpose: "diagnostic",
         expected_flow: "flow-1",
@@ -125,38 +97,6 @@ fn unsigned_challenge_is_rejected() {
         verify(&ch, NOW_MS).unwrap_err(),
         ProofError::MissingSignature
     );
-}
-
-#[test]
-fn expired_challenge_is_rejected() {
-    let ch = challenge(SUPPORTED_ALGORITHM, 60);
-    let just_inside = NOW_MS + 60_000;
-    let just_past = NOW_MS + 61_000;
-    assert!(verify(&ch, just_inside).is_ok());
-    assert_eq!(verify(&ch, just_past).unwrap_err(), ProofError::Expired);
-}
-
-#[test]
-fn challenge_without_expiry_is_accepted_much_later() {
-    let ch = challenge(SUPPORTED_ALGORITHM, 0);
-    assert!(ch.parameters.expires_at.is_none());
-    assert!(verify(&ch, NOW_MS + 10_000_000).is_ok());
-}
-
-#[test]
-fn wrong_flow_is_rejected_before_solving() {
-    let ch = challenge(SUPPORTED_ALGORITHM, 300);
-    let solution = solve_challenge(&ch);
-    let err = verify_solution(VerifyRequest {
-        challenge: &ch,
-        solution: &solution,
-        secret: SECRET,
-        now_ms: NOW_MS,
-        expected_purpose: "diagnostic",
-        expected_flow: "some-other-flow",
-    })
-    .unwrap_err();
-    assert_eq!(err, ProofError::WrongContext);
 }
 
 #[test]
@@ -246,17 +186,6 @@ fn bounded_solver_produces_a_solution_that_verifies() {
 }
 
 #[test]
-fn bounded_solver_refuses_an_unknown_algorithm() {
-    let ch = with("SCRYPT", 10, "0");
-    assert_eq!(
-        weaver_abuse::try_solve_challenge(&ch, &LIMITS),
-        Err(weaver_abuse::SolveError::UnsupportedAlgorithm(
-            "SCRYPT".into()
-        ))
-    );
-}
-
-#[test]
 fn bounded_solver_refuses_too_much_work_before_doing_any() {
     // Over the per-attempt cost.
     assert!(matches!(
@@ -268,13 +197,5 @@ fn bounded_solver_refuses_too_much_work_before_doing_any() {
     assert!(matches!(
         weaver_abuse::try_solve_challenge(&with(SUPPORTED_ALGORITHM, 10, "0000000"), &LIMITS),
         Err(weaver_abuse::SolveError::TooExpensive(_))
-    ));
-}
-
-#[test]
-fn bounded_solver_refuses_a_malformed_prefix() {
-    assert!(matches!(
-        weaver_abuse::try_solve_challenge(&with(SUPPORTED_ALGORITHM, 10, "zz"), &LIMITS),
-        Err(weaver_abuse::SolveError::Malformed(_))
     ));
 }

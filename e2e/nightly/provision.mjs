@@ -4,30 +4,29 @@
  *
  * Drives the *real* account and pairing pages of a live relay — the same pages a
  * person uses — so the nightly can exercise the genuine end-to-end journey
- * (sign up, verify by email link, set a password, sign in, approve a machine)
+ * (sign up, verify by emailed code, set a password, sign in, approve a machine)
  * without a seeded identity and without any development affordance.
  *
  * It is deliberately small and loud: every subcommand asserts the screen it
  * expects, and any failure prints the URL, the visible text and a screenshot,
  * then exits non-zero. It never guesses success.
  *
- * The verification link and the pairing link are produced outside the browser
- * (the link the relay prints and the link `weave pair` prints) and handed in as
- * `--link`. A signed-in session is carried between invocations as a Playwright
- * storage-state file (`--state`), so `verify` can sign in once and `approve` can
- * reuse that session.
+ * The pairing link is produced outside the browser (the link `weave pair`
+ * prints) and handed in as `--link`. A signed-in session is carried between
+ * invocations as a Playwright storage-state file (`--state`), so `signup` can
+ * sign in once and `approve` can reuse that session.
  *
- * The sign-in code is read back from Resend's Receiving API here rather than by
- * the caller, unlike the two links: the relay mails it the moment the password
- * is submitted, and it is only valid for that sign-in — so it has to be read and
- * entered inside the same browser session, before anything else can ask for a
- * fresh one (WVR-167).
+ * Both emailed codes — the signup verification code (WVR-169) and the sign-in
+ * code (WVR-167) — are read back from Resend's Receiving API here rather than by
+ * the caller: the signup flow lives in the tab's session storage and a sign-in
+ * code is only valid for that sign-in, so each has to be read and entered inside
+ * the same browser session that asked for it. That is why signing up, verifying
+ * and the first sign-in are one subcommand.
  *
  * Run from the `e2e` workspace so `playwright` resolves:
  *
- *   node nightly/provision.mjs signup  --base https://<admin> --email <addr>
- *   node nightly/provision.mjs verify  --base https://<admin> --email <addr> \
- *                                      --password <pw> --link <verify-url>
+ *   node nightly/provision.mjs signup  --base https://<admin> --email <addr> \
+ *                                      --password <pw>
  *   node nightly/provision.mjs approve --base https://<admin> --link <pair-url> \
  *                                      --machine laptop --person nightly
  */
@@ -38,6 +37,9 @@ import { chromium } from 'playwright';
 
 /** Resend's inbound-message endpoint: where the relay's own mail is read back. */
 const RECEIVING = 'https://api.resend.com/emails/receiving';
+
+/** The subject of the signup verification code. */
+const VERIFICATION_SUBJECT = /verify your email/i;
 
 /** The subject of the second-factor sign-in code. */
 const SIGNIN_SUBJECT = /sign-in code/i;
@@ -106,7 +108,7 @@ async function press(page, name, screenshotPath) {
 function resendKey() {
   const key = process.env.RESEND_API_KEY;
   if (!key) {
-    console.error('provision: RESEND_API_KEY is required to read the sign-in code back');
+    console.error('provision: RESEND_API_KEY is required to read the emailed codes back');
     process.exit(2);
   }
   return key;
@@ -128,10 +130,10 @@ async function receivedIds(key) {
 /**
  * Waits for the six-digit code the relay just mailed, read back through Resend's
  * Receiving API — never from the relay's own database. Only a message that
- * arrived after `seen` was taken, addressed to `email` and carrying the sign-in
- * subject, can be this sign-in's.
+ * arrived after `seen` was taken, addressed to `email` and carrying a subject
+ * matching `subject`, can be the one just asked for.
  */
-async function waitForSigninCode(key, email, seen, page, screenshotPath) {
+async function waitForCode(key, email, seen, subject, page, screenshotPath) {
   for (let attempt = 0; attempt < 30; attempt += 1) {
     const list = await fetch(`${RECEIVING}?limit=20`, {
       headers: { Authorization: `Bearer ${key}` }
@@ -141,7 +143,7 @@ async function waitForSigninCode(key, email, seen, page, screenshotPath) {
       (candidate) =>
         !seen.has(candidate.id) &&
         (candidate.to ?? []).includes(email) &&
-        SIGNIN_SUBJECT.test(candidate.subject ?? '')
+        subject.test(candidate.subject ?? '')
     );
     if (message) {
       const detail = await fetch(`${RECEIVING}/${message.id}`, {
@@ -155,7 +157,7 @@ async function waitForSigninCode(key, email, seen, page, screenshotPath) {
     }
     await new Promise((resolve) => setTimeout(resolve, 2_000));
   }
-  await fail(`never received the sign-in code email at ${email}`, page, screenshotPath);
+  await fail(`never received a "${subject.source}" email at ${email}`, page, screenshotPath);
 }
 
 function common() {
@@ -175,7 +177,7 @@ function common() {
   });
   const command = positionals[0];
   if (!command) {
-    console.error('usage: provision.mjs <signup|verify|approve> [options]');
+    console.error('usage: provision.mjs <signup|approve> [options]');
     process.exit(2);
   }
   if (!values.base) {
@@ -185,39 +187,36 @@ function common() {
   return { command, ...values };
 }
 
-/** `signup` — create the account and stop on "Check your email". */
+/**
+ * Submits the code page — `/verify` and `/verify-code` share the heading, the
+ * field and the submit — with the code read back after `seen` was taken.
+ */
+async function enterCode(page, key, email, seen, subject, screenshotPath) {
+  await waitForHeading(page, 'Enter your code', 'code', screenshotPath);
+  const code = await waitForCode(key, email, seen, subject, page, screenshotPath);
+  await page.getByLabel('Code', { exact: true }).fill(code);
+  await press(page, 'Continue', screenshotPath);
+}
+
+/** `signup` — create the account, verify it by code, set the password, sign in. */
 async function signup(opts) {
-  if (!opts.email) {
-    console.error('provision: signup requires --email');
+  if (!opts.email || !opts.password) {
+    console.error('provision: signup requires --email and --password');
     process.exit(2);
   }
+  const key = resendKey();
   const { browser, context, page } = await openBrowser(opts);
   try {
     await page.goto(new URL('/sign-up', opts.base).toString());
     await waitForHeading(page, 'Create your account', 'sign-up', opts.screenshot);
     await page.getByLabel('Name', { exact: true }).fill(opts.name);
     await page.getByLabel('Email', { exact: true }).fill(opts.email);
+    // The receiving mailbox is shared across runs: only a message that arrives
+    // after this snapshot can be this signup's.
+    let seen = await receivedIds(key);
     await press(page, 'Continue with email', opts.screenshot);
-    await waitForHeading(page, 'Check your email', 'check-email', opts.screenshot);
-    await context.storageState({ path: opts.state });
-    console.log(`provision: signup started for ${opts.email}`);
-  } catch (error) {
-    await fail(error.message, page, opts.screenshot);
-  } finally {
-    await context.close();
-    await browser.close();
-  }
-}
-
-/** `verify` — open the emailed link, set the password, then sign in. */
-async function verify(opts) {
-  if (!opts.email || !opts.password || !opts.link) {
-    console.error('provision: verify requires --email, --password and --link');
-    process.exit(2);
-  }
-  const { browser, context, page } = await openBrowser(opts);
-  try {
-    await page.goto(opts.link);
+    await waitForPath(page, /\/verify$/, 'the verification step', opts.screenshot);
+    await enterCode(page, key, opts.email, seen, VERIFICATION_SUBJECT, opts.screenshot);
     await waitForPath(page, /\/(set-password|existing-account)$/, 'set-password', opts.screenshot);
     if (new URL(page.url()).pathname.startsWith('/existing-account')) {
       await fail(`the address already had an account: ${opts.email}`, page, opts.screenshot);
@@ -232,17 +231,13 @@ async function verify(opts) {
     // WVR-167: the password is only the first factor. The code is read back
     // here, after the password is submitted and before anything could ask for
     // another one, and entered in the session that asked for it.
-    const key = resendKey();
-    const seen = await receivedIds(key);
+    seen = await receivedIds(key);
     await press(page, 'Sign in', opts.screenshot);
     await waitForPath(page, /\/verify-code$/, 'the second-factor step', opts.screenshot);
-    await waitForHeading(page, 'Enter your code', 'verify-code', opts.screenshot);
-    const code = await waitForSigninCode(key, opts.email, seen, page, opts.screenshot);
-    await page.getByLabel('Code', { exact: true }).fill(code);
-    await press(page, 'Continue', opts.screenshot);
+    await enterCode(page, key, opts.email, seen, SIGNIN_SUBJECT, opts.screenshot);
     await waitForPath(page, /\/app$/, 'the signed-in shell', opts.screenshot);
     await context.storageState({ path: opts.state });
-    console.log(`provision: verified and signed in as ${opts.email}`);
+    console.log(`provision: signed up, verified and signed in as ${opts.email}`);
   } catch (error) {
     await fail(error.message, page, opts.screenshot);
   } finally {
@@ -280,7 +275,6 @@ async function approve(opts) {
 
 const opts = common();
 if (opts.command === 'signup') await signup(opts);
-else if (opts.command === 'verify') await verify(opts);
 else if (opts.command === 'approve') await approve(opts);
 else {
   console.error(`provision: unknown command "${opts.command}"`);

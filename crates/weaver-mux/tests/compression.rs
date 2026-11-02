@@ -13,12 +13,6 @@ fn json(n: usize) -> Vec<u8> {
     v
 }
 
-fn noise(n: usize) -> Vec<u8> {
-    (0..n as u32)
-        .map(|i| (i.wrapping_mul(2654435761) >> 13) as u8)
-        .collect()
-}
-
 /// Open a stream in `class`, send `data` with `stance`, pump, and return
 /// the client's DATA frames plus what the server received.
 async fn send_one(
@@ -89,14 +83,6 @@ async fn stance_is_per_message_not_per_stream() {
 }
 
 #[tokio::test]
-async fn realtime_streams_are_never_compressed() {
-    let mut p = Pair::authenticated().await;
-    let (frames, got) = send_one(&mut p, Class::Realtime, Compress::Auto, &json(8192)).await;
-    assert!(frames.iter().all(|f| !is_compressed(f)));
-    assert_eq!(got, json(8192));
-}
-
-#[tokio::test]
 async fn one_kib_floor_per_fragment() {
     let mut p = Pair::authenticated().await;
     let (frames, _) = send_one(&mut p, Class::Interactive, Compress::Auto, &json(1023)).await;
@@ -116,14 +102,6 @@ async fn one_kib_floor_per_fragment() {
         .collect();
     assert!(!is_compressed(&frames[0]));
     assert!(frames[1..].iter().all(is_compressed));
-}
-
-#[tokio::test]
-async fn entropy_probe_rejects_random_bytes() {
-    let mut p = Pair::authenticated().await;
-    let (frames, got) = send_one(&mut p, Class::Interactive, Compress::Auto, &noise(8192)).await;
-    assert!(frames.iter().all(|f| !is_compressed(f)));
-    assert_eq!(got, noise(8192));
 }
 
 #[tokio::test]

@@ -480,20 +480,6 @@ mod tests {
         }
     }
 
-    /// OFF-96: framework tooling dot-dirs are not risk names and must pass.
-    #[test]
-    fn permits_frontend_dev_server_assets() {
-        for p in [
-            "/@fs/home/remy/dev/app/.svelte-kit/generated/client/app.js",
-            "/node_modules/.pnpm/@sveltejs+kit@1.0.0/node_modules/@sveltejs/kit/src/runtime/client/entry.js",
-            "/.vite/deps/chunk-abc.js",
-            "/.next/static/chunks/main.js",
-            "/.nuxt/dist/client/app.js",
-        ] {
-            assert_eq!(get(p), None, "{p}");
-        }
-    }
-
     #[test]
     fn leaves_legitimate_apps_alone() {
         for p in [

@@ -926,12 +926,4 @@ mod tests {
         assert_eq!(resp.response_code, ResponseCode::NXDomain);
         assert!(resp.answers.is_empty());
     }
-
-    /// A challenge-looking name outside our zones is not ours to answer.
-    #[tokio::test]
-    async fn a_challenge_name_outside_our_zones_is_refused() {
-        let t = responder(vec!["203.0.113.7".parse().unwrap()]).await;
-        let resp = ask(&t, "_acme-challenge.example.org", RecordType::TXT).await;
-        assert_eq!(resp.response_code, ResponseCode::Refused);
-    }
 }

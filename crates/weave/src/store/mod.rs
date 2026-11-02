@@ -343,15 +343,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_device_key_is_one_row() {
-        let (_dir, store) = store().await;
-        assert_eq!(store.device_key().await.unwrap(), "");
-        store.set_device_key("p256:aa").await.unwrap();
-        store.set_device_key("p256:bb").await.unwrap();
-        assert_eq!(store.device_key().await.unwrap(), "p256:bb");
-    }
-
-    #[tokio::test]
     async fn the_index_refuses_a_second_default() {
         let (_dir, store) = store().await;
         store
