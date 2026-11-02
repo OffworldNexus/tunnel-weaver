@@ -164,12 +164,45 @@ fn is_public(method: &Method, path: &str) -> bool {
         // `/api/account/passkeys` routes below, which manage credentials.
         | "/api/account/passkey/begin"
         | "/api/account/passkey/finish" => *method == Method::POST,
-        // The external-identity front door (WVR-169): the callback comes back
-        // from the provider carrying a `state`, so it is a GET like `begin`.
-        "/api/account/sso/microsoft/begin" | "/api/account/sso/microsoft/callback" => {
-            *method == Method::GET
+        // The external-identity front door (WVR-169, generic since WVR-175): the
+        // callback comes back from the provider carrying a `state`, so it is a
+        // GET like `begin`.
+        _ if matches!(sso_action(method, path), Some(SsoAction::Begin | SsoAction::Callback)) => {
+            true
         }
         _ => false,
+    }
+}
+
+/// The half of an external-identity route a request names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SsoAction {
+    Begin,
+    Callback,
+    StepUp,
+}
+
+/// Parses `/api/account/sso/<provider>/<action>`.
+///
+/// The gate opens the whole prefix by its shape rather than by a provider id, so
+/// a new provider needs no change here. The provider segment is restricted to
+/// the ids the config allows (lowercase letters, digits and `-`).
+fn sso_action(method: &Method, path: &str) -> Option<SsoAction> {
+    let rest = path.strip_prefix("/api/account/sso/")?;
+    let (provider, action) = rest.split_once('/')?;
+    if provider.is_empty()
+        || !provider
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        || *method != Method::GET
+    {
+        return None;
+    }
+    match action {
+        "begin" => Some(SsoAction::Begin),
+        "callback" => Some(SsoAction::Callback),
+        "step-up" => Some(SsoAction::StepUp),
+        _ => None,
     }
 }
 
@@ -191,7 +224,7 @@ fn is_basic(method: &Method, path: &str) -> bool {
         | "/api/account/logout" => *method == Method::POST,
         // Re-authenticating at the provider only needs a session, not a strong
         // one: it is itself a way up (WVR-169).
-        "/api/account/sso/microsoft/step-up" => *method == Method::GET,
+        _ if matches!(sso_action(method, path), Some(SsoAction::StepUp)) => true,
         _ => false,
     }
 }
@@ -262,6 +295,55 @@ mod tests {
             required_level(&Method::POST, "/api/account/login/totp"),
             AuthLevel::Basic
         );
+    }
+
+    /// The SSO prefix is opened by its shape, not by a provider id (WVR-175):
+    /// `begin` and `callback` are public, `step-up` needs a session, and an
+    /// unknown action or a non-GET falls through to the default.
+    #[test]
+    fn every_provider_gets_the_same_three_openings() {
+        for provider in ["google", "microsoft", "any-new-one"] {
+            assert_eq!(
+                required_level(&Method::GET, &format!("/api/account/sso/{provider}/begin")),
+                AuthLevel::None
+            );
+            assert_eq!(
+                required_level(
+                    &Method::GET,
+                    &format!("/api/account/sso/{provider}/callback")
+                ),
+                AuthLevel::None
+            );
+            assert_eq!(
+                required_level(
+                    &Method::GET,
+                    &format!("/api/account/sso/{provider}/step-up")
+                ),
+                AuthLevel::Basic
+            );
+            // Anything else under the prefix is not a sign-in route.
+            assert_eq!(
+                required_level(
+                    &Method::POST,
+                    &format!("/api/account/sso/{provider}/callback")
+                ),
+                AuthLevel::Strong
+            );
+            assert_eq!(
+                required_level(
+                    &Method::GET,
+                    &format!("/api/account/sso/{provider}/elsewhere")
+                ),
+                AuthLevel::Strong
+            );
+            assert_eq!(
+                required_level(
+                    &Method::GET,
+                    &format!("/api/account/sso/{provider}/callback/extra")
+                ),
+                AuthLevel::Strong
+            );
+        }
     }
 
     #[test]

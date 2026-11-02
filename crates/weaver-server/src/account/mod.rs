@@ -52,8 +52,10 @@ pub struct AccountRuntime {
     /// in-memory registry of started passkey ceremonies (WVR-163).
     pub webauthn: Arc<Webauthn>,
     pub ceremonies: passkey::Ceremonies,
-    /// The Microsoft identity provider, when the operator enabled it (WVR-169).
-    pub microsoft: Option<Arc<sso::Microsoft>>,
+    /// The external identity providers the operator enabled, by id (WVR-175).
+    /// Empty when none are offered; every route, the refresh task and the config
+    /// endpoint read this one registry.
+    pub sso: sso::SsoProviders,
     /// The console's real-time change bus: presence transitions, membership
     /// writes and metered minutes announce the affected person here, and every
     /// open SSE stream of that person recomputes (WVR-25).
@@ -105,6 +107,34 @@ impl AccountRuntime {
         live: LiveHub,
         breach: Arc<dyn password::BreachCheck>,
     ) -> Result<Arc<Self>, String> {
+        Self::with_breach_and_sso(
+            config,
+            admin_domain,
+            store,
+            altcha,
+            mailer,
+            live,
+            breach,
+            None,
+        )
+    }
+
+    /// Builds the runtime with an injected provider registry.
+    ///
+    /// The harnesses use this to register the fake provider; the daemon passes
+    /// `None` and the registry is built from config. Everything else is
+    /// [`AccountRuntime::with_breach`].
+    #[allow(clippy::too_many_arguments)] // The daemon's whole startup context, as above.
+    pub fn with_breach_and_sso(
+        config: &AccountConfig,
+        admin_domain: &str,
+        store: Store,
+        altcha: Arc<AltchaRuntime>,
+        mailer: Option<Arc<dyn Mailer>>,
+        live: LiveHub,
+        breach: Arc<dyn password::BreachCheck>,
+        sso: Option<sso::SsoProviders>,
+    ) -> Result<Arc<Self>, String> {
         let base_url = config
             .base_url
             .clone()
@@ -129,7 +159,10 @@ impl AccountRuntime {
             config.cookie_secure,
         );
         let webauthn = Arc::new(webauthn_relying_party(&base_url, admin_domain)?);
-        let microsoft = sso::Microsoft::from_config(config, &base_url)?;
+        let sso = match sso {
+            Some(registry) => registry,
+            None => sso::SsoProviders::from_config(config, &base_url)?,
+        };
         // Prefer an explicit support address; otherwise reuse the mailer's sender
         // so the footer can link somewhere real rather than a dead placeholder.
         let support_email = config.support_email.clone().or_else(|| {
@@ -147,7 +180,7 @@ impl AccountRuntime {
             pairings: pairing::Pairings::default(),
             webauthn,
             ceremonies: passkey::Ceremonies::default(),
-            microsoft,
+            sso,
             live,
             base_url,
             dummy_hash,

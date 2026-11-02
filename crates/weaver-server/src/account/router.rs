@@ -105,20 +105,18 @@ pub fn router(runtime: Arc<AccountRuntime>, tunnel: Option<Arc<TunnelRegistry>>)
             "/api/account/passkey/step-up/finish",
             post(passkey_stepup_finish),
         )
-        // External identity providers (WVR-169). `begin` and `callback` are the
-        // public front door (the callback arrives with no session at all);
-        // `step-up` re-authenticates an existing session at the provider.
+        // External identity providers (WVR-169, provider-neutral since WVR-175).
+        // `begin` and `callback` are the public front door (the callback arrives
+        // with no session at all); `step-up` re-authenticates an existing session
+        // at the provider named by the route.
+        .route("/api/account/sso/{provider}/begin", get(super::sso::begin))
         .route(
-            "/api/account/sso/microsoft/begin",
-            get(super::sso::microsoft_begin),
+            "/api/account/sso/{provider}/callback",
+            get(super::sso::callback),
         )
         .route(
-            "/api/account/sso/microsoft/callback",
-            get(super::sso::microsoft_callback),
-        )
-        .route(
-            "/api/account/sso/microsoft/step-up",
-            get(super::sso::microsoft_step_up),
+            "/api/account/sso/{provider}/step-up",
+            get(super::sso::step_up),
         )
         .route("/api/account/passkeys/begin", post(passkey_register_begin))
         .route(
@@ -286,9 +284,14 @@ async fn config(State(rt): State<Arc<AccountRuntime>>) -> Response {
         "resend_cooldown_secs": rt.config.resend_cooldown_secs,
         "support_email": rt.support_email,
         "relay_host": rt.relay_host(),
-        // The identity providers the operator enabled (WVR-169). The sign-in page
-        // renders one button per entry; an empty list means none.
-        "sso_providers": if rt.microsoft.is_some() { vec!["microsoft"] } else { vec![] },
+        // The identity providers the operator enabled (WVR-169, WVR-175). The
+        // sign-in page renders one button per entry; an empty list means none.
+        "sso_providers": rt
+            .sso
+            .describe()
+            .into_iter()
+            .map(|(id, label)| json!({ "id": id, "label": label }))
+            .collect::<Vec<_>>(),
     }))
 }
 
@@ -879,7 +882,7 @@ async fn login(
         );
     };
 
-    let Some(opened) = OpenedSession::open(&rt, account.id, now).await else {
+    let Some(opened) = OpenedSession::open(&rt, account.id, now, "").await else {
         return err(StatusCode::SERVICE_UNAVAILABLE, "temporarily unavailable");
     };
     if manager.password_checked(opened.context).await.is_err() {
@@ -1515,7 +1518,7 @@ async fn passkey_signin_finish(
     };
     let _ = identity;
 
-    let Some(opened) = OpenedSession::open(&rt, asserted.account_id, now).await else {
+    let Some(opened) = OpenedSession::open(&rt, asserted.account_id, now, "").await else {
         return err(StatusCode::SERVICE_UNAVAILABLE, "temporarily unavailable");
     };
     if manager

@@ -83,9 +83,16 @@ pub struct OpenedSession<'a> {
 }
 
 impl<'a> OpenedSession<'a> {
-    /// Opens a session for `account_id`; `None` when the store is unavailable.
-    pub async fn open(rt: &'a AccountRuntime, account_id: i32, now: i64) -> Option<Self> {
-        let raw = rt.sessions.create(account_id, now).await.ok()?;
+    /// Opens a session for `account_id`, recording the external identity
+    /// provider that opened it (empty for a password or passkey sign-in); `None`
+    /// when the store is unavailable.
+    pub async fn open(
+        rt: &'a AccountRuntime,
+        account_id: i32,
+        now: i64,
+        provider: &str,
+    ) -> Option<Self> {
+        let raw = rt.sessions.create(account_id, provider, now).await.ok()?;
         let Some(session) = rt
             .store
             .session_live(&session::token_hash(&raw), now)

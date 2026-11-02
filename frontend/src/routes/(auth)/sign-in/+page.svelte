@@ -3,7 +3,7 @@
 
 	import Altcha from '#lib/account/Altcha.svelte';
 	import { api } from '#lib/account/api';
-	import { ensureConfig, ssoProviders } from '#lib/account/config.svelte';
+	import { ensureConfig, type SsoProvider, ssoProviders } from '#lib/account/config.svelte';
 	import EmailField from '#lib/account/EmailField.svelte';
 	import { jsonForm } from '#lib/account/form';
 	import { notify } from '#lib/account/notices';
@@ -19,8 +19,8 @@
 	import { climb } from '#lib/app/upgrade';
 	import Icon from '#lib/ui/Icon.svelte';
 	import Keycap from '#lib/ui/Keycap.svelte';
-	import Microsoft from '#lib/ui/Microsoft.svelte';
 	import Page from '#lib/ui/Page.svelte';
+	import ProviderLogo from '#lib/ui/ProviderLogo.svelte';
 	import { goto } from '$app/navigation';
 	import { resolve } from '$app/paths';
 
@@ -38,25 +38,24 @@
 	/** Whether this browser can run a passkey ceremony at all. */
 	const passkeys = passkeysSupported();
 
-	/** The external identity providers the operator enabled (WVR-169). */
-	let providers = $state<string[]>([]);
+	/** The external identity providers the operator enabled (WVR-169, WVR-175). */
+	let providers = $state<SsoProvider[]>([]);
 
 	/** Why an SSO sign-in came back refused, if it did (the relay puts it in the URL). */
 	let ssoError = $state('');
 
 	/** The relay's short refusal reasons, in words. */
 	const SSO_ERRORS: Record<string, string> = {
-		email:
-			'That Microsoft account has no email address we can use, or the address belongs to another account.',
-		denied: 'The Microsoft sign-in was cancelled.',
+		email: 'That account has no usable email address, or the address belongs to another account.',
+		denied: 'The provider sign-in was cancelled.',
 		expired: 'That sign-in took too long. Try again.',
 		state: 'That sign-in was not started here. Try again.',
-		code: 'Microsoft did not return a code. Try again.',
-		rejected: 'Microsoft refused the sign-in. Try again.',
-		token: 'Microsoft’s answer could not be verified. Try again.',
-		disabled: 'Microsoft sign-in is not available.',
-		identity: 'That Microsoft account is not linked to this account.',
-		stale: 'Microsoft did not ask you to sign in again, so we could not confirm it was you.'
+		code: 'The provider did not return a code. Try again.',
+		rejected: 'The provider refused the sign-in. Try again.',
+		token: 'The provider’s answer could not be verified. Try again.',
+		disabled: 'That provider sign-in is not available.',
+		identity: 'That provider account is not linked to this account.',
+		stale: 'The provider did not ask you to sign in again, so we could not confirm it was you.'
 	};
 
 	onMount(() => {
@@ -270,7 +269,7 @@
 		</Keycap>
 	</form>
 
-	{#if passkeys || providers.includes('microsoft')}
+	{#if passkeys || providers.length > 0}
 		<div class="alternatives">
 			{#if passkeys}
 				<Keycap
@@ -284,11 +283,12 @@
 					<Icon name="fingerprint" size={14} /> Passkey
 				</Keycap>
 			{/if}
-			{#if providers.includes('microsoft')}
-				<Keycap type="button" variant="key" wide onclick={() => signInWithProvider('microsoft')}>
-					<Microsoft /> Microsoft
+			{#each providers as provider (provider.id)}
+				<Keycap type="button" variant="key" wide onclick={() => signInWithProvider(provider.id)}>
+					<ProviderLogo id={provider.id} />
+					{provider.label}
 				</Keycap>
-			{/if}
+			{/each}
 		</div>
 	{/if}
 

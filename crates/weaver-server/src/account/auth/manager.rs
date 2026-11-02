@@ -63,6 +63,10 @@ struct Inner {
     /// the same terms: only the ways up need it, and a pending enrolment must
     /// not count.
     has_totp: Mutex<Option<bool>>,
+    /// Whether the account holds a password credential, on the same terms: only
+    /// the ways up read it, so a passwordless SSO account is never offered
+    /// `confirm_password`.
+    has_password: Mutex<Option<bool>>,
 }
 
 impl AuthManager {
@@ -91,6 +95,7 @@ impl AuthManager {
             proofs: Mutex::new(None),
             has_passkeys: Mutex::new(None),
             has_totp: Mutex::new(None),
+            has_password: Mutex::new(None),
         }))
     }
 
@@ -113,6 +118,7 @@ impl AuthManager {
             account_id: self.account_id(),
             has_passkeys: self.has_passkeys().await,
             has_totp: self.has_totp().await,
+            has_password: self.has_password().await,
             proofs: self.proofs().await,
             now: self.0.now,
             session_ttl_secs: self.0.session_ttl_secs,
@@ -514,6 +520,30 @@ impl AuthManager {
         has
     }
 
+    /// Whether this session's account holds a password credential, memoised for
+    /// the request.
+    ///
+    /// Same posture as [`AuthManager::has_passkeys`]: only the ways up read it,
+    /// and a read failure reads as "none" — the worst it can do is leave
+    /// `confirm_password` out of a list, which a passwordless account could not
+    /// perform anyway.
+    async fn has_password(&self) -> bool {
+        if let Some(cached) = *self.0.has_password.lock().expect("password mutex poisoned") {
+            return cached;
+        }
+        let has = match self.0.session {
+            Some(session) => self
+                .0
+                .store
+                .password_current_for(session.account_id)
+                .await
+                .is_ok_and(|credential| credential.is_some()),
+            None => false,
+        };
+        *self.0.has_password.lock().expect("password mutex poisoned") = Some(has);
+        has
+    }
+
     async fn load_proofs(&self) -> Result<BTreeMap<ProofKind, i64>, StoreError> {
         let Some(session) = self.0.session else {
             return Ok(BTreeMap::new());
@@ -717,6 +747,7 @@ mod tests {
             account_id: Some(1),
             has_passkeys: false,
             has_totp: false,
+            has_password: true,
             proofs: proofs.iter().copied().collect(),
             now,
             session_ttl_secs: ttl,
@@ -735,6 +766,7 @@ mod tests {
             account_id: Some(1),
             has_passkeys,
             has_totp,
+            has_password: true,
             proofs: proofs.iter().copied().collect(),
             now,
             session_ttl_secs: 86_400,

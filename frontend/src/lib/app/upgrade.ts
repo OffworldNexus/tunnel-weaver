@@ -65,8 +65,15 @@ export function stepRedirect(step: Step, returnTo?: string): string | null {
 	if (step !== 'reauth_provider') {
 		return null;
 	}
+	// The provider is the one that opened this session, named by the relay: an
+	// account may hold several linked identities, and a step-up at another one
+	// would fail its identity check.
+	const provider = session.user?.provider ?? '';
+	if (!provider) {
+		return null;
+	}
 	const path = returnTo ?? (typeof window === 'undefined' ? '/app' : window.location.pathname);
-	return `/api/account/sso/microsoft/step-up?return_path=${encodeURIComponent(path)}`;
+	return `/api/account/sso/${provider}/step-up?return_path=${encodeURIComponent(path)}`;
 }
 
 /**

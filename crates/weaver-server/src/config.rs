@@ -279,41 +279,136 @@ impl AltchaConfig {
     }
 }
 
-/// An operator-provisioned external identity provider (WVR-169).
+/// One operator-provisioned external identity provider (WVR-169, WVR-175).
 ///
 /// Held in the account config rather than a table on purpose: adding, enabling
 /// and removing providers *at runtime* is the separate multi-provider console
-/// (WVR-102), while this slice needs one preset the operator can set from the CLI
-/// and the daemon reads at boot. `client_secret` is always the **sealed** secret
-/// (`nonce ‖ ciphertext` in hex), never the plaintext, and `Debug` redacts it so
-/// the config cannot leak it into the startup log the way a plain field would.
-#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MicrosoftPreset {
-    /// The authority: a tenant GUID or domain, or one of the shared endpoint
-    /// keywords `organizations` / `common` / `consumers`.
-    pub authority: String,
-    /// The application (client) id from the app registration.
-    pub client_id: String,
-    /// The sealed client secret; empty when none is stored.
-    pub client_secret: String,
+/// (WVR-102), while this slice lets the operator set a preset from the CLI and
+/// have the daemon read it at boot.
+///
+/// The preset is a shared shell (`enabled`) around a [`ProviderKind`], so
+/// `enable`/`disable`/`show`/`clear` are implemented once over the map while
+/// each provider keeps its own settings. A `client_secret` is always the
+/// **sealed** secret (`nonce ‖ ciphertext` in hex), never the plaintext, and
+/// `Debug` redacts it so the config cannot leak it into the startup log.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderPreset {
     /// Whether the provider is offered on the sign-in page.
     pub enabled: bool,
+    /// The provider's own settings, tagged by `kind`.
+    #[serde(flatten)]
+    pub kind: ProviderKind,
+}
+
+/// The provider-specific half of a [`ProviderPreset`].
+///
+/// One variant per provider the relay can actually speak to: a preset is never
+/// a name without an implementation. A new provider is one variant here plus
+/// its `account::sso::<id>` file.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ProviderKind {
+    /// Microsoft Entra ID, through its tenant-scoped OIDC endpoints (WVR-169).
+    Microsoft {
+        /// The authority: a tenant GUID or domain, or one of the shared endpoint
+        /// keywords `organizations` / `common` / `consumers`.
+        authority: String,
+        /// The application (client) id from the app registration.
+        client_id: String,
+        /// The sealed client secret; empty when none is stored.
+        client_secret: String,
+    },
+    /// Google Identity, through `accounts.google.com` (WVR-173).
+    Google {
+        /// The OAuth client id from the Google Cloud console.
+        client_id: String,
+        /// The sealed client secret; empty when none is stored.
+        client_secret: String,
+    },
+}
+
+impl ProviderKind {
+    /// The provider's stable id: the route segment, the registry key, and the
+    /// associated data its secrets are sealed with.
+    pub const fn id(&self) -> &'static str {
+        match self {
+            ProviderKind::Microsoft { .. } => "microsoft",
+            ProviderKind::Google { .. } => "google",
+        }
+    }
+
+    /// The button text the sign-in page shows.
+    pub const fn label(&self) -> &'static str {
+        match self {
+            ProviderKind::Microsoft { .. } => "Microsoft",
+            ProviderKind::Google { .. } => "Google",
+        }
+    }
+
+    /// The sealed client secret, whatever the provider calls it.
+    pub fn client_secret(&self) -> &str {
+        match self {
+            ProviderKind::Microsoft { client_secret, .. }
+            | ProviderKind::Google { client_secret, .. } => client_secret,
+        }
+    }
 }
 
 /// Redacts the sealed secret so `Config`'s derived `Debug` cannot print it.
+impl std::fmt::Debug for ProviderPreset {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut debug = f.debug_struct("ProviderPreset");
+        debug.field("kind", &self.kind.id());
+        debug.field("client_secret", &redacted(self.kind.client_secret()));
+        match &self.kind {
+            ProviderKind::Microsoft {
+                authority,
+                client_id,
+                ..
+            } => {
+                debug.field("authority", authority);
+                debug.field("client_id", client_id);
+            }
+            ProviderKind::Google { client_id, .. } => {
+                debug.field("client_id", client_id);
+            }
+        }
+        debug.field("enabled", &self.enabled).finish()
+    }
+}
+
+/// How a stored secret reads in a log or on the CLI: present or absent, never
+/// its value.
+fn redacted(secret: &str) -> &'static str {
+    if secret.is_empty() {
+        "<empty>"
+    } else {
+        "<redacted>"
+    }
+}
+
+/// The pre-registry shape of the Microsoft preset (WVR-169).
+///
+/// Kept only so a config written before WVR-175 still deserialises;
+/// [`Config::load`] rewrites it into `account.sso` once and drops it.
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MicrosoftPreset {
+    /// The authority: a tenant GUID or domain, or a shared endpoint keyword.
+    pub authority: String,
+    /// The application (client) id from the app registration.
+    pub client_id: String,
+    /// The sealed client secret.
+    pub client_secret: String,
+    /// Whether the provider was offered on the sign-in page.
+    pub enabled: bool,
+}
+
 impl std::fmt::Debug for MicrosoftPreset {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("MicrosoftPreset")
             .field("authority", &self.authority)
             .field("client_id", &self.client_id)
-            .field(
-                "client_secret",
-                &if self.client_secret.is_empty() {
-                    "<empty>"
-                } else {
-                    "<redacted>"
-                },
-            )
+            .field("client_secret", &redacted(&self.client_secret))
             .field("enabled", &self.enabled)
             .finish()
     }
@@ -381,8 +476,15 @@ pub struct AccountConfig {
     /// once and kept with the rest of the deployment's state.
     #[serde(default)]
     pub sso_key: SealKey,
-    /// The Microsoft (Entra ID) preset, when the operator has configured one
-    /// (WVR-169). Absent means the provider is not offered at all.
+    /// The external identity providers the operator configured, by id
+    /// (WVR-175). A provider that is absent (or `enabled: false`) is not offered
+    /// at all; one whose sealed secret cannot be opened is skipped at boot.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub sso: std::collections::BTreeMap<String, ProviderPreset>,
+    /// The pre-registry Microsoft preset (WVR-169).
+    ///
+    /// Read once by [`Config::load`], which moves it into [`AccountConfig::sso`]
+    /// and persists the result; never written again.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub microsoft: Option<MicrosoftPreset>,
     /// Whether session cookies carry the `Secure` attribute. Disable only for
@@ -449,6 +551,30 @@ pub struct AccountConfig {
 }
 
 impl AccountConfig {
+    /// Folds the pre-registry `account.microsoft` preset into `account.sso`
+    /// (WVR-175).
+    ///
+    /// Returns whether anything moved, so [`Config::load`] knows to persist the
+    /// new shape. A registry entry already present wins: an operator who has run
+    /// `sso microsoft set` on the new shape must not be overwritten by a stale
+    /// legacy field.
+    pub fn migrate_legacy_sso(&mut self) -> bool {
+        let Some(legacy) = self.microsoft.take() else {
+            return false;
+        };
+        self.sso
+            .entry("microsoft".to_string())
+            .or_insert_with(|| ProviderPreset {
+                enabled: legacy.enabled,
+                kind: ProviderKind::Microsoft {
+                    authority: legacy.authority,
+                    client_id: legacy.client_id,
+                    client_secret: legacy.client_secret,
+                },
+            });
+        true
+    }
+
     /// Fills every empty sealing key with a fresh one and returns the names of
     /// those generated (`totp_key`, `sso_key`).
     pub fn generate_missing_keys(&mut self) -> Vec<&'static str> {
@@ -481,6 +607,7 @@ impl Default for AccountConfig {
             confirm_window_secs: default_account_confirm_window_secs(),
             totp_key: SealKey::default(),
             sso_key: SealKey::default(),
+            sso: std::collections::BTreeMap::new(),
             microsoft: None,
             cookie_secure: true,
             hibp_url: default_account_hibp_url(),
@@ -845,25 +972,50 @@ fn validate_account_config(account: &AccountConfig) -> Vec<String> {
                 .into(),
         );
     }
-    if let Some(microsoft) = &account.microsoft {
-        for (name, value) in [
-            ("authority", &microsoft.authority),
-            ("client_id", &microsoft.client_id),
-            ("client_secret", &microsoft.client_secret),
-        ] {
-            if value.trim().is_empty() {
-                issues.push(format!("account.microsoft.{name} must not be empty"));
-            }
+    for (id, preset) in &account.sso {
+        if preset.kind.id() != id {
+            issues.push(format!(
+                "account.sso.{id}.kind must be '{}' (the map key is its id)",
+                preset.kind.id()
+            ));
         }
-        // The authority is what the discovery document is fetched from, so a
-        // value with a scheme or a slash would build a nonsense URL. It is either
-        // a bare tenant GUID/domain or one of the shared endpoint keywords.
-        if microsoft.authority.contains('/') || microsoft.authority.contains("://") {
-            issues.push(
-                "account.microsoft.authority must be a tenant id/domain or organizations/common/\
-                 consumers, without a scheme or path"
-                    .into(),
-            );
+        if id.is_empty()
+            || !id
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        {
+            issues.push(format!(
+                "account.sso key '{id}' must be lowercase letters, digits or '-'"
+            ));
+        }
+        if preset.kind.client_secret().trim().is_empty() {
+            issues.push(format!("account.sso.{id}.client_secret must not be empty"));
+        }
+        match &preset.kind {
+            ProviderKind::Microsoft {
+                authority,
+                client_id,
+                ..
+            } => {
+                for (name, value) in [("client_id", client_id), ("authority", authority)] {
+                    if value.trim().is_empty() {
+                        issues.push(format!("account.sso.{id}.{name} must not be empty"));
+                    }
+                }
+                // The authority is what the discovery document is fetched from,
+                // so a value with a scheme or a slash would build a nonsense URL.
+                if authority.contains('/') || authority.contains("://") {
+                    issues.push(format!(
+                        "account.sso.{id}.authority must be a tenant id/domain or \
+                         organizations/common/consumers, without a scheme or path"
+                    ));
+                }
+            }
+            ProviderKind::Google { client_id, .. } => {
+                if client_id.trim().is_empty() {
+                    issues.push(format!("account.sso.{id}.client_id must not be empty"));
+                }
+            }
         }
     }
     for (name, value) in [
@@ -979,8 +1131,12 @@ impl Config {
             return Err(ConfigError::MissingKeys(missing));
         }
 
-        let config: Config = serde_json::from_value(val)
+        let mut config: Config = serde_json::from_value(val)
             .map_err(|e| ConfigError::DeserializationFailed(e.to_string()))?;
+        // WVR-175: a config written before the provider registry keeps its
+        // Microsoft preset under `account.microsoft`. Move it into `account.sso`
+        // and persist the new shape once validation has passed (below).
+        let migrated = config.account.migrate_legacy_sso();
 
         // Semantic validation
         let mut validation_issues = Vec::new();
@@ -1063,6 +1219,13 @@ impl Config {
 
         if !validation_issues.is_empty() {
             return Err(ConfigError::ValidationFailed(validation_issues));
+        }
+
+        if migrated {
+            store
+                .save_config(&config)
+                .await
+                .map_err(|e| ConfigError::Store(e.to_string()))?;
         }
 
         Ok(config)
@@ -1172,6 +1335,99 @@ mod tests {
             validate_account_config(&zero)
                 .iter()
                 .any(|issue| issue == "account.inactivity_warning_before_secs must be >= 1")
+        );
+    }
+
+    /// A provider is its shared shell plus its kind, and the map key is the id
+    /// (WVR-175). The sealed secret never appears in `Debug`.
+    #[test]
+    fn a_provider_preset_round_trips_through_its_shared_shell() {
+        let account: AccountConfig = serde_json::from_value(serde_json::json!({
+            "sso": {
+                "google": {
+                    "enabled": true,
+                    "kind": "google",
+                    "client_id": "client-id",
+                    "client_secret": "sealed"
+                }
+            }
+        }))
+        .expect("the preset deserialises");
+        let preset = account.sso.get("google").expect("the google preset");
+        assert!(preset.enabled);
+        assert_eq!(preset.kind.id(), "google");
+        assert_eq!(preset.kind.label(), "Google");
+        assert!(validate_account_config(&account).is_empty());
+
+        let back = serde_json::to_value(&account).expect("it serialises");
+        assert_eq!(back["sso"]["google"]["kind"], "google");
+        assert_eq!(back["sso"]["google"]["enabled"], true);
+        assert_eq!(back["sso"]["google"]["client_id"], "client-id");
+        assert!(!format!("{preset:?}").contains("sealed"));
+    }
+
+    /// A config written before the registry keeps its preset working: `load`
+    /// moves it, and the new shape is what a later save writes.
+    #[test]
+    fn a_legacy_microsoft_preset_migrates_into_the_registry() {
+        let mut account: AccountConfig = serde_json::from_value(serde_json::json!({
+            "microsoft": {
+                "authority": "common",
+                "client_id": "client-id",
+                "client_secret": "sealed",
+                "enabled": true
+            }
+        }))
+        .expect("the legacy preset deserialises");
+        assert!(account.sso.is_empty());
+        assert!(account.migrate_legacy_sso());
+        assert!(account.microsoft.is_none());
+        let preset = account.sso.get("microsoft").expect("the migrated preset");
+        assert!(preset.enabled);
+        assert!(matches!(
+            preset.kind,
+            ProviderKind::Microsoft { ref authority, .. } if authority == "common"
+        ));
+        // A second load has nothing left to move.
+        assert!(!account.migrate_legacy_sso());
+    }
+
+    /// A map key that does not match the kind is a configuration mistake: the
+    /// key is the route segment and the seal AAD, so it cannot be arbitrary.
+    #[test]
+    fn a_provider_key_must_be_its_kind() {
+        let account: AccountConfig = serde_json::from_value(serde_json::json!({
+            "sso": {
+                "not-google": {
+                    "enabled": true,
+                    "kind": "google",
+                    "client_id": "client-id",
+                    "client_secret": "sealed"
+                }
+            }
+        }))
+        .expect("it deserialises");
+        assert!(
+            validate_account_config(&account)
+                .iter()
+                .any(|issue| issue.contains("the map key is its id"))
+        );
+
+        let hostile: AccountConfig = serde_json::from_value(serde_json::json!({
+            "sso": {
+                "Go ogle": {
+                    "enabled": true,
+                    "kind": "google",
+                    "client_id": "client-id",
+                    "client_secret": "sealed"
+                }
+            }
+        }))
+        .expect("it deserialises");
+        assert!(
+            validate_account_config(&hostile)
+                .iter()
+                .any(|issue| issue.contains("lowercase letters, digits or '-'"))
         );
     }
 }

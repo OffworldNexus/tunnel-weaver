@@ -1458,12 +1458,14 @@ impl Store {
         &self,
         account_id: i32,
         token_hash: &str,
+        provider: &str,
         created_at: i64,
         expires_at: i64,
     ) -> Result<browser_session::Model, StoreError> {
         Ok(browser_session::ActiveModel {
             account_id: Set(account_id),
             token_hash: Set(token_hash.to_string()),
+            provider: Set(provider.to_string()),
             created_at: Set(created_at),
             expires_at: Set(expires_at),
             invalidated_at: Set(None),

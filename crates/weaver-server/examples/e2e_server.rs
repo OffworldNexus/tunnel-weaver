@@ -45,6 +45,8 @@ use weaver_mux::KeyId;
 use weaver_proto::pair::{ServerMessage, Target};
 
 use weaver_server::account::AccountRuntime;
+use weaver_server::account::sso::SsoProviders;
+use weaver_server::account::sso::testing::{FakeAssertion, FakeProvider};
 use weaver_server::altcha::AltchaRuntime;
 use weaver_server::cert::managed::ManagedCerts;
 use weaver_server::config::{AccountConfig, BudgetConfig, Config};
@@ -132,6 +134,9 @@ struct HarnessState {
     account: Arc<AccountRuntime>,
     https_port: u16,
     outcomes: Outcomes,
+    /// The identity provider every SSO scenario signs in through; queued per
+    /// scenario through `POST /sso/expect`.
+    fake: Arc<FakeProvider>,
 }
 
 /// The outcome each seeded pairing's stand-in CLI received, by handle.
@@ -254,18 +259,27 @@ async fn pair_link(
 }
 
 /// Starts the capture-mail endpoint on `127.0.0.1:0`, returning its address.
-async fn serve_mail(sent: Captured, account: Arc<AccountRuntime>, https_port: u16) -> SocketAddr {
+async fn serve_mail(
+    sent: Captured,
+    account: Arc<AccountRuntime>,
+    https_port: u16,
+    fake: Arc<FakeProvider>,
+) -> SocketAddr {
     let app = Router::new()
         .route("/messages", get(list_messages).delete(clear_messages))
         .route("/pair/seed", post(seed_pairing))
         .route("/pair/link", get(pair_link))
         .route("/pair/outcome", get(pair_outcome))
+        // The fake identity provider's script: a scenario posts the identity it
+        // wants the next provider redirect to assert.
+        .route("/sso/expect", post(expect_sso))
         .route("/health", get(health))
         .with_state(HarnessState {
             sent,
             account,
             https_port,
             outcomes: Arc::default(),
+            fake,
         });
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind mail");
     let addr = listener.local_addr().expect("mail addr");
@@ -273,6 +287,16 @@ async fn serve_mail(sent: Captured, account: Arc<AccountRuntime>, https_port: u1
         axum::serve(listener, app).await.expect("mail server");
     });
     addr
+}
+
+/// `POST /sso/expect` — queues what the fake provider asserts on the next
+/// redirect. A scenario posts here before it clicks a provider button.
+async fn expect_sso(
+    State(state): State<HarnessState>,
+    Json(assertion): Json<FakeAssertion>,
+) -> StatusCode {
+    state.fake.expect(assertion);
+    StatusCode::NO_CONTENT
 }
 
 // ----- lifecycle ------------------------------------------------------------
@@ -316,7 +340,15 @@ async fn main() {
         sent: Arc::clone(&sent),
     });
 
-    let account = AccountRuntime::with_breach(
+    let fake = Arc::new(FakeProvider::new());
+    let mut sso =
+        SsoProviders::from_config(&config.account, &format!("https://localhost:{https_port}"))
+            .expect("sso registry");
+    // The fake stands in for every real provider, so the shared pipeline is
+    // exercised without a network or an operator's credentials (WVR-175).
+    sso.insert(fake.clone());
+
+    let account = AccountRuntime::with_breach_and_sso(
         &config.account,
         &config.admin_domain,
         store.clone(),
@@ -324,6 +356,7 @@ async fn main() {
         Some(mailer),
         weaver_server::live::LiveHub::new(),
         Arc::new(support::NoBreach),
+        Some(sso),
     )
     .expect("account runtime");
 
@@ -356,7 +389,7 @@ async fn main() {
         shutdown.clone(),
     ));
 
-    let mail_addr = serve_mail(Arc::clone(&sent), account, https_port).await;
+    let mail_addr = serve_mail(Arc::clone(&sent), account, https_port, fake).await;
 
     // The two lines a test runner reads. Flushed immediately so a reader can
     // poll the pipe rather than guess when the servers are up.

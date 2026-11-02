@@ -26,6 +26,13 @@ pub struct Situation {
     /// authenticator app* can be offered as a way up. A pending enrolment does
     /// not count: it is not a factor yet.
     pub has_totp: bool,
+    /// Whether the account holds a password credential.
+    ///
+    /// Only the ways up read it: `confirm_password` is offered by the password
+    /// paths, and an account created by an identity provider has no password to
+    /// re-type. Without this a passwordless SSO session would be told to confirm
+    /// a password that does not exist.
+    pub has_password: bool,
     /// The latest occurrence (Unix seconds) of each proof on the session.
     pub proofs: BTreeMap<ProofKind, i64>,
     /// The request's instant, so lifetimes are evaluated consistently.
@@ -179,8 +186,14 @@ impl AuthPath for PasswordEmailOtpPath {
         if current < AuthLevel::Strong && target >= AuthLevel::Strong {
             steps.push(Step(StepKind::VerifyEmailOtp));
         }
-        // A password typed moments ago (at sign-in, say) already counts.
-        if target >= AuthLevel::Certain && !situation.has_valid(ProofKind::Password) {
+        // A password typed moments ago (at sign-in, say) already counts — if the
+        // account has one. An account created through an identity provider has
+        // no password to re-type: its way to `Certain` is the provider or a
+        // passkey.
+        if target >= AuthLevel::Certain
+            && situation.has_password
+            && !situation.has_valid(ProofKind::Password)
+        {
             steps.push(Step(StepKind::ConfirmPassword));
         }
         if steps.is_empty() {
@@ -293,8 +306,14 @@ impl AuthPath for AuthenticatorPath {
         if current < AuthLevel::Strong && target >= AuthLevel::Strong {
             steps.push(Step(StepKind::VerifyTotp));
         }
-        // A password typed moments ago (at sign-in, say) already counts.
-        if target >= AuthLevel::Certain && !situation.has_valid(ProofKind::Password) {
+        // A password typed moments ago (at sign-in, say) already counts — if the
+        // account has one. A passwordless SSO account that enrolled an app gets
+        // its second factor from the app, and reaches `Certain` through the
+        // provider or a passkey instead.
+        if target >= AuthLevel::Certain
+            && situation.has_password
+            && !situation.has_valid(ProofKind::Password)
+        {
             steps.push(Step(StepKind::ConfirmPassword));
         }
         if steps.is_empty() {
@@ -331,6 +350,12 @@ impl AuthPath for IdentityProviderPath {
         // and this path can do nothing for it: `None` keeps the ways up honest.
         if situation.account_id.is_none() || !situation.was_used(ProofKind::IdentityProvider) {
             return AuthLevel::None;
+        }
+        // A forced re-authentication at the provider is a proof of presence,
+        // exactly what a password typed moments ago is: it reaches `Certain`
+        // on its own, without a second factor first.
+        if situation.has_valid(ProofKind::IdentityProviderPresence) {
+            return AuthLevel::Certain;
         }
         if situation.has_valid(ProofKind::IdentityProviderMfa) {
             return AuthLevel::Strong;
@@ -440,6 +465,9 @@ mod tests {
             account_id: account.then_some(1),
             has_passkeys,
             has_totp,
+            // Every existing test models an account that can hold a password;
+            // the passwordless case has its own test.
+            has_password: true,
             proofs: proofs.iter().copied().collect(),
             now,
             session_ttl_secs: 86_400,
@@ -774,6 +802,112 @@ mod tests {
             AuthenticatorPath
                 .steps_to(&strong, AuthLevel::Strong)
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_provider_presence_proof_reaches_certain() {
+        // Signed in through a provider without a second factor: `Basic`.
+        let basic = situation(true, &[(ProofKind::IdentityProvider, 2_000)], 2_100);
+        assert_eq!(IdentityProviderPath.current_level(&basic), AuthLevel::Basic);
+        // A provider that asserted a second factor: `Strong`.
+        let strong = situation(
+            true,
+            &[
+                (ProofKind::IdentityProvider, 2_000),
+                (ProofKind::IdentityProviderMfa, 2_000),
+            ],
+            2_100,
+        );
+        assert_eq!(
+            IdentityProviderPath.current_level(&strong),
+            AuthLevel::Strong
+        );
+        // A forced re-authentication is presence, the same thing a password
+        // typed moments ago proves: it reaches `Certain` on its own.
+        let certain = situation(
+            true,
+            &[
+                (ProofKind::IdentityProvider, 1_000),
+                (ProofKind::IdentityProviderPresence, 2_000),
+            ],
+            2_100,
+        );
+        assert_eq!(
+            IdentityProviderPath.current_level(&certain),
+            AuthLevel::Certain
+        );
+        // The presence window is the confirmation window; past it, the session
+        // falls back to what its other proofs hold.
+        let stale = situation(
+            true,
+            &[
+                (ProofKind::IdentityProvider, 1_000),
+                (ProofKind::IdentityProviderPresence, 1_000),
+            ],
+            2_000,
+        );
+        assert_eq!(IdentityProviderPath.current_level(&stale), AuthLevel::Basic);
+    }
+
+    /// A passwordless account (one an identity provider created) must never be
+    /// offered `confirm_password`: there is nothing to re-type, and the step
+    /// could only fail (WVR-173). Its way to `Certain` is the provider itself.
+    #[test]
+    fn a_passwordless_account_is_never_asked_to_confirm_a_password() {
+        let s = situation(
+            true,
+            &[
+                (ProofKind::IdentityProvider, 2_000),
+                (ProofKind::IdentityProviderMfa, 2_000),
+                (ProofKind::EmailOtp, 2_000),
+            ],
+            2_100,
+        );
+        let passwordless = Situation {
+            has_password: false,
+            ..s.clone()
+        };
+        assert!(
+            PasswordEmailOtpPath
+                .steps_to(&passwordless, AuthLevel::Certain)
+                .is_empty()
+        );
+        // The provider re-authentication is still the way up.
+        assert_eq!(
+            IdentityProviderPath.steps_to(&passwordless, AuthLevel::Certain),
+            vec![vec![Step(StepKind::ReauthenticateProvider)]]
+        );
+        // An account that does hold a password is still asked for it.
+        assert_eq!(
+            PasswordEmailOtpPath.steps_to(&s, AuthLevel::Certain),
+            vec![vec![Step(StepKind::ConfirmPassword)]]
+        );
+
+        // The authenticator path follows the same rule.
+        let app = situation_with(
+            true,
+            false,
+            true,
+            &[
+                (ProofKind::IdentityProvider, 2_000),
+                (ProofKind::IdentityProviderMfa, 2_000),
+                (ProofKind::Totp, 2_000),
+            ],
+            2_100,
+        );
+        let app_passwordless = Situation {
+            has_password: false,
+            ..app.clone()
+        };
+        assert!(
+            AuthenticatorPath
+                .steps_to(&app_passwordless, AuthLevel::Certain)
+                .is_empty()
+        );
+        assert_eq!(
+            AuthenticatorPath.steps_to(&app, AuthLevel::Certain),
+            vec![vec![Step(StepKind::ConfirmPassword)]]
         );
     }
 }
