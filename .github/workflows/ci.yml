@@ -386,7 +386,10 @@ jobs:
         if: matrix.use_cross && matrix.can_run
         run: |
           sudo apt-get update
-          sudo apt-get install -y qemu-user-static gcc-aarch64-linux-gnu
+          # `qemu-user-static` is gone from the 26.04 images: it is a virtual
+          # package now, provided by `qemu-user-binfmt` (static binaries plus the
+          # binfmt registration `cross` needs).
+          sudo apt-get install -y qemu-user-binfmt gcc-aarch64-linux-gnu
 
       - name: Install cross
         if: matrix.use_cross
