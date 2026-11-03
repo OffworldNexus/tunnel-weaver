@@ -117,24 +117,24 @@ async fn test_store_open_runs_migrations_and_is_idempotent() {
         let store = Store::open(&db_path).await.expect("open failed");
         let count: i64 = scalar(
             &store,
-            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN ('config', 'acme_account', 'domains', 'certificates', 'cert_events', 'seaql_migrations', 'person', 'machine', 'machine_key_log', 'service', 'usage_daily', 'usage_live', 'challenge', 'abuse_bucket', 'auth_event', 'login_challenge', 'passkey_credential', 'totp_credential', 'signup_policy', 'signup_rule')",
+            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN ('config', 'acme_account', 'domains', 'certificates', 'cert_events', 'seaql_migrations', 'person', 'machine', 'machine_key_log', 'service', 'usage_daily', 'usage_live', 'challenge', 'abuse_bucket', 'auth_event', 'login_challenge', 'passkey_credential', 'totp_credential', 'signup_policy', 'signup_rule', 'account_ban')",
         )
         .await;
-        assert_eq!(count, 20);
+        assert_eq!(count, 21);
         // Ten migrations: `m0001_init`, `m0002_usage_daily`,
         // `m0003_inactivity`, `m0004_auth_levels`, `m0005_passkeys`,
         // `m0006_totp`, `m0007_external_identity`,
         // `m0008_login_challenge_purpose`, `m0009_session_provider` and
         // `m0010_signup_policy`.
-        assert_eq!(store.schema_version().await.expect("schema_version"), 10);
+        assert_eq!(store.schema_version().await.expect("schema_version"), 11);
     }
 
     // Re-open existing database: should succeed and not re-apply migrations
     {
         let store = Store::open(&db_path).await.expect("re-open failed");
         let migration_count: i64 = scalar(&store, "SELECT count(*) FROM seaql_migrations").await;
-        assert_eq!(migration_count, 10);
-        assert_eq!(store.schema_version().await.expect("schema_version"), 10);
+        assert_eq!(migration_count, 11);
+        assert_eq!(store.schema_version().await.expect("schema_version"), 11);
     }
 }
 
@@ -3032,4 +3032,232 @@ async fn test_activation_rechecks_the_signup_policy() {
     )
     .await;
     assert!(matches!(outcome, ActivationOutcome::Activated(_)));
+}
+
+// ---------------------------------------------------------------------------
+// Account suspension (WVR-178).
+// ---------------------------------------------------------------------------
+
+/// A live session for `account_id`, so a ban has something to kill.
+async fn live_session(store: &Store, account_id: i32, now: i64) -> String {
+    let token = format!("session-hash-{account_id}-{now}");
+    store
+        .session_create(account_id, &token, "", now, now + 86_400)
+        .await
+        .expect("session");
+    token
+}
+
+#[tokio::test]
+async fn test_account_ban_and_unban_keep_the_history() {
+    use sea_orm::EntityTrait as _;
+    use weaver_server::store::entity::account_ban;
+
+    let store = Store::connect("sqlite::memory:").await.unwrap();
+    let now = 1_800_000_000;
+    let account = activated(&store, "Banned", "banned@example.com").await;
+    let token = live_session(&store, account.id, now).await;
+    assert!(store.session_live(&token, now).await.unwrap().is_some());
+
+    let banned = store
+        .account_ban("banned@example.com", "abuse report #12", now)
+        .await
+        .expect("ban");
+    assert_eq!(banned.state, "banned");
+    assert!(
+        store.session_live(&token, now).await.unwrap().is_none(),
+        "a ban ends every live session"
+    );
+
+    // Already banned, and an address nobody holds: both are caller errors.
+    assert!(matches!(
+        store.account_ban("banned@example.com", "again", now).await,
+        Err(StoreError::Conflict(_))
+    ));
+    assert!(matches!(
+        store.account_ban("nobody@example.com", "who?", now).await,
+        Err(StoreError::Conflict(_))
+    ));
+
+    let lifted = store
+        .account_unban("banned@example.com", now + 100)
+        .await
+        .expect("unban");
+    assert_eq!(lifted.state, "active");
+    assert!(matches!(
+        store.account_unban("banned@example.com", now + 200).await,
+        Err(StoreError::Conflict(_))
+    ));
+
+    // Banning again appends a second row; the lifted one stays as history.
+    let rebanned = store
+        .account_ban("banned@example.com", "second", now + 300)
+        .await
+        .expect("re-ban");
+    assert_eq!(rebanned.state, "banned");
+    let rows = account_ban::Entity::find()
+        .all(store.db())
+        .await
+        .expect("history");
+    assert_eq!(rows.len(), 2, "ban history is kept: {rows:?}");
+    let first = rows
+        .iter()
+        .find(|row| row.reason == "abuse report #12")
+        .unwrap();
+    assert_eq!(first.unbanned_at, Some(now + 100));
+    let second = rows.iter().find(|row| row.reason == "second").unwrap();
+    assert_eq!(second.banned_at, now + 300);
+    assert_eq!(second.unbanned_at, None);
+
+    // The summary shows the open ban, not the older lifted one.
+    let summaries = store.account_summaries(false).await.unwrap();
+    assert_eq!(summaries.len(), 1);
+    let ban = summaries[0].ban.as_ref().expect("a ban record");
+    assert_eq!(ban.reason, "second");
+    assert_eq!(ban.unbanned_at, None);
+}
+
+#[tokio::test]
+async fn test_account_summaries_list_every_address_and_filter_banned() {
+    use sea_orm::{ActiveModelTrait, EntityTrait as _, Set};
+    use weaver_server::store::entity::{account_ban, email_identity};
+
+    let store = Store::connect("sqlite::memory:").await.unwrap();
+    let now = 1_800_000_000;
+    let banned = activated(&store, "Banned", "banned@example.com").await;
+    let fine = activated(&store, "Fine", "fine@example.com").await;
+    // A linked identity provider adds a second address to the banned account.
+    email_identity::ActiveModel {
+        account_id: Set(banned.id),
+        email: Set("linked@example.com".into()),
+        lookup_key: Set("linked@example.com".into()),
+        verified_at: Set(Some(now)),
+        created_at: Set(now),
+        ..Default::default()
+    }
+    .insert(store.db())
+    .await
+    .expect("linked address");
+
+    store
+        .account_ban("linked@example.com", "provider abuse", now)
+        .await
+        .expect("ban by any address");
+
+    let all = store.account_summaries(false).await.unwrap();
+    assert_eq!(all.len(), 2);
+    assert_eq!(
+        all[0].emails,
+        vec![
+            "banned@example.com".to_string(),
+            "linked@example.com".into()
+        ],
+        "every address, the original first"
+    );
+    assert_eq!(all[0].ban.as_ref().unwrap().reason, "provider abuse");
+    assert_eq!(all[1].account.id, fine.id);
+    assert!(
+        all[1].ban.is_none(),
+        "an account that was never banned carries no record"
+    );
+
+    let only_banned = store.account_summaries(true).await.unwrap();
+    assert_eq!(only_banned.len(), 1);
+    assert_eq!(only_banned[0].account.id, banned.id);
+
+    // Deleting the account takes its history with it.
+    store.delete_account(banned.id).await.unwrap();
+    assert!(
+        account_ban::Entity::find()
+            .all(store.db())
+            .await
+            .unwrap()
+            .is_empty(),
+        "the history cascades with the account"
+    );
+}
+
+#[tokio::test]
+async fn test_inactivity_exempts_banned_accounts_and_resumes_at_unban() {
+    let store = Store::connect("sqlite::memory:").await.unwrap();
+    let t0 = 1_800_000_000;
+    let _account = activated(&store, "Suspended", "suspended@example.com").await;
+    store
+        .account_ban("suspended@example.com", "ban", t0)
+        .await
+        .unwrap();
+
+    // Long past every threshold: the sweep must not even consider it.
+    let now = t0 + 2 * YEAR;
+    assert!(
+        store
+            .inactivity_candidates(now, 11 * MONTH, 0, 10)
+            .await
+            .unwrap()
+            .is_empty(),
+        "a banned account is never a sweep candidate"
+    );
+    assert_eq!(
+        store.inactivity_next_event(0, 1, 2).await.unwrap(),
+        None,
+        "the scheduler is not woken for a banned account"
+    );
+
+    // Lifting the ban restarts the clock at the unban instant.
+    let unban_at = now - 10 * 86_400;
+    store
+        .account_unban("suspended@example.com", unban_at)
+        .await
+        .unwrap();
+    let candidates = store
+        .inactivity_candidates(now, 11 * MONTH, 0, 10)
+        .await
+        .unwrap();
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(
+        candidates[0].last_activity, unban_at,
+        "the window restarted at the unban, not at the pre-ban activity"
+    );
+    assert_eq!(
+        store
+            .inactivity_next_event(0, 11 * MONTH, YEAR)
+            .await
+            .unwrap(),
+        Some(unban_at + 11 * MONTH),
+        "the next warning is measured from the unban"
+    );
+}
+
+#[tokio::test]
+async fn test_serving_machine_by_key_refuses_a_banned_account() {
+    use weaver_mux::KeyId;
+
+    let store = Store::connect("sqlite::memory:").await.unwrap();
+    let now = 1_800_000_000;
+    let account = activated(&store, "Owner", "owner@example.com").await;
+    let person = store.create_person(account.id, "owner").await.unwrap();
+    let key = KeyId::Ed25519([0x5A; 32]);
+    store
+        .create_machine(person.id, "laptop", &key)
+        .await
+        .unwrap();
+    assert!(store.serving_machine_by_key(&key).await.unwrap().is_some());
+
+    store
+        .account_ban("owner@example.com", "ban", now)
+        .await
+        .unwrap();
+    assert!(
+        store.serving_machine_by_key(&key).await.unwrap().is_none(),
+        "a banned account's key cannot open or keep a tunnel"
+    );
+    // The key itself is untouched: the resolver knows who holds it, which is
+    // how an unban needs no re-enrolment.
+    assert!(store.machine_by_key(&key).await.unwrap().is_some());
+
+    store
+        .account_unban("owner@example.com", now + 1)
+        .await
+        .unwrap();
+    assert!(store.serving_machine_by_key(&key).await.unwrap().is_some());
 }

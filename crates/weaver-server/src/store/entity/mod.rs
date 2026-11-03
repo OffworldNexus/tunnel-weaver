@@ -6,6 +6,7 @@
 
 pub mod abuse_bucket;
 pub mod account;
+pub mod account_ban;
 pub mod acme_account;
 pub mod altcha_client;
 pub mod altcha_proof;

@@ -274,6 +274,7 @@ async fn serve_mail(
         // wants the next provider redirect to assert.
         .route("/sso/expect", post(expect_sso))
         .route("/signup-policy", put(set_signup_policy))
+        .route("/account-state", put(set_account_state))
         .route("/health", get(health))
         .with_state(HarnessState {
             sent,
@@ -298,6 +299,48 @@ async fn expect_sso(
 ) -> StatusCode {
     state.fake.expect(assertion);
     StatusCode::NO_CONTENT
+}
+
+/// A ban or an unban, as a scenario states it.
+#[derive(Deserialize)]
+struct AccountStateBody {
+    /// Any of the account's addresses.
+    email: String,
+    /// `banned` or `active`.
+    state: String,
+    /// Mandatory for `banned`, ignored otherwise.
+    #[serde(default)]
+    reason: String,
+}
+
+/// `PUT /account-state` — ban or unban an account (WVR-178).
+///
+/// The CLI is a control-socket client and the suite has no socket, so the
+/// harness calls the same `Suspension` handle the daemon's control server
+/// does. It passes no tunnel registry: the browser scenarios exercise sessions
+/// and sign-in, not tunnels.
+async fn set_account_state(
+    State(state): State<HarnessState>,
+    Json(body): Json<AccountStateBody>,
+) -> StatusCode {
+    let suspension = weaver_server::account::suspension::Suspension::new(
+        state.account.store.clone(),
+        state.account.live.clone(),
+        None,
+    );
+    let lookup = weaver_server::email::normalize_address(&body.email);
+    let now = weaver_server::wall_clock::unix_secs();
+    let result = match body.state.as_str() {
+        "banned" if !body.reason.trim().is_empty() => {
+            suspension.ban(&lookup, body.reason.trim(), now).await
+        }
+        "active" => suspension.unban(&lookup, now).await,
+        _ => return StatusCode::BAD_REQUEST,
+    };
+    match result {
+        Ok(_) => StatusCode::NO_CONTENT,
+        Err(_) => StatusCode::CONFLICT,
+    }
 }
 
 /// A whole signup policy, as a scenario states it.

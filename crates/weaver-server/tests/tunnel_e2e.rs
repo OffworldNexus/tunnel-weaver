@@ -866,6 +866,49 @@ async fn test_close_connection_signals_the_live_connection() {
     relay.shutdown_token.cancel();
 }
 
+/// Evicting a key drops its routes at once, leaves the `domains` row intact,
+/// and closes the connection with the policy code (WVR-178: a ban).
+#[tokio::test]
+async fn test_evict_keys_stops_serving_and_keeps_the_domain_row() {
+    let root = "weaver.test";
+    let relay = spawn_test_relay(root).await;
+    let key = client_key();
+    let (proxy_tx, _) = tokio::sync::mpsc::channel(1);
+    let (close_tx, close_rx) = tokio::sync::oneshot::channel();
+    let conn_id = relay.registry.register_connection(key, close_tx);
+    let hostname = poc_hostname("web", root);
+
+    let registered = relay
+        .registry
+        .register_service(key, conn_id, "web", proxy_tx)
+        .await;
+    assert!(registered.is_ok(), "{registered:?}");
+    assert!(relay.registry.resolve(&hostname).await.is_some());
+
+    let evicted = relay
+        .registry
+        .evict_keys(&[key], weaver_mux::CloseCode::Rejected);
+    assert_eq!(evicted, 1);
+    assert!(
+        relay.registry.resolve(&hostname).await.is_none(),
+        "a suspended hostname stops serving at once"
+    );
+    assert!(!relay.registry.is_active(&hostname));
+    assert_eq!(
+        close_rx.await.expect("the connection is signalled"),
+        weaver_mux::CloseCode::Rejected,
+        "the key is kept: unbanning needs no re-enrolment"
+    );
+
+    // The hostname is still the machine's: re-registering after an unban
+    // restores the same route without touching the schema.
+    let domain = relay.registry.store().get_domain(&hostname).await.unwrap();
+    assert!(domain.is_some(), "the domains row survives the eviction");
+
+    relay.registry.unregister_connection(key, conn_id);
+    relay.shutdown_token.cancel();
+}
+
 /// Two services registered on one connection route to their own origins.
 #[tokio::test]
 async fn test_two_services_on_one_connection() {

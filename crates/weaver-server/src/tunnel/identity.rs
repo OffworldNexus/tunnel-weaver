@@ -38,9 +38,14 @@ impl StoreIdentityResolver {
         Self { store }
     }
 
-    /// The public key for `key_id`, or `None` if no machine holds it.
+    /// The public key for `key_id`, or `None` when no machine holds it **or its
+    /// account may no longer serve** (WVR-178).
+    ///
+    /// This is the tunnel handshake gate: a banned account keeps its key, so the
+    /// client is told to stop rather than to re-pair, but it cannot open a
+    /// connection while the suspension holds.
     pub async fn public_key(&self, key_id: &KeyId) -> Option<PublicKey> {
-        self.identity(key_id).await?;
+        self.store.serving_machine_by_key(key_id).await.ok()??;
         Some(match *key_id {
             KeyId::Ed25519(bytes) => PublicKey::Ed25519(bytes),
             KeyId::P256(bytes) => PublicKey::P256(bytes),

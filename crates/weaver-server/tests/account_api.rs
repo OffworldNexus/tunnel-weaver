@@ -4809,3 +4809,106 @@ async fn the_config_lists_the_enabled_providers_and_unknown_ones_are_absent() {
     .await;
     assert_eq!(unknown.status, StatusCode::NOT_FOUND);
 }
+
+// ----- account suspension (WVR-178) ---------------------------------------
+
+/// Bans the account that owns `email`, the way the operator's CLI does.
+async fn ban_account(fixture: &Fixture, email: &str, now: i64) {
+    fixture
+        .account
+        .store
+        .account_ban(email, "operator's private reason", now)
+        .await
+        .expect("ban");
+}
+
+#[tokio::test]
+async fn a_banned_account_is_refused_only_after_its_password_is_proved() {
+    let fixture = setup().await;
+    register(&fixture, "A", "banned@example.com", "correct horse battery").await;
+    ban_account(&fixture, "banned@example.com", 1_800_000_000).await;
+
+    // A wrong password gets the ordinary refusal: a ban tells nothing to
+    // someone who cannot sign in to the account.
+    let wrong = call(
+        &fixture.router,
+        "POST",
+        "/api/account/login",
+        &[],
+        Some(serde_json::json!({
+            "email": "banned@example.com",
+            "password": "the-wrong-password",
+            "altcha": solved(&fixture.account, "login").await,
+        })),
+    )
+    .await;
+    assert_eq!(wrong.status, StatusCode::UNAUTHORIZED, "{:?}", wrong.body);
+    assert_eq!(wrong.body["error"], "invalid email or password");
+
+    // The right password reveals the suspension, never its reason, and mints
+    // no session.
+    let suspended = call(
+        &fixture.router,
+        "POST",
+        "/api/account/login",
+        &[],
+        Some(serde_json::json!({
+            "email": "banned@example.com",
+            "password": "correct horse battery",
+            "altcha": solved(&fixture.account, "login").await,
+        })),
+    )
+    .await;
+    assert_eq!(
+        suspended.status,
+        StatusCode::FORBIDDEN,
+        "{:?}",
+        suspended.body
+    );
+    assert_eq!(
+        suspended.body["error"],
+        weaver_server::account::suspension::SUSPENDED
+    );
+    assert!(
+        !suspended.body.to_string().contains("private reason"),
+        "the ban reason never reaches the person"
+    );
+    assert!(
+        suspended.cookie("__Host-weaver_session").is_none(),
+        "a suspended sign-in opens no session"
+    );
+}
+
+#[tokio::test]
+async fn a_banned_external_identity_is_refused_after_the_callback() {
+    let fixture = setup().await;
+    // The first provider sign-in creates the account and signs it in.
+    let first = sso_sign_in(
+        &fixture,
+        sso_new("subject-ban", "suspended@example.test").named("Suspended"),
+    )
+    .await;
+    assert_eq!(
+        first.headers.get(header::LOCATION).unwrap(),
+        "/app",
+        "the first sign-in lands on the app: {:?}",
+        first.body
+    );
+    ban_account(&fixture, "suspended@example.test", 1_800_000_000).await;
+
+    let reply = sso_sign_in(
+        &fixture,
+        sso_new("subject-ban", "suspended@example.test").named("Suspended"),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::FOUND, "{:?}", reply.body);
+    assert_eq!(
+        reply.headers.get(header::LOCATION).unwrap(),
+        "/sign-in?sso_error=suspended",
+        "the callback refuses a suspended account"
+    );
+    assert!(
+        reply.cookie("__Host-weaver_session").is_none(),
+        "a refused callback mints no session"
+    );
+}

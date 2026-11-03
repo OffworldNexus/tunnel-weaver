@@ -167,6 +167,22 @@ export async function setSignupPolicy(policy) {
   if (!response.ok) throw new Error(`PUT /signup-policy failed with ${response.status}`);
 }
 
+// ----- account suspension ----------------------------------------------------
+
+/**
+ * Bans or lifts the ban on an account (WVR-178). The CLI is a control-socket
+ * client and the suite has no socket, so the harness drives the same daemon-side
+ * operation directly: `{ email, state: 'banned'|'active', reason }`.
+ */
+export async function setAccountState(account) {
+  const response = await fetch(`${harness.mailUrl}/account-state`, {
+    method: 'PUT',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(account)
+  });
+  if (!response.ok) throw new Error(`PUT /account-state failed with ${response.status}`);
+}
+
 // ----- pairing ---------------------------------------------------------------
 
 /** A fresh key per seed, as a real pairing mints a new key each time. */

@@ -33,7 +33,10 @@
 - Conformance (nightly / PR to develop only, needs the DO droplet): h2spec
   and Autobahn run in `.github/workflows/nightly.yml`; allow-lists live in
   `ci/conformance/*-allowlist.txt`, one case per line with a justification.
-- Last measured: 2026-11-03, after WVR-177 (deterministic tests): full suite
+- Last measured: 2026-11-04, after WVR-178 (account suspension): full suite
+  632 passed/0 failed/3 ignored, ignored e2e 3 passed, e2e 39 scenarios/532
+  steps passed, SPA lint and svelte-check clean, fmt/clippy/deny clean. (Prior:
+  2026-11-03, after WVR-177 (deterministic tests): full suite
   624 passed/0 failed/3 ignored in ~25s, 5 runs in a row, all green. It was
   ~99s because every `tunnel_e2e` registration placed a real ACME order with
   Let's Encrypt staging. Proptest 87 passed, e2e 34 scenarios/488 steps passed,

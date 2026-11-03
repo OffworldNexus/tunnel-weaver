@@ -4,14 +4,16 @@ use crate::cert::CertState;
 
 /// Envelope for client requests sent across the control socket.
 ///
-/// All requests require `v: 1` and one of the nine valid command verbs.
+/// All requests require `v: 1` and one of the verbs in the dispatcher's
+/// `ALLOWED_VERBS` list.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ControlRequest {
     /// Protocol version envelope; must be 1.
     pub v: u32,
-    /// Command verb ("status", "cert.status", "cert.wait", "cert.order", "cert.renew", "usage", "backup", "doctor", "shutdown").
+    /// Command verb ("status", "cert.status", "cert.wait", "cert.order", "cert.renew", "usage", "backup", "doctor", "shutdown", "account.ban", "account.unban", "account.list").
     pub cmd: String,
-    /// Target domain or hostname for certificate operations.
+    /// Target domain or hostname for certificate operations; the account's
+    /// address for account operations.
     #[serde(default)]
     pub name: Option<String>,
     /// Limit for event history queries.
@@ -44,6 +46,12 @@ pub struct ControlRequest {
     /// Usage query: upper bound, absolute Unix seconds (exclusive).
     #[serde(default)]
     pub until: Option<i64>,
+    /// `account ban`: the operator's reason, mandatory.
+    #[serde(default)]
+    pub reason: Option<String>,
+    /// `account list`: only accounts banned right now.
+    #[serde(default)]
+    pub banned: Option<bool>,
 }
 
 /// Generic error response returned when a command fails or validation rejects the request.
@@ -82,6 +90,8 @@ impl ControlRequest {
             service: None,
             since: None,
             until: None,
+            reason: None,
+            banned: None,
         }
     }
 }
@@ -211,6 +221,39 @@ pub struct CertDetailResponse {
     /// ACME validation mechanism of the stored row (`dns-01`/`http-01`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub validation: Option<String>,
+}
+
+/// Response payload for `account.ban` and `account.unban`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AccountStateResponse {
+    pub ok: bool,
+    /// The account's address that resolved the command, normalised the way the
+    /// store's lookup key is — the operator sees what the command matched.
+    pub address: String,
+    /// The account's state after the command (`active`/`banned`).
+    pub state: String,
+}
+
+/// One account in the operator's `account list` (WVR-178).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AccountSummary {
+    /// Every address the account holds, primary first.
+    pub addresses: Vec<String>,
+    /// `active` or `banned`.
+    pub state: String,
+    /// Unix seconds of the most recent ban; absent when never banned.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub banned_at: Option<i64>,
+    /// The operator's reason for that ban; absent when never banned.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// Response payload for `account.list`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AccountListResponse {
+    pub ok: bool,
+    pub accounts: Vec<AccountSummary>,
 }
 
 /// Individual streamed event for `cert.wait`.

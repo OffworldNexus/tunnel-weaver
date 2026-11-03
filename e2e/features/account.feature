@@ -55,6 +55,14 @@ Feature: Account lifecycle
     Given an account exists for "Ada Lovelace" with the password "correct-horse-battery-staple"
     When I sign in with the wrong password "definitely-not-it"
     Then I see the error "invalid email or password"
+    # WVR-178: a ban is no more disclosed than the address is. The same wrong
+    # password against the banned account gets the same generic answer, so the
+    # suspension sentence stays something only someone who proved the password
+    # can see.
+    When the operator bans my account with the reason "operator-secret-reason"
+    And I sign in with the wrong password "definitely-not-it"
+    Then I see the error "invalid email or password"
+    And I do not see the suspension refusal
 
   Scenario: Creating an account with an existing email does not disclose it before confirmation
     Given an account exists for "Ada Lovelace" with the password "correct-horse-battery-staple"
@@ -62,6 +70,20 @@ Feature: Account lifecycle
     And I create an account for "Ada Lovelace"
     And I enter the code from the verification email
     Then I see the "You already have an account" heading
+
+  # WVR-178: a banned address answers on the same existing-account path as any
+  # other, so the ban is not disclosed to someone who has only proved the address
+  # is theirs. Nor does the attempt mint anything: the password sign-in that
+  # follows meets the ban, not a fresh active account.
+  Scenario: Signing up with a banned address creates no account and discloses nothing
+    Given an account exists for "Ada Lovelace" with the password "correct-horse-battery-staple"
+    And the operator bans my account with the reason "operator-secret-reason"
+    When I open the "sign-up" page
+    And I create an account for "Ada Lovelace"
+    And I enter the code from the verification email
+    Then I see the "You already have an account" heading
+    When I submit the password "correct-horse-battery-staple"
+    Then I see the suspension refusal
 
   Scenario: Requesting a reset link by email and signing in with the new password
     Given an account exists for "Ada Lovelace" with the password "correct-horse-battery-staple"

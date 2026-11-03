@@ -695,6 +695,32 @@ impl Store {
         Ok(Some((pers, mach)))
     }
 
+    /// The machine holding `key_id`, provided its account may still serve
+    /// (WVR-178).
+    ///
+    /// Same lookup as [`Store::machine_by_key`] plus the account-state gate: a
+    /// banned account keeps its key — so lifting the ban needs no re-enrolment —
+    /// but is refused at the tunnel handshake and when it re-registers a
+    /// service. An unknown key and a banned account both answer `None` on
+    /// purpose: the relay tells the client to stop either way, and a ban must
+    /// never read as a revoked key.
+    pub async fn serving_machine_by_key(
+        &self,
+        key_id: &KeyId,
+    ) -> Result<Option<(person::Model, machine::Model)>, StoreError> {
+        let Some((person, machine)) = self.machine_by_key(key_id).await? else {
+            return Ok(None);
+        };
+        let account = entity::account::Entity::find_by_id(person.account_id)
+            .one(&self.db)
+            .await?;
+        let serving = account.is_some_and(|account| {
+            crate::store::account::AccountState::parse(&account.state)
+                == Some(crate::store::account::AccountState::Active)
+        });
+        Ok(serving.then_some((person, machine)))
+    }
+
     /// Moves a machine onto a new key: the old key stops working at once.
     ///
     /// In one transaction: `machine.key_id` is overwritten, the old key's log
@@ -938,7 +964,9 @@ impl Store {
         let now = unix_secs();
         Ok(entity::account::ActiveModel {
             name: Set(name.to_string()),
-            state: Set("active".to_string()),
+            state: Set(crate::store::account::AccountState::Active
+                .as_str()
+                .to_string()),
             created_at: Set(now),
             activated_at: Set(now),
             ..Default::default()

@@ -250,6 +250,42 @@ impl TunnelRegistry {
         }
     }
 
+    /// Evicts every route held by `keys`, then asks those connections to close
+    /// with `code` (WVR-178).
+    ///
+    /// Route eviction happens first and under a single write lock, so nothing is
+    /// served while the GOAWAY round trip is in flight; the close then reuses
+    /// [`Self::close_connection`]. Returns the number of hostnames evicted.
+    ///
+    /// This is how a ban stops an account's public hostnames: [`Self::resolve`]
+    /// only ever serves a live in-memory route, so removing it is immediate,
+    /// while the `domains` row (its `service_id` included) is left alone — the
+    /// hostname is still the person's, and re-registering after an unban
+    /// restores it unchanged.
+    pub fn evict_keys(&self, keys: &[KeyId], code: CloseCode) -> usize {
+        let evicted: Vec<(String, i32)> = {
+            let mut routes = self.routes.write().unwrap();
+            let doomed: Vec<(String, i32)> = routes
+                .iter()
+                .filter(|(_, route)| keys.contains(&route.key_id))
+                .map(|(hostname, route)| (hostname.clone(), route.service_id))
+                .collect();
+            for (hostname, _) in &doomed {
+                routes.remove(hostname);
+            }
+            doomed
+        };
+        for (hostname, service_id) in &evicted {
+            self.metering.unregister_service(*service_id);
+            self.set_active(hostname, false);
+            info!(%hostname, "Evicted hostname of a suspended account");
+        }
+        for key in keys {
+            self.close_connection(key, code);
+        }
+        evicted.len()
+    }
+
     /// Re-derives the live route hostnames of `key_id` after its machine was
     /// renamed, mirroring the change to `active_hosts` and the connection's
     /// service set.
@@ -344,6 +380,19 @@ impl TunnelRegistry {
         let Some(identity) = self.identities.identity(&key_id).await else {
             return Err(RefusalCode::Unauthorized);
         };
+
+        // A machine that handshook a moment before its account was suspended
+        // must not re-add a route after the ban evicted it (WVR-178).
+        if self
+            .store
+            .serving_machine_by_key(&key_id)
+            .await
+            .ok()
+            .flatten()
+            .is_none()
+        {
+            return Err(RefusalCode::Unauthorized);
+        }
 
         let host_lower = identity.hostname(service, &self.tunnel_domain);
 

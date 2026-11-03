@@ -289,7 +289,7 @@ pub async fn run_server(
             managed: Arc::new(ManagedCerts::from_config(&config)),
             cert_resolver: Some(Arc::clone(&resolver)),
             cert_manager: Some(Arc::clone(&cert_manager)),
-            tunnel_registry: Some(tunnel_registry),
+            tunnel_registry: Some(Arc::clone(&tunnel_registry)),
             metering: Some(Arc::clone(&metering)),
             guard: guard.clone(),
             altcha: Some(altcha.clone()),
@@ -332,6 +332,11 @@ pub async fn run_server(
     let control_store = Arc::new(store.clone());
     let control_cert_mgr = Arc::clone(&cert_manager);
     let control_metering = Arc::clone(&metering);
+    let control_suspension = crate::account::suspension::Suspension::new(
+        store.clone(),
+        account.live.clone(),
+        Some(tunnel_registry),
+    );
     let control_task = tokio::spawn(async move {
         if let Err(err) = crate::control::server::run_control_server_with_listener(
             control_listener,
@@ -340,6 +345,7 @@ pub async fn run_server(
             control_store,
             control_cert_mgr,
             control_metering,
+            control_suspension,
             control_start_time,
             control_token,
         )

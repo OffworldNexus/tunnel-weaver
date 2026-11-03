@@ -335,9 +335,15 @@ deletion, sleeps until then, and settles every account due at that tick
   `activated_at` for an account that never signed in);
 - the newest day any of its services was metered (`usage_daily`, folded, or the
   live day);
+- the latest time it was unbanned (`account_ban.unbanned_at`): time spent
+  suspended is not idleness;
 - and two "active right now" signals that always win whatever the timestamps
   say: a live browser session (`browser_session` unexpired and uninvalidated)
   and a live tunnel for any of its machines.
+
+A suspended account is not a candidate at all: the sweep neither warns nor
+deletes it, so a ban can never silently turn into a deletion that frees the
+address.
 
 The last two matter because a tunnel can run for months without a console
 sign-in, so an account that looks stale on paper may in fact be serving traffic.
@@ -406,6 +412,58 @@ never names the rule. An SSO identity the provider does not vouch for cannot
 create an account under any policy at all. Existing accounts are untouched:
 signing in (password, passkey or SSO), linking a provider identity, and every
 other account operation keep working whatever the policy says.
+
+## Suspending an account
+
+An operator can suspend an account without deleting it. The account keeps every
+address, key and hostname it had, and lifting the suspension restores all of
+them; nothing has to be re-enrolled.
+
+```console
+weaver-server account ban EMAIL --reason "abuse report #12"
+weaver-server account unban EMAIL
+weaver-server account list [--banned]
+```
+
+The address is any of the account's addresses, normalised the same way as the
+sign-in lookup, and `--reason` is mandatory: it is stored with the ban for the
+operator's record and is never shown to the account holder. These verbs are
+control-socket clients — the running daemon performs the ban, so **a daemon must
+be running**. `list` prints one row per account with every address it holds, its
+state, and its most recent ban (the open one while banned, otherwise the last one
+lifted); an account that was never banned shows `-` in both ban columns.
+
+A ban is stored, and one transaction does everything the store can do: it opens
+an `account_ban` row, sets `account.state` to `banned` and invalidates every live
+browser session. On top of that the daemon drops what only it holds — it pushes
+the session change so open console tabs sign out on the spot (not on their next
+request), and it evicts the account's routes before closing its tunnels with
+`CloseCode::Rejected`. The key is kept, which is why an unban needs no
+re-enrolment: the machine comes back on its next `weave start`.
+
+While a ban holds:
+
+- sign-in is refused by password, passkey and SSO, but only **after**
+  authentication succeeded — a wrong password still answers "invalid email or
+  password", so a ban never tells an outsider that the account exists. The
+  account holder sees **"This account has been suspended. Contact the relay
+  operator."** and never the reason;
+- the account's machines cannot open a tunnel or register a service, and its
+  hostnames stop serving (the routes are gone; the `domains` rows stay, so the
+  machine restores them when it reconnects);
+- no account email is sent, password reset included (`issue_and_send_reset`
+  skips any account that is not `active`);
+- the address is still taken: a sign-up on it goes down the ordinary
+  "you already have an account" path, and an SSO sign-in on it resolves to the
+  banned account and is refused;
+- the inactivity sweep ignores the account outright.
+
+`account_ban` is a history table, not a flag: `unbanned_at` is `NULL` while a ban
+holds and carries the instant it was lifted otherwise, and a partial unique index
+allows at most one open ban per account. Banning again after an unban appends a
+new row. Because time spent suspended is not idleness, the sweep treats the
+latest `unbanned_at` as activity, so an account lifted after a long ban starts a
+fresh full window instead of becoming deletable at the next tick.
 
 ## Schema
 
