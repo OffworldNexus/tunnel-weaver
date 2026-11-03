@@ -33,10 +33,13 @@
 - Conformance (nightly / PR to develop only, needs the DO droplet): h2spec
   and Autobahn run in `.github/workflows/nightly.yml`; allow-lists live in
   `ci/conformance/*-allowlist.txt`, one case per line with a justification.
-- Last measured: 2026-11-02, after WVR-175/WVR-173 (the SSO provider registry
+- Last measured: 2026-11-03, after WVR-98 (the relay signup policy): full
+  suite 624 passed/0 failed/3 ignored, e2e 34 scenarios/488 steps passed,
+  ignored e2e 3 passed, SPA lint and svelte-check clean,
+  fmt/clippy/deny/fuzz clean. (Prior: 2026-11-02, after WVR-175/WVR-173 (the SSO provider registry
   and the Google preset): full suite 613 passed/0 failed/3 ignored, e2e 31
   scenarios/450 steps passed, ignored e2e 3 passed, SPA lint and svelte-check
-  clean, fmt/clippy/deny/fuzz clean. (Prior: 2026-11-02, after pruning
+  clean, fmt/clippy/deny/fuzz clean; 2026-11-02, after pruning
   low-value tests: 593 passed/0 failed/3 ignored, e2e 28 scenarios/430 steps
   passed, ignored e2e 3 passed, SPA lint and svelte-check clean,
   fmt/clippy/deny/fuzz clean; 2026-10-26, 700 passed/4 ignored (99s), e2e 27/360 (93s); 2026-10-25, 678 passed/0 failed/4 ignored (135s),

@@ -2,6 +2,8 @@ use thiserror::Error;
 
 use crate::config::ConfigError;
 
+use super::signup::SignupRefusal;
+
 /// Errors arising from Store operations.
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -41,6 +43,12 @@ pub enum StoreError {
     /// A caller-level conflict, e.g. an entity that must be unique already exists.
     #[error("Conflict: {0}")]
     Conflict(String),
+
+    /// The relay's signup policy does not allow this address to create an
+    /// account (WVR-98). `refusal` is for the operator's log, never for the
+    /// person, who sees one fixed refusal.
+    #[error("signup refused by policy: {refusal}")]
+    SignupRefused { refusal: SignupRefusal },
 
     /// A bounded table has reached its configured capacity.
     #[error("bounded table at capacity: {0}")]

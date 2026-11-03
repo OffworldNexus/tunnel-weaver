@@ -55,7 +55,10 @@
 		token: 'The provider’s answer could not be verified. Try again.',
 		disabled: 'That provider sign-in is not available.',
 		identity: 'That provider account is not linked to this account.',
-		stale: 'The provider did not ask you to sign in again, so we could not confirm it was you.'
+		stale: 'The provider did not ask you to sign in again, so we could not confirm it was you.',
+		// WVR-98: the relay's signup policy refused a first sign-in. The wording
+		// matches the password path's refusal exactly.
+		signup_closed: "Sign-ups with this address aren't open on this relay."
 	};
 
 	onMount(() => {

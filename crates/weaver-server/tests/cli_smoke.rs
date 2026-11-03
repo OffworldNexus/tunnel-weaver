@@ -488,3 +488,66 @@ fn test_altcha_clients_cli() {
     let list: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(list[0]["revoked"], true);
 }
+
+/// WVR-98: the `signup` verbs write the policy the account plane reads on every
+/// attempt, so this covers the store round trip and the exit codes.
+#[test]
+fn test_signup_policy_cli() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("signup-cli.db");
+    let bin = env!("CARGO_BIN_EXE_weaver-server");
+
+    let run = |args: &[&str]| {
+        Command::new(bin)
+            .arg("--db")
+            .arg(&db_path)
+            .args(args)
+            .output()
+            .expect("spawn weaver-server")
+    };
+    let stdout = |out: &std::process::Output| String::from_utf8_lossy(&out.stdout).to_string();
+
+    // An install with no policy configured is open, with the default implicit.
+    let out = run(&["signup", "list"]);
+    assert_eq!(stdout(&out), "default allow\n");
+
+    // Rules are appended 100 at a time and validate their value.
+    let out = run(&["signup", "add", "deny", "domain", "acme.com"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let out = run(&["signup", "add", "allow", "email", "Bob@ACME.com"]);
+    assert!(out.status.success());
+    let out = run(&["signup", "default", "deny"]);
+    assert!(out.status.success());
+    assert_eq!(
+        stdout(&run(&["signup", "list"])),
+        "100 deny domain acme.com\n200 allow email bob@acme.com\ndefault deny\n"
+    );
+
+    // A duplicate number and an unknown delete are store refusals (exit 1); a
+    // malformed command line is a usage error (exit 2).
+    assert_eq!(
+        run(&["signup", "add", "100", "allow", "domain", "other.com"])
+            .status
+            .code(),
+        Some(1)
+    );
+    assert_eq!(run(&["signup", "delete", "999"]).status.code(), Some(1));
+    assert_eq!(
+        run(&["signup", "add", "allow", "domain", "not_a_domain"])
+            .status
+            .code(),
+        Some(2)
+    );
+    assert_eq!(run(&["signup", "default", "maybe"]).status.code(), Some(2));
+
+    // Deleting what is there leaves the default in charge.
+    assert!(run(&["signup", "delete", "100"]).status.success());
+    assert_eq!(
+        stdout(&run(&["signup", "list"])),
+        "200 allow email bob@acme.com\ndefault deny\n"
+    );
+}

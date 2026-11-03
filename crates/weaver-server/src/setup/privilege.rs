@@ -77,6 +77,12 @@ pub fn ensure_root_or_elevate(config: &GatheredConfig, is_headless: bool) {
         cmd.arg("--relay-ip").arg(ip.to_string());
     }
 
+    // The elevated child never prompts, so the answers gathered here travel as
+    // flags (WVR-98). Values are already normalised; the child re-validates.
+    for value in &config.signup_allow {
+        cmd.arg("--signup-allow").arg(value.as_str());
+    }
+
     if let Some(dir) = &config.acme_directory {
         cmd.arg("--acme-directory").arg(dir);
     }

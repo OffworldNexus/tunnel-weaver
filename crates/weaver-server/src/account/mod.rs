@@ -30,11 +30,29 @@ use crate::altcha::AltchaRuntime;
 use crate::config::AccountConfig;
 use crate::email::Mailer;
 use crate::live::LiveHub;
+use crate::store::signup::SignupRefusal;
 use crate::store::{Store, StoreError};
 use crate::tunnel::TunnelRegistry;
 use password::Passwords;
 use session::Sessions;
 use weaver_mux::{CloseCode, KeyId};
+
+/// The one refusal an operator's signup policy shows a person (WVR-98).
+///
+/// Fixed on purpose: it never names the rule that matched, and it depends only
+/// on the address, so it discloses nothing about whether an account already
+/// exists for it.
+pub(crate) const SIGNUP_CLOSED: &str = "Sign-ups with this address aren't open on this relay.";
+
+/// Records a policy refusal for the operator: the address's domain and why the
+/// address was refused, never the address itself.
+pub(crate) fn log_signup_refusal(lookup_key: &str, refusal: SignupRefusal) {
+    tracing::info!(
+        domain = crate::store::signup::domain_of(lookup_key),
+        %refusal,
+        "signup refused by policy"
+    );
+}
 
 /// Shared state for the account plane, built once and mounted into the edge.
 #[derive(Clone)]

@@ -122,6 +122,47 @@ pub enum Commands {
         #[command(subcommand)]
         command: SsoCommands,
     },
+
+    /// Controls who may create an account on this relay (WVR-98).
+    Signup {
+        /// The operation to perform.
+        #[command(subcommand)]
+        command: SignupCommands,
+    },
+}
+
+/// Subcommands for the relay's account-creation policy (WVR-98).
+///
+/// Rules are Apache-ipfw style: numbered, evaluated in ascending order, first
+/// match wins; the default applies when none matches. Every verb writes the
+/// store directly, and the daemon re-reads the policy per attempt, so a change
+/// applies to the very next signup with no restart.
+#[derive(Subcommand, Debug, Clone)]
+pub enum SignupCommands {
+    /// Sets the decision for an address that matches no rule.
+    Default {
+        /// `allow` or `deny`.
+        #[arg(value_name = "DECISION")]
+        decision: String,
+    },
+
+    /// Adds a rule; the first matching rule in number order wins.
+    Add {
+        /// `[NUMBER] allow|deny domain|email VALUE` as one positional group.
+        /// Omitting NUMBER places the rule 100 after the highest one.
+        #[arg(value_name = "RULE", num_args = 3..=4)]
+        rule: Vec<String>,
+    },
+
+    /// Deletes the rule with this number.
+    Delete {
+        /// The rule number, as shown by `signup list`.
+        #[arg(value_name = "NUMBER")]
+        number: i32,
+    },
+
+    /// Lists the rules in evaluation order, then the default.
+    List,
 }
 
 /// Subcommands for one external identity provider (WVR-169, WVR-175).
@@ -385,6 +426,13 @@ pub struct SetupArgs {
     /// detection; required behind NAT where the bindable address differs.
     #[arg(long = "relay-ip", value_name = "ADDR")]
     pub relay_ips: Vec<std::net::IpAddr>,
+
+    /// An email address or domain allowed to create an account, repeatable
+    /// (WVR-98). Any value replaces the whole policy with deny-by-default plus
+    /// one allow rule per value; omitted, an interactive setup asks and a
+    /// headless one leaves sign-ups open to anyone.
+    #[arg(long = "signup-allow", value_name = "EMAIL_OR_DOMAIN")]
+    pub signup_allow: Vec<String>,
 
     /// Dedicated system user for the service.
     #[arg(long, default_value = "weaver", value_name = "NAME")]
@@ -1070,6 +1118,13 @@ async fn main() {
             let code = handle_sso(provider, json, command, db_path).await;
             std::process::exit(code);
         }
+        Commands::Signup { command } => {
+            let db_path = cli
+                .db
+                .unwrap_or_else(|| PathBuf::from("/var/lib/weaver/weaver.db"));
+            let code = handle_signup(command, db_path).await;
+            std::process::exit(code);
+        }
     }
 }
 
@@ -1513,6 +1568,36 @@ struct GatheredAcme {
     acme_eab_hmac: Option<String>,
     /// Path to a custom root CA PEM, if one was supplied.
     acme_root_ca: Option<PathBuf>,
+}
+
+/// Resolves which addresses and domains may create an account (WVR-98).
+///
+/// `--signup-allow` values win and are validated here, so a typo fails the run
+/// before anything is installed. With no flag, an interactive setup asks; a
+/// headless or elevated run never prompts, so it uses the values the parent
+/// gathered (forwarded as flags) or leaves sign-ups open to anyone.
+fn resolve_signup_allow(
+    flag: Vec<String>,
+    non_interactive: bool,
+) -> Vec<weaver_server::store::signup::RuleValue> {
+    use weaver_server::store::signup::RuleValue;
+
+    if !flag.is_empty() {
+        return flag
+            .into_iter()
+            .map(|input| match RuleValue::infer(&input) {
+                Ok(value) => value,
+                Err(message) => {
+                    eprintln!("Error: {message}.");
+                    std::process::exit(2);
+                }
+            })
+            .collect();
+    }
+    if non_interactive {
+        return Vec::new();
+    }
+    prompt_required(weaver_server::setup::interactive::prompt_signup_allow_list)
 }
 
 /// Runs an interactive prompt, exiting the process when the operator aborts.
@@ -1982,6 +2067,127 @@ fn report_sso(config: &Config, provider: &str, json: bool) {
     );
 }
 
+/// Handles `weaver-server signup …` against the local store (WVR-98).
+///
+/// Like `altcha` and `sso`, this opens the database directly rather than going
+/// through the daemon: the account plane re-reads the policy on every attempt,
+/// so a change here applies to the next signup with no restart.
+///
+/// Exit codes follow the other CLI verbs: `0` success, `1` a store refusal
+/// (unknown rule, duplicate number), `2` a malformed command line.
+async fn handle_signup(command: SignupCommands, db_path: PathBuf) -> i32 {
+    use weaver_server::store::signup::{Decision, RuleKind, RuleValue};
+
+    let store = match Store::open(&db_path).await {
+        Ok(store) => store,
+        Err(err) => {
+            eprintln!("Failed to open database at {}: {err}", db_path.display());
+            return 1;
+        }
+    };
+    match command {
+        SignupCommands::Default { decision } => {
+            let Some(decision) = Decision::parse(&decision) else {
+                eprintln!("Error: decision must be `allow` or `deny`.");
+                return 2;
+            };
+            match store.signup_default_set(decision).await {
+                Ok(()) => {
+                    println!("default {}", decision.as_str());
+                    0
+                }
+                Err(err) => {
+                    eprintln!("Error: {err}");
+                    1
+                }
+            }
+        }
+        SignupCommands::Add { rule } => {
+            // clap guarantees three or four words; with four the first is the
+            // number, with three the rule is appended after the highest one.
+            let (number, words) = match rule.as_slice() {
+                [number, rest @ ..] if rest.len() == 3 => match number.parse::<i32>() {
+                    Ok(number) => (Some(number), rest),
+                    Err(_) => {
+                        eprintln!("Error: '{number}' is not a rule number.");
+                        return 2;
+                    }
+                },
+                words => (None, words),
+            };
+            let [decision, kind, value] = words else {
+                eprintln!("Error: expected `[NUMBER] allow|deny domain|email VALUE`.");
+                return 2;
+            };
+            let (Some(decision), Some(kind)) = (Decision::parse(decision), RuleKind::parse(kind))
+            else {
+                eprintln!("Error: expected `allow|deny domain|email VALUE`.");
+                return 2;
+            };
+            let value = match RuleValue::typed(kind, value) {
+                Ok(value) => value,
+                Err(message) => {
+                    eprintln!("Error: {message}.");
+                    return 2;
+                }
+            };
+            match store.signup_rule_add(number, decision, value).await {
+                Ok(rule) => {
+                    println!("{} {}", rule.number, rule.decision.as_str());
+                    0
+                }
+                Err(err) => {
+                    eprintln!("Error: {err}");
+                    1
+                }
+            }
+        }
+        SignupCommands::Delete { number } => match store.signup_rule_delete(number).await {
+            Ok(true) => {
+                println!("deleted {number}");
+                0
+            }
+            Ok(false) => {
+                eprintln!("Error: no rule numbered {number}.");
+                1
+            }
+            Err(err) => {
+                eprintln!("Error: {err}");
+                1
+            }
+        },
+        SignupCommands::List => {
+            let rules = match store.signup_rules().await {
+                Ok(rules) => rules,
+                Err(err) => {
+                    eprintln!("Error: {err}");
+                    return 1;
+                }
+            };
+            let default = match store.signup_default().await {
+                Ok(default) => default,
+                Err(err) => {
+                    eprintln!("Error: {err}");
+                    return 1;
+                }
+            };
+            for rule in &rules {
+                println!(
+                    "{} {} {} {}",
+                    rule.number,
+                    rule.decision.as_str(),
+                    rule.value.kind().as_str(),
+                    rule.value.as_str()
+                );
+            }
+            // The default is printed last, as the implicit line the whole list
+            // falls through to.
+            println!("default {}", default.as_str());
+            0
+        }
+    }
+}
+
 /// Handles `weaver-server altcha …` against the local store.
 ///
 /// Like `configure`, this opens the database directly rather than going through
@@ -2280,6 +2486,10 @@ async fn handle_setup(args: SetupArgs, db_path: PathBuf) {
         prefix: args.prefix.clone(),
         skip_reachability_check: args.skip_reachability_check,
         relay_ips: args.relay_ips.clone(),
+        signup_allow: resolve_signup_allow(
+            args.signup_allow.clone(),
+            args.headless || args.no_prompt_values,
+        ),
         email: email_config.clone(),
         email_config_file: None,
     };

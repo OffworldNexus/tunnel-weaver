@@ -364,6 +364,49 @@ its sessions and, because the store is the routing authority, its hostnames and
 keys), and its live tunnels are then closed with `KeyRevoked`. The sweep logs
 the number of warnings sent, accounts deleted and failures per tick.
 
+## Who may create an account
+
+An install is open by default: anyone with an email address can sign up. The
+relay can instead be closed, with named exceptions, by one relay-wide policy.
+It is Apache-ipfw shaped — a default decision plus numbered rules:
+
+- rules are evaluated in ascending number order and the **first match wins**;
+- a rule names either one exact email address (`email value`) or one exact
+  domain (`domain value`, the part after `@` — `acme.com` never matches
+  `eng.acme.com`), normalised to the store's lookup key (trimmed, lowercased);
+- when no rule matches, the default decides.
+
+```console
+weaver-server signup list                          # rules in order, then the default
+weaver-server signup default deny                  # deny anyone not matched
+weaver-server signup add allow domain acme.com     # automatically 100, 200, …
+weaver-server signup add 150 deny email ex@acme.com
+weaver-server signup delete 150
+```
+
+Omitting the number places the rule 100 after the highest one, so a gap can be
+inserted in between later; reusing a number is refused, and so is a value that
+is neither a domain nor an address. The verbs write the store directly and the
+account plane reads the policy on every attempt, so a change applies to the
+**next** signup with no daemon restart.
+
+The `weaver-server setup` wizard asks for the addresses and domains that may
+sign up (one per line, blank to finish). Any value switches the relay to
+deny-by-default with one allow rule per value, replacing whatever policy was
+there; leaving it blank writes nothing, so a re-run never silently reopens a
+closed relay. Headless setup takes the same answers as `--signup-allow EMAIL_OR_DOMAIN`
+(repeatable).
+
+Enforcement is on account creation only. A denied address gets no verification
+email and no pending registration, and the sign-up form says **"Sign-ups with
+this address aren't open on this relay."** — the same wording on the set-password
+step if the policy closed mid-registration, and on the sign-in page
+(`sso_error=signup_closed`) when an SSO first sign-in is refused. The message
+never names the rule. An SSO identity the provider does not vouch for cannot
+create an account under any policy at all. Existing accounts are untouched:
+signing in (password, passkey or SSO), linking a provider identity, and every
+other account operation keep working whatever the policy says.
+
 ## Schema
 
 All migrations were squashed into a single `m0001_init` that creates the final

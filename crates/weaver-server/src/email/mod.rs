@@ -343,6 +343,21 @@ fn secrets_of(cfg: &EmailConfig) -> Vec<String> {
         .collect()
 }
 
+/// Validates a bare email domain: dotted, whitespace-free, and made only of the
+/// characters a hostname uses.
+///
+/// Shared by [`is_valid_address`] and by the signup policy's `domain` rules, so
+/// an operator cannot allow a domain that no address could ever carry.
+pub fn is_valid_domain(domain: &str) -> bool {
+    !domain.is_empty()
+        && domain.contains('.')
+        && !domain.starts_with('.')
+        && !domain.ends_with('.')
+        && domain
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+}
+
 /// Validates a bare email address well enough to feed a `From`/`To` envelope.
 ///
 /// Deliberately permissive: exactly one `@`, a non-empty local part, and a
@@ -357,13 +372,17 @@ pub fn is_valid_address(addr: &str) -> bool {
     let (Some(local), Some(domain), None) = (parts.next(), parts.next(), parts.next()) else {
         return false;
     };
-    !local.is_empty()
-        && domain.contains('.')
-        && !domain.starts_with('.')
-        && !domain.ends_with('.')
-        && domain
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+    !local.is_empty() && is_valid_domain(domain)
+}
+
+/// The lookup/uniqueness key of an address: trimmed and lowercased, with no dot
+/// or plus folding.
+///
+/// One definition for the whole program: the store's `email_identity.lookup_key`
+/// and the signup policy both compare against this exact form, so a rule written
+/// `Bob@ACME.com` matches `bob@acme.com` and nothing else.
+pub fn normalize_address(addr: &str) -> String {
+    addr.trim().to_lowercase()
 }
 
 #[cfg(test)]
@@ -375,8 +394,28 @@ mod tests {
         for good in ["a@b.com", "ops+jobs@relay.example.org", "x@y.z"] {
             assert!(is_valid_address(good), "{good}");
         }
-        for bad in ["", "nope", "a@b", "a@@b.com", "a b@c.com", "a@.com", "a@b."] {
+        for bad in [
+            "",
+            "nope",
+            "a@b",
+            "a@@b.com",
+            "a b@c.com",
+            "a@ b.com",
+            "a@.com",
+            "a@b.",
+            "a@b_c.com",
+        ] {
             assert!(!is_valid_address(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn valid_domains() {
+        for good in ["b.com", "relay.example.org", "x.y.z"] {
+            assert!(is_valid_domain(good), "{good}");
+        }
+        for bad in ["", "b", ".com", "com.", "a b.com", "a@b.com", "b_c.com"] {
+            assert!(!is_valid_domain(bad), "{bad}");
         }
     }
 

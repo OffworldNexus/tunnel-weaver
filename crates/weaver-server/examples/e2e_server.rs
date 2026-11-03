@@ -36,7 +36,7 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
-use axum::routing::{get, post};
+use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
@@ -273,6 +273,7 @@ async fn serve_mail(
         // The fake identity provider's script: a scenario posts the identity it
         // wants the next provider redirect to assert.
         .route("/sso/expect", post(expect_sso))
+        .route("/signup-policy", put(set_signup_policy))
         .route("/health", get(health))
         .with_state(HarnessState {
             sent,
@@ -297,6 +298,46 @@ async fn expect_sso(
 ) -> StatusCode {
     state.fake.expect(assertion);
     StatusCode::NO_CONTENT
+}
+
+/// A whole signup policy, as a scenario states it.
+#[derive(Deserialize)]
+struct SignupPolicyBody {
+    /// `allow` or `deny`, applied when no rule matches.
+    default: String,
+    /// Addresses or domains allowed to sign up, in evaluation order.
+    allow: Vec<String>,
+}
+
+/// `PUT /signup-policy` — replace the relay's signup policy (WVR-98).
+///
+/// The refusals this feature adds only exist when a policy does, and the suite
+/// has no database or CLI handle. So the harness calls the same store method the
+/// setup wizard uses, and a scenario states the policy whole rather than
+/// replaying CLI verbs.
+async fn set_signup_policy(
+    State(state): State<HarnessState>,
+    Json(body): Json<SignupPolicyBody>,
+) -> StatusCode {
+    let mut rules = Vec::new();
+    for input in &body.allow {
+        match weaver_server::store::signup::RuleValue::infer(input) {
+            Ok(value) => rules.push((weaver_server::store::signup::Decision::Allow, value)),
+            Err(_) => return StatusCode::BAD_REQUEST,
+        }
+    }
+    let Some(default) = weaver_server::store::signup::Decision::parse(&body.default) else {
+        return StatusCode::BAD_REQUEST;
+    };
+    match state
+        .account
+        .store
+        .signup_policy_replace(default, &rules)
+        .await
+    {
+        Ok(()) => StatusCode::NO_CONTENT,
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    }
 }
 
 // ----- lifecycle ------------------------------------------------------------
