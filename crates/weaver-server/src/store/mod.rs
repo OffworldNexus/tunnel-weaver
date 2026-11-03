@@ -15,6 +15,7 @@ pub mod entity;
 pub mod error;
 pub mod migration;
 pub mod names;
+pub mod signup;
 pub mod usage;
 pub mod usage_live;
 

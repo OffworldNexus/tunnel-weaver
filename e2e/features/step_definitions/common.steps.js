@@ -20,14 +20,21 @@ const PAGES = {
 };
 
 /** A per-scenario address, so a persistent database cannot collide across runs. */
-function uniqueEmail(name) {
+function uniqueEmail(name, domain = 'example.com') {
   const slug = name.toLowerCase().replace(/[^a-z0-9]+/g, '-');
-  return `e2e+${slug}-${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}@example.com`;
+  return `e2e+${slug}-${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}@${domain}`;
 }
 
 Given('a unique email address for {string}', function (name) {
   this.name = name;
   this.email = uniqueEmail(name);
+});
+
+// WVR-98: a policy rule names a domain, so a scenario needs an address that
+// lives under one rather than the suite's usual example.com.
+Given('a unique email address at {string} for {string}', function (domain, name) {
+  this.name = name;
+  this.email = uniqueEmail(name, domain);
 });
 
 Given('an account exists for {string} with the password {string}', async function (name, password) {

@@ -150,6 +150,23 @@ export const latestMailCode = (subject) =>
       `No six-digit code in a ${JSON.stringify(subject)} message: ${await describeMailbox()}`
   );
 
+// ----- signup policy ---------------------------------------------------------
+
+/**
+ * Replaces the relay's signup policy (WVR-98). The refusal paths only exist
+ * when a policy does, and the suite has no database or CLI handle, so a
+ * scenario states the whole policy — default decision plus allowed addresses
+ * and domains — in one call.
+ */
+export async function setSignupPolicy(policy) {
+  const response = await fetch(`${harness.mailUrl}/signup-policy`, {
+    method: 'PUT',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(policy)
+  });
+  if (!response.ok) throw new Error(`PUT /signup-policy failed with ${response.status}`);
+}
+
 // ----- pairing ---------------------------------------------------------------
 
 /** A fresh key per seed, as a real pairing mints a new key each time. */

@@ -628,7 +628,7 @@ async fn finish_sign_in(
             subject: &assertion.subject,
             name: &assertion.name,
             email: &address,
-            lookup_key: &address.to_lowercase(),
+            lookup_key: &crate::email::normalize_address(&address),
             email_verified_at: verified.then_some(now),
             sealed_refresh: &sealed_refresh,
             now,
@@ -636,6 +636,12 @@ async fn finish_sign_in(
         .await
     {
         Ok(resolved) => resolved,
+        // The relay's signup policy refused this first sign-in (WVR-98): the
+        // person is sent back to the sign-in page with the fixed wording.
+        Err(StoreError::SignupRefused { refusal }) => {
+            crate::account::log_signup_refusal(&address, refusal);
+            return Err(refused("signup_closed", "signup policy denied"));
+        }
         // The address belongs to another account and the provider does not
         // vouch for it: refusing is the takeover-safe answer.
         Err(StoreError::Conflict(_)) => return Err(refused("email", "address already in use")),

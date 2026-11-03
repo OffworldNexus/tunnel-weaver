@@ -28,6 +28,8 @@ pub mod password_reset_token;
 pub mod pending_registration;
 pub mod person;
 pub mod service;
+pub mod signup_policy;
+pub mod signup_rule;
 pub mod sso_flow;
 pub mod totp_credential;
 pub mod usage_daily;

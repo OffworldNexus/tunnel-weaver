@@ -45,6 +45,7 @@ use crate::store::account::{
 use crate::store::entity::pending_registration;
 use crate::store::entity::{account, person};
 use crate::store::names;
+use crate::store::signup::SignupDecision;
 use crate::tunnel::TunnelRegistry;
 use crate::wall_clock::unix_secs;
 use weaver_mux::CloseCode;
@@ -316,6 +317,13 @@ async fn signup(
         return response;
     }
 
+    // The policy runs before any write: a denied address gets no pending
+    // registration and no email, and sees the fixed refusal (WVR-98).
+    let lookup_key = crate::email::normalize_address(email);
+    if let Some(response) = admit_signup(&rt, &lookup_key).await {
+        return response;
+    }
+
     let now = unix_secs();
     let flow_id = session::new_token();
     let pending = match rt
@@ -324,7 +332,7 @@ async fn signup(
             flow_id: flow_id.clone(),
             name: name.to_string(),
             email: email.to_string(),
-            lookup_key: normalize_email(email),
+            lookup_key: crate::email::normalize_address(email),
             created_at: now,
             // Outlive the code so a verified user can still finish setting a
             // password inside the completion window.
@@ -349,6 +357,10 @@ async fn signup(
 }
 
 /// `POST /api/account/resend` — re-issue a verification code, throttled.
+///
+/// The signup policy (WVR-98) is deliberately not re-checked here: a resend
+/// creates nothing, and both the verification and completion steps refuse an
+/// address the policy has closed, so a code that arrives is harmless.
 async fn resend(
     State(rt): State<Arc<AccountRuntime>>,
     headers: HeaderMap,
@@ -433,6 +445,13 @@ async fn verify_signup(
     // under its identity is a state this program never writes.
     if purpose != Purpose::VerifyAddress {
         return refuse();
+    }
+
+    // The policy may have closed since the address was first submitted, so it is
+    // applied again here — before ownership turns into anything, and before the
+    // existing-address branch could disclose an account (WVR-98).
+    if let Some(response) = admit_signup(&rt, &pending.lookup_key).await {
+        return response;
     }
 
     // The code proved the mailbox. Record it as the consumed proof token the
@@ -585,6 +604,12 @@ async fn complete(
         Ok(ActivationOutcome::ExistingAccount(_)) => {
             json_ok(json!({ "outcome": "existing_account", "email": pending.email }))
         }
+        // The policy closed between the first submission and this request; the
+        // store re-checks it inside the activation transaction (WVR-98).
+        Err(StoreError::SignupRefused { refusal }) => {
+            crate::account::log_signup_refusal(&pending.lookup_key, refusal);
+            err(StatusCode::FORBIDDEN, crate::account::SIGNUP_CLOSED)
+        }
         Err(_) => err(StatusCode::SERVICE_UNAVAILABLE, "temporarily unavailable"),
     }
 }
@@ -618,7 +643,7 @@ async fn reset_request(
         return response;
     }
     let now = unix_secs();
-    let lookup = normalize_email(email);
+    let lookup = crate::email::normalize_address(email);
 
     // Resolve without disclosing. Both branches below do the same amount of
     // work so an observer cannot learn whether the address exists.
@@ -830,7 +855,7 @@ async fn login(
         return response;
     }
     let now = unix_secs();
-    let lookup = normalize_email(&req.email);
+    let lookup = crate::email::normalize_address(&req.email);
 
     // Resolve without disclosing; verify against a dummy hash when absent so the
     // response timing does not reveal whether the address exists.
@@ -1441,7 +1466,7 @@ async fn passkey_signin_begin(
         return err(StatusCode::FORBIDDEN, "request refused");
     }
     let now = unix_secs();
-    let lookup = normalize_email(&req.email);
+    let lookup = crate::email::normalize_address(&req.email);
     if lookup.is_empty() {
         return match passkey::begin_discover(&rt, now) {
             Ok(started) => passkey_started(started),
@@ -2753,6 +2778,27 @@ async fn spa(State(_rt): State<Arc<AccountRuntime>>, headers: HeaderMap, uri: Ur
 
 // ----- helpers --------------------------------------------------------------
 
+/// Applies the relay's account-creation policy to an address (WVR-98).
+///
+/// `None` means the address may sign up; a refusal is logged for the operator
+/// and becomes the one fixed message the person sees. Shared by every password
+/// signup step that could create an account, so the wording and the log can
+/// never drift apart. Returns `Option<Response>` like [`consume_altcha`], whose
+/// response payload is far too large for a `Result` error variant.
+async fn admit_signup(rt: &AccountRuntime, lookup_key: &str) -> Option<Response> {
+    match rt.store.signup_decision(lookup_key).await {
+        Ok(SignupDecision::Allowed) => None,
+        Ok(SignupDecision::Denied { refusal }) => {
+            crate::account::log_signup_refusal(lookup_key, refusal);
+            Some(err(StatusCode::FORBIDDEN, crate::account::SIGNUP_CLOSED))
+        }
+        Err(_) => Some(err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "temporarily unavailable",
+        )),
+    }
+}
+
 /// Verifies and consumes an ALTCHA payload for one purpose, mapping engine
 /// results onto HTTP responses. `None` means the proof was accepted; `Some` is a
 /// ready refusal response.
@@ -3035,11 +3081,6 @@ fn asset_response(
         out.insert(header::CONTENT_ENCODING, value);
     }
     response
-}
-
-/// Normalises an address into its lookup/uniqueness key. No dot/plus rewriting.
-fn normalize_email(email: &str) -> String {
-    email.trim().to_lowercase()
 }
 
 /// A short human phrase for a lifetime, used in email copy. Singular forms are

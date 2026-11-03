@@ -22,6 +22,7 @@ use crate::setup::interactive::GatheredConfig;
 use crate::setup::planner::Plan;
 use crate::setup::units::{ServiceUnitParams, render_service_unit, render_socket_unit};
 use crate::store::Store;
+use crate::store::signup::Decision;
 
 /// Computes the SHA-256 digest of a file.
 fn file_sha256(path: &Path) -> Option<[u8; 32]> {
@@ -318,6 +319,22 @@ pub async fn execute_install(
         .save_config(&config)
         .await
         .map_err(|e| format!("failed to save config: {e}"))?;
+
+    // The wizard's answer to "who may create an account" (WVR-98): any value
+    // switches the relay to deny-by-default with one allow rule per value. No
+    // value leaves an existing policy untouched — an upgrade must not silently
+    // reopen signups.
+    if !gathered.signup_allow.is_empty() {
+        let rules = gathered
+            .signup_allow
+            .iter()
+            .map(|value| (Decision::Allow, value.clone()))
+            .collect::<Vec<_>>();
+        store
+            .signup_policy_replace(Decision::Deny, &rules)
+            .await
+            .map_err(|e| format!("failed to save the signup policy: {e}"))?;
+    }
 
     if let Some(acct) = registered_account {
         let dir_url = config.acme_directory.clone().unwrap_or_else(|| {

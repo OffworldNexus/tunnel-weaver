@@ -24,6 +24,7 @@ use super::entity::{
     password_credential, password_reset_token, pending_registration, person, service, sso_flow,
     totp_credential, usage_daily, usage_live, verification_token,
 };
+use super::signup::SignupDecision;
 use super::{Store, StoreError};
 
 /// `auth_event.kind` for the emailed-code proof.
@@ -681,6 +682,18 @@ impl Store {
     ) -> Result<ActivationOutcome, StoreError> {
         let txn = self.db.begin().await?;
 
+        // The signup policy is re-checked here, at the moment the account would
+        // come into existence (WVR-98): a registration that started while the
+        // address was allowed must not land after the operator closed it. The
+        // check precedes the token consume so a refusal leaves the completion
+        // window usable if the policy opens again.
+        if let SignupDecision::Denied { refusal } =
+            self.signup_decision_in_txn(&txn, req.lookup_key).await?
+        {
+            txn.rollback().await?;
+            return Err(StoreError::SignupRefused { refusal });
+        }
+
         // Single-use, unexpired consume. `rows_affected == 0` means a replay, a
         // revoked link, or an expired link — all refused.
         let consumed = verification_token::Entity::update_many()
@@ -1242,6 +1255,17 @@ impl Store {
                 account,
                 created: false,
             });
+        }
+
+        // This is the first sign-in: it is about to create an account, so the
+        // relay's signup policy applies (WVR-98). The store also refuses an
+        // address the provider does not vouch for under any configured policy.
+        if let SignupDecision::Denied { refusal } = self
+            .signup_admit_in_txn(&txn, req.lookup_key, req.email_verified_at.is_some())
+            .await?
+        {
+            txn.rollback().await?;
+            return Err(StoreError::SignupRefused { refusal });
         }
 
         let created = account::ActiveModel {

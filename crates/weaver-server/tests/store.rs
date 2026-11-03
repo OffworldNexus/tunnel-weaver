@@ -8,6 +8,7 @@ use weaver_server::store::account::{
     NewPendingRegistration, NewTotpCredential, NewVerificationToken, ResetRequest,
 };
 use weaver_server::store::entity::totp_credential;
+use weaver_server::store::signup::Decision;
 use weaver_server::{Config, ConfigError, Store, StoreError};
 
 /// Runs a scalar query and returns the first column of the first row.
@@ -116,23 +117,24 @@ async fn test_store_open_runs_migrations_and_is_idempotent() {
         let store = Store::open(&db_path).await.expect("open failed");
         let count: i64 = scalar(
             &store,
-            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN ('config', 'acme_account', 'domains', 'certificates', 'cert_events', 'seaql_migrations', 'person', 'machine', 'machine_key_log', 'service', 'usage_daily', 'usage_live', 'challenge', 'abuse_bucket', 'auth_event', 'login_challenge', 'passkey_credential', 'totp_credential')",
+            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN ('config', 'acme_account', 'domains', 'certificates', 'cert_events', 'seaql_migrations', 'person', 'machine', 'machine_key_log', 'service', 'usage_daily', 'usage_live', 'challenge', 'abuse_bucket', 'auth_event', 'login_challenge', 'passkey_credential', 'totp_credential', 'signup_policy', 'signup_rule')",
         )
         .await;
-        assert_eq!(count, 18);
-        // Eight migrations: `m0001_init`, `m0002_usage_daily`,
+        assert_eq!(count, 20);
+        // Ten migrations: `m0001_init`, `m0002_usage_daily`,
         // `m0003_inactivity`, `m0004_auth_levels`, `m0005_passkeys`,
         // `m0006_totp`, `m0007_external_identity`,
-        // `m0008_login_challenge_purpose` and `m0009_session_provider`.
-        assert_eq!(store.schema_version().await.expect("schema_version"), 9);
+        // `m0008_login_challenge_purpose`, `m0009_session_provider` and
+        // `m0010_signup_policy`.
+        assert_eq!(store.schema_version().await.expect("schema_version"), 10);
     }
 
     // Re-open existing database: should succeed and not re-apply migrations
     {
         let store = Store::open(&db_path).await.expect("re-open failed");
         let migration_count: i64 = scalar(&store, "SELECT count(*) FROM seaql_migrations").await;
-        assert_eq!(migration_count, 9);
-        assert_eq!(store.schema_version().await.expect("schema_version"), 9);
+        assert_eq!(migration_count, 10);
+        assert_eq!(store.schema_version().await.expect("schema_version"), 10);
     }
 }
 
@@ -2987,4 +2989,47 @@ async fn test_external_identity_resolves_creates_links_and_refuses_takeover() {
         .expect("links");
     assert!(!linked.created);
     assert_eq!(linked.account.id, existing);
+}
+
+/// WVR-98: a registration that started while the address was allowed must not
+/// land after the operator closed signups — and the refusal must leave the
+/// completion window usable if the policy opens again, rather than burning it.
+#[tokio::test]
+async fn test_activation_rechecks_the_signup_policy() {
+    let temp = TempDir::new().expect("tempdir");
+    let store = Store::open(temp.path().join("signup-policy-activate.db"))
+        .await
+        .expect("open failed");
+    let now = 1_000;
+    let email = "late@example.com";
+    let hash = "$argon2id$v=19$m=8,t=1,p=1$c2FsdA$aGFzaA";
+    let (pending, proof, completion) =
+        stage_verified_signup(&store, "Late", email, email, now).await;
+
+    store.signup_default_set(Decision::Deny).await.unwrap();
+    let refused = store
+        .account_activate(ActivationRequest {
+            pending_registration_id: pending,
+            consume_token_id: completion,
+            proof_token_id: proof,
+            name: "Late",
+            email,
+            lookup_key: email,
+            encoded_hash: hash,
+            now,
+        })
+        .await;
+    assert!(matches!(refused, Err(StoreError::SignupRefused { .. })));
+    assert!(
+        store.email_identity_find(email).await.unwrap().is_none(),
+        "a refused activation must not create the account"
+    );
+
+    // Reopening signups lets the same completion token finish the signup.
+    store.signup_default_set(Decision::Allow).await.unwrap();
+    let outcome = activate(
+        &store, pending, proof, completion, "Late", email, email, hash, now,
+    )
+    .await;
+    assert!(matches!(outcome, ActivationOutcome::Activated(_)));
 }

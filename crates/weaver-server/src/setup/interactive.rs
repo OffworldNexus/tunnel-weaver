@@ -33,6 +33,9 @@ pub struct GatheredConfig {
     /// Operator-supplied public IPs, forwarded across the `sudo` re-exec so a
     /// NAT deployment keeps its explicit `--relay-ip` values.
     pub relay_ips: Vec<std::net::IpAddr>,
+    /// The addresses and domains allowed to create an account (WVR-98), already
+    /// validated and normalised. Empty means sign-ups are open to anyone.
+    pub signup_allow: Vec<crate::store::signup::RuleValue>,
     /// Gathered transactional-email settings, or `None` when email is off.
     pub email: Option<EmailConfig>,
     /// A 0600 staging file the elevated child reads the email block from, so
@@ -112,8 +115,37 @@ pub fn prompt_line(prompt: &str, default: Option<&str>) -> std::io::Result<Strin
         .map_err(inquire_err)
 }
 
-/// Reads masked input for sensitive values (such as API keys and EAB HMAC keys).
+/// Asks which email addresses or domains may create an account (WVR-98).
 ///
+/// One value per line; a blank line ends the list, which leaves sign-ups open to
+/// anyone. Each value is parsed with the same validator the `signup` CLI uses,
+/// so a typo is re-asked here instead of being written to the store.
+pub fn prompt_signup_allow_list() -> std::io::Result<Vec<crate::store::signup::RuleValue>> {
+    println!("\n{}", "Who may create an account".bold().white());
+    println!(
+        "  {}",
+        "Only these addresses and domains may sign up; everything else is refused. \
+         Leave the first one blank to keep sign-ups open to anyone."
+            .dark_grey()
+    );
+    let mut allowed = Vec::new();
+    loop {
+        let input = prompt_line(
+            "Email address or domain allowed to sign up (blank to finish)",
+            None,
+        )?;
+        if input.is_empty() {
+            return Ok(allowed);
+        }
+        match crate::store::signup::RuleValue::infer(&input) {
+            Ok(value) if allowed.contains(&value) => println!("  Already listed."),
+            Ok(value) => allowed.push(value),
+            Err(message) => println!("{} {message}.", "✗".red().bold()),
+        }
+    }
+}
+
+/// Reads masked input for sensitive values (such as API keys and EAB HMAC keys).
 /// Uses `inquire`'s [`Password`] prompt. Its default display mode is *hidden*:
 /// nothing is drawn while the operator types, so a dropped character, a stray
 /// paste, or accidental surrounding quoting is invisible until the provider
@@ -462,6 +494,24 @@ pub fn display_plan_and_confirm(
         "none".dark_grey()
     };
     println!("  {:<18} {}", "EAB Account:".dark_grey(), eab_status);
+    println!();
+
+    println!("{}", "Sign-ups".bold().white());
+    if config.signup_allow.is_empty() {
+        println!(
+            "  {:<18} {}",
+            "Allowed:".dark_grey(),
+            "anyone with an email address".dark_grey()
+        );
+    } else {
+        let allowed = config
+            .signup_allow
+            .iter()
+            .map(crate::store::signup::RuleValue::as_str)
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!("  {:<18} {}", "Allowed:".dark_grey(), allowed.white());
+    }
     println!();
 
     if let Some(email) = &config.email {

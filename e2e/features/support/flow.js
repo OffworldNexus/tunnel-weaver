@@ -13,6 +13,12 @@ export const VERIFICATION_SUBJECT = 'Verify your email address';
 export const SIGN_IN_CODE_SUBJECT = 'Your Tunnel Weaver sign-in code';
 
 /**
+ * The one message every refused sign-up shows — the first submission and the
+ * SSO return alike (WVR-98).
+ */
+export const SIGNUP_REFUSAL = "Sign-ups with this address aren't open on this relay.";
+
+/**
  * Presses a button by its exact name. A submit gated by the proof-of-work
  * widget stays disabled until it solves; the click waits for that.
  */
@@ -26,11 +32,19 @@ async function ensureOn(world, pathname, heading) {
   await assert.seeHeading(world.page, heading);
 }
 
-export async function createAccount(world, name) {
+/**
+ * Fills and submits the sign-up form. It asserts nothing about the destination,
+ * so a caller can assert a refusal instead of the code step (WVR-98).
+ */
+export async function attemptCreateAccount(world, name) {
   await ensureOn(world, '/sign-up', 'Create your account');
   await world.page.getByLabel('Name', { exact: true }).fill(name);
   await world.page.getByLabel('Email', { exact: true }).fill(world.email);
   await press(world, 'Continue with email');
+}
+
+export async function createAccount(world, name) {
+  await attemptCreateAccount(world, name);
   await assert.seeHeading(world.page, 'Enter your code');
 }
 

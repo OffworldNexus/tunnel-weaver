@@ -5,7 +5,7 @@
 
 import { After, AfterAll, Before, BeforeAll, setDefaultTimeout } from '@cucumber/cucumber';
 import { chromium } from 'playwright';
-import { clearMail, startHarness, stopHarness } from './harness.js';
+import { clearMail, setSignupPolicy, startHarness, stopHarness } from './harness.js';
 
 setDefaultTimeout(60_000);
 
@@ -48,6 +48,9 @@ Before(async function () {
   this.authenticatorId = authenticator.authenticatorId;
   // "The latest email" can then only be mail this scenario caused.
   await clearMail();
+  // WVR-98: sign-ups are open unless a scenario says otherwise, and the policy
+  // persists in the harness's database across scenarios.
+  await setSignupPolicy({ default: 'allow', allow: [] });
 });
 
 After(async function (scenario) {
