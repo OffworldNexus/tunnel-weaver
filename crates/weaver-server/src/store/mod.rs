@@ -25,8 +25,8 @@ use std::time::Duration;
 use sea_orm::sea_query::{Expr, OnConflict};
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectOptions, ConnectionTrait, Database, DatabaseConnection,
-    DbBackend, EntityTrait, QueryFilter, QueryOrder, QuerySelect, Select, Set, Statement,
-    TransactionTrait,
+    DatabaseTransaction, DbBackend, EntityTrait, QueryFilter, QueryOrder, QuerySelect, Select, Set,
+    SqliteTransactionMode, Statement, TransactionOptions, TransactionTrait,
 };
 use sea_orm_migration::MigratorTrait;
 
@@ -162,6 +162,35 @@ impl Store {
 
     fn backend(&self) -> DbBackend {
         self.db.get_database_backend()
+    }
+
+    /// Opens a transaction that will write. Every write transaction in the
+    /// relay goes through here.
+    ///
+    /// On SQLite this is `BEGIN IMMEDIATE`, which takes the write lock up
+    /// front. A plain `BEGIN` is deferred: it reads from a snapshot first and
+    /// only asks for the write lock at its first write. If another writer
+    /// commits in between, the snapshot is stale and SQLite fails the upgrade
+    /// right away with `SQLITE_BUSY_SNAPSHOT` ("database is locked"). It does
+    /// not wait for `busy_timeout`, because waiting could never make that
+    /// snapshot current again. With `BEGIN IMMEDIATE`, a contending writer
+    /// waits at `BEGIN` on SQLite's busy handler, up to [`SQLITE_BUSY_TIMEOUT`],
+    /// until the holder commits or rolls back. Its reads then start from that
+    /// commit, so the transaction never sees a stale snapshot. A deadline
+    /// expiring is real overload and comes back as an error. No retry loop is
+    /// built on top: retrying with the same deadline would only repeat the wait.
+    ///
+    /// Other backends ignore the SQLite mode and start an ordinary transaction.
+    /// The crate's `clippy.toml` bans the bare `begin()`, so a deferred writer
+    /// cannot creep back in.
+    pub(crate) async fn begin_write(&self) -> Result<DatabaseTransaction, StoreError> {
+        Ok(self
+            .db
+            .begin_with_options(TransactionOptions {
+                sqlite_transaction_mode: Some(SqliteTransactionMode::Immediate),
+                ..TransactionOptions::default()
+            })
+            .await?)
     }
 
     /// Writes `config_json` into the singleton config row, creating or replacing it.
@@ -628,7 +657,7 @@ impl Store {
         }
         let now = unix_secs();
         let key = key_id.to_string();
-        let txn = self.db.begin().await?;
+        let txn = self.begin_write().await?;
         let created = machine::ActiveModel {
             person_id: Set(person_id),
             name: Set(lower),
@@ -679,7 +708,7 @@ impl Store {
         new_key: &KeyId,
     ) -> Result<machine::Model, StoreError> {
         let now = unix_secs();
-        let txn = self.db.begin().await?;
+        let txn = self.begin_write().await?;
         let Some(current) = machine::Entity::find_by_id(machine_id).one(&txn).await? else {
             txn.rollback().await?;
             return Err(StoreError::Conflict(format!(
@@ -714,7 +743,7 @@ impl Store {
         key_id: &KeyId,
     ) -> Result<Option<machine::Model>, StoreError> {
         let now = unix_secs();
-        let txn = self.db.begin().await?;
+        let txn = self.begin_write().await?;
         let Some(found) = machine::Entity::find()
             .filter(machine::Column::KeyId.eq(key_id.to_string()))
             .one(&txn)
@@ -823,7 +852,7 @@ impl Store {
                 "machine '{new_name}' must match ^[a-z0-9]{{1,15}}$"
             )));
         }
-        let txn = self.db.begin().await?;
+        let txn = self.begin_write().await?;
         let Some(current) = machine::Entity::find_by_id(machine_id).one(&txn).await? else {
             txn.rollback().await?;
             return Err(StoreError::Conflict(format!(

@@ -41,7 +41,7 @@ use std::ffi::CString;
 use sea_orm::sea_query::{OnConflict, Value};
 use sea_orm::{
     ColumnTrait, ConnectionTrait, DbBackend, EntityTrait, QueryFilter, QueryOrder, QuerySelect,
-    Set, Statement, TransactionTrait,
+    Set, Statement,
 };
 use sqlx::Connection as _;
 
@@ -172,7 +172,7 @@ impl Store {
         if pairs.is_empty() {
             return Ok(());
         }
-        let txn = self.db.begin().await?;
+        let txn = self.begin_write().await?;
         match self.backend() {
             DbBackend::Sqlite => {
                 for &(service_id, day) in &pairs {
@@ -227,7 +227,12 @@ impl Store {
 
         let pool = self.db.get_sqlite_connection_pool();
         let mut conn = pool.acquire().await.map_err(sqlx_error)?;
-        let mut txn = conn.begin().await.map_err(sqlx_error)?;
+        // A write transaction, opened like `Store::begin_write` opens one:
+        // `BEGIN IMMEDIATE` takes the write lock before the first read.
+        let mut txn = conn
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(sqlx_error)?;
 
         // 1. Every row must exist before any blob handle is opened.
         for &(service_id, day) in &pairs {
@@ -284,7 +289,7 @@ impl Store {
         pairs: &[(i32, i64)],
     ) -> Result<(), StoreError> {
         let backend = self.backend();
-        let txn = self.db.begin().await?;
+        let txn = self.begin_write().await?;
         ensure_rows_portable(&txn, pairs).await?;
         for write in writes {
             let column = write.slots.column();

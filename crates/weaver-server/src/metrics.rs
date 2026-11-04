@@ -39,7 +39,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use sea_orm::sea_query::OnConflict;
 use sea_orm::{
     ColumnTrait, ConnectionTrait, DatabaseTransaction, EntityTrait, JoinType, QueryFilter,
-    QuerySelect, RelationTrait, Set, Statement, TransactionTrait,
+    QuerySelect, RelationTrait, Set, Statement,
 };
 use serde_json::{Value, json};
 
@@ -511,7 +511,7 @@ impl MetricsStore {
     /// Folds one complete day's live arrays into a rollup row per service, then
     /// deletes those live rows — atomically.
     async fn fold_day(&self, day: i64) -> Result<(), StoreError> {
-        let txn = self.store.db().begin().await?;
+        let txn = self.store.begin_write().await?;
         let arrays = crate::store::usage_live::live_day_slots(&txn, day, &Slots::ALL).await?;
 
         let mut by_service: HashMap<i32, [Vec<i64>; 6]> = HashMap::new();

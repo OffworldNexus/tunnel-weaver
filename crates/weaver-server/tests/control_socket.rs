@@ -737,6 +737,7 @@ fn now_secs() -> i64 {
 #[tokio::test]
 async fn test_usage_control_verb_and_cli() {
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicI64, Ordering};
     use std::time::Instant;
     use tokio_util::sync::CancellationToken;
     use weaver_server::cert::{CertManager, CertResolver, SystemClock};
@@ -758,7 +759,8 @@ async fn test_usage_control_verb_and_cli() {
         Arc::new(SystemClock),
     );
 
-    // Seed one service and drive the manager's own loop so open time accrues.
+    // Seed one service. The manager's clock is pinned 5 s into a minute, and
+    // the test moves it by hand, so every observation lands in that minute.
     let alice = store.create_test_person("Alice").await.unwrap();
     let laptop = store
         .create_machine(alice.id, "laptop", &weaver_mux::KeyId::Ed25519([1; 32]))
@@ -766,9 +768,12 @@ async fn test_usage_control_verb_and_cli() {
         .unwrap();
     let web = store.get_or_create_service(laptop.id, "web").await.unwrap();
 
-    let metering = Arc::new(MeteringManager::new(
+    let base_ms = now_secs().div_euclid(60) * 60_000 + 5_000;
+    let clock = Arc::new(AtomicI64::new(base_ms));
+    let metering = Arc::new(MeteringManager::with_pinned_clock(
         store.as_ref().clone(),
         Duration::from_secs(60),
+        Arc::clone(&clock),
     ));
     metering.register_service(web.id);
     metering.record_request(web.id);
@@ -780,10 +785,10 @@ async fn test_usage_control_verb_and_cli() {
     metering.visitor_service_bytes(web.id, 1_000, 2_000);
     metering.tunnel_bytes(1, 300, 600);
     metering.unregister_stream(1);
-    let meter_task = metering.start(CancellationToken::new());
-    tokio::time::sleep(Duration::from_millis(1_100)).await;
-    // Stop the open clock, then flush. The current minute is complete-only-
-    // persisted, so the row the CLI reads is served live from memory.
+    // The service stays open for exactly 1 050 ms of the pinned clock. Then the
+    // open clock stops and the manager flushes. Only complete minutes are
+    // persisted, so the row the CLI reads comes live from memory.
+    clock.fetch_add(1_050, Ordering::Relaxed);
     metering.unregister_service(web.id);
     metering.flush().await.expect("flush");
 
@@ -810,7 +815,7 @@ async fn test_usage_control_verb_and_cli() {
         .await;
     });
 
-    let now = now_secs();
+    let now = base_ms.div_euclid(1_000);
     let from = (now - 3_600).to_string();
     let until = (now + 3_600).to_string();
 
@@ -848,20 +853,8 @@ async fn test_usage_control_verb_and_cli() {
     assert_eq!(val["services"][0]["tunnel_in"], 300);
     assert_eq!(val["services"][0]["tunnel_out"], 600);
     assert_eq!(val["services"][0]["requests"], 3);
-    // The bucket key is the wall-clock minute, and this test registers the
-    // service, meters it, and flushes in quick succession. On a loaded runner
-    // that can straddle a minute boundary, producing one extra covered minute;
-    // the point of the figure is that the seeded usage landed in a minute at
-    // all, not that the calendar cooperated.
-    let covered = val["services"][0]["covered_minutes"]
-        .as_i64()
-        .expect("a covered-minute count");
-    assert!((1..=2).contains(&covered), "covered minutes: {covered}");
-    assert!(
-        val["services"][0]["open_ms"].as_i64().unwrap() > 0,
-        "open time accrued: {}",
-        val["services"][0]["open_ms"]
-    );
+    assert_eq!(val["services"][0]["covered_minutes"], 1);
+    assert_eq!(val["services"][0]["open_ms"], 1_050);
 
     // Human output prints the service row.
     let output = run_usage(vec![
@@ -933,7 +926,6 @@ async fn test_usage_control_verb_and_cli() {
             .contains("'since' must be before 'until'")
     );
 
-    meter_task.abort();
     shutdown_token.cancel();
 }
 

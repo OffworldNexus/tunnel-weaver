@@ -44,7 +44,7 @@
 //!   clamping each bucket's `open_ms` to `0..=60_000`.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-#[cfg(test)]
+#[cfg(any(test, feature = "test-util"))]
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
@@ -123,7 +123,7 @@ enum Clock {
     /// The system clock.
     System,
     /// A value the caller controls, advanced by the caller rather than by time.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-util"))]
     Fixed(Arc<AtomicI64>),
 }
 
@@ -132,7 +132,7 @@ impl Clock {
     fn now_ms(&self) -> i64 {
         match self {
             Clock::System => crate::wall_clock::unix_ms(),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-util"))]
             Clock::Fixed(value) => value.load(Ordering::Relaxed),
         }
     }
@@ -156,6 +156,11 @@ pub struct MeteringManager {
     /// views re-read. `None` in tests, where nothing is watching.
     live: Option<LiveHub>,
     inner: Mutex<Inner>,
+    /// Bumped after every recorded observation, so a test can wait for a
+    /// report that some other task makes, such as the edge's close-time byte
+    /// report, instead of sleeping. See [`observations`](Self::observations).
+    #[cfg(any(test, feature = "test-util"))]
+    observed: tokio::sync::watch::Sender<u64>,
 }
 
 impl MeteringManager {
@@ -178,6 +183,26 @@ impl MeteringManager {
         self
     }
 
+    /// Creates a manager whose clock is the Unix-millisecond value in `clock`.
+    /// The time changes only when the caller stores a new value.
+    ///
+    /// Integration tests use this to pin the minute: every observation, tick,
+    /// flush and query reads this value, so a test decides which minute its
+    /// usage lands in. Waiting on the wall clock leaves that to chance.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn with_pinned_clock(
+        store: Store,
+        flush_interval: Duration,
+        clock: Arc<AtomicI64>,
+    ) -> Self {
+        Self::with_clock(
+            store,
+            flush_interval,
+            Clock::Fixed(clock),
+            DEFAULT_RETENTION,
+        )
+    }
+
     /// Creates a manager reading time from `clock`.
     fn with_clock(
         store: Store,
@@ -192,7 +217,28 @@ impl MeteringManager {
             clock,
             live: None,
             inner: Mutex::new(Inner::default()),
+            #[cfg(any(test, feature = "test-util"))]
+            observed: tokio::sync::watch::Sender::new(0),
         }
+    }
+
+    /// A receiver that wakes after each observation the manager records:
+    /// requests, byte reports, and open and close of a service.
+    ///
+    /// The value counts observations and only serves to signal a change. A
+    /// test subscribes first, checks [`query`](Self::query), and awaits
+    /// `changed()` while the usage it expects is still missing. Nothing that
+    /// lands after the subscription can then be missed.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn observations(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.observed.subscribe()
+    }
+
+    /// Signals [`observations`](Self::observations) subscribers. Compiled
+    /// away outside test builds.
+    fn observed(&self) {
+        #[cfg(any(test, feature = "test-util"))]
+        self.observed.send_modify(|count| *count += 1);
     }
 
     fn lock(&self) -> MutexGuard<'_, Inner> {
@@ -433,6 +479,8 @@ impl MeteringManager {
             .entry((service_id, minute_of(now_ms)))
             .or_default();
         bucket.requests = bucket.requests.saturating_add(1);
+        drop(inner);
+        self.observed();
     }
 
     fn visitor_service_bytes_at(
@@ -449,6 +497,8 @@ impl MeteringManager {
             .or_default();
         bucket.bytes_in = bucket.bytes_in.saturating_add(bytes_in);
         bucket.bytes_out = bucket.bytes_out.saturating_add(bytes_out);
+        drop(inner);
+        self.observed();
     }
 
     fn tunnel_bytes_at(&self, stream_id: StreamId, now_ms: i64, bytes_in: u64, bytes_out: u64) {
@@ -462,6 +512,8 @@ impl MeteringManager {
             .or_default();
         bucket.tunnel_in = bucket.tunnel_in.saturating_add(bytes_in);
         bucket.tunnel_out = bucket.tunnel_out.saturating_add(bytes_out);
+        drop(inner);
+        self.observed();
     }
 
     fn register_service_at(&self, service_id: i32, now_ms: i64) {
@@ -472,12 +524,16 @@ impl MeteringManager {
         inner.registered.entry(service_id).or_insert(Open {
             accounted_ms: now_ms,
         });
+        drop(inner);
+        self.observed();
     }
 
     fn unregister_service_at(&self, service_id: i32, now_ms: i64) {
         let mut inner = self.lock();
         accrue(&mut inner, service_id, now_ms);
         inner.registered.remove(&service_id);
+        drop(inner);
+        self.observed();
     }
 
     fn tick_at(&self, now_ms: i64) {

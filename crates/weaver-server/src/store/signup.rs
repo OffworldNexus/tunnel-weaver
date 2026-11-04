@@ -13,7 +13,7 @@
 use std::fmt;
 
 use sea_orm::sea_query::OnConflict;
-use sea_orm::{ConnectionTrait, EntityTrait, QueryOrder, Set, TransactionTrait};
+use sea_orm::{ConnectionTrait, EntityTrait, QueryOrder, Set};
 
 use super::entity::signup_policy::SINGLETON_ID;
 use super::entity::{signup_policy, signup_rule};
@@ -325,7 +325,7 @@ impl Store {
         decision: Decision,
         value: RuleValue,
     ) -> Result<Rule, StoreError> {
-        let txn = self.db.begin().await?;
+        let txn = self.begin_write().await?;
         let number = match number {
             Some(number) => number,
             None => signup_rule::Entity::find()
@@ -377,7 +377,7 @@ impl Store {
         default: Decision,
         rules: &[(Decision, RuleValue)],
     ) -> Result<(), StoreError> {
-        let txn = self.db.begin().await?;
+        let txn = self.begin_write().await?;
         signup_rule::Entity::delete_many().exec(&txn).await?;
         for (index, (decision, value)) in rules.iter().enumerate() {
             signup_rule::Entity::insert(signup_rule::ActiveModel {

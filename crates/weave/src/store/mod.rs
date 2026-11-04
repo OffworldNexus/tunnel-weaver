@@ -15,7 +15,8 @@ use std::path::Path;
 use sea_orm::sea_query::{Expr, OnConflict};
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectOptions, ConnectionTrait, Database, DatabaseConnection,
-    EntityTrait, QueryFilter, QueryOrder, Set, TransactionTrait,
+    DatabaseTransaction, EntityTrait, QueryFilter, QueryOrder, Set, SqliteTransactionMode,
+    TransactionOptions, TransactionTrait,
 };
 use sea_orm_migration::MigratorTrait;
 
@@ -65,6 +66,26 @@ impl Store {
         Ok(Self { db })
     }
 
+    /// Opens a transaction that will write. Every write transaction in the
+    /// client goes through here.
+    ///
+    /// `BEGIN IMMEDIATE` takes the write lock up front. A plain deferred
+    /// `BEGIN` reads first, and if another `weave` process commits before
+    /// this one's first write, SQLite fails the write at once with
+    /// `SQLITE_BUSY_SNAPSHOT` ("database is locked") without waiting for
+    /// `busy_timeout`. With `BEGIN IMMEDIATE`, a contending writer waits at
+    /// `BEGIN` until the holder is done, then reads from the latest commit.
+    /// The crate's `clippy.toml` bans the bare `begin()`.
+    async fn begin_write(&self) -> Result<DatabaseTransaction, StoreError> {
+        Ok(self
+            .db
+            .begin_with_options(TransactionOptions {
+                sqlite_transaction_mode: Some(SqliteTransactionMode::Immediate),
+                ..TransactionOptions::default()
+            })
+            .await?)
+    }
+
     // ----- device key -------------------------------------------------------
 
     /// The current device key's fingerprint; empty when none was ever opened.
@@ -106,7 +127,7 @@ impl Store {
         key_id: &str,
     ) -> Result<Relay, StoreError> {
         let admin_host = normalize_admin_host(admin_host)?;
-        let txn = self.db.begin().await?;
+        let txn = self.begin_write().await?;
         let saved = match find_host(&txn, &admin_host).await? {
             Some(existing) => {
                 let mut active: relay::ActiveModel = existing.into();
@@ -153,7 +174,7 @@ impl Store {
     /// Makes `admin_host` the default relay. `None` when it is not paired.
     pub async fn set_default(&self, admin_host: &str) -> Result<Option<Relay>, StoreError> {
         let admin_host = normalize_admin_host(admin_host)?;
-        let txn = self.db.begin().await?;
+        let txn = self.begin_write().await?;
         let Some(target) = find_host(&txn, &admin_host).await? else {
             return Ok(None);
         };
@@ -175,7 +196,7 @@ impl Store {
     /// relay takes over and is returned.
     pub async fn forget(&self, admin_host: &str) -> Result<Option<Relay>, StoreError> {
         let admin_host = normalize_admin_host(admin_host)?;
-        let txn = self.db.begin().await?;
+        let txn = self.begin_write().await?;
         let Some(removed) = find_host(&txn, &admin_host).await? else {
             return Ok(None);
         };
