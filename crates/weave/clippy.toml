@@ -1,0 +1,9 @@
+# A bare `begin()` opens a deferred SQLite transaction. If it reads first and
+# another `weave` process commits before its first write, SQLite fails the
+# write at once with SQLITE_BUSY_SNAPSHOT and does not wait for `busy_timeout`.
+# Writers go through `Store::begin_write` (`BEGIN IMMEDIATE`) instead; see its
+# docs.
+disallowed-methods = [
+    { path = "sea_orm::TransactionTrait::begin", reason = "use `Store::begin_write`: a deferred write transaction fails with SQLITE_BUSY_SNAPSHOT under contention" },
+    { path = "sqlx::Connection::begin", reason = "use `begin_with(\"BEGIN IMMEDIATE\")`: a deferred write transaction fails with SQLITE_BUSY_SNAPSHOT under contention" },
+]

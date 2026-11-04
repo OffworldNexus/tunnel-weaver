@@ -13,7 +13,7 @@
 use sea_orm::sea_query::{Expr, OnConflict};
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, Condition, DatabaseTransaction, EntityTrait, PaginatorTrait,
-    QueryFilter, QueryOrder, QuerySelect, Set, TransactionTrait,
+    QueryFilter, QueryOrder, QuerySelect, Set,
 };
 
 use std::collections::{HashMap, HashSet};
@@ -326,7 +326,7 @@ impl Store {
         pending_registration_id: i32,
         new: NewVerificationToken,
     ) -> Result<verification_token::Model, StoreError> {
-        let txn = self.db.begin().await?;
+        let txn = self.begin_write().await?;
         verification_token::Entity::update_many()
             .col_expr(
                 verification_token::Column::RevokedAt,
@@ -425,7 +425,7 @@ impl Store {
         account_id: i32,
         new: NewPasswordResetToken,
     ) -> Result<password_reset_token::Model, StoreError> {
-        let txn = self.db.begin().await?;
+        let txn = self.begin_write().await?;
         password_reset_token::Entity::update_many()
             .col_expr(
                 password_reset_token::Column::RevokedAt,
@@ -606,7 +606,7 @@ impl Store {
     /// Idempotent: an account that is already gone is the goal state, so a
     /// repeat call commits and returns `Ok(())`.
     pub async fn delete_account(&self, account_id: i32) -> Result<(), StoreError> {
-        let txn = self.db.begin().await?;
+        let txn = self.begin_write().await?;
         let Some(account) = account::Entity::find_by_id(account_id).one(&txn).await? else {
             txn.commit().await?;
             return Ok(());
@@ -680,7 +680,7 @@ impl Store {
         &self,
         req: ActivationRequest<'_>,
     ) -> Result<ActivationOutcome, StoreError> {
-        let txn = self.db.begin().await?;
+        let txn = self.begin_write().await?;
 
         // The signup policy is re-checked here, at the moment the account would
         // come into existence (WVR-98): a registration that started while the
@@ -810,7 +810,7 @@ impl Store {
         &self,
         req: ResetRequest<'_>,
     ) -> Result<account::Model, StoreError> {
-        let txn = self.db.begin().await?;
+        let txn = self.begin_write().await?;
 
         let consumed = password_reset_token::Entity::update_many()
             .col_expr(
@@ -862,7 +862,7 @@ impl Store {
         encoded_hash: &str,
         now: i64,
     ) -> Result<account::Model, StoreError> {
-        let txn = self.db.begin().await?;
+        let txn = self.begin_write().await?;
 
         let account = match rotate_credential(&txn, account_id, encoded_hash, now).await {
             Ok(account) => account,
@@ -1224,7 +1224,7 @@ impl Store {
         &self,
         req: NewExternalIdentity<'_>,
     ) -> Result<ExternalSignIn, StoreError> {
-        let txn = self.db.begin().await?;
+        let txn = self.begin_write().await?;
 
         if let Some(identity) = external_identity::Entity::find()
             .filter(external_identity::Column::Provider.eq(req.provider))

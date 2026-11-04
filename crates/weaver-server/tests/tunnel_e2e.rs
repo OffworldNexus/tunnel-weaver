@@ -1,6 +1,7 @@
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -15,7 +16,6 @@ use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{ClientConfig, DigitallySignedStruct, Error as RustlsError, SignatureScheme};
 use tempfile::NamedTempFile;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::time::sleep;
 use tokio_rustls::TlsConnector;
 use tokio_util::sync::CancellationToken;
 use weave::{ServiceSpec, StartOptions, Target};
@@ -25,6 +25,7 @@ use weaver_server::cert::resolver::CertResolver;
 use weaver_server::cert::{CertManager, SystemClock};
 use weaver_server::config::Config;
 use weaver_server::edge::https::run_https_server_with_registry;
+use weaver_server::live::LiveHub;
 use weaver_server::store::Store;
 use weaver_server::tunnel::StoreIdentityResolver;
 use weaver_server::tunnel::TunnelRegistry;
@@ -121,11 +122,21 @@ async fn run_start_releasing(
 struct TestOrigin {
     addr: SocketAddr,
     token: CancellationToken,
+    /// The accept loop. It owns the listener, so the port is closed once
+    /// the loop has returned.
+    accepting: tokio::task::JoinHandle<()>,
 }
 
 impl TestOrigin {
     fn port(&self) -> u16 {
         self.addr.port()
+    }
+
+    /// Takes the origin offline and returns once its listener is closed, so
+    /// a later connection attempt is refused rather than racing the shutdown.
+    async fn stop(self) {
+        self.token.cancel();
+        self.accepting.await.unwrap();
     }
 }
 
@@ -141,7 +152,7 @@ async fn spawn_test_origin_named(label: &'static str) -> TestOrigin {
     let token = CancellationToken::new();
     let t = token.clone();
     let port = addr.port();
-    tokio::spawn(async move {
+    let accepting = tokio::spawn(async move {
         loop {
             let (stream, _) = tokio::select! {
                 _ = t.cancelled() => break,
@@ -186,7 +197,11 @@ async fn spawn_test_origin_named(label: &'static str) -> TestOrigin {
             });
         }
     });
-    TestOrigin { addr, token }
+    TestOrigin {
+        addr,
+        token,
+        accepting,
+    }
 }
 
 fn start_options(server: String, ca: &std::path::Path, port: u16) -> StartRun {
@@ -298,10 +313,44 @@ struct TestRelay {
     cert_manager: Arc<CertManager>,
     store: Arc<Store>,
     metering: Arc<weaver_server::metering::MeteringManager>,
+    /// The metering clock, in Unix ms. It moves only when a test moves it.
+    meter_clock: Arc<AtomicI64>,
+    /// The registry's change bus: a test that has to see a registration or a
+    /// release subscribes here instead of polling.
+    live: LiveHub,
     shutdown_token: CancellationToken,
     ca_pem_path: std::path::PathBuf,
     _temp_db: NamedTempFile,
     _temp_ca: NamedTempFile,
+}
+
+/// How long a wait on the change bus may run before the test fails. A pass
+/// never depends on it: it only turns a hang into a failure that names what
+/// never happened.
+const HANG_GUARD: Duration = Duration::from_secs(30);
+
+impl TestRelay {
+    /// Waits until `host` routes to a live tunnel and is active.
+    async fn until_routed(&self, host: &str) {
+        let registry = &self.registry;
+        let holds = move || async move {
+            registry.resolve(host).await.is_some() && registry.is_active(host)
+        };
+        tokio::time::timeout(HANG_GUARD, until_announced(&self.live, holds))
+            .await
+            .unwrap_or_else(|_| panic!("{host} never registered"));
+    }
+
+    /// Waits until `host` no longer routes and is inactive.
+    async fn until_unrouted(&self, host: &str) {
+        let registry = &self.registry;
+        let holds = move || async move {
+            registry.resolve(host).await.is_none() && !registry.is_active(host)
+        };
+        tokio::time::timeout(HANG_GUARD, until_announced(&self.live, holds))
+            .await
+            .unwrap_or_else(|_| panic!("{host} never unregistered"));
+    }
 }
 
 async fn spawn_test_relay(tunnel_domain: &str) -> TestRelay {
@@ -345,7 +394,7 @@ async fn spawn_test_relay(tunnel_domain: &str) -> TestRelay {
 
     // Generate the single self-signed wildcard `[<root>, *.<root>]` the edge
     // presents, plus the loopback names the test client uses directly.
-    let (server_tls, cert_pem) = {
+    let (server_tls, cert_pem, key_pem) = {
         let key_pair = rcgen::KeyPair::generate().unwrap();
         let params = rcgen::CertificateParams::new(vec![
             tunnel_domain.to_string(),
@@ -369,25 +418,57 @@ async fn spawn_test_relay(tunnel_domain: &str) -> TestRelay {
             .with_single_cert(cert_der, key_der)
             .unwrap();
         config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
-        (Arc::new(config), cert_pem)
+        (Arc::new(config), cert_pem, key_pem)
     };
 
     let mut temp_ca = NamedTempFile::new().unwrap();
     std::io::Write::write_all(&mut temp_ca, cert_pem.as_bytes()).unwrap();
     let ca_pem_path = temp_ca.path().to_path_buf();
 
+    // The relay boots with that wildcard already issued, as any relay past its
+    // first start does. `register_service` waits for the covering certificate,
+    // so without the seeded row every registration would place a real order
+    // with the ACME directory over the network, and the lease would stay
+    // pending for as long as that order takes.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    store
+        .save_certificate(
+            tunnel_domain,
+            weaver_server::store::NewCertificate {
+                cert_pem: cert_pem.clone(),
+                key_pem,
+                not_before: now,
+                not_after: now + 90 * 86_400,
+                directory: "https://acme-staging-v02.api.letsencrypt.org/directory".into(),
+                obtained_at: now,
+                validation: "dns-01".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+    cert_manager.init().await.unwrap();
+
     let resolver = Arc::new(StoreIdentityResolver::new(store.as_ref().clone()));
-    let metering = Arc::new(weaver_server::metering::MeteringManager::new(
+    // Metering reads a pinned clock, 5 s into the current minute, that only the
+    // test moves. Open time is then exactly what a test advanced it by, and no
+    // minute boundary can fall mid-test.
+    let meter_clock = Arc::new(AtomicI64::new(now.div_euclid(60) * 60_000 + 5_000));
+    let metering = Arc::new(weaver_server::metering::MeteringManager::with_pinned_clock(
         store.as_ref().clone(),
         std::time::Duration::from_secs(60),
+        Arc::clone(&meter_clock),
     ));
+    let live = LiveHub::new();
     let registry = Arc::new(TunnelRegistry::new(
         tunnel_domain.to_string(),
         Arc::clone(&cert_manager),
         resolver,
         store.as_ref().clone(),
         Arc::clone(&metering),
-        weaver_server::live::LiveHub::new(),
+        live.clone(),
     ));
 
     let shutdown_token = CancellationToken::new();
@@ -407,6 +488,8 @@ async fn spawn_test_relay(tunnel_domain: &str) -> TestRelay {
         cert_manager,
         store,
         metering,
+        meter_clock,
+        live,
         shutdown_token,
         ca_pem_path,
         _temp_db: temp_db,
@@ -432,18 +515,7 @@ async fn test_tunnel_registration_and_http1_http2_proxying() {
 
     // 2. Wait for registration in registry
     let expected_hostname = poc_hostname("web", root);
-    let mut registered = false;
-    for _ in 0..50 {
-        if relay.registry.resolve(&expected_hostname).await.is_some() {
-            registered = true;
-            break;
-        }
-        sleep(Duration::from_millis(100)).await;
-    }
-    assert!(registered, "Service should register within 5 seconds");
-
-    // Verify cert_manager active status
-    assert!(relay.registry.is_active(&expected_hostname));
+    relay.until_routed(&expected_hostname).await;
 
     // 3. Visitor request over HTTP/1.1
     let client_tls_h1 = create_client_tls_config(vec![b"http/1.1".to_vec()]);
@@ -585,21 +657,10 @@ async fn test_tunnel_registration_and_http1_http2_proxying() {
         format!("origin POST /upload {} bytes", 640 * 1024).as_bytes()
     );
 
-    // 5. Terminate client and verify 404 within 1 second
+    // 5. Terminate the client: its route goes, and the hostname 404s.
     client_token.cancel();
     let _ = client_task.await;
-
-    // Wait up to 1 second for route to be removed from registry
-    let mut unreg = false;
-    for _ in 0..10 {
-        if relay.registry.resolve(&expected_hostname).await.is_none() {
-            unreg = true;
-            break;
-        }
-        sleep(Duration::from_millis(100)).await;
-    }
-    assert!(unreg, "Route should be removed within 1 second");
-    assert!(!relay.registry.is_active(&expected_hostname));
+    relay.until_unrouted(&expected_hostname).await;
 
     // Send another request and expect 404
     let tcp3 = TcpStream::connect(relay.addr).await.unwrap();
@@ -627,12 +688,33 @@ async fn test_tunnel_registration_and_http1_http2_proxying() {
     relay.shutdown_token.cancel();
 }
 
+/// Waits until `holds` is true. It checks once, then again after each change
+/// the registry announces on `live`.
+///
+/// The registry announces each registration, unregistration and eviction
+/// after its state is in place. The subscription is taken before the first
+/// check, so a change that lands between the check and the wait is still
+/// delivered, and nothing ever sleeps. A lagged receiver re-checks like any
+/// other wake. The hub never closes while the relay is alive.
+async fn until_announced<F, Fut>(live: &LiveHub, holds: F)
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    use tokio::sync::broadcast::error::RecvError;
+    let mut changes = live.subscribe();
+    while !holds().await {
+        match changes.recv().await {
+            Ok(_) | Err(RecvError::Lagged(_)) => {}
+            Err(RecvError::Closed) => panic!("the relay's change bus closed"),
+        }
+    }
+}
+
 /// The control stream is the registration lease: finishing it drops the
 /// route and deactivates the cert while the tunnel connection stays up.
 ///
-/// Multi-threaded on purpose: the client driver, the relay, and this poll loop
-/// all make progress on their own worker, so a busy `cargo test --workspace`
-/// run cannot starve the lease release into a spurious timeout.
+/// Every wait is on the registry's change bus, never on a sleep.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_control_stream_is_the_registration_lease() {
     let root = "localhost";
@@ -647,32 +729,12 @@ async fn test_control_stream_is_the_registration_lease() {
     let client_task = tokio::spawn(async move { run_start_releasing(opts, s_tok, r_tok).await });
 
     let hostname = poc_hostname("web", root);
-    let mut registered = false;
-    for _ in 0..50 {
-        if relay.registry.resolve(&hostname).await.is_some() {
-            registered = true;
-            break;
-        }
-        sleep(Duration::from_millis(100)).await;
-    }
-    assert!(registered, "service should register");
-    assert!(relay.registry.is_active(&hostname));
+    relay.until_routed(&hostname).await;
 
-    // Drop the lease; the connection stays open. The relay only unregisters
-    // after the control stream finishes and the drop is observed, which under a
-    // fully parallel test run can take well over two seconds — wait generously
-    // rather than flake.
+    // Drop the lease. The connection stays open, and finishing the control
+    // stream is the only thing that unregisters the service.
     release.cancel();
-    let mut released = false;
-    for _ in 0..100 {
-        if relay.registry.resolve(&hostname).await.is_none() {
-            released = true;
-            break;
-        }
-        sleep(Duration::from_millis(100)).await;
-    }
-    assert!(released, "finishing the control stream must unregister");
-    assert!(!relay.registry.is_active(&hostname));
+    relay.until_unrouted(&hostname).await;
     assert!(
         !client_task.is_finished(),
         "connection must survive the lease release"
@@ -702,15 +764,7 @@ async fn test_tunnel_supersession() {
     });
 
     let expected_hostname = poc_hostname("web", root);
-    let mut reg1 = false;
-    for _ in 0..50 {
-        if relay.registry.resolve(&expected_hostname).await.is_some() {
-            reg1 = true;
-            break;
-        }
-        sleep(Duration::from_millis(100)).await;
-    }
-    assert!(reg1, "Instance 1 should register");
+    relay.until_routed(&expected_hostname).await;
 
     // Start instance 2 with identical key
     let token2 = CancellationToken::new();
@@ -731,15 +785,7 @@ async fn test_tunnel_supersession() {
     );
 
     // Verify instance 2 is now registered and serving
-    let mut reg2 = false;
-    for _ in 0..50 {
-        if relay.registry.resolve(&expected_hostname).await.is_some() {
-            reg2 = true;
-            break;
-        }
-        sleep(Duration::from_millis(100)).await;
-    }
-    assert!(reg2, "Instance 2 should be active in registry");
+    relay.until_routed(&expected_hostname).await;
 
     // Clean up
     token2.cancel();
@@ -842,15 +888,7 @@ async fn test_two_services_on_one_connection() {
     let host_a = poc_hostname("alpha", root);
     let host_b = poc_hostname("beta", root);
     for host in [&host_a, &host_b] {
-        let mut ok = false;
-        for _ in 0..50 {
-            if relay.registry.resolve(host).await.is_some() {
-                ok = true;
-                break;
-            }
-            sleep(Duration::from_millis(100)).await;
-        }
-        assert!(ok, "{host} should register");
+        relay.until_routed(host).await;
     }
 
     let (status_a, body_a) = visitor_get_h1(relay.addr, &host_a, "/a").await;
@@ -897,7 +935,7 @@ async fn spawn_ws_echo_origin() -> TestOrigin {
     let addr = listener.local_addr().unwrap();
     let token = CancellationToken::new();
     let t = token.clone();
-    tokio::spawn(async move {
+    let accepting = tokio::spawn(async move {
         loop {
             let (stream, _) = tokio::select! {
                 _ = t.cancelled() => break,
@@ -927,7 +965,11 @@ async fn spawn_ws_echo_origin() -> TestOrigin {
             });
         }
     });
-    TestOrigin { addr, token }
+    TestOrigin {
+        addr,
+        token,
+        accepting,
+    }
 }
 
 /// WebSocket rides the tunnel end to end: h1 `Upgrade` and h2 RFC 8441
@@ -949,15 +991,7 @@ async fn test_websocket_upgrade_h1_and_h2_extended_connect() {
     let task = tokio::spawn(async move { run_start(opts, c_tok).await });
 
     let host = poc_hostname("ws", root);
-    let mut ok = false;
-    for _ in 0..50 {
-        if relay.registry.resolve(&host).await.is_some() {
-            ok = true;
-            break;
-        }
-        sleep(Duration::from_millis(100)).await;
-    }
-    assert!(ok, "ws service should register");
+    relay.until_routed(&host).await;
 
     // --- h1: classic Upgrade via tungstenite over TLS ---
     {
@@ -1073,7 +1107,7 @@ async fn spawn_ws_closing_origin() -> TestOrigin {
     let addr = listener.local_addr().unwrap();
     let token = CancellationToken::new();
     let t = token.clone();
-    tokio::spawn(async move {
+    let accepting = tokio::spawn(async move {
         loop {
             let (stream, _) = tokio::select! {
                 _ = t.cancelled() => break,
@@ -1108,7 +1142,11 @@ async fn spawn_ws_closing_origin() -> TestOrigin {
             });
         }
     });
-    TestOrigin { addr, token }
+    TestOrigin {
+        addr,
+        token,
+        accepting,
+    }
 }
 
 /// A raw WebSocket origin that sends a text frame followed by a Close frame
@@ -1122,7 +1160,7 @@ async fn spawn_ws_abrupt_close_origin() -> TestOrigin {
     let addr = listener.local_addr().unwrap();
     let token = CancellationToken::new();
     let t = token.clone();
-    tokio::spawn(async move {
+    let accepting = tokio::spawn(async move {
         loop {
             let (stream, _) = tokio::select! {
                 _ = t.cancelled() => break,
@@ -1152,7 +1190,11 @@ async fn spawn_ws_abrupt_close_origin() -> TestOrigin {
             });
         }
     });
-    TestOrigin { addr, token }
+    TestOrigin {
+        addr,
+        token,
+        accepting,
+    }
 }
 
 /// A trailing origin Close must survive an immediate origin-side TCP close:
@@ -1176,12 +1218,7 @@ async fn test_websocket_abrupt_origin_close_reaches_visitor() {
     let task = tokio::spawn(async move { run_start(opts, c_tok).await });
 
     let host = poc_hostname("ws", root);
-    for _ in 0..50 {
-        if relay.registry.resolve(&host).await.is_some() {
-            break;
-        }
-        sleep(Duration::from_millis(100)).await;
-    }
+    relay.until_routed(&host).await;
 
     let connector = TlsConnector::from(create_client_tls_config(vec![b"http/1.1".to_vec()]));
     let tcp = TcpStream::connect(relay.addr).await.unwrap();
@@ -1271,12 +1308,7 @@ async fn test_websocket_origin_initiated_close_reaches_visitor() {
     let task = tokio::spawn(async move { run_start(opts, c_tok).await });
 
     let host = poc_hostname("ws", root);
-    for _ in 0..50 {
-        if relay.registry.resolve(&host).await.is_some() {
-            break;
-        }
-        sleep(Duration::from_millis(100)).await;
-    }
+    relay.until_routed(&host).await;
 
     let connector = TlsConnector::from(create_client_tls_config(vec![b"http/1.1".to_vec()]));
     let tcp = TcpStream::connect(relay.addr).await.unwrap();
@@ -1352,20 +1384,11 @@ async fn test_origin_down_502s_only_that_service() {
     let host_down = poc_hostname("down", root);
     let host_up = poc_hostname("up", root);
     for host in [&host_down, &host_up] {
-        let mut ok = false;
-        for _ in 0..50 {
-            if relay.registry.resolve(host).await.is_some() {
-                ok = true;
-                break;
-            }
-            sleep(Duration::from_millis(100)).await;
-        }
-        assert!(ok, "{host} should register");
+        relay.until_routed(host).await;
     }
 
     // Take the "down" origin fully offline before any request reaches it.
-    down.token.cancel();
-    sleep(Duration::from_millis(100)).await;
+    down.stop().await;
 
     let (status_down, _) = visitor_get_h1(relay.addr, &host_down, "/x").await;
     let (status_up, body_up) = visitor_get_h1(relay.addr, &host_up, "/x").await;
@@ -1778,15 +1801,7 @@ async fn test_translation_matrix_h1_and_h2() {
     let task = tokio::spawn(async move { run_start(opts, c_tok).await });
 
     let host = poc_hostname("m", root);
-    let mut ok = false;
-    for _ in 0..50 {
-        if relay.registry.resolve(&host).await.is_some() {
-            ok = true;
-            break;
-        }
-        sleep(Duration::from_millis(100)).await;
-    }
-    assert!(ok);
+    relay.until_routed(&host).await;
     let public_origin = format!("https://{host}");
     let target_origin = format!("http://{}", origin.addr);
 
@@ -1995,15 +2010,7 @@ async fn test_h2_split_cookie_fields_reach_the_origin_joined() {
     let task = tokio::spawn(async move { run_start(opts, c_tok).await });
 
     let host = poc_hostname("m", root);
-    let mut routed = false;
-    for _ in 0..50 {
-        if relay.registry.resolve(&host).await.is_some() {
-            routed = true;
-            break;
-        }
-        sleep(Duration::from_millis(100)).await;
-    }
-    assert!(routed, "tunnel never registered");
+    relay.until_routed(&host).await;
 
     // A visitor speaking HTTP/2, sending the Cookie field split exactly the
     // way Chrome does when it carries a session cookie and a CSRF cookie.
@@ -2029,24 +2036,20 @@ async fn test_h2_split_cookie_fields_reach_the_origin_joined() {
         .header(http::header::COOKIE, "sessionid=def")
         .body(Empty::<Bytes>::new())
         .unwrap();
-    sender.send_request(req).await.unwrap();
+    let resp = sender.send_request(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
 
-    // The origin must have seen a single Cookie field, joined with "; ".
-    let mut headers = None;
-    for _ in 0..50 {
-        if let Some(seen) = origin
-            .seen
-            .lock()
-            .unwrap()
-            .iter()
-            .find(|s| s.path == "/back/account/login/")
-        {
-            headers = Some(seen.headers.clone());
-            break;
-        }
-        sleep(Duration::from_millis(20)).await;
-    }
-    let headers = headers.expect("origin never saw the request");
+    // The origin must have seen a single Cookie field, joined with "; ". It
+    // records a request before it answers, so the response arriving means the
+    // record is already there.
+    let headers = origin
+        .seen
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|s| s.path == "/back/account/login/")
+        .map(|seen| seen.headers.clone())
+        .expect("origin never saw the request");
     let cookies: Vec<&str> = headers
         .iter()
         .filter(|(name, _)| name == "cookie")
@@ -2076,7 +2079,7 @@ async fn spawn_closing_origin() -> TestOrigin {
     let addr = listener.local_addr().unwrap();
     let token = CancellationToken::new();
     let t = token.clone();
-    tokio::spawn(async move {
+    let accepting = tokio::spawn(async move {
         loop {
             let (mut stream, _) = tokio::select! {
                 _ = t.cancelled() => break,
@@ -2102,7 +2105,11 @@ async fn spawn_closing_origin() -> TestOrigin {
             });
         }
     });
-    TestOrigin { addr, token }
+    TestOrigin {
+        addr,
+        token,
+        accepting,
+    }
 }
 
 /// Raw HTTP/1.1 through the edge: `Connection: close` must actually close
@@ -2127,12 +2134,7 @@ async fn assert_connection_close_closes(origin: TestOrigin) {
     let client_task = tokio::spawn(async move { run_start(opts, c_tok).await });
 
     let hostname = poc_hostname("web", root);
-    for _ in 0..50 {
-        if relay.registry.resolve(&hostname).await.is_some() {
-            break;
-        }
-        sleep(Duration::from_millis(100)).await;
-    }
+    relay.until_routed(&hostname).await;
 
     let connector = TlsConnector::from(create_client_tls_config(vec![b"http/1.1".to_vec()]));
     let tcp = TcpStream::connect(relay.addr).await.unwrap();
@@ -2179,13 +2181,19 @@ async fn assert_connection_close_closes(origin: TestOrigin) {
 #[tokio::test]
 async fn test_client_leaving_during_cert_issuance_does_not_leave_hostname_active() {
     // An "ACME directory" that accepts the TCP connection and never answers:
-    // `ensure` blocks inside the order for as long as we hold the socket.
+    // `ensure` blocks inside the order for as long as we hold the socket. The
+    // first accept is the signal that the order is in flight.
     let stall = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let stall_addr = stall.local_addr().unwrap();
+    let (ordering_tx, ordering_rx) = tokio::sync::oneshot::channel::<()>();
     let stall_task = tokio::spawn(async move {
+        let mut ordering_tx = Some(ordering_tx);
         let mut held = Vec::new();
         while let Ok((sock, _)) = stall.accept().await {
             held.push(sock);
+            if let Some(tx) = ordering_tx.take() {
+                let _ = tx.send(());
+            }
         }
     });
 
@@ -2250,19 +2258,19 @@ async fn test_client_leaving_during_cert_issuance_does_not_leave_hostname_active
                 .await
         })
     };
-    let mut routed = false;
-    for _ in 0..50 {
-        if registry.resolve(&hostname).await.is_some() {
-            routed = true;
-            break;
-        }
-        sleep(Duration::from_millis(20)).await;
-    }
-    assert!(routed, "route must appear before the order completes");
+    // The order reaching the directory proves the route went in first:
+    // `register_service` inserts it before it awaits the certificate.
+    tokio::time::timeout(HANG_GUARD, ordering_rx)
+        .await
+        .expect("the certificate order never reached the directory")
+        .unwrap();
+    assert!(
+        registry.resolve(&hostname).await.is_some(),
+        "route must appear before the order completes"
+    );
     assert!(registry.is_active(&hostname));
-    // Give the order a real chance to finish early if the stall were not
-    // holding: it must still be in flight.
-    sleep(Duration::from_millis(300)).await;
+    // The directory holds its socket and never answers, so the order cannot
+    // have completed.
     assert!(!reg.is_finished(), "the order must still be in flight");
 
     // The client goes away mid-order.
@@ -2316,15 +2324,7 @@ async fn test_store_backed_auth_and_service_domain_persistence() {
 
     // Wait until route appears in the registry
     let expected_hostname = poc_hostname("myservice", root);
-    let mut registered = false;
-    for _ in 0..50 {
-        if relay.registry.resolve(&expected_hostname).await.is_some() {
-            registered = true;
-            break;
-        }
-        sleep(Duration::from_millis(100)).await;
-    }
-    assert!(registered, "Service must register successfully");
+    relay.until_routed(&expected_hostname).await;
 
     // 3. Verify service was persisted under the connecting machine in SQLite
     let resolved = store
@@ -2382,18 +2382,7 @@ async fn test_metering_attributes_traffic_per_service() {
     let web_host = poc_hostname("web", root);
     let api_host = poc_hostname("api", root);
     for host in [&web_host, &api_host] {
-        let mut registered = false;
-        for _ in 0..50 {
-            if relay.registry.resolve(host).await.is_some() {
-                registered = true;
-                break;
-            }
-            sleep(Duration::from_millis(100)).await;
-        }
-        assert!(
-            registered,
-            "service for {host} should register within 5 seconds"
-        );
+        relay.until_routed(host).await;
     }
 
     // Drive one request to each service.
@@ -2404,50 +2393,51 @@ async fn test_metering_attributes_traffic_per_service() {
     assert_eq!(status, StatusCode::OK);
     assert!(String::from_utf8_lossy(&body).contains("api"));
 
-    // Let the relay's 1 s sampler and stream teardown report the byte deltas,
-    // and the manager's own ticker accrue open time.
-    let meter_token = CancellationToken::new();
-    let meter_task = relay.metering.start(meter_token.clone());
-    sleep(Duration::from_millis(1500)).await;
+    // Both services have now been open for exactly one second of the
+    // metering clock.
+    relay.meter_clock.fetch_add(1_000, Ordering::Relaxed);
 
-    // Flush everything, including the in-flight minute.
-    relay.metering.flush().await.expect("meter flush");
-
-    let web = relay
-        .metering
-        .query(None, Some("web"), 0, i64::MAX / 60)
-        .await
-        .expect("query web");
-    let api = relay
-        .metering
-        .query(None, Some("api"), 0, i64::MAX / 60)
-        .await
-        .expect("query api");
+    // The edge reports a visitor connection's bytes from its own task when
+    // the connection closes. The test re-reads after each observation the
+    // manager records until both services carry traffic on both legs.
+    // `query` blends in the unflushed minute, so nothing has to be flushed.
+    let mut observed = relay.metering.observations();
+    let query = |service: &'static str| {
+        let metering = Arc::clone(&relay.metering);
+        async move {
+            metering
+                .query(None, Some(service), 0, i64::MAX / 60)
+                .await
+                .expect("query usage")
+        }
+    };
+    let metered = |rows: &[weaver_server::metering::UsageTotal]| {
+        rows.first()
+            .is_some_and(|row| row.bytes_out > 0 && row.tunnel_in > 0)
+    };
+    let (web, api) = tokio::time::timeout(HANG_GUARD, async {
+        loop {
+            let (web, api) = (query("web").await, query("api").await);
+            if metered(&web) && metered(&api) {
+                break (web, api);
+            }
+            observed
+                .changed()
+                .await
+                .expect("the metering manager is alive");
+        }
+    })
+    .await
+    .expect("visitor and tunnel bytes never reached metering");
 
     // Each service gets its own aggregate row, attributed independently.
     assert_eq!(web.len(), 1, "one aggregate row for web");
     assert_eq!(api.len(), 1, "one aggregate row for api");
-    assert!(web[0].requests >= 1, "web requests: {:?}", web[0]);
-    assert!(api[0].requests >= 1, "api requests: {:?}", api[0]);
-    assert!(
-        web[0].bytes_out > 0 && web[0].tunnel_in > 0,
-        "web visitor/tunnel bytes: {:?}",
-        web[0]
-    );
-    assert!(
-        api[0].bytes_out > 0 && api[0].tunnel_in > 0,
-        "api visitor/tunnel bytes: {:?}",
-        api[0]
-    );
-    assert!(
-        web[0].open_ms > 0 && api[0].open_ms > 0,
-        "open time accrued: web={:?} api={:?}",
-        web[0],
-        api[0]
-    );
+    assert_eq!(web[0].requests, 1, "web requests: {:?}", web[0]);
+    assert_eq!(api[0].requests, 1, "api requests: {:?}", api[0]);
+    assert_eq!(web[0].open_ms, 1_000, "web open time: {:?}", web[0]);
+    assert_eq!(api[0].open_ms, 1_000, "api open time: {:?}", api[0]);
 
-    meter_token.cancel();
-    let _ = meter_task.await;
     client_token.cancel();
     web_origin.token.cancel();
     api_origin.token.cancel();

@@ -8,7 +8,7 @@
 //! `abuse_bucket` rows change.
 
 use sea_orm::sea_query::OnConflict;
-use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, Set, TransactionTrait};
+use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, Set};
 use weaver_abuse::{Charge, Gcra, Key, PolicyId, Quota};
 
 use super::entity::abuse_bucket;
@@ -29,7 +29,7 @@ impl Store {
         now_ms: i64,
         retry_cap_ms: i64,
     ) -> Result<Vec<Charge>, StoreError> {
-        let txn = self.db.begin().await?;
+        let txn = self.begin_write().await?;
         let mut decisions = Vec::with_capacity(budgets.len());
         for (key, quota) in budgets {
             let key_id = key.id as i64;

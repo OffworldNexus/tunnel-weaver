@@ -6,9 +6,7 @@
 //! swept once expired.
 
 use sea_orm::sea_query::OnConflict;
-use sea_orm::{
-    ActiveModelTrait, ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter, Set, TransactionTrait,
-};
+use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter, Set};
 use weaver_abuse::ConsumeOutcome;
 
 use super::entity::{altcha_client, altcha_proof};
@@ -83,7 +81,7 @@ impl Store {
         new: NewAltchaClient,
         now_ms: i64,
     ) -> Result<altcha_client::Model, StoreError> {
-        let txn = self.db.begin().await?;
+        let txn = self.begin_write().await?;
         if new.service_id.is_none() {
             let existing = altcha_client::Entity::find()
                 .filter(altcha_client::Column::ServiceId.is_null())

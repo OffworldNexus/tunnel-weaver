@@ -2,7 +2,7 @@
 
 ## Testing
 
-- Full suite (fast): `cargo test --workspace` (~99s, timeout 300000ms)
+- Full suite (fast): `cargo test --workspace` (~25s warm, timeout 300000ms)
 - CI-strength property tests: `PROPTEST_CASES=2000 PROPTEST_RNG_SEED=67 cargo test -p weaver-mux` (~70s, timeout 300000ms)
 - Ignored e2e suite: `cargo test --workspace -- --ignored` (~1s warm, timeout 60000ms)
 - Format check: `cargo fmt --check` (~1s, timeout 30000ms)
@@ -16,7 +16,7 @@
   `cd frontend && pnpm run build` (~3s, timeout 180000ms). Must exit 0 and
   externalize the bootstrap (no inline `<script>` in `build/index.html`).
 - Browser BDD (Cucumber + Playwright against the real server):
-  `cd e2e && pnpm test` (~93s, timeout 300000ms); one-time
+  `cd e2e && pnpm test` (~120s, timeout 300000ms); one-time
   `pnpm exec playwright install chromium`. It rebuilds
   `weaver-server --example e2e_server` first, so stop any running copy of that
   binary (a live one blocks the relink with `ETXTBSY`). A single feature file
@@ -33,7 +33,12 @@
 - Conformance (nightly / PR to develop only, needs the DO droplet): h2spec
   and Autobahn run in `.github/workflows/nightly.yml`; allow-lists live in
   `ci/conformance/*-allowlist.txt`, one case per line with a justification.
-- Last measured: 2026-11-03, after WVR-98 (the relay signup policy): full
+- Last measured: 2026-11-03, after WVR-177 (deterministic tests): full suite
+  624 passed/0 failed/3 ignored in ~25s, 5 runs in a row, all green. It was
+  ~99s because every `tunnel_e2e` registration placed a real ACME order with
+  Let's Encrypt staging. Proptest 87 passed, e2e 34 scenarios/488 steps passed,
+  ignored e2e 3 passed, fmt/clippy/deny/fuzz clean. (Prior: 2026-11-03, after
+  WVR-98 (the relay signup policy): full
   suite 624 passed/0 failed/3 ignored, e2e 34 scenarios/488 steps passed,
   ignored e2e 3 passed, SPA lint and svelte-check clean,
   fmt/clippy/deny/fuzz clean. (Prior: 2026-11-02, after WVR-175/WVR-173 (the SSO provider registry
@@ -49,7 +54,7 @@
   (74s); 641 passed/4 ignored (101s), e2e 25/273 (61s); 2026-10-23, 619
   passed/4 ignored (107s), e2e 21/227 (53s); 2026-10-19, 577 passed (100s),
   e2e 18/193 (43s); 2026-10-12, 559 passed (100s) after WVR-50; 550 passed
-  (72s).)
+  (72s).))
 
 ## Conventions
 
