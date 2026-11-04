@@ -79,6 +79,8 @@ async fn references_point_where_the_model_says() {
         // exist yet, so it carries their ids as plain columns.
         ("external_identity", vec!["account"]),
         ("sso_flow", vec![]),
+        // WVR-178: the ban history belongs to its account and goes with it.
+        ("account_ban", vec!["account"]),
     ] {
         let mut found: Vec<String> = rows(
             &store,
@@ -111,6 +113,9 @@ async fn references_point_where_the_model_says() {
         // WVR-169: one challenge per flow, whichever column keys it.
         "ux_login_challenge_session_id",
         "ux_login_challenge_pending_registration_id",
+        // WVR-178: one open ban per account, plus the history lookup.
+        "ux_account_ban_open",
+        "idx_account_ban_account_id",
     ] {
         assert_eq!(
             rows(

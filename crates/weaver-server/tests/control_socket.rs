@@ -249,7 +249,7 @@ async fn test_control_socket_daemon_suite() {
         assert_eq!(val["tunnel_domain"], "weaver.test");
         assert_eq!(val["admin_domain"], "relay-admin.test");
         // Ten migrations: `m0001_init` through `m0010_signup_policy`.
-        assert_eq!(val["schema_version"], 10);
+        assert_eq!(val["schema_version"], 11);
         // The seeded tunnel wildcard reports issued; the admin certificate has
         // no stored row and is still pending, so it counts as ordering.
         assert_eq!(val["cert_counts"]["issued"], 1);
@@ -608,6 +608,11 @@ async fn test_cert_wait_streaming_failed_exit_4_and_renew_rate_limit() {
         Duration::from_secs(60),
     ));
     tokio::spawn(async move {
+        let suspension = weaver_server::account::suspension::Suspension::new(
+            srv_store.as_ref().clone(),
+            weaver_server::live::LiveHub::new(),
+            None,
+        );
         let _ = weaver_server::control::server::run_control_server_with_listener(
             listener,
             srv_sock,
@@ -615,6 +620,7 @@ async fn test_cert_wait_streaming_failed_exit_4_and_renew_rate_limit() {
             srv_store,
             srv_mgr,
             srv_metering,
+            suspension,
             Instant::now(),
             srv_token,
         )
@@ -802,6 +808,11 @@ async fn test_usage_control_verb_and_cli() {
     let srv_mgr = Arc::clone(&cert_manager);
     let srv_metering = Arc::clone(&metering);
     tokio::spawn(async move {
+        let suspension = weaver_server::account::suspension::Suspension::new(
+            srv_store.as_ref().clone(),
+            weaver_server::live::LiveHub::new(),
+            None,
+        );
         let _ = weaver_server::control::server::run_control_server_with_listener(
             listener,
             srv_sock,
@@ -809,6 +820,7 @@ async fn test_usage_control_verb_and_cli() {
             srv_store,
             srv_mgr,
             srv_metering,
+            suspension,
             Instant::now(),
             srv_token,
         )
@@ -998,6 +1010,11 @@ async fn test_status_and_cert_status_report_admin_and_cert_metadata() {
         Duration::from_secs(60),
     ));
     tokio::spawn(async move {
+        let suspension = weaver_server::account::suspension::Suspension::new(
+            srv_store.as_ref().clone(),
+            weaver_server::live::LiveHub::new(),
+            None,
+        );
         let _ = weaver_server::control::server::run_control_server_with_listener(
             listener,
             srv_sock,
@@ -1005,6 +1022,7 @@ async fn test_status_and_cert_status_report_admin_and_cert_metadata() {
             srv_store,
             srv_mgr,
             srv_metering,
+            suspension,
             Instant::now(),
             srv_token,
         )
@@ -1106,6 +1124,11 @@ async fn test_doctor_control_verb_and_cli() {
         Duration::from_secs(60),
     ));
     tokio::spawn(async move {
+        let suspension = weaver_server::account::suspension::Suspension::new(
+            srv_store.as_ref().clone(),
+            weaver_server::live::LiveHub::new(),
+            None,
+        );
         let _ = weaver_server::control::server::run_control_server_with_listener(
             listener,
             srv_sock,
@@ -1113,6 +1136,7 @@ async fn test_doctor_control_verb_and_cli() {
             srv_store,
             srv_mgr,
             srv_metering,
+            suspension,
             Instant::now(),
             srv_token,
         )
@@ -1201,6 +1225,226 @@ async fn test_doctor_control_verb_and_cli() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("Weaver Server Doctor"));
     assert!(stdout.contains("Port 80"));
+
+    shutdown_token.cancel();
+}
+
+/// Runs the CLI against a control socket and returns its output.
+async fn run_cli(bin: &str, sock: &std::path::Path, args: Vec<String>) -> std::process::Output {
+    let bin = bin.to_string();
+    let sock = sock.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        Command::new(bin)
+            .arg("--socket")
+            .arg(&sock)
+            .args(args)
+            .output()
+            .expect("run weaver-server")
+    })
+    .await
+    .expect("join the CLI run")
+}
+
+// 9. `account ban` / `unban` / `list`: the CLI is a control-socket client and
+// the running daemon performs the ban (WVR-178).
+#[tokio::test]
+async fn test_account_control_verbs_and_cli() {
+    use sea_orm::{ActiveModelTrait, Set};
+    use std::sync::Arc;
+    use std::time::Instant;
+    use tokio_util::sync::CancellationToken;
+    use weaver_server::cert::{CertManager, CertResolver, SystemClock};
+    use weaver_server::metering::MeteringManager;
+    use weaver_server::store::entity::email_identity;
+
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("accounts.db");
+    let control_sock_path = dir.path().join("control.sock");
+
+    let store = Arc::new(Store::open(&db_path).await.unwrap());
+    let config = Arc::new(create_valid_test_config(0, 0, control_sock_path.clone()));
+    store.save_config(&config).await.unwrap();
+
+    // One account with an address, and one that was never banned.
+    let poc = store.create_test_person("poc").await.unwrap();
+    email_identity::ActiveModel {
+        account_id: Set(poc.account_id),
+        email: Set("poc@example.com".into()),
+        lookup_key: Set("poc@example.com".into()),
+        verified_at: Set(Some(now_secs())),
+        created_at: Set(now_secs()),
+        ..Default::default()
+    }
+    .insert(store.db())
+    .await
+    .unwrap();
+    let spare = store.create_test_person("spare").await.unwrap();
+    email_identity::ActiveModel {
+        account_id: Set(spare.account_id),
+        email: Set("spare@example.com".into()),
+        lookup_key: Set("spare@example.com".into()),
+        verified_at: Set(Some(now_secs())),
+        created_at: Set(now_secs()),
+        ..Default::default()
+    }
+    .insert(store.db())
+    .await
+    .unwrap();
+
+    let resolver = Arc::new(CertResolver::new(config.tunnel_domain.clone()));
+    let cert_manager = CertManager::new(
+        Arc::clone(&config),
+        Arc::clone(&store),
+        resolver,
+        Arc::new(SystemClock),
+    );
+
+    let shutdown_token = CancellationToken::new();
+    let listener =
+        weaver_server::control::server::bind_control_listener(&control_sock_path).unwrap();
+    let srv_token = shutdown_token.clone();
+    let srv_sock = control_sock_path.clone();
+    let srv_cfg = Arc::clone(&config);
+    let srv_store = Arc::clone(&store);
+    let srv_mgr = Arc::clone(&cert_manager);
+    let srv_metering = Arc::new(MeteringManager::new(
+        store.as_ref().clone(),
+        Duration::from_secs(60),
+    ));
+    tokio::spawn(async move {
+        let suspension = weaver_server::account::suspension::Suspension::new(
+            srv_store.as_ref().clone(),
+            weaver_server::live::LiveHub::new(),
+            None,
+        );
+        let _ = weaver_server::control::server::run_control_server_with_listener(
+            listener,
+            srv_sock,
+            srv_cfg,
+            srv_store,
+            srv_mgr,
+            srv_metering,
+            suspension,
+            Instant::now(),
+            srv_token,
+        )
+        .await;
+    });
+
+    let bin_path = env!("CARGO_BIN_EXE_weaver-server");
+
+    // `list` shows every account, never-banned ones with empty ban columns.
+    let listed = run_cli(
+        bin_path,
+        &control_sock_path,
+        vec!["account".into(), "list".into()],
+    )
+    .await;
+    assert_eq!(listed.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&listed.stdout);
+    assert!(stdout.contains("poc@example.com"), "{stdout}");
+    assert!(stdout.contains("spare@example.com"), "{stdout}");
+
+    // `--reason` is mandatory: clap refuses the command without it.
+    let reasonless = run_cli(
+        bin_path,
+        &control_sock_path,
+        vec!["account".into(), "ban".into(), "poc@example.com".into()],
+    )
+    .await;
+    assert_eq!(reasonless.status.code(), Some(2));
+
+    // The daemon bans and answers with the state it just wrote.
+    let banned = run_cli(
+        bin_path,
+        &control_sock_path,
+        vec![
+            "account".into(),
+            "ban".into(),
+            "poc@example.com".into(),
+            "--reason".into(),
+            "abuse report".into(),
+        ],
+    )
+    .await;
+    assert_eq!(banned.status.code(), Some(0), "{banned:?}");
+    let summaries = store.account_summaries(false).await.unwrap();
+    assert_eq!(summaries[0].account.state, "banned");
+    assert_eq!(summaries[0].ban.as_ref().unwrap().reason, "abuse report");
+
+    // `--banned --json` is the machine-readable view of the same list.
+    let banned_list = run_cli(
+        bin_path,
+        &control_sock_path,
+        vec![
+            "account".into(),
+            "list".into(),
+            "--banned".into(),
+            "--json".into(),
+        ],
+    )
+    .await;
+    assert_eq!(banned_list.status.code(), Some(0));
+    let json: serde_json::Value = serde_json::from_slice(&banned_list.stdout).expect("list json");
+    let accounts = json["accounts"].as_array().unwrap();
+    assert_eq!(accounts.len(), 1, "{json}");
+    assert_eq!(accounts[0]["state"], "banned");
+    assert_eq!(accounts[0]["reason"], "abuse report");
+
+    // Banning twice, and unbanning something that is not banned, are refusals.
+    let again = run_cli(
+        bin_path,
+        &control_sock_path,
+        vec![
+            "account".into(),
+            "ban".into(),
+            "poc@example.com".into(),
+            "--reason".into(),
+            "again".into(),
+        ],
+    )
+    .await;
+    assert_eq!(again.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&again.stderr).contains("already banned"));
+
+    let unbanned = run_cli(
+        bin_path,
+        &control_sock_path,
+        vec!["account".into(), "unban".into(), "poc@example.com".into()],
+    )
+    .await;
+    assert_eq!(unbanned.status.code(), Some(0), "{unbanned:?}");
+    let summaries = store.account_summaries(false).await.unwrap();
+    assert_eq!(summaries[0].account.state, "active");
+    assert!(
+        summaries[0].ban.as_ref().unwrap().unbanned_at.is_some(),
+        "the lifted ban stays as history"
+    );
+
+    let twice = run_cli(
+        bin_path,
+        &control_sock_path,
+        vec!["account".into(), "unban".into(), "poc@example.com".into()],
+    )
+    .await;
+    assert_eq!(twice.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&twice.stderr).contains("not banned"));
+
+    // An address nobody holds is refused, not silently ignored.
+    let unknown = run_cli(
+        bin_path,
+        &control_sock_path,
+        vec![
+            "account".into(),
+            "ban".into(),
+            "nobody@example.com".into(),
+            "--reason".into(),
+            "who".into(),
+        ],
+    )
+    .await;
+    assert_eq!(unknown.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&unknown.stderr).contains("no account matches"));
 
     shutdown_token.cancel();
 }

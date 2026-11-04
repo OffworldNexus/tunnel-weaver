@@ -63,6 +63,14 @@ When('I sign in with the wrong password {string}', async function (password) {
   await signIn(this, password);
 });
 
+// WVR-178: the sign-in form submitted and nothing more. A suspended account is
+// refused after the password is proved but before the code step, so a scenario
+// that expects a refusal has to own the assertion rather than have the code step
+// do it here.
+When('I submit the password {string}', async function (password) {
+  await signIn(this, password);
+});
+
 // WVR-167: the two halves of the sign-in, exposed so a feature can assert the
 // code step is reached (and what it refuses) rather than having both factors
 // run inside one step.

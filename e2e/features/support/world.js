@@ -13,6 +13,8 @@ class WeaverWorld extends World {
   email = '';
   /** The reset link taken from the mailbox. */
   resetLink = '';
+  /** The note the operator's ban carries, so a leak of it can be disproved (WVR-178). */
+  banReason = '';
   /** The pending pairing, and the approvals of earlier ones keyed by machine. */
   pairing = { handle: '', fingerprint: '' };
   paired = {};

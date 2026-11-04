@@ -18,6 +18,7 @@ pub mod second_factor;
 pub mod session;
 pub mod signin;
 pub mod sso;
+pub mod suspension;
 pub mod totp;
 pub mod views;
 

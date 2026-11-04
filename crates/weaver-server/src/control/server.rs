@@ -8,10 +8,12 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use super::protocol::{
-    BackupResponse, CertDetailResponse, CertEventSummary, CertListResponse, CertSummary,
-    CertWaitEvent, ControlRequest, ErrorResponse, ListenersInfo, RenewResponse, ShutdownResponse,
-    StatusEmail, StatusResponse, UsageResponse, UsageService,
+    AccountListResponse, AccountStateResponse, AccountSummary, BackupResponse, CertDetailResponse,
+    CertEventSummary, CertListResponse, CertSummary, CertWaitEvent, ControlRequest, ErrorResponse,
+    ListenersInfo, RenewResponse, ShutdownResponse, StatusEmail, StatusResponse, UsageResponse,
+    UsageService,
 };
+use crate::account::suspension::Suspension;
 use crate::cert::{CertManager, CertState};
 use crate::config::Config;
 use crate::metering::MeteringManager;
@@ -84,6 +86,7 @@ pub async fn run_control_server_with_listener(
     store: Arc<Store>,
     cert_manager: Arc<CertManager>,
     metering: Arc<MeteringManager>,
+    suspension: Suspension,
     start_time: Instant,
     shutdown_token: CancellationToken,
 ) -> Result<(), std::io::Error> {
@@ -100,6 +103,7 @@ pub async fn run_control_server_with_listener(
                         let store = Arc::clone(&store);
                         let cert_manager = Arc::clone(&cert_manager);
                         let metering = Arc::clone(&metering);
+                        let suspension = suspension.clone();
                         let shutdown_token = shutdown_token.clone();
 
                         tokio::spawn(async move {
@@ -109,6 +113,7 @@ pub async fn run_control_server_with_listener(
                                 store,
                                 cert_manager,
                                 metering,
+                                suspension,
                                 start_time,
                                 shutdown_token,
                             ).await {
@@ -130,12 +135,14 @@ pub async fn run_control_server_with_listener(
 }
 
 /// Binds and runs the UNIX domain control socket listener until cancelled by `shutdown_token`.
+#[allow(clippy::too_many_arguments)] // Shared runtime handles are threaded explicitly to keep the listener API flat.
 pub async fn run_control_server(
     socket_path: PathBuf,
     config: Arc<Config>,
     store: Arc<Store>,
     cert_manager: Arc<CertManager>,
     metering: Arc<MeteringManager>,
+    suspension: Suspension,
     start_time: Instant,
     shutdown_token: CancellationToken,
 ) -> Result<(), std::io::Error> {
@@ -147,6 +154,7 @@ pub async fn run_control_server(
         store,
         cert_manager,
         metering,
+        suspension,
         start_time,
         shutdown_token,
     )
@@ -295,12 +303,14 @@ async fn is_active(store: &Store, name: &str) -> bool {
 }
 
 /// Handles a single control socket connection: reads one JSON request, dispatches it, and writes response.
+#[allow(clippy::too_many_arguments)] // Shared runtime handles are threaded explicitly to keep the connection API flat.
 async fn handle_connection(
     mut stream: UnixStream,
     config: Arc<Config>,
     store: Arc<Store>,
     cert_manager: Arc<CertManager>,
     metering: Arc<MeteringManager>,
+    suspension: Suspension,
     start_time: Instant,
     shutdown_token: CancellationToken,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -356,6 +366,9 @@ async fn handle_connection(
         "backup",
         "doctor",
         "shutdown",
+        "account.ban",
+        "account.unban",
+        "account.list",
     ];
 
     if !ALLOWED_VERBS.contains(&cmd) {
@@ -908,6 +921,87 @@ async fn handle_connection(
             info!("Control socket received shutdown command, triggering graceful daemon stop");
             shutdown_token.cancel();
         }
+        "account.ban" => {
+            let (Some(address), Some(reason)) = (req.name, req.reason) else {
+                let resp =
+                    ErrorResponse::new("An address and a --reason are required to ban an account");
+                reply(&mut writer, &resp).await?;
+                return Ok(());
+            };
+            let reason = reason.trim();
+            // One line keeps `account list` readable, and a ban always has a
+            // reason: an empty one would leave the operator with a row that
+            // explains nothing.
+            if reason.is_empty() || reason.contains(['\n', '\r', '\t']) {
+                let resp = ErrorResponse::new("The ban reason must be one non-empty line");
+                reply(&mut writer, &resp).await?;
+                return Ok(());
+            }
+            let lookup_key = crate::email::normalize_address(&address);
+            match suspension
+                .ban(&lookup_key, reason, crate::wall_clock::unix_secs())
+                .await
+            {
+                Ok(model) => {
+                    let resp = AccountStateResponse {
+                        ok: true,
+                        address: lookup_key,
+                        state: model.state,
+                    };
+                    reply(&mut writer, &resp).await?;
+                }
+                Err(err) => {
+                    let resp = ErrorResponse::new(format!("Cannot ban that account: {err}"));
+                    reply(&mut writer, &resp).await?;
+                }
+            }
+        }
+        "account.unban" => {
+            let Some(address) = req.name else {
+                let resp = ErrorResponse::new("An address is required to unban an account");
+                reply(&mut writer, &resp).await?;
+                return Ok(());
+            };
+            let lookup_key = crate::email::normalize_address(&address);
+            match suspension
+                .unban(&lookup_key, crate::wall_clock::unix_secs())
+                .await
+            {
+                Ok(model) => {
+                    let resp = AccountStateResponse {
+                        ok: true,
+                        address: lookup_key,
+                        state: model.state,
+                    };
+                    reply(&mut writer, &resp).await?;
+                }
+                Err(err) => {
+                    let resp = ErrorResponse::new(format!("Cannot unban that account: {err}"));
+                    reply(&mut writer, &resp).await?;
+                }
+            }
+        }
+        "account.list" => match store.account_summaries(req.banned.unwrap_or(false)).await {
+            Ok(summaries) => {
+                let resp = AccountListResponse {
+                    ok: true,
+                    accounts: summaries
+                        .into_iter()
+                        .map(|summary| AccountSummary {
+                            addresses: summary.emails,
+                            state: summary.account.state,
+                            banned_at: summary.ban.as_ref().map(|ban| ban.banned_at),
+                            reason: summary.ban.map(|ban| ban.reason),
+                        })
+                        .collect(),
+                };
+                reply(&mut writer, &resp).await?;
+            }
+            Err(err) => {
+                let resp = ErrorResponse::new(format!("Cannot list accounts: {err}"));
+                reply(&mut writer, &resp).await?;
+            }
+        },
         _ => unreachable!(),
     }
 

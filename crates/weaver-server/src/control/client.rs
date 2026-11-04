@@ -9,8 +9,8 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
 use super::protocol::{
-    BackupResponse, CertDetailResponse, CertListResponse, ControlRequest, RenewResponse,
-    StatusResponse, UsageResponse,
+    AccountListResponse, AccountStateResponse, BackupResponse, CertDetailResponse,
+    CertListResponse, ControlRequest, RenewResponse, StatusResponse, UsageResponse,
 };
 use crate::cert::format_unix_timestamp;
 use crate::email::providers::display_name;
@@ -983,6 +983,142 @@ pub async fn client_shutdown(socket_path: &Path, json: bool) -> i32 {
     }
 
     println!("{} Server shutdown initiated", "✓".yellow().bold());
+    0
+}
+
+/// Executes the `weaver-server account ban` CLI command.
+///
+/// The daemon does the ban — store write and live fan-out — so this is a plain
+/// control-socket client, exactly like `shutdown` or `backup`. There is no
+/// direct database access from the CLI.
+pub async fn client_account_ban(
+    socket_path: &Path,
+    address: String,
+    reason: String,
+    json: bool,
+) -> i32 {
+    let req = ControlRequest {
+        name: Some(address),
+        reason: Some(reason),
+        ..ControlRequest::new("account.ban")
+    };
+
+    let line = match send_request_and_read_line(socket_path, &req).await {
+        Ok(l) => l,
+        Err(code) => return code,
+    };
+
+    let trimmed = line.trim();
+    if let Some(code) = json_short_circuit(trimmed, json) {
+        return code;
+    }
+
+    let resp: AccountStateResponse = match serde_json::from_str(trimmed) {
+        Ok(r) => r,
+        Err(_) => return response_error(trimmed),
+    };
+
+    if !resp.ok {
+        eprintln!("{} Account ban failed", "✗ Error:".red().bold());
+        return 1;
+    }
+
+    println!(
+        "{} {} is now {}",
+        "✓".green().bold(),
+        resp.address.bold(),
+        resp.state.bold()
+    );
+    0
+}
+
+/// Executes the `weaver-server account unban` CLI command.
+pub async fn client_account_unban(socket_path: &Path, address: String, json: bool) -> i32 {
+    let req = ControlRequest {
+        name: Some(address),
+        ..ControlRequest::new("account.unban")
+    };
+
+    let line = match send_request_and_read_line(socket_path, &req).await {
+        Ok(l) => l,
+        Err(code) => return code,
+    };
+
+    let trimmed = line.trim();
+    if let Some(code) = json_short_circuit(trimmed, json) {
+        return code;
+    }
+
+    let resp: AccountStateResponse = match serde_json::from_str(trimmed) {
+        Ok(r) => r,
+        Err(_) => return response_error(trimmed),
+    };
+
+    if !resp.ok {
+        eprintln!("{} Account unban failed", "✗ Error:".red().bold());
+        return 1;
+    }
+
+    println!(
+        "{} {} is now {}",
+        "✓".green().bold(),
+        resp.address.bold(),
+        resp.state.bold()
+    );
+    0
+}
+
+/// Executes the `weaver-server account list` CLI command.
+///
+/// One row per account: every address it holds, its state, and the most recent
+/// ban — the open one while banned, otherwise the last one lifted. An account
+/// that was never banned shows `-` in both ban columns.
+pub async fn client_account_list(socket_path: &Path, banned_only: bool, json: bool) -> i32 {
+    let req = ControlRequest {
+        banned: Some(banned_only),
+        ..ControlRequest::new("account.list")
+    };
+
+    let line = match send_request_and_read_line(socket_path, &req).await {
+        Ok(l) => l,
+        Err(code) => return code,
+    };
+
+    let trimmed = line.trim();
+    if let Some(code) = json_short_circuit(trimmed, json) {
+        return code;
+    }
+
+    let resp: AccountListResponse = match serde_json::from_str(trimmed) {
+        Ok(r) => r,
+        Err(_) => return response_error(trimmed),
+    };
+
+    if !resp.ok {
+        eprintln!("{} Account listing failed", "✗ Error:".red().bold());
+        return 1;
+    }
+
+    if resp.accounts.is_empty() {
+        println!("{}", "No accounts.".dark_grey());
+        return 0;
+    }
+
+    let mut table = create_styled_table();
+    table.set_header(vec!["Addresses", "State", "Banned", "Reason"]);
+    for account in resp.accounts {
+        let banned = account
+            .banned_at
+            .map(format_unix_timestamp)
+            .unwrap_or_else(|| "-".to_string());
+        let reason = account.reason.unwrap_or_else(|| "-".to_string());
+        let state = match account.state.as_str() {
+            "banned" => account.state.red().bold().to_string(),
+            _ => account.state.green().to_string(),
+        };
+        table.add_row(vec![account.addresses.join(", "), state, banned, reason]);
+    }
+    println!("{table}");
     0
 }
 

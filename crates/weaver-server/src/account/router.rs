@@ -30,6 +30,7 @@ use crate::account::passkey;
 use crate::account::second_factor::{Challenge, Flow, Purpose};
 use crate::account::session::{self, CSRF_COOKIE, CSRF_HEADER, SESSION_COOKIE};
 use crate::account::signin::{DeliverError, OpenedSession, deliver_code};
+use crate::account::suspension;
 use crate::account::views::{
     USAGE_WINDOW_SECS, key_of, load_error, owned_machine, person_of, person_services, signed_in,
 };
@@ -39,8 +40,8 @@ use crate::live::{Change, Entity, Viewer};
 use crate::metrics::{Function, Metric, MetricsQuery, MetricsStore};
 use crate::store::StoreError;
 use crate::store::account::{
-    ActivationOutcome, ActivationRequest, NewPasswordResetToken, NewPendingRegistration,
-    NewVerificationToken, ResetRequest,
+    AccountState, ActivationOutcome, ActivationRequest, NewPasswordResetToken,
+    NewPendingRegistration, NewVerificationToken, ResetRequest,
 };
 use crate::store::entity::pending_registration;
 use crate::store::entity::{account, person};
@@ -693,7 +694,7 @@ async fn issue_and_send_reset(
     digest: String,
     now: i64,
 ) {
-    if account.state != "active" {
+    if AccountState::parse(&account.state) != Some(AccountState::Active) {
         return;
     }
     let cooling_down = matches!(
@@ -886,6 +887,13 @@ async fn login(
             .await;
         return err(StatusCode::UNAUTHORIZED, "invalid email or password");
     };
+
+    // Only now, with the password proved, does a suspension show: a wrong
+    // password for a banned account got the ordinary refusal above, so the ban
+    // tells nothing to someone who cannot sign in to it (WVR-178).
+    if suspension::suspended(account) {
+        return suspension::refusal();
+    }
 
     // The second factor travels by email, so an account without an address
     // cannot sign in. Only test-only fixtures lack one; treat it as an
@@ -1521,6 +1529,19 @@ async fn passkey_signin_finish(
         let _ = manager.passkey_failed(None, None, "").await;
         return err(StatusCode::UNAUTHORIZED, PASSKEY_SIGNIN_REFUSED);
     };
+
+    // The assertion verified, so the account is who it says it is: only now may
+    // a suspension be disclosed (WVR-178).
+    let suspended = rt
+        .store
+        .account_by_id(asserted.account_id)
+        .await
+        .ok()
+        .flatten()
+        .is_some_and(|account| suspension::suspended(&account));
+    if suspended {
+        return suspension::refusal();
+    }
 
     // The second factor travels by email, so an account without an address
     // cannot sign in; only test-only fixtures lack one, and it is never a

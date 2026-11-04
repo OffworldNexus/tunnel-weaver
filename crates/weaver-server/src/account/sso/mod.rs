@@ -651,6 +651,11 @@ async fn finish_sign_in(
         }
     };
     let account = resolved.account;
+    // The provider callback succeeded, so the person proved who they are: only
+    // now is a suspension disclosed, and never the reason (WVR-178).
+    if crate::account::suspension::suspended(&account) {
+        return Err(refused("suspended", "account suspended"));
+    }
     let identity = rt
         .store
         .email_identity_for_account(account.id)

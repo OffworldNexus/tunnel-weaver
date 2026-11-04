@@ -12,14 +12,14 @@
 
 use sea_orm::sea_query::{Expr, OnConflict};
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, Condition, DatabaseTransaction, EntityTrait, PaginatorTrait,
-    QueryFilter, QueryOrder, QuerySelect, Set,
+    ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, DatabaseTransaction, EntityTrait,
+    PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Set,
 };
 
 use std::collections::{HashMap, HashSet};
 
 use super::entity::{
-    account, auth_event, browser_session, domain, email_identity, email_verification,
+    account, account_ban, auth_event, browser_session, domain, email_identity, email_verification,
     external_identity, login_challenge, machine, machine_key_log, passkey_credential,
     password_credential, password_reset_token, pending_registration, person, service, sso_flow,
     totp_credential, usage_daily, usage_live, verification_token,
@@ -59,6 +59,40 @@ const PROOF_TOTP: &str = "totp";
 /// The single-factor `identity_provider` proof is deliberately absent from that
 /// list: on its own it is only `Basic`.
 const PROOF_IDENTITY_PROVIDER_MFA: &str = "identity_provider_mfa";
+
+/// The lifecycle state recorded in `account.state` (WVR-178).
+///
+/// `Active` is the only state in which an account may sign in, hold a machine
+/// connection or serve a hostname; `Banned` is the operator's suspension. The
+/// column is free text, so an unknown value is **not** `Active`: [`Self::parse`]
+/// returns `None` for it and every caller that gates access fails closed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccountState {
+    /// The account may act.
+    Active,
+    /// The operator suspended the account.
+    Banned,
+}
+
+impl AccountState {
+    /// The value stored in `account.state`.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Banned => "banned",
+        }
+    }
+
+    /// Parses a stored value; `None` means "not a state this build knows", which
+    /// callers treat as no access rather than as a default.
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "active" => Some(Self::Active),
+            "banned" => Some(Self::Banned),
+            _ => None,
+        }
+    }
+}
 
 /// Caller-supplied fields for a new in-flight signup.
 #[derive(Debug, Clone)]
@@ -546,6 +580,187 @@ impl Store {
         Ok(account::Entity::find_by_id(id).one(&self.db).await?)
     }
 
+    /// Bans the account that owns `lookup_key` and opens its ban history row
+    /// (WVR-178).
+    ///
+    /// One transaction does everything the ban itself promises: it opens the
+    /// `account_ban` row, flips `account.state` to `banned`, and invalidates
+    /// every live browser session. The ban is therefore in force the instant it
+    /// commits, whatever the daemon is doing; the caller separately tells a
+    /// running daemon to drop the account's tunnels and push the console
+    /// sign-out, since those live in its memory rather than in the store.
+    ///
+    /// `reason` is the operator's own text. It is stored for the record and is
+    /// never shown to the account holder.
+    pub async fn account_ban(
+        &self,
+        lookup_key: &str,
+        reason: &str,
+        now: i64,
+    ) -> Result<account::Model, StoreError> {
+        let txn = self.begin_write().await?;
+        let account = account_by_lookup_key(&txn, lookup_key).await?;
+        if AccountState::parse(&account.state) == Some(AccountState::Banned) {
+            return Err(StoreError::Conflict(
+                "that account is already banned".into(),
+            ));
+        }
+        account_ban::Entity::insert(account_ban::ActiveModel {
+            account_id: Set(account.id),
+            banned_at: Set(now),
+            reason: Set(reason.to_string()),
+            unbanned_at: Set(None),
+            ..Default::default()
+        })
+        .exec_without_returning(&txn)
+        .await?;
+        let banned = account::ActiveModel {
+            id: Set(account.id),
+            state: Set(AccountState::Banned.as_str().to_string()),
+            ..Default::default()
+        }
+        .update(&txn)
+        .await?;
+        invalidate_sessions_for_account(&txn, account.id, now).await?;
+        txn.commit().await?;
+        Ok(banned)
+    }
+
+    /// Lifts the ban on the account that owns `lookup_key` (WVR-178).
+    ///
+    /// The open history row is closed with `now` rather than deleted, so the
+    /// operator keeps the record of the suspension, and the account returns to
+    /// `active` with every address, key and hostname intact. Nothing else is
+    /// undone: the sessions the ban invalidated stay invalidated, and a machine
+    /// comes back on its next `weave start`, exactly as after a web-side
+    /// disconnect.
+    pub async fn account_unban(
+        &self,
+        lookup_key: &str,
+        now: i64,
+    ) -> Result<account::Model, StoreError> {
+        let txn = self.begin_write().await?;
+        let account = account_by_lookup_key(&txn, lookup_key).await?;
+        if AccountState::parse(&account.state) != Some(AccountState::Banned) {
+            return Err(StoreError::Conflict("that account is not banned".into()));
+        }
+        let closed = account_ban::Entity::update_many()
+            .col_expr(account_ban::Column::UnbannedAt, Expr::value(Some(now)))
+            .filter(account_ban::Column::AccountId.eq(account.id))
+            .filter(account_ban::Column::UnbannedAt.is_null())
+            .exec(&txn)
+            .await?;
+        if closed.rows_affected != 1 {
+            return Err(StoreError::Conflict(
+                "that account has no open ban to lift".into(),
+            ));
+        }
+        let unbanned = account::ActiveModel {
+            id: Set(account.id),
+            state: Set(AccountState::Active.as_str().to_string()),
+            ..Default::default()
+        }
+        .update(&txn)
+        .await?;
+        txn.commit().await?;
+        Ok(unbanned)
+    }
+
+    /// Every account, with all of its addresses and its most recent ban record,
+    /// ordered by account id (WVR-178).
+    ///
+    /// This is the operator's `account list` view: one row per account, all of
+    /// its addresses (a linked identity provider adds more), and at most one ban
+    /// — the open one while banned, otherwise the last closed one. `banned_only`
+    /// narrows it to accounts that are banned right now.
+    pub async fn account_summaries(
+        &self,
+        banned_only: bool,
+    ) -> Result<Vec<AccountSummary>, StoreError> {
+        let mut query = account::Entity::find();
+        if banned_only {
+            query = query.filter(account::Column::State.eq(AccountState::Banned.as_str()));
+        }
+        let accounts = query
+            .order_by_asc(account::Column::Id)
+            .all(&self.db)
+            .await?;
+        if accounts.is_empty() {
+            return Ok(Vec::new());
+        }
+        let account_ids: Vec<i32> = accounts.iter().map(|account| account.id).collect();
+
+        // Ordered by id so an account's original address comes first; a linked
+        // identity provider appends its own.
+        let mut emails: HashMap<i32, Vec<String>> = HashMap::new();
+        for identity in email_identity::Entity::find()
+            .filter(email_identity::Column::AccountId.is_in(account_ids.clone()))
+            .order_by_asc(email_identity::Column::Id)
+            .all(&self.db)
+            .await?
+        {
+            emails
+                .entry(identity.account_id)
+                .or_default()
+                .push(identity.email);
+        }
+
+        // Newest first, so the first row seen for an account is the one to show.
+        let mut bans: HashMap<i32, account_ban::Model> = HashMap::new();
+        for ban in account_ban::Entity::find()
+            .filter(account_ban::Column::AccountId.is_in(account_ids))
+            .order_by_desc(account_ban::Column::BannedAt)
+            .order_by_desc(account_ban::Column::Id)
+            .all(&self.db)
+            .await?
+        {
+            bans.entry(ban.account_id).or_insert(ban);
+        }
+
+        Ok(accounts
+            .into_iter()
+            .map(|account| AccountSummary {
+                emails: emails.remove(&account.id).unwrap_or_default(),
+                ban: bans.remove(&account.id),
+                account,
+            })
+            .collect())
+    }
+
+    /// The latest instant each of `account_ids` was unbanned (every account when
+    /// `None`) (WVR-178).
+    ///
+    /// The inactivity sweep reads this as activity: time spent banned must not
+    /// count as idleness, so an account lifted after a long suspension gets a
+    /// fresh window instead of becoming deletable at the next tick.
+    async fn latest_unban_by_account(
+        &self,
+        account_ids: Option<&[i32]>,
+    ) -> Result<HashMap<i32, i64>, StoreError> {
+        // Scoped to this function: the trait's `max` would otherwise shadow
+        // `Ord::max` on the integers used throughout this module.
+        use sea_orm::sea_query::ExprTrait as _;
+        let mut query = account_ban::Entity::find()
+            .select_only()
+            .column(account_ban::Column::AccountId)
+            .column_as(
+                Expr::col(account_ban::Column::UnbannedAt).max(),
+                "last_unban",
+            )
+            .filter(account_ban::Column::UnbannedAt.is_not_null())
+            .group_by(account_ban::Column::AccountId);
+        if let Some(account_ids) = account_ids {
+            query = query.filter(account_ban::Column::AccountId.is_in(account_ids.to_vec()));
+        }
+        Ok(query
+            .into_tuple::<(i32, Option<i64>)>()
+            .all(&self.db)
+            .await?
+            .into_iter()
+            .filter_map(|(account_id, at)| at.map(|at| (account_id, at)))
+            .collect())
+    }
+
     /// Records a successful sign-in for `account_id` at `now` (Unix seconds).
     ///
     /// This is the inactivity clock: both the password login and the warning
@@ -716,7 +931,7 @@ impl Store {
 
         let created = account::ActiveModel {
             name: Set(req.name.to_string()),
-            state: Set("active".to_string()),
+            state: Set(AccountState::Active.as_str().to_string()),
             created_at: Set(req.now),
             activated_at: Set(req.now),
             ..Default::default()
@@ -1270,7 +1485,7 @@ impl Store {
 
         let created = account::ActiveModel {
             name: Set(req.name.to_string()),
-            state: Set("active".to_string()),
+            state: Set(AccountState::Active.as_str().to_string()),
             created_at: Set(req.now),
             activated_at: Set(req.now),
             ..Default::default()
@@ -1781,12 +1996,15 @@ impl Store {
     /// inactivity sweep.
     ///
     /// "Activity" is the later of the last sign-in (or, for an account that has
-    /// never signed in, its activation) and the newest day any of its services
-    /// was metered — folding `usage_daily` and the live day together. A day
-    /// counts at its UTC midnight, which is deliberately a hair conservative:
-    /// the threshold is measured in months, so sub-day precision would only ever
-    /// delay the sweep. The sign-in prefilter is exact because usage can only
-    /// make an account *more* recent.
+    /// never signed in, its activation), the newest day any of its services was
+    /// metered — folding `usage_daily` and the live day together — and the moment
+    /// its last ban was lifted. A day counts at its UTC midnight, which is
+    /// deliberately a hair conservative: the threshold is measured in months, so
+    /// sub-day precision would only ever delay the sweep. The sign-in prefilter
+    /// is exact because usage can only make an account *more* recent.
+    ///
+    /// Banned accounts are excluded outright: a suspension must never become a
+    /// deletion that frees the address (WVR-178).
     ///
     /// Accounts with a live browser session are flagged, not filtered here, so
     /// the caller can still count them.
@@ -1800,6 +2018,7 @@ impl Store {
         let cutoff = now.saturating_sub(threshold_secs);
         let accounts = account::Entity::find()
             .filter(account::Column::Id.gt(after_id))
+            .filter(account::Column::State.eq(AccountState::Active.as_str()))
             .filter(account::Column::ActivatedAt.lte(cutoff))
             .filter(
                 Condition::any()
@@ -1816,6 +2035,7 @@ impl Store {
         let account_ids: Vec<i32> = accounts.iter().map(|a| a.id).collect();
 
         let newest_usage = self.newest_usage_day_by_account(Some(&account_ids)).await?;
+        let last_unban = self.latest_unban_by_account(Some(&account_ids)).await?;
         // Only a session that reached the second factor counts as activity
         // (WVR-167). A session that only proved the password has not "used" the
         // account, so it must not keep a dormant account alive; the derivation
@@ -1835,6 +2055,7 @@ impl Store {
                 let last_activity = activity_of(
                     account.last_login_at.unwrap_or(account.activated_at),
                     newest_usage.get(&account.id).copied(),
+                    last_unban.get(&account.id).copied(),
                 );
                 InactivityCandidate {
                     account_id: account.id,
@@ -1855,6 +2076,9 @@ impl Store {
     /// already sent for this stretch of idleness, and its deletion, at
     /// `activity + delete_after`. Events at or before `after` belong to a tick
     /// that already ran.
+    ///
+    /// Banned accounts are skipped: they are exempt from the sweep until the
+    /// ban is lifted (WVR-178).
     pub async fn inactivity_next_event(
         &self,
         after: i64,
@@ -1867,6 +2091,7 @@ impl Store {
             .column(account::Column::ActivatedAt)
             .column(account::Column::LastLoginAt)
             .column(account::Column::InactivityWarningAt)
+            .filter(account::Column::State.eq(AccountState::Active.as_str()))
             .into_tuple()
             .all(&self.db)
             .await?;
@@ -1874,6 +2099,7 @@ impl Store {
             return Ok(None);
         }
         let newest_usage = self.newest_usage_day_by_account(None).await?;
+        let last_unban = self.latest_unban_by_account(None).await?;
 
         Ok(accounts
             .into_iter()
@@ -1881,6 +2107,7 @@ impl Store {
                 let activity = activity_of(
                     last_login_at.unwrap_or(activated_at),
                     newest_usage.get(&id).copied(),
+                    last_unban.get(&id).copied(),
                 );
                 let warned = warning_at.is_some_and(|warned| warned >= activity);
                 let warning = (!warned).then(|| activity.saturating_add(warn_after));
@@ -2017,8 +2244,24 @@ impl Store {
 
 /// An account's last activity: its sign-in (or activation) or, when later, the
 /// UTC midnight of its newest metered day.
-fn activity_of(sign_in: i64, newest_day: Option<i64>) -> i64 {
-    newest_day.map_or(sign_in, |day| sign_in.max(day.saturating_mul(86_400)))
+fn activity_of(sign_in: i64, newest_day: Option<i64>, last_unban: Option<i64>) -> i64 {
+    let metered = newest_day.map_or(sign_in, |day| sign_in.max(day.saturating_mul(86_400)));
+    // Time spent suspended is not idleness: the sweep restarts the window when
+    // the ban is lifted (WVR-178), so an account is never deleted right after an
+    // unban that followed a long ban.
+    last_unban.map_or(metered, |at| metered.max(at))
+}
+
+/// One account as the operator's `account list` shows it (WVR-178).
+#[derive(Debug, Clone)]
+pub struct AccountSummary {
+    pub account: account::Model,
+    /// Every address the account owns, in insertion order (the signup address
+    /// first; a linked identity provider appends its own).
+    pub emails: Vec<String>,
+    /// The most recent ban record: the open one while the account is banned,
+    /// otherwise the last one lifted. `None` when it was never banned.
+    pub ban: Option<account_ban::Model>,
 }
 
 /// One account the inactivity sweep should consider (WVR-160).
@@ -2103,6 +2346,26 @@ async fn rotate_credential<C: sea_orm::ConnectionTrait>(
         .one(conn)
         .await?
         .ok_or_else(|| StoreError::Conflict("account missing during credential rotation".into()))
+}
+
+/// Resolves an address's lookup key to its account inside a caller's transaction.
+///
+/// The key is already normalised by the caller (`email::normalize_address`), so
+/// any address the account owns is found the same way the sign-in paths find it.
+/// An unknown address is a conflict with a message the operator sees verbatim.
+async fn account_by_lookup_key<C: ConnectionTrait>(
+    conn: &C,
+    lookup_key: &str,
+) -> Result<account::Model, StoreError> {
+    let identity = email_identity::Entity::find()
+        .filter(email_identity::Column::LookupKey.eq(lookup_key))
+        .one(conn)
+        .await?
+        .ok_or_else(|| StoreError::Conflict("no account matches that address".into()))?;
+    account::Entity::find_by_id(identity.account_id)
+        .one(conn)
+        .await?
+        .ok_or_else(|| StoreError::Conflict("no account matches that address".into()))
 }
 
 /// Invalidates every live session for an account inside a caller's transaction.

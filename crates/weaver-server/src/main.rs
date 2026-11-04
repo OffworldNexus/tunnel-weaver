@@ -129,6 +129,51 @@ pub enum Commands {
         #[command(subcommand)]
         command: SignupCommands,
     },
+
+    /// Suspends an account, lifts a suspension, or lists accounts (WVR-178).
+    Account {
+        /// The operation to perform.
+        #[command(subcommand)]
+        command: AccountCommands,
+    },
+}
+
+/// Subcommands for suspending an account (WVR-178).
+///
+/// Every verb is a control-socket client: the running daemon performs the
+/// change, so a ban takes effect in the same instant — sessions end, console
+/// tabs are signed out and tunnels drop.
+#[derive(Subcommand, Debug, Clone)]
+pub enum AccountCommands {
+    /// Suspends an account; its sessions end and its tunnels drop at once.
+    Ban {
+        /// Any of the account's email addresses.
+        #[arg(value_name = "EMAIL")]
+        email: String,
+
+        /// Why the account is suspended. Stored with the ban, never shown to
+        /// the person, who sees one fixed sentence.
+        #[arg(long, value_name = "TEXT")]
+        reason: String,
+    },
+
+    /// Lifts a suspension.
+    Unban {
+        /// Any of the account's email addresses.
+        #[arg(value_name = "EMAIL")]
+        email: String,
+    },
+
+    /// Lists accounts with their addresses, state and latest ban.
+    List {
+        /// Only accounts that are banned right now.
+        #[arg(long)]
+        banned: bool,
+
+        /// Outputs the response as raw JSON.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// Subcommands for the relay's account-creation policy (WVR-98).
@@ -1123,6 +1168,31 @@ async fn main() {
                 .db
                 .unwrap_or_else(|| PathBuf::from("/var/lib/weaver/weaver.db"));
             let code = handle_signup(command, db_path).await;
+            std::process::exit(code);
+        }
+        Commands::Account { command } => {
+            let socket_path = cli
+                .socket
+                .unwrap_or_else(|| PathBuf::from("/run/weaver/control.sock"));
+            let code = match command {
+                AccountCommands::Ban { email, reason } => {
+                    weaver_server::control::client::client_account_ban(
+                        &socket_path,
+                        email,
+                        reason,
+                        false,
+                    )
+                    .await
+                }
+                AccountCommands::Unban { email } => {
+                    weaver_server::control::client::client_account_unban(&socket_path, email, false)
+                        .await
+                }
+                AccountCommands::List { banned, json } => {
+                    weaver_server::control::client::client_account_list(&socket_path, banned, json)
+                        .await
+                }
+            };
             std::process::exit(code);
         }
     }
